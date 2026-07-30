@@ -151,6 +151,17 @@ func (s *Store) UpdateUserProfile(ctx context.Context, id uuid.UUID, profile jso
 		id, profile, p.DisplayName, p.AvatarURL))
 }
 
+// UpdateUserPhone attaches a verified phone number to an existing account (as opposed to
+// CreateUser, which sets phone at signup). The partial unique index on phone causes this to
+// return domain.ErrConflict if the number is already linked to a different user.
+func (s *Store) UpdateUserPhone(ctx context.Context, id uuid.UUID, phone string) (domain.User, error) {
+	return scanUser(s.pool.QueryRow(ctx, `
+		UPDATE users SET phone=$2, updated_at=now()
+		WHERE id=$1
+		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
+		id, phone))
+}
+
 func (s *Store) UpsertDevice(ctx context.Context, device domain.Device) (domain.Device, error) {
 	if device.ID == uuid.Nil {
 		device.ID = uuid.New()

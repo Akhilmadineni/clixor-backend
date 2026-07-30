@@ -54,6 +54,7 @@ type Store interface {
 	UserByPhone(context.Context, string) (domain.User, error)
 	UsersByPhones(context.Context, []string) ([]domain.User, error)
 	UpdateUserProfile(context.Context, uuid.UUID, json.RawMessage) (domain.User, error)
+	UpdateUserPhone(context.Context, uuid.UUID, string) (domain.User, error)
 	UserByExternalIdentity(context.Context, string, string) (domain.User, error)
 	LinkExternalIdentity(context.Context, string, string, uuid.UUID, string) error
 

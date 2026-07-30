@@ -149,6 +149,42 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/User"}
+  /me/phone/start:
+    post:
+      operationId: startPhoneLink
+      description: Sends an OTP to attach a verified phone number to the signed-in account (as opposed to /auth/phone/start, which signs in/up).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: {type: string, pattern: "^\\+[1-9][0-9]{7,14}$"}
+      responses:
+        "202": {description: Verification pending}
+  /me/phone/verify:
+    post:
+      operationId: verifyPhoneLink
+      description: Verifies the OTP and links the phone number to the signed-in account so friends can find them via contact lookup.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: {type: string}
+                code: {type: string}
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+        "409": {description: Phone number already linked to another account}
   /devices/{device_id}:
     put:
       operationId: upsertDevice

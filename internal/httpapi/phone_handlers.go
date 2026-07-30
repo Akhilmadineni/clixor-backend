@@ -118,3 +118,79 @@ func writeVerificationRetry(w http.ResponseWriter, err error) bool {
 	writeError(w, http.StatusTooManyRequests, "verification_rate_limited", "Too many verification attempts. Please wait before trying again.")
 	return true
 }
+
+// startPhoneLink and verifyPhoneLink attach a verified phone number to the currently
+// authenticated account (e.g. an email sign-up completing profile setup), as opposed to
+// startPhoneVerification/verifyPhone above, which sign in or create an account by phone.
+func (s *Server) startPhoneLink(w http.ResponseWriter, r *http.Request) {
+	var request phoneAuthRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	request.Phone = strings.TrimSpace(request.Phone)
+	if !e164Pattern.MatchString(request.Phone) {
+		writeDomainError(w, domain.ErrInvalid)
+		return
+	}
+	if err := s.verifier.Send(r.Context(), request.Phone); err != nil {
+		if writeVerificationRetry(w, err) {
+			return
+		}
+		if errors.Is(err, verification.ErrUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "verification_unavailable", "Phone verification is unavailable.")
+			return
+		}
+		s.logger.Error("send_phone_link_verification", "error", err)
+		writeError(w, http.StatusBadGateway, "verification_failed", "The verification message could not be sent.")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "pending"})
+}
+
+func (s *Server) verifyPhoneLink(w http.ResponseWriter, r *http.Request) {
+	id, ok := identityFrom(r.Context())
+	if !ok {
+		writeDomainError(w, domain.ErrUnauthenticated)
+		return
+	}
+	var request phoneAuthRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	request.Phone = strings.TrimSpace(request.Phone)
+	if !e164Pattern.MatchString(request.Phone) || len(request.Code) < 4 || len(request.Code) > 10 {
+		writeDomainError(w, domain.ErrInvalid)
+		return
+	}
+	if err := s.verifier.Check(r.Context(), request.Phone, request.Code); err != nil {
+		if writeVerificationRetry(w, err) {
+			return
+		}
+		if errors.Is(err, verification.ErrInvalidCode) || errors.Is(err, verification.ErrExpiredCode) {
+			writeError(w, http.StatusUnauthorized, "invalid_code", "The verification code is invalid or expired.")
+			return
+		}
+		if errors.Is(err, verification.ErrUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "verification_unavailable", "Phone verification is unavailable.")
+			return
+		}
+		s.logger.Error("check_phone_link_verification", "error", err)
+		writeError(w, http.StatusBadGateway, "verification_failed", "Phone verification is temporarily unavailable.")
+		return
+	}
+	user, err := s.store.UpdateUserPhone(r.Context(), id.UserID, request.Phone)
+	if err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			writeError(w, http.StatusConflict, "phone_taken", "This phone number is already linked to another account.")
+			return
+		}
+		writeDomainError(w, err)
+		return
+	}
+	if _, err := s.store.ClaimConversationInvites(r.Context(), id.UserID, request.Phone); err != nil {
+		s.logger.Error("claim_phone_link_invites", "error", err, "user_id", id.UserID)
+		writeError(w, http.StatusInternalServerError, "invite_claim_failed", "The phone number was linked, but its pending invitations could not be claimed.")
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}

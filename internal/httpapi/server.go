@@ -82,6 +82,8 @@ func (s *Server) Router() http.Handler {
 			router.Post("/auth/logout", s.logout)
 			router.Get("/me", s.me)
 			router.Patch("/me", s.updateProfile)
+			router.Post("/me/phone/start", s.startPhoneLink)
+			router.Post("/me/phone/verify", s.verifyPhoneLink)
 			router.Post("/users/lookup", s.lookupUsers)
 			router.Route("/devices", func(router chi.Router) {
 				router.Get("/", s.listDevices)

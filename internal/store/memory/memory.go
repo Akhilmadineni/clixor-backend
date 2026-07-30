@@ -186,6 +186,26 @@ func (s *Store) UpdateUserProfile(_ context.Context, id uuid.UUID, profile json.
 	return user, nil
 }
 
+func (s *Store) UpdateUserPhone(_ context.Context, id uuid.UUID, phone string) (domain.User, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[id]
+	if !ok {
+		return domain.User{}, domain.ErrNotFound
+	}
+	if existing, exists := s.phoneToUser[phone]; exists && existing != id {
+		return domain.User{}, domain.ErrConflict
+	}
+	if user.Phone != "" {
+		delete(s.phoneToUser, user.Phone)
+	}
+	user.Phone = phone
+	user.UpdatedAt = time.Now().UTC()
+	s.users[id] = user
+	s.phoneToUser[phone] = id
+	return user, nil
+}
+
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
