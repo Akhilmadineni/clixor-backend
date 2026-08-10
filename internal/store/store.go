@@ -53,6 +53,8 @@ type Store interface {
 	UserByEmail(context.Context, string) (domain.User, error)
 	UserByPhone(context.Context, string) (domain.User, error)
 	UsersByPhones(context.Context, []string) ([]domain.User, error)
+	UsersByUsernames(context.Context, []string) ([]domain.User, error)
+	SearchUsersByUsername(context.Context, string, int) ([]domain.User, error)
 	UpdateUserProfile(context.Context, uuid.UUID, json.RawMessage) (domain.User, error)
 	UpdateUserPhone(context.Context, uuid.UUID, string) (domain.User, error)
 	UserByExternalIdentity(context.Context, string, string) (domain.User, error)

@@ -166,8 +166,19 @@ func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
+	if username, ok := profile["username"].(string); ok && strings.TrimSpace(username) != "" {
+		normalized := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(username), "@"))
+		if len(normalized) < 3 || len(normalized) > 30 {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_username", "Username must be 3–30 characters (letters, numbers, _ or .).")
+			return
+		}
+	}
 	user, err := s.store.UpdateUserProfile(r.Context(), id.UserID, rawJSON(profile))
 	if err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			writeError(w, http.StatusConflict, "username_taken", "That username is already taken.")
+			return
+		}
 		writeDomainError(w, err)
 		return
 	}

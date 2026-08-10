@@ -85,6 +85,7 @@ func (s *Server) Router() http.Handler {
 			router.Post("/me/phone/start", s.startPhoneLink)
 			router.Post("/me/phone/verify", s.verifyPhoneLink)
 			router.Post("/users/lookup", s.lookupUsers)
+			router.Get("/users/search", s.searchUsers)
 			router.Route("/devices", func(router chi.Router) {
 				router.Get("/", s.listDevices)
 				router.Put("/{deviceID}", s.upsertDevice)

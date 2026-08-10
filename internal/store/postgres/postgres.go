@@ -115,6 +115,95 @@ func (s *Store) UsersByPhones(ctx context.Context, phones []string) ([]domain.Us
 	return result, rows.Err()
 }
 
+func (s *Store) UsersByUsernames(ctx context.Context, usernames []string) ([]domain.User, error) {
+	normalized := normalizeUsernameList(usernames)
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
+		FROM users
+		WHERE lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) = ANY($1)
+		ORDER BY lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', ''))`, normalized)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []domain.User
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, user)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) SearchUsersByUsername(ctx context.Context, query string, limit int) ([]domain.User, error) {
+	q := normalizeUsername(query)
+	if q == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
+		FROM users
+		WHERE lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) LIKE $1 || '%'
+		ORDER BY lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', ''))
+		LIMIT $2`, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []domain.User
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, user)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) UpdateUserProfile(ctx context.Context, id uuid.UUID, profile json.RawMessage) (domain.User, error) {
+	var p struct {
+		DisplayName string `json:"display_name"`
+		AvatarURL   string `json:"avatar_url"`
+		Username    string `json:"username"`
+	}
+	_ = json.Unmarshal(profile, &p)
+	if p.Username != "" {
+		normalized, ok := validateUsername(p.Username)
+		if !ok {
+			return domain.User{}, domain.ErrInvalid
+		}
+		// Persist a canonical @handle in profile JSON.
+		var raw map[string]any
+		if err := json.Unmarshal(profile, &raw); err != nil {
+			return domain.User{}, domain.ErrInvalid
+		}
+		raw["username"] = "@" + normalized
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return domain.User{}, err
+		}
+		profile = encoded
+	}
+	return scanUser(s.pool.QueryRow(ctx, `
+		UPDATE users SET
+			profile=$2,
+			display_name=COALESCE(NULLIF($3,''),display_name),
+			avatar_url=COALESCE(NULLIF($4,''),avatar_url),
+			updated_at=now()
+		WHERE id=$1
+		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
+		id, profile, p.DisplayName, p.AvatarURL))
+}
+
 func (s *Store) UserByExternalIdentity(ctx context.Context, provider, subject string) (domain.User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
 		SELECT u.id,COALESCE(u.email,''),COALESCE(u.phone,''),u.display_name,u.avatar_url,
@@ -132,23 +221,6 @@ func (s *Store) LinkExternalIdentity(ctx context.Context, provider, subject stri
 		WHERE external_identities.user_id=EXCLUDED.user_id`,
 		provider, subject, userID, email)
 	return mapError(err)
-}
-
-func (s *Store) UpdateUserProfile(ctx context.Context, id uuid.UUID, profile json.RawMessage) (domain.User, error) {
-	var p struct {
-		DisplayName string `json:"display_name"`
-		AvatarURL   string `json:"avatar_url"`
-	}
-	_ = json.Unmarshal(profile, &p)
-	return scanUser(s.pool.QueryRow(ctx, `
-		UPDATE users SET
-			profile=$2,
-			display_name=COALESCE(NULLIF($3,''),display_name),
-			avatar_url=COALESCE(NULLIF($4,''),avatar_url),
-			updated_at=now()
-		WHERE id=$1
-		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
-		id, profile, p.DisplayName, p.AvatarURL))
 }
 
 // UpdateUserPhone attaches a verified phone number to an existing account (as opposed to
@@ -1258,6 +1330,43 @@ func mapError(err error) error {
 }
 
 func nullableString(value string) string { return strings.TrimSpace(value) }
+
+func normalizeUsername(value string) string {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.TrimPrefix(trimmed, "@")
+	return strings.ToLower(trimmed)
+}
+
+func normalizeUsernameList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		normalized := normalizeUsername(value)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
+}
+
+func validateUsername(value string) (string, bool) {
+	normalized := normalizeUsername(value)
+	if len(normalized) < 3 || len(normalized) > 30 {
+		return "", false
+	}
+	for _, r := range normalized {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '.' {
+			continue
+		}
+		return "", false
+	}
+	return normalized, true
+}
 
 func nullableJSON(value json.RawMessage) any {
 	if len(value) == 0 || string(value) == "null" {

@@ -20,6 +20,7 @@ type Store struct {
 	users          map[uuid.UUID]domain.User
 	emailToUser    map[string]uuid.UUID
 	phoneToUser    map[string]uuid.UUID
+	usernameToUser map[string]uuid.UUID
 	externalUsers  map[string]uuid.UUID
 	devices        map[uuid.UUID]domain.Device
 	preKeys        map[uuid.UUID][]domain.OneTimePreKey
@@ -41,6 +42,7 @@ func New() *Store {
 		users:          make(map[uuid.UUID]domain.User),
 		emailToUser:    make(map[string]uuid.UUID),
 		phoneToUser:    make(map[string]uuid.UUID),
+		usernameToUser: make(map[string]uuid.UUID),
 		externalUsers:  make(map[string]uuid.UUID),
 		devices:        make(map[uuid.UUID]domain.Device),
 		preKeys:        make(map[uuid.UUID][]domain.OneTimePreKey),
@@ -138,6 +140,72 @@ func (s *Store) UsersByPhones(_ context.Context, phones []string) ([]domain.User
 	return result, nil
 }
 
+func normalizeUsernameMemory(value string) string {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.TrimPrefix(trimmed, "@")
+	return strings.ToLower(trimmed)
+}
+
+func profileUsername(profile json.RawMessage) string {
+	var p struct {
+		Username string `json:"username"`
+	}
+	_ = json.Unmarshal(profile, &p)
+	return normalizeUsernameMemory(p.Username)
+}
+
+func (s *Store) UsersByUsernames(_ context.Context, usernames []string) ([]domain.User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]domain.User, 0, len(usernames))
+	seen := make(map[uuid.UUID]struct{})
+	for _, username := range usernames {
+		key := normalizeUsernameMemory(username)
+		if key == "" {
+			continue
+		}
+		id, ok := s.usernameToUser[key]
+		if !ok {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, s.users[id])
+	}
+	return result, nil
+}
+
+func (s *Store) SearchUsersByUsername(_ context.Context, query string, limit int) ([]domain.User, error) {
+	q := normalizeUsernameMemory(query)
+	if q == "" {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 20
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0)
+	for key := range s.usernameToUser {
+		if strings.HasPrefix(key, q) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) > limit {
+		keys = keys[:limit]
+	}
+	result := make([]domain.User, 0, len(keys))
+	for _, key := range keys {
+		if id, ok := s.usernameToUser[key]; ok {
+			result = append(result, s.users[id])
+		}
+	}
+	return result, nil
+}
+
 func (s *Store) UserByExternalIdentity(ctx context.Context, provider, subject string) (domain.User, error) {
 	s.mu.RLock()
 	id, ok := s.externalUsers[provider+":"+subject]
@@ -169,12 +237,36 @@ func (s *Store) UpdateUserProfile(_ context.Context, id uuid.UUID, profile json.
 	if !ok {
 		return domain.User{}, domain.ErrNotFound
 	}
-	user.Profile = cloneJSON(profile)
 	var p struct {
 		DisplayName string `json:"display_name"`
 		AvatarURL   string `json:"avatar_url"`
+		Username    string `json:"username"`
 	}
 	_ = json.Unmarshal(profile, &p)
+	if p.Username != "" {
+		normalized := normalizeUsernameMemory(p.Username)
+		if len(normalized) < 3 || len(normalized) > 30 {
+			return domain.User{}, domain.ErrInvalid
+		}
+		if existing, exists := s.usernameToUser[normalized]; exists && existing != id {
+			return domain.User{}, domain.ErrConflict
+		}
+		if old := profileUsername(user.Profile); old != "" && old != normalized {
+			delete(s.usernameToUser, old)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(profile, &raw); err != nil {
+			return domain.User{}, domain.ErrInvalid
+		}
+		raw["username"] = "@" + normalized
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return domain.User{}, err
+		}
+		profile = encoded
+		s.usernameToUser[normalized] = id
+	}
+	user.Profile = cloneJSON(profile)
 	if p.DisplayName != "" {
 		user.DisplayName = p.DisplayName
 	}

@@ -145,17 +145,58 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		Phones []string `json:"phones"`
+		Phones    []string `json:"phones"`
+		Usernames []string `json:"usernames"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	phones, ok := normalizePhones(request.Phones)
-	if !ok || len(phones) > 1024 {
+	if len(request.Phones) == 0 && len(request.Usernames) == 0 {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
-	users, err := s.store.UsersByPhones(r.Context(), phones)
+	var users []domain.User
+	if len(request.Phones) > 0 {
+		phones, ok := normalizePhones(request.Phones)
+		if !ok || len(phones) > 1024 {
+			writeDomainError(w, domain.ErrInvalid)
+			return
+		}
+		phoneUsers, err := s.store.UsersByPhones(r.Context(), phones)
+		if err != nil {
+			writeDomainError(w, err)
+			return
+		}
+		users = append(users, phoneUsers...)
+	}
+	if len(request.Usernames) > 0 {
+		if len(request.Usernames) > 1024 {
+			writeDomainError(w, domain.ErrInvalid)
+			return
+		}
+		usernameUsers, err := s.store.UsersByUsernames(r.Context(), request.Usernames)
+		if err != nil {
+			writeDomainError(w, err)
+			return
+		}
+		users = append(users, usernameUsers...)
+	}
+	writeJSON(w, http.StatusOK, domain.Page[domain.User]{Items: users})
+}
+
+func (s *Server) searchUsers(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		writeDomainError(w, domain.ErrInvalid)
+		return
+	}
+	limit := 20
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	users, err := s.store.SearchUsersByUsername(r.Context(), query, limit)
 	if err != nil {
 		writeDomainError(w, err)
 		return
