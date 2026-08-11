@@ -32,9 +32,10 @@ Branch: `main`
 - This implementation is merged into `main`. Every future push or merge to
   `main` starts CI; a successful CI run then dispatches the serialized NAS
   deployment workflow.
-- The first main-branch deployment exposed and fixed a privilege-boundary
-  check: root-owned runtime material is validated inside the capability-limited
-  bootstrap container, so the Actions runner does not need access to the 0700
-  NAS secret tree.
+- The first main-branch deployment hardened the runtime privilege boundary:
+  root-owned material is validated inside the capability-limited bootstrap
+  container; the dedicated deployment group gets traverse-only access to the
+  secret directory and read access only to Compose's `runtime.env`; PKI private
+  material remains root-only.
 
 No live credential is stored in this repository.
