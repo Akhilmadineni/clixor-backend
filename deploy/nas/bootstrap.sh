@@ -167,6 +167,6 @@ chown -R 999:1000 "${project_root}/data/redis"
 chown -R 1000:1000 "${project_root}/data/nats" "${project_root}/data/minio"
 chown -R 65534:65534 "${project_root}/data/prometheus"
 chown -R 472:472 "${project_root}/data/grafana"
-chmod 0700 "${secret_root}"
+chmod 0710 "${secret_root}"
 
 echo "Clustr NAS directories, internal PKI, and runtime secrets are ready."
