@@ -51,8 +51,9 @@ Branch: `main`
   OpenAPI definitions, backend tests, production Compose/Kubernetes manifests,
   NAS deployment automation, operational runbooks, and backend CI/CD.
 - The combined `Uthejmopathi/Clustr` repository owns the Swift/iOS client only.
-  Its historical backend directory and backend-specific GitHub Actions are being
-  removed after this repository's reconciled production rollout succeeds.
+  Its historical backend directory and backend-specific GitHub Actions were
+  removed from `main` in commit `610ff55` after this repository's reconciled
+  production rollout succeeded.
 - Existing `CLUSTER_*` configuration keys, `clustr-*` runtime names, database
   names, public hostnames, and NAS paths are compatibility identifiers, not an
   indication that their source belongs in the iOS repository.
