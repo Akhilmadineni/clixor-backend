@@ -25,11 +25,13 @@ Branch: `feature/akhil/nas-cicd`
   image and Compose model on unhealthy rollout.
 - Application secrets remain only under `/volume1/docker/clustr/secrets` on the
   NAS. No populated credential belongs in this repository or GitHub Actions.
+- The repository-scoped runner `atlanteans-nas-clixor` is registered with
+  `self-hosted`, `Linux`, `X64`, `nas`, and `clixor` labels. Its
+  `github-runner-clixor.service` systemd unit is enabled, active, and listening
+  for jobs on runner version 2.336.0.
 
-## Remaining installation step
+## Remaining activation step
 
-- Register and enable the repository-scoped NAS runner. This creates persistent
-  GitHub access and therefore requires operator confirmation at action time.
 - Merge this branch to `main`; the first deploy can then run after CI succeeds.
 
 No live credential is stored in this repository.

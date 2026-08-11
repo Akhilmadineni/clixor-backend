@@ -77,9 +77,11 @@ Compose model. Database migrations are intentionally forward-only and must remai
 compatible with the previous API release; restoring a database dump is a separate,
 operator-approved disaster-recovery action, never an automatic rollback.
 
-The final workflow step verifies the public Cloudflare route independently. Keep
-the dedicated runner registered only to this repository and do not reuse the
-TradingBot or VerifyCore runner credentials.
+The final workflow step verifies the public Cloudflare route independently. The
+repository-scoped runner is installed as `atlanteans-nas-clixor` in
+`/volume1/docker/github-runner-clixor` and runs under the enabled
+`github-runner-clixor.service` systemd unit. Keep it registered only to this
+repository and do not reuse the TradingBot or VerifyCore runner credentials.
 
 For Portainer, create a stack named `clustr` from `compose.yaml`, define
 `CLUSTER_IMAGE_TAG` as the already-built release tag, and keep the external network
