@@ -138,6 +138,22 @@ install -m 0400 -o 65534 -g 65534 "${deployment_source}/prometheus.yml" "${runti
 install -m 0400 -o 65534 -g 65534 "${secret_root}/metrics.token" "${runtime_prometheus_root}/metrics.token"
 install -m 0400 -o 472 -g 472 "${deployment_source}/grafana-datasource.yml" "${runtime_grafana_root}/datasource.yml"
 
+# Validate root-owned runtime material here, while this deliberately
+# capability-limited bootstrap container can traverse the 0700 secret tree.
+# The unprivileged Actions runner must not be granted read access merely so the
+# outer deployment script can inspect these files.
+for required_path in \
+  "${runtime_env}" \
+  "${pki_root}/ca.crt" \
+  "${runtime_tls_root}/haproxy.cfg" \
+  "${runtime_media_root}/nginx.conf"
+do
+  if [ ! -s "${required_path}" ]; then
+    echo "Missing NAS runtime file: ${required_path}" >&2
+    exit 1
+  fi
+done
+
 chown -R 70:70 "${project_root}/data/postgres"
 chown -R 999:1000 "${project_root}/data/redis"
 chown -R 1000:1000 "${project_root}/data/nats" "${project_root}/data/minio"

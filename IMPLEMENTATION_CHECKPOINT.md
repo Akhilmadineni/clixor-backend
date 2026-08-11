@@ -32,5 +32,9 @@ Branch: `main`
 - This implementation is merged into `main`. Every future push or merge to
   `main` starts CI; a successful CI run then dispatches the serialized NAS
   deployment workflow.
+- The first main-branch deployment exposed and fixed a privilege-boundary
+  check: root-owned runtime material is validated inside the capability-limited
+  bootstrap container, so the Actions runner does not need access to the 0700
+  NAS secret tree.
 
 No live credential is stored in this repository.

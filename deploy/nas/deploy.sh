@@ -113,14 +113,6 @@ docker run --rm \
   --volume "$project_root:$project_root" \
   "$bootstrap_image"
 
-for required_path in \
-  "$project_root/secrets/runtime.env" \
-  "$project_root/secrets/pki/ca.crt" \
-  "$project_root/runtime/dependency-tls/haproxy.cfg" \
-  "$project_root/runtime/media/nginx.conf"
-do
-  [ -s "$required_path" ] || fail "missing NAS runtime file: $required_path"
-done
 for network_name in clustr_internal homelab_proxy; do
   docker network inspect "$network_name" >/dev/null 2>&1 || fail "required external Docker network is missing: $network_name"
 done
