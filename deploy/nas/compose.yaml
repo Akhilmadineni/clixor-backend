@@ -1,0 +1,321 @@
+name: clustr
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    container_name: clustr-postgres
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/postgres-tls/server.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/server.key
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    networks:
+      clustr_data:
+      clustr_internal:
+        aliases:
+          - postgres.clustr.internal
+    volumes:
+      - /volume1/docker/clustr/data/postgres:/var/lib/postgresql/data
+      - /volume1/docker/clustr/runtime/postgres-tls/server.crt:/run/postgres-tls/server.crt:ro
+      - /volume1/docker/clustr/runtime/postgres-tls/server.key:/run/postgres-tls/server.key:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    shm_size: 256m
+    security_opt:
+      - no-new-privileges:true
+    logging: &local-logging
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  redis:
+    image: redis:8.0.3-alpine
+    container_name: clustr-redis
+    user: "999:1000"
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}"
+    networks:
+      - clustr_data
+    volumes:
+      - /volume1/docker/clustr/data/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  nats:
+    image: nats:2.11.6-alpine
+    container_name: clustr-nats
+    user: "1000:1000"
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec nats-server --jetstream --store_dir=/data --http_port=8222 --auth "$${NATS_AUTH_TOKEN}" --tls --tlscert=/run/nats-tls/server.crt --tlskey=/run/nats-tls/server.key
+    networks:
+      clustr_data:
+      clustr_internal:
+        aliases:
+          - nats.clustr.internal
+    volumes:
+      - /volume1/docker/clustr/data/nats:/data
+      - /volume1/docker/clustr/runtime/nats-tls/server.crt:/run/nats-tls/server.crt:ro
+      - /volume1/docker/clustr/runtime/nats-tls/server.key:/run/nats-tls/server.key:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: clustr-minio
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    command: ["server", "/data", "--address", ":9000"]
+    networks:
+      - clustr_data
+    volumes:
+      - /volume1/docker/clustr/data/minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  dependency-tls:
+    image: haproxy:3.2-alpine
+    container_name: clustr-dependency-tls
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      clustr_data:
+      clustr_internal:
+        aliases:
+          - clustr-tls
+    volumes:
+      - /volume1/docker/clustr/runtime/dependency-tls/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /volume1/docker/clustr/runtime/dependency-tls/server.pem:/run/pki/server.pem:ro
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  migrate:
+    profiles: ["migration"]
+    image: clustr-api:${CLUSTER_IMAGE_TAG:?set CLUSTER_IMAGE_TAG to the immutable release tag}
+    pull_policy: never
+    entrypoint: ["/clustr-migrate"]
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    networks:
+      - clustr_internal
+      - homelab_proxy
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /volume1/docker/clustr/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /volume1/docker/clustr/secrets/apns:/run/secrets/apns:ro
+
+  api:
+    image: clustr-api:${CLUSTER_IMAGE_TAG:?set CLUSTER_IMAGE_TAG to the immutable release tag}
+    pull_policy: never
+    container_name: clustr-api
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:18180:8080"
+    networks:
+      - clustr_internal
+      - homelab_proxy
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 2.0
+    stop_grace_period: 30s
+    logging: *local-logging
+    volumes:
+      - /volume1/docker/clustr/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /volume1/docker/clustr/secrets/apns:/run/secrets/apns:ro
+
+  media:
+    image: nginx:1.29-alpine
+    container_name: clustr-media
+    user: "101:101"
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    expose:
+      - "8081"
+    ports:
+      - "127.0.0.1:18181:8081"
+    networks:
+      - clustr_internal
+      - homelab_proxy
+    volumes:
+      - /volume1/docker/clustr/runtime/media/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /volume1/docker/clustr/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=64m,uid=101,gid=101,mode=0750
+      - /var/run:size=4m,uid=101,gid=101,mode=0750
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  postgres-backup:
+    image: postgres:17.5-alpine
+    container_name: clustr-postgres-backup
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    entrypoint: ["/bin/sh", "/opt/clustr/backup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - clustr_data
+      - clustr_internal
+    volumes:
+      - /volume1/docker/clustr/runtime/postgres-backup/backup.sh:/opt/clustr/backup.sh:ro
+      - /volume1/docker/clustr/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /volume1/docker/clustr/backups:/backups
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: clustr-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    networks:
+      - clustr_internal
+    volumes:
+      - /volume1/docker/clustr/runtime/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /volume1/docker/clustr/runtime/prometheus/metrics.token:/run/secrets/metrics.token:ro
+      - /volume1/docker/clustr/data/prometheus:/prometheus
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    container_name: clustr-grafana
+    env_file:
+      - /volume1/docker/clustr/secrets/runtime.env
+    environment:
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: https://clustr-grafana.atlanteanz.com
+    depends_on:
+      - prometheus
+    expose:
+      - "3000"
+    ports:
+      - "127.0.0.1:13000:3000"
+    networks:
+      - clustr_internal
+      - homelab_proxy
+    volumes:
+      - /volume1/docker/clustr/data/grafana:/var/lib/grafana
+      - /volume1/docker/clustr/runtime/grafana/datasource.yml:/etc/grafana/provisioning/datasources/clustr.yml:ro
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
+networks:
+  clustr_data:
+    name: clustr_data
+    internal: true
+  clustr_internal:
+    name: clustr_internal
+    external: true
+  homelab_proxy:
+    name: homelab_proxy
+    external: true

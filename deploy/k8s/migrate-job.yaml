@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: clustr-migrate-replace-with-release
+  namespace: clustr
+spec:
+  backoffLimit: 4
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clustr-migrate
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: clustr-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/replace-me/clustr-api:replace-with-immutable-sha
+          imagePullPolicy: IfNotPresent
+          command: ["/clustr-migrate"]
+          envFrom:
+            - configMapRef:
+                name: clustr-api
+            - secretRef:
+                name: clustr-api
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

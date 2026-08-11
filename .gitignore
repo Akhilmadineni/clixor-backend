@@ -1,5 +1,8 @@
-_build/
-rebar3.crashdump
-*.beam
-*.log
-.erlang.cookie
+.DS_Store
+.env
+.tools/
+.build/
+bin/
+coverage.out
+data/
+uploads/

@@ -1,0 +1,528 @@
+openapi: 3.1.0
+info:
+  title: Clustr API
+  version: 0.1.0
+  description: Production messaging and shared-group API. Message and media content is client-encrypted.
+servers:
+  - url: https://api.clustr.example/v1
+security:
+  - bearerAuth: []
+paths:
+  /auth/register:
+    post:
+      security: []
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Credentials"}
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuthResponse"}
+  /auth/login:
+    post:
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Credentials"}
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuthResponse"}
+  /auth/refresh:
+    post:
+      security: []
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string}
+      responses:
+        "200":
+          description: Rotated token pair
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenPair"}
+  /auth/phone/start:
+    post:
+      security: []
+      operationId: startPhoneVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: {type: string, pattern: "^\\+[1-9][0-9]{7,14}$"}
+      responses:
+        "202": {description: Verification pending}
+        "429":
+          description: Destination cooldown, lockout, or fraud budget reached
+          headers:
+            Retry-After: {schema: {type: integer}}
+        "503": {description: Phone verification is not configured}
+  /auth/phone/verify:
+    post:
+      security: []
+      operationId: verifyPhone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code, device_name, platform]
+              properties:
+                phone: {type: string}
+                code: {type: string}
+                device_id: {type: string, format: uuid}
+                device_name: {type: string}
+                platform: {type: string, enum: [ios, android, web]}
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuthResponse"}
+        "401": {description: Invalid or expired single-use code}
+        "429":
+          description: Guess limit or destination lockout reached
+          headers:
+            Retry-After: {schema: {type: integer}}
+  /webhooks/telnyx/messaging:
+    post:
+      security: []
+      operationId: receiveTelnyxMessagingWebhook
+      description: Ed25519-signed SMS delivery events. Payloads are never logged or persisted.
+      parameters:
+        - in: header
+          name: telnyx-signature-ed25519
+          required: true
+          schema: {type: string}
+        - in: header
+          name: telnyx-timestamp
+          required: true
+          schema: {type: integer, format: int64}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        "200": {description: Event accepted or already processed}
+        "401": {description: Invalid signature or replay window}
+  /me:
+    get:
+      operationId: me
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+    patch:
+      operationId: updateProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+  /devices/{device_id}:
+    put:
+      operationId: upsertDevice
+      parameters:
+        - {$ref: "#/components/parameters/DeviceID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, platform]
+              properties:
+                name: {type: string}
+                platform: {type: string}
+                push_token: {type: string}
+                identity_key: {type: string, description: Base64 public identity key}
+                signed_prekey: {$ref: "#/components/schemas/SignedPreKey"}
+      responses:
+        "200":
+          description: Device registered
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Device"}
+  /devices/{device_id}/prekeys:
+    put:
+      operationId: uploadPrekeys
+      parameters:
+        - {$ref: "#/components/parameters/DeviceID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keys]
+              properties:
+                keys:
+                  type: array
+                  maxItems: 1000
+                  items: {$ref: "#/components/schemas/PreKey"}
+      responses:
+        "204": {description: Prekeys stored}
+  /users/{user_id}/prekeys:claim:
+    post:
+      operationId: claimPrekeys
+      parameters:
+        - {$ref: "#/components/parameters/UserID"}
+      responses:
+        "200":
+          description: Prekey bundles for every linked device; available one-time prekeys are atomically consumed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items: {$ref: "#/components/schemas/PreKeyBundle"}
+  /conversations:
+    get:
+      operationId: listConversations
+      parameters:
+        - {name: before, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+      responses:
+        "200":
+          description: Conversation page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/Conversation"}}}}
+    post:
+      operationId: createConversation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, member_ids]
+              properties:
+                kind: {type: string, enum: [direct, group]}
+                title: {type: string, maxLength: 200}
+                member_ids: {type: array, maxItems: 1023, items: {type: string, format: uuid}}
+                metadata: {type: object, additionalProperties: true}
+      responses:
+        "201":
+          description: Conversation created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Conversation"}
+  /conversations/{conversation_id}/members:
+    get:
+      operationId: listConversationMembers
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "200": {description: Current conversation membership}
+    post:
+      operationId: addConversationMember
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: string, format: uuid}
+                role: {type: string, enum: [member, admin]}
+      responses:
+        "204": {description: Member added or role updated}
+  /conversations/{conversation_id}/members/{user_id}:
+    delete:
+      operationId: removeConversationMember
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {$ref: "#/components/parameters/UserID"}
+      responses:
+        "204": {description: Member removed}
+  /conversations/{conversation_id}/owner:
+    put:
+      operationId: transferConversationOwnership
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: {type: string, format: uuid}
+      responses:
+        "204": {description: Ownership transferred atomically}
+  /conversations/{conversation_id}/messages:
+    get:
+      operationId: listMessages
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {name: after_seq, in: query, schema: {type: integer, format: int64, minimum: 0}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+      responses:
+        "200":
+          description: Ordered replay page
+    post:
+      operationId: sendMessage
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SendMessage"}
+      responses:
+        "201":
+          description: Accepted idempotent message
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Message"}
+  /conversations/{conversation_id}/receipt:
+    put:
+      operationId: updateReceipt
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delivered_seq, read_seq]
+              properties:
+                delivered_seq: {type: integer, format: int64, minimum: 0}
+                read_seq: {type: integer, format: int64, minimum: 0}
+      responses:
+        "200": {description: Monotonic receipt updated}
+  /conversations/{conversation_id}/receipts:
+    get:
+      operationId: listReceipts
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "200": {description: Current delivery and read watermarks for conversation members}
+  /conversations/{conversation_id}/entities/{kind}:
+    get:
+      operationId: listEntities
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {$ref: "#/components/parameters/EntityKind"}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+      responses:
+        "200": {description: Incremental entity page}
+  /conversations/{conversation_id}/entities/{kind}/{entity_id}:
+    put:
+      operationId: putEntity
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {$ref: "#/components/parameters/EntityKind"}
+        - {name: entity_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {$ref: "#/components/parameters/ExpectedVersion"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        "200": {description: Versioned entity stored}
+    delete:
+      operationId: deleteEntity
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {$ref: "#/components/parameters/EntityKind"}
+        - {name: entity_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {$ref: "#/components/parameters/ExpectedVersion"}
+      responses:
+        "204": {description: Tombstone created}
+  /conversations/{conversation_id}/media:
+    post:
+      operationId: createMediaUpload
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [byte_size, ciphertext_sha256]
+              properties:
+                byte_size: {type: integer, format: int64, minimum: 1, maximum: 1073741824}
+                ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
+      responses:
+        "201": {description: Short-lived encrypted upload URL}
+  /realtime:
+    get:
+      operationId: realtime
+      description: Upgrade to WebSocket. Events are at-least-once and deduplicated by ID.
+      responses:
+        "101": {description: Switching Protocols}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ConversationID: {name: conversation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    DeviceID: {name: device_id, in: path, required: true, schema: {type: string, format: uuid}}
+    UserID: {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
+    EntityKind:
+      name: kind
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [profile, expense, task, file, chore, feed_item, recurring_expense, settlement, group_meta, payment_handles, trip_plan, check_in]
+    ExpectedVersion:
+      name: expected_version
+      in: query
+      required: true
+      description: Current version for optimistic concurrency, or 0 when creating
+      schema: {type: integer, format: int64, minimum: 0}
+  schemas:
+    Credentials:
+      type: object
+      required: [email, password, device_name, platform]
+      properties:
+        email: {type: string, format: email}
+        password: {type: string, minLength: 10, maxLength: 256}
+        display_name: {type: string, maxLength: 100}
+        device_id: {type: string, format: uuid}
+        device_name: {type: string}
+        platform: {type: string}
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_at]
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        token_type: {type: string, const: Bearer}
+        expires_at: {type: string, format: date-time}
+    AuthResponse:
+      type: object
+      required: [user, device, tokens]
+      properties:
+        user: {$ref: "#/components/schemas/User"}
+        device: {$ref: "#/components/schemas/Device"}
+        tokens: {$ref: "#/components/schemas/TokenPair"}
+    User:
+      type: object
+      required: [id, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string}
+        phone: {type: string}
+        display_name: {type: string}
+        avatar_url: {type: string, format: uri}
+        profile: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Device:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        name: {type: string}
+        platform: {type: string}
+        identity_key: {type: string}
+        signed_prekey: {$ref: "#/components/schemas/SignedPreKey"}
+    SignedPreKey:
+      type: object
+      required: [key_id, public_key, signature]
+      additionalProperties: false
+      properties:
+        key_id: {type: integer, minimum: 0}
+        public_key: {type: string, contentEncoding: base64}
+        signature: {type: string, contentEncoding: base64}
+    PreKey:
+      type: object
+      required: [key_id, public_key]
+      additionalProperties: false
+      properties:
+        key_id: {type: integer, minimum: 0}
+        public_key: {type: string, contentEncoding: base64}
+    PreKeyBundle:
+      type: object
+      required: [device_id, identity_key, signed_prekey]
+      properties:
+        device_id: {type: string, format: uuid}
+        identity_key: {type: string, contentEncoding: base64}
+        signed_prekey: {$ref: "#/components/schemas/SignedPreKey"}
+        one_time_prekey: {$ref: "#/components/schemas/PreKey"}
+    Conversation:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [direct, group]}
+        title: {type: string}
+        metadata: {type: object, additionalProperties: true}
+        last_seq: {type: integer, format: int64}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    SendMessage:
+      type: object
+      required: [client_message_id, content_type, ciphertext]
+      properties:
+        id: {type: string, format: uuid}
+        client_message_id: {type: string, minLength: 8, maxLength: 128}
+        content_type: {type: string, enum: [text, image, video, audio, file, location]}
+        ciphertext: {type: string, contentEncoding: base64}
+        envelope: {type: object, additionalProperties: true}
+        reply_to_id: {type: string, format: uuid}
+    Message:
+      allOf:
+        - {$ref: "#/components/schemas/SendMessage"}
+        - type: object
+          properties:
+            conversation_id: {type: string, format: uuid}
+            sender_id: {type: string, format: uuid}
+            sender_device_id: {type: string, format: uuid}
+            seq: {type: integer, format: int64}
+            created_at: {type: string, format: date-time}
+            server_received_at: {type: string, format: date-time}
+    Page:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {}}
+        next_cursor: {type: string}
