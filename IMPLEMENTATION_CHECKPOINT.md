@@ -4,7 +4,7 @@ Last updated: 2026-08-10 (America/Chicago)
 
 Repository: `https://github.com/Akhilmadineni/clixor-backend`
 
-Branch: `feature/akhil/nas-cicd`
+Branch: `main`
 
 ## Current state
 
@@ -29,9 +29,8 @@ Branch: `feature/akhil/nas-cicd`
   `self-hosted`, `Linux`, `X64`, `nas`, and `clixor` labels. Its
   `github-runner-clixor.service` systemd unit is enabled, active, and listening
   for jobs on runner version 2.336.0.
-
-## Remaining activation step
-
-- Merge this branch to `main`; the first deploy can then run after CI succeeds.
+- This implementation is merged into `main`. Every future push or merge to
+  `main` starts CI; a successful CI run then dispatches the serialized NAS
+  deployment workflow.
 
 No live credential is stored in this repository.
