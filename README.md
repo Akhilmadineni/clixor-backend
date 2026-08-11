@@ -1,8 +1,13 @@
-# Clustr production backend
+# Clixor production backend
 
 Go backend for Clustr messaging and shared-group data. The production topology uses
 PostgreSQL, Redis, NATS, S3-compatible object storage, a Redis-backed OTP service
 with Telnyx SMS transport, and APNs.
+
+This is the sole source repository for the backend. The
+`Uthejmopathi/Clustr` repository contains the Swift/iOS client; retained `clustr`
+runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
+the existing NAS deployment.
 
 ## Run a smoke environment
 

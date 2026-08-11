@@ -11,6 +11,13 @@ Branch: `main`
 - The production Go backend was split from the combined Clustr iOS repository
   into this private, backend-only repository. The Go module is now
   `github.com/Akhilmadineni/clixor-backend`.
+- The split has been reconciled through combined-repository `main` commit
+  `b38233b`. Post-split phone linking, pilot authentication, unique usernames,
+  username discovery, persistent chat state, and unread-state changes are all
+  present here alongside the NAS-owned OTP/fraud engine and Telnyx transport.
+- The former Twilio adapter is intentionally not carried forward: Telnyx is the
+  production SMS transport and the disabled provider remains the safe fallback.
+  No active backend implementation remains owned by the combined iOS repository.
 - Existing production runtime identifiers, environment variables, public
   hostnames, containers, data paths, and database schema deliberately retain
   their `clustr` names so this repository split does not interrupt clients or
@@ -37,5 +44,17 @@ Branch: `main`
   container; the dedicated deployment group gets traverse-only access to the
   secret directory and read access only to Compose's `runtime.env`; PKI private
   material remains root-only.
+
+## Repository ownership boundary
+
+- This repository owns all backend application code, database migrations,
+  OpenAPI definitions, backend tests, production Compose/Kubernetes manifests,
+  NAS deployment automation, operational runbooks, and backend CI/CD.
+- The combined `Uthejmopathi/Clustr` repository owns the Swift/iOS client only.
+  Its historical backend directory and backend-specific GitHub Actions are being
+  removed after this repository's reconciled production rollout succeeds.
+- Existing `CLUSTER_*` configuration keys, `clustr-*` runtime names, database
+  names, public hostnames, and NAS paths are compatibility identifiers, not an
+  indication that their source belongs in the iOS repository.
 
 No live credential is stored in this repository.
