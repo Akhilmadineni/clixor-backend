@@ -9,6 +9,11 @@ This is the sole source repository for the backend. The
 runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
 the existing NAS deployment.
 
+## Contributors
+
+- [Uthej Mopathi](https://github.com/Uthejmopathi) — original author of the
+  Clixor Privacy Policy and Terms of Use page.
+
 ## Run a smoke environment
 
 The repository includes a non-durable mode for API development and automated tests:
