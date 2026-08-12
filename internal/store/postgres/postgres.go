@@ -529,6 +529,12 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 			return domain.Conversation{}, mapError(err)
 		}
 	}
+	payload, _ := json.Marshal(conversation)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('conversation.created',$1,$2)`,
+		conversation.ID, payload); err != nil {
+		return domain.Conversation{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Conversation{}, err
 	}
@@ -710,6 +716,16 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 	}
 	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at=now() WHERE id=$1`, conversationID); err != nil {
 		return err
+	}
+	if errors.Is(targetErr, pgx.ErrNoRows) {
+		payload, _ := json.Marshal(domain.ConversationMemberAdded{
+			ConversationID: conversationID, ActorID: actorID, UserID: userID,
+		})
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('conversation.member_added',$1,$2)`,
+			conversationID, payload); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

@@ -529,6 +529,8 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 	for _, phone := range p.InvitePhones {
 		s.invites[conversation.ID][phone] = p.CreatedBy
 	}
+	payload, _ := json.Marshal(conversation)
+	s.appendOutbox("conversation.created", conversation.ID, payload)
 	return conversation, nil
 }
 
@@ -657,10 +659,11 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	if actor := members[actorID]; actor.Role != "owner" && actor.Role != "admin" {
 		return domain.ErrForbidden
 	}
-	if target, exists := members[userID]; exists && target.Role == "owner" {
+	target, targetExists := members[userID]
+	if targetExists && target.Role == "owner" {
 		return domain.ErrForbidden
 	}
-	if _, exists := members[userID]; !exists && len(members) >= 1024 {
+	if !targetExists && len(members) >= 1024 {
 		return domain.ErrInvalid
 	}
 	members[userID] = domain.ConversationMember{
@@ -669,6 +672,12 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	conversation := s.conversations[conversationID]
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	if !targetExists {
+		payload, _ := json.Marshal(domain.ConversationMemberAdded{
+			ConversationID: conversationID, ActorID: actorID, UserID: userID,
+		})
+		s.appendOutbox("conversation.member_added", conversationID, payload)
+	}
 	return nil
 }
 

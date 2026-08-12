@@ -32,6 +32,22 @@ func TestValidProductionConfiguration(t *testing.T) {
 	}
 }
 
+func TestSandboxAPNSCredentialsMustBeConfiguredTogether(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.APNSSandbox.TeamID = "sandbox-team"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "sandbox APNs credentials") {
+		t.Fatalf("expected partial sandbox credentials to fail validation, received %v", err)
+	}
+
+	cfg.APNSSandbox = APNSConfig{
+		TeamID: "sandbox-team", KeyID: "sandbox-key", BundleID: "com.example.Clixor",
+		PrivateKeyFile: "/run/secrets/AuthKey-sandbox.p8", Environment: "sandbox",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("complete sandbox credentials failed validation: %v", err)
+	}
+}
+
 func TestProductionVerificationRequiresExplicitCostAndSecretControls(t *testing.T) {
 	cfg := validProductionConfig()
 	cfg.Verification.OTPAllowedPrefixes = nil

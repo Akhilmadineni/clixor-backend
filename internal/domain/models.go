@@ -86,6 +86,12 @@ type ConversationMember struct {
 	MutedUntil     *time.Time `json:"muted_until,omitempty"`
 }
 
+type ConversationMemberAdded struct {
+	ConversationID uuid.UUID `json:"conversation_id"`
+	ActorID        uuid.UUID `json:"actor_id"`
+	UserID         uuid.UUID `json:"user_id"`
+}
+
 type Message struct {
 	ID               uuid.UUID       `json:"id"`
 	ClientMessageID  string          `json:"client_message_id"`

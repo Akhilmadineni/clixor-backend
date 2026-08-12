@@ -149,7 +149,7 @@ func main() {
 			logger.Warn("phone verification is disabled until provider credentials are installed")
 		}
 		if cfg.APNS.TeamID != "" && cfg.APNS.KeyID != "" && cfg.APNS.PrivateKeyFile != "" {
-			apns, err := push.NewAPNS(
+			primaryAPNS, err := push.NewAPNS(
 				cfg.APNS.TeamID, cfg.APNS.KeyID, cfg.APNS.BundleID,
 				cfg.APNS.PrivateKeyFile, cfg.APNS.Environment,
 			)
@@ -162,7 +162,31 @@ func main() {
 				logger.Error("open APNs provider", "error", err)
 				os.Exit(1)
 			}
-			pushService = apns
+			pushService = primaryAPNS
+			if cfg.APNS.Environment == "production" {
+				sandbox := cfg.APNSSandbox
+				if sandbox.TeamID == "" {
+					// Traditional APNs signing keys work with both endpoints. Separate
+					// sandbox credentials remain available for environment-scoped keys.
+					sandbox = cfg.APNS
+					sandbox.Environment = "sandbox"
+				}
+				sandboxAPNS, sandboxErr := push.NewAPNS(
+					sandbox.TeamID, sandbox.KeyID, sandbox.BundleID,
+					sandbox.PrivateKeyFile, "sandbox",
+				)
+				if sandboxErr != nil {
+					primaryAPNS.Close()
+					mediaService.Close()
+					limiter.Close()
+					presenceService.Close()
+					bus.Close()
+					persistence.Close()
+					logger.Error("open sandbox APNs provider", "error", sandboxErr)
+					os.Exit(1)
+				}
+				pushService = &push.EnvironmentFallback{Primary: primaryAPNS, Fallback: sandboxAPNS}
+			}
 		} else {
 			pushService = push.Disabled{}
 			logger.Warn("APNs is disabled; push credentials are not configured")

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -216,8 +217,9 @@ func (s *Server) upsertDevice(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
+	request.PushToken = strings.ToLower(strings.TrimSpace(request.PushToken))
 	if strings.TrimSpace(request.Name) == "" || request.Platform != "ios" ||
-		len(request.Name) > 100 || len(request.PushToken) > 512 ||
+		len(request.Name) > 100 || !validPushToken(request.PushToken) ||
 		(request.IdentityKey != "" && !validEncodedKey(request.IdentityKey)) ||
 		(len(request.SignedPreKey) > 0 && !validSignedPreKey(request.SignedPreKey)) {
 		writeDomainError(w, domain.ErrInvalid)
@@ -233,6 +235,17 @@ func (s *Server) upsertDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, device)
+}
+
+func validPushToken(token string) bool {
+	if token == "" {
+		return true
+	}
+	if len(token) > 512 || len(token)%2 != 0 {
+		return false
+	}
+	_, err := hex.DecodeString(token)
+	return err == nil
 }
 
 func (s *Server) registerDevice(r *http.Request, userID, deviceID uuid.UUID, name, platform string) (domain.Device, error) {

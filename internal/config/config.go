@@ -30,6 +30,7 @@ type Config struct {
 	S3            S3Config
 	Verification  VerificationConfig
 	APNS          APNSConfig
+	APNSSandbox   APNSConfig
 }
 
 type S3Config struct {
@@ -158,6 +159,13 @@ func Load() (Config, error) {
 			PrivateKeyFile: os.Getenv("CLUSTER_APNS_PRIVATE_KEY_FILE"),
 			Environment:    env("CLUSTER_APNS_ENVIRONMENT", "production"),
 		},
+		APNSSandbox: APNSConfig{
+			TeamID:         os.Getenv("CLUSTER_APNS_SANDBOX_TEAM_ID"),
+			KeyID:          os.Getenv("CLUSTER_APNS_SANDBOX_KEY_ID"),
+			BundleID:       os.Getenv("CLUSTER_APNS_SANDBOX_BUNDLE_ID"),
+			PrivateKeyFile: os.Getenv("CLUSTER_APNS_SANDBOX_PRIVATE_KEY_FILE"),
+			Environment:    "sandbox",
+		},
 	}
 	if cfg.Store == "memory" && cfg.AccessSecret == "" {
 		cfg.AccessSecret = "development-only-secret-change-me"
@@ -244,6 +252,12 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.APNS.Environment != "production" {
 		return errors.New("production requires CLUSTER_APNS_ENVIRONMENT=production")
+	}
+	sandboxConfigured := cfg.APNSSandbox.TeamID != "" || cfg.APNSSandbox.KeyID != "" ||
+		cfg.APNSSandbox.BundleID != "" || cfg.APNSSandbox.PrivateKeyFile != ""
+	if sandboxConfigured && (cfg.APNSSandbox.TeamID == "" || cfg.APNSSandbox.KeyID == "" ||
+		cfg.APNSSandbox.BundleID == "" || cfg.APNSSandbox.PrivateKeyFile == "") {
+		return errors.New("sandbox APNs credentials must be configured together")
 	}
 	return nil
 }

@@ -71,6 +71,27 @@ func (a *APNS) Send(ctx context.Context, deviceToken, title, body string, data m
 	if err != nil {
 		return err
 	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(attempt*attempt) * 250 * time.Millisecond
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		lastErr = a.sendOnce(ctx, deviceToken, payload, notificationID)
+		if lastErr == nil || !retryable(lastErr) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func (a *APNS) sendOnce(ctx context.Context, deviceToken string, payload []byte, notificationID string) error {
 	token, err := a.providerToken()
 	if err != nil {
 		return err
@@ -87,6 +108,9 @@ func (a *APNS) Send(ctx context.Context, deviceToken, title, body string, data m
 	request.Header.Set("apns-priority", "10")
 	request.Header.Set("apns-expiration", "0")
 	request.Header.Set("apns-id", notificationID)
+	// APNs coalesces pending retries for the same entity instead of displaying
+	// a burst if the durable outbox is replayed after a transient failure.
+	request.Header.Set("apns-collapse-id", notificationID)
 	response, err := a.client.Do(request)
 	if err != nil {
 		return err
@@ -100,7 +124,15 @@ func (a *APNS) Send(ctx context.Context, deviceToken, title, body string, data m
 		Reason string `json:"reason"`
 	}
 	_ = json.Unmarshal(raw, &failure)
-	return fmt.Errorf("APNs status %d: %s", response.StatusCode, failure.Reason)
+	return &DeliveryError{StatusCode: response.StatusCode, Reason: failure.Reason}
+}
+
+func retryable(err error) bool {
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) {
+		return delivery.StatusCode >= 500 && delivery.StatusCode <= 599
+	}
+	return true
 }
 
 func (a *APNS) providerToken() (string, error) {
