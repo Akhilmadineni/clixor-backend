@@ -28,8 +28,16 @@ jobs:
         run: |
           if [ "$(id -u)" -eq 0 ]; then
             deploy/nas/configure-legal-hostname.sh
-          else
+          elif sudo -n true 2>/dev/null; then
             sudo -n deploy/nas/configure-legal-hostname.sh
+          else
+            docker run --rm --privileged --pid=host \
+              --env HOST_WORKSPACE="$GITHUB_WORKSPACE" \
+              alpine:3.22 sh -ec '
+                apk add --no-cache util-linux >/dev/null
+                exec nsenter --target 1 --mount --uts --ipc --net --pid --root --wd=/ -- \
+                  "$HOST_WORKSPACE/deploy/nas/configure-legal-hostname.sh"
+              '
           fi
 
       - name: Verify branded legal pages
