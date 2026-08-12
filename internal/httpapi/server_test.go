@@ -35,7 +35,7 @@ type testClient struct {
 func TestLegalDocumentIsPublic(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
-	for _, path := range []string{"/privacy", "/legal", "/terms"} {
+	for _, path := range []string{"/", "/privacy", "/legal", "/terms"} {
 		response, err := http.Get(server.URL + path)
 		if err != nil {
 			t.Fatal(err)
@@ -54,6 +54,32 @@ func TestLegalDocumentIsPublic(t *testing.T) {
 		if csp := response.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
 			t.Fatalf("%s omitted its content security policy", path)
 		}
+	}
+}
+
+func TestLegacyLegalHostnameRedirectsToClixor(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/privacy?source=legacy", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "clustr-api.atlanteanz.com"
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusPermanentRedirect {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	if location := response.Header.Get("Location"); location != "https://clixor.atlanteanz.com/privacy?source=legacy" {
+		t.Fatalf("location = %q", location)
 	}
 }
 

@@ -96,11 +96,13 @@ Cloudflare Tunnel with these rules before its final `http_status:404` catch-all:
 ```yaml
 - hostname: clustr-api.atlanteanz.com
   service: http://localhost:18180
+- hostname: clixor.atlanteanz.com
+  service: http://localhost:18180
 - hostname: clustr-media.atlanteanz.com
   service: http://localhost:18181
 ```
 
-No inbound router ports or Nginx Proxy Manager changes are required. The two
+No inbound router ports or Nginx Proxy Manager changes are required. The three
 one-level hostnames are covered by the zone's standard wildcard edge certificate.
 Do not replace them with nested names such as `api.clustr.atlanteanz.com` unless a
 dedicated nested-host certificate is provisioned.
@@ -124,11 +126,13 @@ prefix and its associated object-store keys after validation.
 The API binary embeds the public Clixor Privacy Policy and Terms of Use so they
 remain available without authentication or a separate database/service:
 
-- `https://clustr-api.atlanteanz.com/privacy`
-- `https://clustr-api.atlanteanz.com/terms`
+- `https://clixor.atlanteanz.com/`
+- `https://clixor.atlanteanz.com/privacy`
+- `https://clixor.atlanteanz.com/terms`
 
-The privacy URL is suitable for App Store Connect. A branded hostname can be
-added later without changing the legal document or its deployment lifecycle.
+The branded privacy URL is suitable for App Store Connect. Legal-page requests
+to the API hostname redirect permanently to the branded hostname; API and webhook
+traffic continue using `clustr-api.atlanteanz.com` for client compatibility.
 
 ## Release gates
 

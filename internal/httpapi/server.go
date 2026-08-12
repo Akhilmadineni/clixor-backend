@@ -62,6 +62,7 @@ func (s *Server) Router() http.Handler {
 
 	router.Get("/health/live", s.live)
 	router.Get("/health/ready", s.ready)
+	router.Get("/", s.legal)
 	router.Get("/privacy", s.legal)
 	router.Get("/legal", s.legal)
 	router.Get("/terms", s.legal)

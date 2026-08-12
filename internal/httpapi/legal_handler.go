@@ -8,7 +8,12 @@ import (
 //go:embed legal/index.html
 var legalDocument []byte
 
-func (s *Server) legal(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) legal(w http.ResponseWriter, r *http.Request) {
+	if r.Host == "clustr-api.atlanteanz.com" {
+		http.Redirect(w, r, "https://clixor.atlanteanz.com"+r.URL.RequestURI(), http.StatusPermanentRedirect)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	w.Header().Set(
