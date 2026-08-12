@@ -62,6 +62,9 @@ func (s *Server) Router() http.Handler {
 
 	router.Get("/health/live", s.live)
 	router.Get("/health/ready", s.ready)
+	router.Get("/privacy", s.legal)
+	router.Get("/legal", s.legal)
+	router.Get("/terms", s.legal)
 	router.Handle("/metrics", s.protectMetrics(promhttp.Handler()))
 
 	router.Route("/v1", func(router chi.Router) {

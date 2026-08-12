@@ -32,6 +32,31 @@ type testClient struct {
 	client  *http.Client
 }
 
+func TestLegalDocumentIsPublic(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	for _, path := range []string{"/privacy", "/legal", "/terms"} {
+		response, err := http.Get(server.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d", path, response.StatusCode)
+		}
+		if !bytes.Contains(body, []byte("Privacy Policy &amp; Terms of Use")) {
+			t.Fatalf("%s did not return the Clixor legal document", path)
+		}
+		if response.Header.Get("Content-Security-Policy") == "" {
+			t.Fatalf("%s omitted its content security policy", path)
+		}
+	}
+}
+
 func TestMessagingLifecycleAndIsolation(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)

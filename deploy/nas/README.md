@@ -119,6 +119,17 @@ python3 deploy/nas/smoke.py \
 The test creates uniquely prefixed accounts and data. Remove only that reported
 prefix and its associated object-store keys after validation.
 
+## Clixor legal pages
+
+The API binary embeds the public Clixor Privacy Policy and Terms of Use so they
+remain available without authentication or a separate database/service:
+
+- `https://clustr-api.atlanteanz.com/privacy`
+- `https://clustr-api.atlanteanz.com/terms`
+
+The privacy URL is suitable for App Store Connect. A branded hostname can be
+added later without changing the legal document or its deployment lifecycle.
+
 ## Release gates
 
 Before public traffic:
