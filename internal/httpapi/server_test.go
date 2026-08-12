@@ -51,7 +51,7 @@ func TestLegalDocumentIsPublic(t *testing.T) {
 		if !bytes.Contains(body, []byte("Privacy Policy &amp; Terms of Use")) {
 			t.Fatalf("%s did not return the Clixor legal document", path)
 		}
-		if response.Header.Get("Content-Security-Policy") == "" {
+		if csp := response.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
 			t.Fatalf("%s omitted its content security policy", path)
 		}
 	}
