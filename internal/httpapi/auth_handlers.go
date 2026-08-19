@@ -147,6 +147,15 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, user)
 }
 
+func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	id, _ := identityFrom(r.Context())
+	if err := s.store.DeleteAccount(r.Context(), id.UserID); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) updateProfile(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFrom(r.Context())
 	var profile map[string]any

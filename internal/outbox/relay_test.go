@@ -3,12 +3,15 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/push"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/Akhilmadineni/clixor-backend/internal/store/memory"
@@ -162,6 +165,50 @@ func TestSubscriptionCreateSendsOneNotificationAndSuppressesInitialCharge(t *tes
 	}
 }
 
+func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
+	ctx := context.Background()
+	persistence := memory.New()
+	user := createUser(t, persistence, "media-delete@example.com", "Delete Media")
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: user.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := domain.MediaObject{
+		ID: uuid.New(), OwnerID: user.ID, ConversationID: conversation.ID,
+		ObjectKey: "private/delete-me", ContentType: "image/jpeg", ByteSize: 1,
+	}
+	if _, err := persistence.CreateMedia(ctx, object); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	mediaRecorder := &recordingMedia{deleteErr: errors.New("minio temporarily unavailable")}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	relay := New(persistence, nil, &recordingPush{}, mediaRecorder, logger)
+	relay.flush(ctx)
+	events, err := persistence.LockOutboxBatch(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || len(mediaRecorder.deleted) != 1 {
+		t.Fatalf("failed deletion was not retained for retry: events=%+v calls=%+v", events, mediaRecorder.deleted)
+	}
+
+	mediaRecorder.deleteErr = nil
+	relay.flush(ctx)
+	events, err = persistence.LockOutboxBatch(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 || len(mediaRecorder.deleted) != 2 {
+		t.Fatalf("successful deletion was not acknowledged: events=%+v calls=%+v", events, mediaRecorder.deleted)
+	}
+}
+
 func notificationForEntity(
 	t *testing.T,
 	fixture *relayFixture,
@@ -218,7 +265,7 @@ func newRelayFixture(t *testing.T, metadata json.RawMessage) *relayFixture {
 	recorder := &recordingPush{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return &relayFixture{
-		ctx: ctx, store: persistence, relay: New(persistence, nil, recorder, logger), push: recorder,
+		ctx: ctx, store: persistence, relay: New(persistence, nil, recorder, media.Unavailable{}, logger), push: recorder,
 		actor: actor, recipient: recipient, conversation: conversation,
 		actorDevices: actorDevices, recipientDevices: recipientDevices, outsiderDevices: outsiderDevices,
 	}
@@ -273,3 +320,25 @@ func (r *recordingPush) Send(
 }
 
 func (*recordingPush) Close() {}
+
+type recordingMedia struct {
+	deleted   []string
+	deleteErr error
+}
+
+func (*recordingMedia) UploadURL(context.Context, string, string, int64, time.Duration) (*url.URL, error) {
+	return nil, media.ErrUnavailable
+}
+
+func (*recordingMedia) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
+	return nil, media.ErrUnavailable
+}
+
+func (*recordingMedia) Verify(context.Context, string, int64) error { return media.ErrUnavailable }
+
+func (r *recordingMedia) Delete(_ context.Context, objectKey string) error {
+	r.deleted = append(r.deleted, objectKey)
+	return r.deleteErr
+}
+
+func (*recordingMedia) Close() {}

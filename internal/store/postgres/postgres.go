@@ -78,19 +78,19 @@ func (s *Store) CreateUser(ctx context.Context, p store.CreateUserParams) (domai
 func (s *Store) UserByID(ctx context.Context, id uuid.UUID) (domain.User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
-		FROM users WHERE id=$1`, id))
+		FROM users WHERE id=$1 AND deleted_at IS NULL`, id))
 }
 
 func (s *Store) UserByEmail(ctx context.Context, email string) (domain.User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
-		FROM users WHERE lower(email)=lower($1)`, strings.TrimSpace(email)))
+		FROM users WHERE lower(email)=lower($1) AND deleted_at IS NULL`, strings.TrimSpace(email)))
 }
 
 func (s *Store) UserByPhone(ctx context.Context, phone string) (domain.User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
-		FROM users WHERE phone=$1`, phone))
+		FROM users WHERE phone=$1 AND deleted_at IS NULL`, phone))
 }
 
 func (s *Store) UsersByPhones(ctx context.Context, phones []string) ([]domain.User, error) {
@@ -99,7 +99,7 @@ func (s *Store) UsersByPhones(ctx context.Context, phones []string) ([]domain.Us
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
-		FROM users WHERE phone = ANY($1) ORDER BY phone`, phones)
+		FROM users WHERE phone = ANY($1) AND deleted_at IS NULL ORDER BY phone`, phones)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +123,8 @@ func (s *Store) UsersByUsernames(ctx context.Context, usernames []string) ([]dom
 	rows, err := s.pool.Query(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
 		FROM users
-		WHERE lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) = ANY($1)
+		WHERE deleted_at IS NULL
+		  AND lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) = ANY($1)
 		ORDER BY lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', ''))`, normalized)
 	if err != nil {
 		return nil, err
@@ -151,7 +152,8 @@ func (s *Store) SearchUsersByUsername(ctx context.Context, query string, limit i
 	rows, err := s.pool.Query(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
 		FROM users
-		WHERE lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) LIKE $1 || '%'
+		WHERE deleted_at IS NULL
+		  AND lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) LIKE $1 || '%'
 		ORDER BY lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', ''))
 		LIMIT $2`, q, limit)
 	if err != nil {
@@ -199,7 +201,7 @@ func (s *Store) UpdateUserProfile(ctx context.Context, id uuid.UUID, profile jso
 			display_name=COALESCE(NULLIF($3,''),display_name),
 			avatar_url=COALESCE(NULLIF($4,''),avatar_url),
 			updated_at=now()
-		WHERE id=$1
+		WHERE id=$1 AND deleted_at IS NULL
 		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
 		id, profile, p.DisplayName, p.AvatarURL))
 }
@@ -209,7 +211,7 @@ func (s *Store) UserByExternalIdentity(ctx context.Context, provider, subject st
 		SELECT u.id,COALESCE(u.email,''),COALESCE(u.phone,''),u.display_name,u.avatar_url,
 		       u.profile,u.password_hash,u.created_at,u.updated_at
 		FROM users u JOIN external_identities i ON i.user_id=u.id
-		WHERE i.provider=$1 AND i.subject=$2`, provider, subject))
+		WHERE i.provider=$1 AND i.subject=$2 AND u.deleted_at IS NULL`, provider, subject))
 }
 
 func (s *Store) LinkExternalIdentity(ctx context.Context, provider, subject string, userID uuid.UUID, email string) error {
@@ -229,7 +231,7 @@ func (s *Store) LinkExternalIdentity(ctx context.Context, provider, subject stri
 func (s *Store) UpdateUserPhone(ctx context.Context, id uuid.UUID, phone string) (domain.User, error) {
 	return scanUser(s.pool.QueryRow(ctx, `
 		UPDATE users SET phone=$2, updated_at=now()
-		WHERE id=$1
+		WHERE id=$1 AND deleted_at IS NULL
 		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
 		id, phone))
 }

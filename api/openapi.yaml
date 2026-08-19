@@ -149,6 +149,12 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/User"}
+    delete:
+      operationId: deleteAccount
+      description: Irreversibly deletes authentication and discovery data, removes group memberships, and preserves shared financial history under a Deleted user tombstone.
+      responses:
+        "204": {description: Account deleted and all sessions revoked}
+        "401": {description: Access token is missing, invalid, or already revoked}
   /me/phone/start:
     post:
       operationId: startPhoneLink

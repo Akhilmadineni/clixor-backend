@@ -296,6 +296,111 @@ func TestRegistrationAllocatesAccountBoundDeviceIdentity(t *testing.T) {
 	}
 }
 
+func TestDeleteAccountRevokesIdentityAndPreservesSharedHistory(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	alice := registerTestUser(t, server.URL, "delete-alice@example.com")
+	bob := registerTestUser(t, server.URL, "delete-bob@example.com")
+	phone := "+13125550199"
+	username := "@delete_alice"
+
+	alice.do(t, http.MethodPatch, "/v1/me", map[string]any{
+		"display_name": "Alice Delete", "username": username,
+		"avatar_url": "https://media.example/alice.jpg", "bio": "private profile",
+	}, http.StatusOK, nil)
+	alice.do(t, http.MethodPost, "/v1/me/phone/start", map[string]any{
+		"phone": phone,
+	}, http.StatusAccepted, nil)
+	alice.do(t, http.MethodPost, "/v1/me/phone/verify", map[string]any{
+		"phone": phone, "code": "000000",
+	}, http.StatusOK, nil)
+
+	var shared domain.Conversation
+	alice.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "Shared expenses", "member_ids": []uuid.UUID{bob.user.ID},
+		"metadata": map[string]any{"members": []map[string]any{{
+			"id": "stable-local-member-id", "backendUserId": alice.user.ID,
+			"name": "Alice Delete", "email": alice.user.Email, "phone": phone,
+			"username": username, "profileImageURL": "https://media.example/alice.jpg",
+		}}},
+	}, http.StatusCreated, &shared)
+
+	entityID := uuid.New()
+	alice.do(t, http.MethodPut,
+		"/v1/conversations/"+shared.ID.String()+"/entities/expense/"+entityID.String()+"?expected_version=0",
+		map[string]any{
+			"description": "Rent", "amount": 1200,
+			"payer": map[string]any{
+				"backendUserId": alice.user.ID, "displayName": "Alice Delete",
+				"email": alice.user.Email,
+			},
+		}, http.StatusOK, nil)
+	alice.do(t, http.MethodPost, "/v1/conversations/"+shared.ID.String()+"/messages", map[string]any{
+		"client_message_id": uuid.NewString(), "content_type": "text",
+		"ciphertext": base64.StdEncoding.EncodeToString([]byte("shared encrypted history")),
+	}, http.StatusCreated, nil)
+
+	var personal domain.Conversation
+	alice.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "Personal scratchpad",
+	}, http.StatusCreated, &personal)
+
+	alice.do(t, http.MethodDelete, "/v1/me", nil, http.StatusNoContent, nil)
+	alice.do(t, http.MethodGet, "/v1/me", nil, http.StatusUnauthorized, nil)
+	alice.client.do(t, http.MethodPost, "/v1/auth/refresh", map[string]any{
+		"refresh_token": alice.tokens.RefreshToken,
+	}, http.StatusUnauthorized, nil)
+
+	unauthenticated := testClient{baseURL: server.URL, client: http.DefaultClient}
+	unauthenticated.do(t, http.MethodPost, "/v1/auth/login", map[string]any{
+		"email": alice.user.Email, "password": "very-secure-test-password",
+		"device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusUnauthorized, nil)
+
+	var lookup domain.Page[domain.User]
+	bob.do(t, http.MethodPost, "/v1/users/lookup", map[string]any{
+		"phones": []string{phone}, "usernames": []string{username},
+	}, http.StatusOK, &lookup)
+	if len(lookup.Items) != 0 {
+		t.Fatalf("deleted identity remained discoverable: %+v", lookup.Items)
+	}
+
+	var retained domain.Conversation
+	bob.do(t, http.MethodGet, "/v1/conversations/"+shared.ID.String(), nil, http.StatusOK, &retained)
+	if retained.CreatedBy != bob.user.ID || strings.Contains(string(retained.Metadata), "Alice Delete") ||
+		strings.Contains(string(retained.Metadata), alice.user.Email) ||
+		!strings.Contains(string(retained.Metadata), "Deleted user") {
+		t.Fatalf("shared conversation was not transferred and anonymized: %+v", retained)
+	}
+	var members domain.Page[domain.ConversationMember]
+	bob.do(t, http.MethodGet, "/v1/conversations/"+shared.ID.String()+"/members", nil, http.StatusOK, &members)
+	if len(members.Items) != 1 || members.Items[0].UserID != bob.user.ID || members.Items[0].Role != "owner" {
+		t.Fatalf("deleted membership or ownership remained: %+v", members.Items)
+	}
+	var expenses domain.Page[domain.Entity]
+	bob.do(t, http.MethodGet, "/v1/conversations/"+shared.ID.String()+"/entities/expense",
+		nil, http.StatusOK, &expenses)
+	if len(expenses.Items) != 1 || expenses.Items[0].Version != 2 ||
+		strings.Contains(string(expenses.Items[0].Payload), "Alice Delete") ||
+		!strings.Contains(string(expenses.Items[0].Payload), "Deleted user") {
+		t.Fatalf("shared financial history was not retained anonymously: %+v", expenses.Items)
+	}
+	var messages domain.Page[domain.Message]
+	bob.do(t, http.MethodGet, "/v1/conversations/"+shared.ID.String()+"/messages?after_seq=0",
+		nil, http.StatusOK, &messages)
+	if len(messages.Items) != 1 || messages.Items[0].SenderID != alice.user.ID {
+		t.Fatalf("shared encrypted message history was not retained: %+v", messages.Items)
+	}
+	bob.do(t, http.MethodGet, "/v1/conversations/"+personal.ID.String(), nil, http.StatusNotFound, nil)
+
+	// Erasure releases login identifiers so the former email can create a wholly
+	// new account rather than restoring the deleted tombstone.
+	replacement := registerTestUser(t, server.URL, alice.user.Email)
+	if replacement.user.ID == alice.user.ID {
+		t.Fatal("registration restored the deleted account instead of creating a new identity")
+	}
+}
+
 func TestLogoutImmediatelyRevokesAccessSession(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)

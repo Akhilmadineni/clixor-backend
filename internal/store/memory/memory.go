@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -95,7 +96,7 @@ func (s *Store) UserByID(_ context.Context, id uuid.UUID) (domain.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	user, ok := s.users[id]
-	if !ok {
+	if !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.User{}, domain.ErrNotFound
 	}
 	return user, nil
@@ -234,7 +235,7 @@ func (s *Store) UpdateUserProfile(_ context.Context, id uuid.UUID, profile json.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, ok := s.users[id]
-	if !ok {
+	if !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.User{}, domain.ErrNotFound
 	}
 	var p struct {
@@ -282,7 +283,7 @@ func (s *Store) UpdateUserPhone(_ context.Context, id uuid.UUID, phone string) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, ok := s.users[id]
-	if !ok {
+	if !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.User{}, domain.ErrNotFound
 	}
 	if existing, exists := s.phoneToUser[phone]; exists && existing != id {
@@ -296,6 +297,182 @@ func (s *Store) UpdateUserPhone(_ context.Context, id uuid.UUID, phone string) (
 	s.users[id] = user
 	s.phoneToUser[phone] = id
 	return user, nil
+}
+
+func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.users[userID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
+	identity := store.AccountIdentity{
+		UserID: userID, Email: user.Email, Phone: user.Phone,
+		DisplayName: user.DisplayName, Username: profileUsername(user.Profile),
+	}
+	now := time.Now().UTC()
+	deletedConversations := make(map[uuid.UUID]struct{})
+	var objectKeys []string
+	var updatedEntities []domain.Entity
+
+	for conversationID, members := range s.members {
+		if _, present := members[userID]; !present {
+			continue
+		}
+		if len(members) == 1 {
+			deletedConversations[conversationID] = struct{}{}
+			delete(s.conversations, conversationID)
+			delete(s.members, conversationID)
+			delete(s.invites, conversationID)
+			delete(s.messages, conversationID)
+			continue
+		}
+
+		successor := oldestMember(members, userID)
+		conversation := s.conversations[conversationID]
+		if conversation.CreatedBy == userID {
+			conversation.CreatedBy = successor.UserID
+		}
+		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err == nil && changed {
+			conversation.Metadata = metadata
+		}
+		conversation.UpdatedAt = now
+		s.conversations[conversationID] = conversation
+		if members[userID].Role == "owner" {
+			successor.Role = "owner"
+			members[successor.UserID] = successor
+		}
+		delete(members, userID)
+		delete(s.receipts, conversationID.String()+":"+userID.String())
+
+		for key, entity := range s.entities {
+			if entity.ConversationID != conversationID {
+				continue
+			}
+			payload, changed, err := store.AnonymizeAccountJSON(entity.Payload, identity)
+			if err != nil || !changed {
+				continue
+			}
+			entity.Payload = payload
+			entity.Version++
+			entity.UpdatedAt = now
+			s.entities[key] = entity
+			updatedEntities = append(updatedEntities, entity)
+		}
+	}
+
+	for key, message := range s.clientMessages {
+		if _, deleted := deletedConversations[message.ConversationID]; deleted {
+			delete(s.clientMessages, key)
+		}
+	}
+	for key, receipt := range s.receipts {
+		_, conversationDeleted := deletedConversations[receipt.ConversationID]
+		if receipt.UserID == userID || conversationDeleted {
+			delete(s.receipts, key)
+		}
+	}
+	for key, entity := range s.entities {
+		if _, deleted := deletedConversations[entity.ConversationID]; deleted {
+			delete(s.entities, key)
+		}
+	}
+	for id, mediaObject := range s.media {
+		if _, deleted := deletedConversations[mediaObject.ConversationID]; deleted {
+			objectKeys = append(objectKeys, mediaObject.ObjectKey)
+			delete(s.media, id)
+		}
+	}
+	for conversationID, phones := range s.invites {
+		for phone, invitedBy := range phones {
+			if invitedBy == userID || phone == user.Phone {
+				delete(phones, phone)
+			}
+		}
+		if len(phones) == 0 {
+			delete(s.invites, conversationID)
+		}
+	}
+	for key, linkedUserID := range s.externalUsers {
+		if linkedUserID == userID {
+			delete(s.externalUsers, key)
+		}
+	}
+	for sessionID, session := range s.sessions {
+		if session.UserID == userID {
+			delete(s.sessions, sessionID)
+		}
+	}
+	for deviceID, device := range s.devices {
+		if device.UserID != userID {
+			continue
+		}
+		delete(s.preKeys, deviceID)
+		device.Name = "Deleted device"
+		device.PushToken = ""
+		device.IdentityKey = ""
+		device.SignedPreKey = nil
+		s.devices[deviceID] = device
+	}
+	delete(s.emailToUser, strings.ToLower(strings.TrimSpace(user.Email)))
+	delete(s.phoneToUser, user.Phone)
+	delete(s.usernameToUser, profileUsername(user.Profile))
+
+	user.Email = ""
+	user.Phone = ""
+	user.DisplayName = store.DeletedUserDisplayName
+	user.AvatarURL = ""
+	user.Profile = json.RawMessage(`{"deleted":true}`)
+	user.PasswordHash = ""
+	user.UpdatedAt = now
+	s.users[userID] = user
+
+	filtered := s.outbox[:0]
+	needles := [][]byte{[]byte(userID.String()), []byte(identity.Email), []byte(identity.Phone), []byte(identity.Username)}
+	for _, event := range s.outbox {
+		if _, deleted := deletedConversations[event.AggregateID]; deleted || containsAny(event.Payload, needles) {
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	s.outbox = filtered
+	for _, entity := range updatedEntities {
+		payload, _ := json.Marshal(entity)
+		s.appendOutbox("entity.updated", entity.ConversationID, payload)
+	}
+	if len(objectKeys) > 0 {
+		sort.Strings(objectKeys)
+		for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
+			end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
+			payload, _ := json.Marshal(store.MediaDeletePayload{ObjectKeys: objectKeys[start:end]})
+			s.appendOutbox("media.delete", userID, payload)
+		}
+	}
+	return nil
+}
+
+func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid.UUID) domain.ConversationMember {
+	var result domain.ConversationMember
+	for id, member := range members {
+		if id == excluded {
+			continue
+		}
+		if result.UserID == uuid.Nil || member.JoinedAt.Before(result.JoinedAt) ||
+			(member.JoinedAt.Equal(result.JoinedAt) && id.String() < result.UserID.String()) {
+			result = member
+		}
+	}
+	return result
+}
+
+func containsAny(payload []byte, needles [][]byte) bool {
+	for _, needle := range needles {
+		if len(needle) > 0 && bytes.Contains(payload, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {

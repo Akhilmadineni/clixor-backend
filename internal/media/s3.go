@@ -80,4 +80,8 @@ func (s *S3) Verify(ctx context.Context, objectKey string, expectedSize int64) e
 	return nil
 }
 
+func (s *S3) Delete(ctx context.Context, objectKey string) error {
+	return s.client.RemoveObject(ctx, s.bucket, objectKey, minio.RemoveObjectOptions{})
+}
+
 func (*S3) Close() {}

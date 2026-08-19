@@ -218,7 +218,7 @@ func main() {
 		presenceService, cfg.MetricsToken, logger,
 	)
 	if durableStore {
-		go outbox.New(persistence, bus, pushService, logger).Run(ctx)
+		go outbox.New(persistence, bus, pushService, mediaService, logger).Run(ctx)
 	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

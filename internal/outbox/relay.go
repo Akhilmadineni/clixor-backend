@@ -11,6 +11,7 @@ import (
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
+	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/observability"
 	"github.com/Akhilmadineni/clixor-backend/internal/push"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
@@ -22,10 +23,11 @@ type Relay struct {
 	bus    events.Bus
 	logger *slog.Logger
 	push   push.Service
+	media  media.Service
 }
 
-func New(store store.Store, bus events.Bus, pushService push.Service, logger *slog.Logger) *Relay {
-	return &Relay{store: store, bus: bus, push: pushService, logger: logger}
+func New(store store.Store, bus events.Bus, pushService push.Service, mediaService media.Service, logger *slog.Logger) *Relay {
+	return &Relay{store: store, bus: bus, push: pushService, media: mediaService, logger: logger}
 }
 
 func (r *Relay) Run(ctx context.Context) {
@@ -50,6 +52,17 @@ func (r *Relay) flush(ctx context.Context) {
 	}
 	published := make([]int64, 0, len(batch))
 	for _, item := range batch {
+		if item.Topic == "media.delete" {
+			if err := r.deleteMedia(ctx, item); err != nil {
+				observability.OutboxEvents.WithLabelValues("media_delete_failed").Inc()
+				r.logger.Error("outbox_media_delete_failed", "error", err, "outbox_id", item.ID)
+				continue
+			}
+			observability.OutboxEvents.WithLabelValues("published").Inc()
+			observability.OutboxLag.Observe(time.Since(item.CreatedAt).Seconds())
+			published = append(published, item.ID)
+			continue
+		}
 		event, recipients, ok := r.translate(ctx, item)
 		if !ok {
 			observability.OutboxEvents.WithLabelValues("translate_failed").Inc()
@@ -70,6 +83,25 @@ func (r *Relay) flush(ctx context.Context) {
 			r.logger.Error("outbox_ack_failed", "error", err)
 		}
 	}
+}
+
+func (r *Relay) deleteMedia(ctx context.Context, item domain.OutboxEvent) error {
+	var payload store.MediaDeletePayload
+	if err := json.Unmarshal(item.Payload, &payload); err != nil {
+		return fmt.Errorf("decode media deletion: %w", err)
+	}
+	if len(payload.ObjectKeys) == 0 || len(payload.ObjectKeys) > store.MediaDeleteBatchSize {
+		return fmt.Errorf("invalid media deletion object count: %d", len(payload.ObjectKeys))
+	}
+	for _, objectKey := range payload.ObjectKeys {
+		if strings.TrimSpace(objectKey) == "" {
+			return fmt.Errorf("invalid empty media object key")
+		}
+		if err := r.media.Delete(ctx, objectKey); err != nil {
+			return fmt.Errorf("delete media object %q: %w", objectKey, err)
+		}
+	}
+	return nil
 }
 
 func (r *Relay) sendPush(ctx context.Context, item domain.OutboxEvent, recipients []uuid.UUID) {

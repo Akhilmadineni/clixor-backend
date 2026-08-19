@@ -1,10 +1,20 @@
 # Clixor backend repository checkpoint
 
-Last updated: 2026-08-10 (America/Chicago)
+Last updated: 2026-08-19 (America/Chicago)
 
 Repository: `https://github.com/Akhilmadineni/clixor-backend`
 
-Branch: `main`
+Branch: `feature/akhil/delete-account-backend`
+
+## Account deletion implementation checkpoint
+
+- Authenticated `DELETE /v1/me` returns `204` only after a serializable account-erasure transaction commits.
+- Login identifiers, password hash, external identities, sessions, push tokens, encryption prekeys, profile fields, phone, email, avatar, and username are removed. The user/device rows remain inaccessible identity-free tombstones only where shared message/entity foreign keys require them.
+- The deleted account is removed from every group and from all lookup paths. Ownership is deterministically transferred to the oldest remaining member.
+- Single-member conversations are deleted. Their MinIO object keys are queued in bounded durable outbox batches; the relay retries idempotent MinIO deletion until it succeeds.
+- Shared messages, expenses, and settlements remain available to other members. Embedded member identity is rewritten to `Deleted user` while stable accounting IDs remain intact.
+- Migration `000004_account_deletion.sql`, OpenAPI documentation, HTTP contract tests, store tests, PostgreSQL integration coverage, and MinIO retry coverage are included.
+- Local validation on Go 1.26.5 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. The NAS PostgreSQL migration/transaction smoke test is the next deployment gate.
 
 ## Current state
 
