@@ -4,7 +4,7 @@ Last updated: 2026-08-19 (America/Chicago)
 
 Repository: `https://github.com/Akhilmadineni/clixor-backend`
 
-Branch: `feature/akhil/delete-account-backend`
+Branch: `feature/akhil/delete-account-backend` (production source merged to `main` at `2e35f2a`)
 
 ## Account deletion implementation checkpoint
 
@@ -15,6 +15,7 @@ Branch: `feature/akhil/delete-account-backend`
 - Shared messages, expenses, and settlements remain available to other members. Embedded member identity is rewritten to `Deleted user` while stable accounting IDs remain intact.
 - Migration `000004_account_deletion.sql`, OpenAPI documentation, HTTP contract tests, store tests, PostgreSQL integration coverage, and MinIO retry coverage are included.
 - Validation on Go 1.26.6 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. Migration 000004 and the account-deletion integration suite also pass against a fresh PostgreSQL 17 database on the NAS; the temporary test database was removed immediately afterward. CI and the production image are pinned to Go 1.26.6, with `golang.org/x/net` v0.55.0, to address the August 2026 Go security advisories caught by `govulncheck`.
+- GitHub Actions CI run `32298576923` and NAS deployment run `32298831529` completed successfully for revision `2e35f2a`. Public readiness returned 200. A disposable production account verified register 201, delete 204, revoked access/refresh/login 401, released-identifier registration 201, and cleanup delete 204.
 
 ## Current state
 
