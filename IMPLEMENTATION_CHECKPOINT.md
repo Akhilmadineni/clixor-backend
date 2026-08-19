@@ -14,7 +14,7 @@ Branch: `feature/akhil/delete-account-backend`
 - Single-member conversations are deleted. Their MinIO object keys are queued in bounded durable outbox batches; the relay retries idempotent MinIO deletion until it succeeds.
 - Shared messages, expenses, and settlements remain available to other members. Embedded member identity is rewritten to `Deleted user` while stable accounting IDs remain intact.
 - Migration `000004_account_deletion.sql`, OpenAPI documentation, HTTP contract tests, store tests, PostgreSQL integration coverage, and MinIO retry coverage are included.
-- Local validation on Go 1.26.5 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. The NAS PostgreSQL migration/transaction smoke test is the next deployment gate.
+- Validation on Go 1.26.5 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. Migration 000004 and the account-deletion integration suite also pass against a fresh PostgreSQL 17 database on the NAS; the temporary test database was removed immediately afterward.
 
 ## Current state
 
