@@ -206,6 +206,7 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 		{`DELETE FROM conversation_invites
 		  WHERE invited_by=$1 OR claimed_by=$1 OR ($2<>'' AND phone=$2)`, []any{userID, identity.Phone}},
 		{`DELETE FROM external_identities WHERE user_id=$1`, []any{userID}},
+		{`DELETE FROM age_assurances WHERE user_id=$1`, []any{userID}},
 		{`DELETE FROM sessions WHERE user_id=$1`, []any{userID}},
 		{`DELETE FROM one_time_prekeys
 		  WHERE device_id IN (SELECT id FROM devices WHERE user_id=$1)`, []any{userID}},

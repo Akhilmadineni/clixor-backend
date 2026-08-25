@@ -59,6 +59,8 @@ type Store interface {
 	UpdateUserPhone(context.Context, uuid.UUID, string) (domain.User, error)
 	UserByExternalIdentity(context.Context, string, string) (domain.User, error)
 	LinkExternalIdentity(context.Context, string, string, uuid.UUID, string) error
+	AgeAssurance(context.Context, uuid.UUID) (domain.AgeAssurance, error)
+	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)

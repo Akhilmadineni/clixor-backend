@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -351,14 +352,35 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 	if request.ID == uuid.Nil {
 		request.ID = uuid.New()
 	}
+	envelope, validEnvelope := parseE2EEEnvelope(request.Envelope)
 	if len(request.ClientMessageID) < 8 || len(request.ClientMessageID) > 128 ||
 		len(request.Ciphertext) == 0 || len(request.Ciphertext) > 2<<20 ||
-		!allowedContentType(request.ContentType) {
+		len(request.Envelope) == 0 || len(request.Envelope) > 1<<20 ||
+		!allowedContentType(request.ContentType) || !validEnvelope {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
 	if _, err := base64.StdEncoding.DecodeString(request.Ciphertext); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_ciphertext", "Ciphertext must be base64 encoded.")
+		return
+	}
+	device, err := s.store.Device(r.Context(), id.UserID, id.DeviceID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	registeredIdentity, registered := decodeEncodedBytes(device.IdentityKey, 32)
+	senderIdentity, validSender := decodeEncodedBytes(envelope.SenderIdentityKey, 32)
+	if !registered {
+		writeError(w, http.StatusConflict, "e2ee_device_not_ready", "Publish this device's encryption identity before sending messages.")
+		return
+	}
+	if !validSender || subtle.ConstantTimeCompare(registeredIdentity, senderIdentity) != 1 {
+		writeError(w, http.StatusUnprocessableEntity, "e2ee_identity_mismatch", "The message identity does not match the authenticated device.")
+		return
+	}
+	if !envelope.hasRecipient(id.DeviceID) {
+		writeError(w, http.StatusUnprocessableEntity, "e2ee_sender_not_recipient", "The sending device must be able to decrypt its sent message.")
 		return
 	}
 	message, recipients, err := s.store.CreateMessage(r.Context(), store.CreateMessageParams{
@@ -376,6 +398,62 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		Seq: message.Seq, Payload: eventPayload, OccurredAt: time.Now().UTC(),
 	})
 	writeJSON(w, http.StatusCreated, message)
+}
+
+type e2eeMessageEnvelope struct {
+	Protocol           string `json:"protocol"`
+	Version            int    `json:"version"`
+	SenderIdentityKey  string `json:"sender_identity_key"`
+	SenderEphemeralKey string `json:"sender_ephemeral_key"`
+	Recipients         []struct {
+		DeviceID   uuid.UUID `json:"device_id"`
+		KeyID      uint32    `json:"key_id"`
+		WrappedKey string    `json:"wrapped_key"`
+	} `json:"recipients"`
+	Signature string `json:"signature"`
+}
+
+func parseE2EEEnvelope(value json.RawMessage) (e2eeMessageEnvelope, bool) {
+	var envelope e2eeMessageEnvelope
+	if json.Unmarshal(value, &envelope) != nil || envelope.Protocol != "clixor-e2ee-v1" ||
+		envelope.Version != 1 || len(envelope.Recipients) == 0 || len(envelope.Recipients) > 4096 ||
+		!hasEncodedSize(envelope.SenderIdentityKey, 32) ||
+		!hasEncodedSize(envelope.SenderEphemeralKey, 32) || !hasEncodedSize(envelope.Signature, 64) {
+		return e2eeMessageEnvelope{}, false
+	}
+	seen := make(map[uuid.UUID]struct{}, len(envelope.Recipients))
+	for _, recipient := range envelope.Recipients {
+		if recipient.DeviceID == uuid.Nil || recipient.KeyID == 0 || !hasEncodedSize(recipient.WrappedKey, 60) {
+			return e2eeMessageEnvelope{}, false
+		}
+		if _, duplicate := seen[recipient.DeviceID]; duplicate {
+			return e2eeMessageEnvelope{}, false
+		}
+		seen[recipient.DeviceID] = struct{}{}
+	}
+	return envelope, true
+}
+
+func (e e2eeMessageEnvelope) hasRecipient(deviceID uuid.UUID) bool {
+	for _, recipient := range e.Recipients {
+		if recipient.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEncodedSize(value string, size int) bool {
+	_, ok := decodeEncodedBytes(value, size)
+	return ok
+}
+
+func decodeEncodedBytes(value string, size int) ([]byte, bool) {
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(value)
+	}
+	return decoded, err == nil && len(decoded) == size
 }
 
 func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {

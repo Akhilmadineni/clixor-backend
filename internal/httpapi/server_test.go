@@ -114,7 +114,7 @@ func TestMessagingLifecycleAndIsolation(t *testing.T) {
 		"client_message_id": uuid.NewString(),
 		"content_type":      "text",
 		"ciphertext":        base64.StdEncoding.EncodeToString([]byte("opaque encrypted bytes")),
-		"envelope":          map[string]any{"protocol": "signal-v1", "counter": 1},
+		"envelope":          testE2EEEnvelope(alice.device.ID),
 	}
 	var first domain.Message
 	alice.do(t, http.MethodPost, "/v1/conversations/"+conversation.ID.String()+"/messages",
@@ -170,6 +170,22 @@ func TestMessagingLifecycleAndIsolation(t *testing.T) {
 	}
 }
 
+func TestLegacyPlaintextChatEnvelopeIsRejected(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	user := registerTestUser(t, server.URL, "legacy-chat@example.com")
+	var conversation domain.Conversation
+	user.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "E2EE only",
+	}, http.StatusCreated, &conversation)
+	user.do(t, http.MethodPost, "/v1/conversations/"+conversation.ID.String()+"/messages", map[string]any{
+		"client_message_id": uuid.NewString(),
+		"content_type":      "text",
+		"ciphertext":        base64.StdEncoding.EncodeToString([]byte(`{"text":"server-readable"}`)),
+		"envelope":          map[string]any{"protocol": "clustr-transition-v1"},
+	}, http.StatusUnprocessableEntity, nil)
+}
+
 func TestRealtimeMessageDelivery(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
@@ -199,6 +215,7 @@ func TestRealtimeMessageDelivery(t *testing.T) {
 			"client_message_id": uuid.NewString(),
 			"content_type":      "text",
 			"ciphertext":        base64.StdEncoding.EncodeToString([]byte("encrypted")),
+			"envelope":          testE2EEEnvelope(alice.device.ID),
 		}, http.StatusCreated, nil)
 
 	var event domain.RealtimeEvent
@@ -338,6 +355,7 @@ func TestDeleteAccountRevokesIdentityAndPreservesSharedHistory(t *testing.T) {
 	alice.do(t, http.MethodPost, "/v1/conversations/"+shared.ID.String()+"/messages", map[string]any{
 		"client_message_id": uuid.NewString(), "content_type": "text",
 		"ciphertext": base64.StdEncoding.EncodeToString([]byte("shared encrypted history")),
+		"envelope":   testE2EEEnvelope(alice.device.ID),
 	}, http.StatusCreated, nil)
 
 	var personal domain.Conversation
@@ -463,6 +481,10 @@ func TestPhoneLookupInvitesAndConversationLifecycle(t *testing.T) {
 	}, http.StatusOK, &registered)
 	registeredClient := phoneClient
 	registeredClient.token = registered.Tokens.AccessToken
+	registeredClient.do(t, http.MethodPut, "/v1/me/age-assurance", map[string]any{
+		"source": "self_attested_date_of_birth", "declaration": "self_declared",
+		"date_of_birth": "1990-01-01",
+	}, http.StatusOK, nil)
 
 	var lookup domain.Page[domain.User]
 	owner.do(t, http.MethodPost, "/v1/users/lookup", map[string]any{
@@ -490,6 +512,10 @@ func TestPhoneLookupInvitesAndConversationLifecycle(t *testing.T) {
 	}, http.StatusOK, &invited)
 	invitedClient := phoneClient
 	invitedClient.token = invited.Tokens.AccessToken
+	invitedClient.do(t, http.MethodPut, "/v1/me/age-assurance", map[string]any{
+		"source": "self_attested_date_of_birth", "declaration": "self_declared",
+		"date_of_birth": "1990-01-01",
+	}, http.StatusOK, nil)
 	var invitedGroups domain.Page[domain.Conversation]
 	invitedClient.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusOK, &invitedGroups)
 	if len(invitedGroups.Items) != 1 || invitedGroups.Items[0].ID != group.ID {
@@ -638,8 +664,36 @@ func registerTestUser(t *testing.T, baseURL, email string) registeredUser {
 		"device_name": "Test iPhone", "platform": "ios",
 	}, http.StatusCreated, &response)
 	client.token = response.Tokens.AccessToken
+	client.do(t, http.MethodPut, "/v1/me/age-assurance", map[string]any{
+		"source": "self_attested_date_of_birth", "declaration": "self_declared",
+		"date_of_birth": "1990-01-01",
+	}, http.StatusOK, nil)
+	client.do(t, http.MethodPut, "/v1/devices/"+response.Device.ID.String(), map[string]any{
+		"name": "Test iPhone", "platform": "ios",
+		"identity_key": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
+		"signed_prekey": map[string]any{
+			"key_id":     1,
+			"public_key": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
+			"signature":  base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{4}, 64)),
+		},
+	}, http.StatusOK, nil)
 	return registeredUser{
 		user: response.User, device: response.Device, tokens: response.Tokens, client: client,
+	}
+}
+
+func testE2EEEnvelope(deviceID uuid.UUID) map[string]any {
+	return map[string]any{
+		"protocol":             "clixor-e2ee-v1",
+		"version":              1,
+		"sender_identity_key":  base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
+		"sender_ephemeral_key": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
+		"recipients": []map[string]any{{
+			"device_id":   deviceID,
+			"key_id":      1,
+			"wrapped_key": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 60)),
+		}},
+		"signature": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{4}, 64)),
 	}
 }
 
