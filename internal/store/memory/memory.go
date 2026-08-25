@@ -23,6 +23,7 @@ type Store struct {
 	phoneToUser    map[string]uuid.UUID
 	usernameToUser map[string]uuid.UUID
 	externalUsers  map[string]uuid.UUID
+	ageAssurances  map[uuid.UUID]domain.AgeAssurance
 	devices        map[uuid.UUID]domain.Device
 	preKeys        map[uuid.UUID][]domain.OneTimePreKey
 	sessions       map[uuid.UUID]domain.Session
@@ -45,6 +46,7 @@ func New() *Store {
 		phoneToUser:    make(map[string]uuid.UUID),
 		usernameToUser: make(map[string]uuid.UUID),
 		externalUsers:  make(map[string]uuid.UUID),
+		ageAssurances:  make(map[uuid.UUID]domain.AgeAssurance),
 		devices:        make(map[uuid.UUID]domain.Device),
 		preKeys:        make(map[uuid.UUID][]domain.OneTimePreKey),
 		sessions:       make(map[uuid.UUID]domain.Session),
@@ -231,6 +233,27 @@ func (s *Store) LinkExternalIdentity(_ context.Context, provider, subject string
 	return nil
 }
 
+func (s *Store) AgeAssurance(_ context.Context, userID uuid.UUID) (domain.AgeAssurance, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	assurance, ok := s.ageAssurances[userID]
+	if !ok {
+		return domain.AgeAssurance{}, domain.ErrNotFound
+	}
+	return assurance, nil
+}
+
+func (s *Store) UpsertAgeAssurance(_ context.Context, assurance domain.AgeAssurance) (domain.AgeAssurance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[assurance.UserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.AgeAssurance{}, domain.ErrNotFound
+	}
+	s.ageAssurances[assurance.UserID] = assurance
+	return assurance, nil
+}
+
 func (s *Store) UpdateUserProfile(_ context.Context, id uuid.UUID, profile json.RawMessage) (domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -399,6 +422,7 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			delete(s.externalUsers, key)
 		}
 	}
+	delete(s.ageAssurances, userID)
 	for sessionID, session := range s.sessions {
 		if session.UserID == userID {
 			delete(s.sessions, sessionID)

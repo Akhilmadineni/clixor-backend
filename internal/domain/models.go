@@ -28,6 +28,20 @@ type User struct {
 	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
+// AgeAssurance records only the minimum information needed to enforce the
+// adults-only policy. Exact dates of birth and identity documents are never
+// persisted by the backend.
+type AgeAssurance struct {
+	UserID        uuid.UUID  `json:"-"`
+	Status        string     `json:"status"`
+	MinimumAge    int        `json:"minimum_age"`
+	Source        string     `json:"source"`
+	Declaration   string     `json:"declaration"`
+	PolicyVersion string     `json:"policy_version"`
+	CheckedAt     time.Time  `json:"checked_at"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+}
+
 type Device struct {
 	ID           uuid.UUID       `json:"id"`
 	UserID       uuid.UUID       `json:"user_id"`

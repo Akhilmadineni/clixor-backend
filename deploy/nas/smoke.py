@@ -78,6 +78,46 @@ def register(base_url: str, email: str) -> dict[str, object]:
     return result
 
 
+def assure_adult(base_url: str, auth: dict[str, object]) -> None:
+    tokens = auth["tokens"]
+    assert isinstance(tokens, dict)
+    result = request(
+        base_url,
+        "PUT",
+        "/v1/me/age-assurance",
+        token=str(tokens["access_token"]),
+        body={
+            "source": "self_attested_date_of_birth",
+            "declaration": "self_declared",
+            "date_of_birth": "1990-01-01",
+        },
+    )
+    if not isinstance(result, dict) or result.get("status") != "adult":
+        raise SmokeFailure(f"adult age assurance failed: {result!r}")
+
+
+def publish_encryption_identity(base_url: str, auth: dict[str, object], marker: bytes) -> None:
+    tokens = auth["tokens"]
+    device = auth["device"]
+    assert isinstance(tokens, dict) and isinstance(device, dict)
+    request(
+        base_url,
+        "PUT",
+        f"/v1/devices/{device['id']}",
+        token=str(tokens["access_token"]),
+        body={
+            "name": "Smoke iPhone",
+            "platform": "ios",
+            "identity_key": base64.b64encode(marker * 32).decode(),
+            "signed_prekey": {
+                "key_id": 1,
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "signature": base64.b64encode(b"s" * 64).decode(),
+            },
+        },
+    )
+
+
 def upload_bytes(url: str, content: bytes, headers: dict[str, str]) -> None:
     request_headers = {"User-Agent": "clustr-smoke/1", **headers}
     req = urllib.request.Request(
@@ -155,6 +195,12 @@ def run(base_url: str, expected_media_host: str | None) -> str:
     alice = register(base_url, f"{prefix}-alice@example.com")
     bob = register(base_url, f"{prefix}-bob@example.com")
     eve = register(base_url, f"{prefix}-eve@example.com")
+    assure_adult(base_url, alice)
+    assure_adult(base_url, bob)
+    assure_adult(base_url, eve)
+    publish_encryption_identity(base_url, alice, b"i")
+    publish_encryption_identity(base_url, bob, b"b")
+    publish_encryption_identity(base_url, eve, b"v")
 
     alice_tokens = alice["tokens"]
     bob_tokens = bob["tokens"]
@@ -198,7 +244,18 @@ def run(base_url: str, expected_media_host: str | None) -> str:
         "client_message_id": str(uuid.uuid4()),
         "content_type": "text",
         "ciphertext": base64.b64encode(b"opaque smoke envelope").decode(),
-        "envelope": {"protocol": "smoke-opaque-v1", "counter": 1},
+        "envelope": {
+            "protocol": "clixor-e2ee-v1",
+            "version": 1,
+            "sender_identity_key": base64.b64encode(b"i" * 32).decode(),
+            "sender_ephemeral_key": base64.b64encode(b"e" * 32).decode(),
+            "recipients": [{
+                "device_id": alice["device"]["id"],
+                "key_id": 1,
+                "wrapped_key": base64.b64encode(b"w" * 60).decode(),
+            }],
+            "signature": base64.b64encode(b"s" * 64).decode(),
+        },
     }
     message = request(
         base_url,
