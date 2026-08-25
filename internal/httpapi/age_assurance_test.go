@@ -44,7 +44,7 @@ func TestEvaluateAgeAssuranceAdultBoundaries(t *testing.T) {
 	}
 }
 
-func TestAdultAgeAssuranceGuardsProductRoutes(t *testing.T) {
+func TestAgeAssuranceIsOptionalWhileProductGateIsDisabled(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
 	client := testClient{baseURL: server.URL, client: http.DefaultClient}
@@ -60,7 +60,14 @@ func TestAdultAgeAssuranceGuardsProductRoutes(t *testing.T) {
 	if pending["status"] != "pending" || pending["minimum_age"] != float64(18) {
 		t.Fatalf("unexpected pending response: %#v", pending)
 	}
-	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusForbidden, nil)
+	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusOK, nil)
+	var updated domain.User
+	client.do(t, http.MethodPatch, "/v1/me", map[string]any{
+		"displayName": "Age-gate rollback user", "username": "age_gate_rollback",
+	}, http.StatusOK, &updated)
+	if updated.Profile == nil {
+		t.Fatal("freshly registered user could not complete profile without age assurance")
+	}
 
 	var adult domain.AgeAssurance
 	client.do(t, http.MethodPut, "/v1/me/age-assurance", map[string]any{
@@ -73,7 +80,7 @@ func TestAdultAgeAssuranceGuardsProductRoutes(t *testing.T) {
 	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusOK, nil)
 }
 
-func TestUnderageAssuranceBlocksProductRoutes(t *testing.T) {
+func TestUnderageAssuranceDoesNotBlockProductRoutesWhileGateIsDisabled(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
 	client := testClient{baseURL: server.URL, client: http.DefaultClient}
@@ -93,7 +100,7 @@ func TestUnderageAssuranceBlocksProductRoutes(t *testing.T) {
 	if underage.Status != "underage" {
 		t.Fatalf("unexpected underage assurance: %+v", underage)
 	}
-	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusForbidden, nil)
+	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusOK, nil)
 	client.do(t, http.MethodPut, "/v1/me/age-assurance", map[string]any{
 		"source": "self_attested_date_of_birth", "declaration": "self_declared",
 		"date_of_birth": "1990-01-01",
