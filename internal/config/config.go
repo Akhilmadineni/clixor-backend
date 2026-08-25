@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -12,25 +13,26 @@ import (
 )
 
 type Config struct {
-	Environment   string
-	HTTPAddr      string
-	PublicBaseURL string
-	TLSCAFile     string
-	Store         string
-	DatabaseURL   string
-	RedisURL      string
-	NATSURL       string
-	JWTIssuer     string
-	AccessSecret  string
-	MetricsToken  string
-	AppleClientID string
-	AccessTTL     time.Duration
-	RefreshTTL    time.Duration
-	AutoMigrate   bool
-	S3            S3Config
-	Verification  VerificationConfig
-	APNS          APNSConfig
-	APNSSandbox   APNSConfig
+	Environment       string
+	HTTPAddr          string
+	PublicBaseURL     string
+	TLSCAFile         string
+	Store             string
+	DatabaseURL       string
+	RedisURL          string
+	NATSURL           string
+	JWTIssuer         string
+	AccessSecret      string
+	MetricsToken      string
+	AppleClientID     string
+	TrustedProxyCIDRs []netip.Prefix
+	AccessTTL         time.Duration
+	RefreshTTL        time.Duration
+	AutoMigrate       bool
+	S3                S3Config
+	Verification      VerificationConfig
+	APNS              APNSConfig
+	APNSSandbox       APNSConfig
 }
 
 type S3Config struct {
@@ -70,6 +72,13 @@ type APNSConfig struct {
 }
 
 func Load() (Config, error) {
+	trustedProxyCIDRs, err := envCIDRs(
+		"CLUSTER_TRUSTED_PROXY_CIDRS",
+		"127.0.0.0/8,::1/128",
+	)
+	if err != nil {
+		return Config{}, err
+	}
 	accessTTL, err := time.ParseDuration(env("CLUSTER_ACCESS_TTL", "15m"))
 	if err != nil {
 		return Config{}, fmt.Errorf("CLUSTER_ACCESS_TTL: %w", err)
@@ -115,21 +124,22 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
-		Environment:   env("CLUSTER_ENV", "development"),
-		HTTPAddr:      env("CLUSTER_HTTP_ADDR", ":8080"),
-		PublicBaseURL: env("CLUSTER_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
-		TLSCAFile:     os.Getenv("CLUSTER_TLS_CA_FILE"),
-		Store:         env("CLUSTER_STORE", "postgres"),
-		DatabaseURL:   env("CLUSTER_DATABASE_URL", "postgres://clustr:clustr@127.0.0.1:5432/clustr?sslmode=disable"),
-		RedisURL:      env("CLUSTER_REDIS_URL", "redis://127.0.0.1:6379/0"),
-		NATSURL:       env("CLUSTER_NATS_URL", "nats://127.0.0.1:4222"),
-		JWTIssuer:     env("CLUSTER_JWT_ISSUER", "clustr-api"),
-		AccessSecret:  os.Getenv("CLUSTER_JWT_ACCESS_SECRET"),
-		MetricsToken:  os.Getenv("CLUSTER_METRICS_TOKEN"),
-		AppleClientID: env("CLUSTER_APPLE_CLIENT_ID", "com.Clustr.Clustr.Clustr"),
-		AccessTTL:     accessTTL,
-		RefreshTTL:    refreshTTL,
-		AutoMigrate:   envBool("CLUSTER_AUTO_MIGRATE", true),
+		Environment:       env("CLUSTER_ENV", "development"),
+		HTTPAddr:          env("CLUSTER_HTTP_ADDR", ":8080"),
+		PublicBaseURL:     env("CLUSTER_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
+		TLSCAFile:         os.Getenv("CLUSTER_TLS_CA_FILE"),
+		Store:             env("CLUSTER_STORE", "postgres"),
+		DatabaseURL:       env("CLUSTER_DATABASE_URL", "postgres://clustr:clustr@127.0.0.1:5432/clustr?sslmode=disable"),
+		RedisURL:          env("CLUSTER_REDIS_URL", "redis://127.0.0.1:6379/0"),
+		NATSURL:           env("CLUSTER_NATS_URL", "nats://127.0.0.1:4222"),
+		JWTIssuer:         env("CLUSTER_JWT_ISSUER", "clustr-api"),
+		AccessSecret:      os.Getenv("CLUSTER_JWT_ACCESS_SECRET"),
+		MetricsToken:      os.Getenv("CLUSTER_METRICS_TOKEN"),
+		AppleClientID:     env("CLUSTER_APPLE_CLIENT_ID", "com.Clustr.Clustr.Clustr"),
+		TrustedProxyCIDRs: trustedProxyCIDRs,
+		AccessTTL:         accessTTL,
+		RefreshTTL:        refreshTTL,
+		AutoMigrate:       envBool("CLUSTER_AUTO_MIGRATE", true),
 		S3: S3Config{
 			Endpoint:       env("CLUSTER_S3_ENDPOINT", "127.0.0.1:9000"),
 			PublicEndpoint: os.Getenv("CLUSTER_S3_PUBLIC_ENDPOINT"),
@@ -381,4 +391,22 @@ func envCSV(key string) []string {
 		}
 	}
 	return values
+}
+
+func envCIDRs(key, fallback string) ([]netip.Prefix, error) {
+	raw := env(key, fallback)
+	parts := strings.Split(raw, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s contains invalid CIDR %q: %w", key, value, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }

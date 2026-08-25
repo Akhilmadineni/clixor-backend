@@ -5,8 +5,8 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -28,25 +28,27 @@ import (
 )
 
 type Server struct {
-	store        store.Store
-	tokens       *auth.TokenManager
-	bus          events.Bus
-	limiter      ratelimit.Limiter
-	media        media.Service
-	verifier     verification.Service
-	apple        appleauth.Verifier
-	presence     presence.Service
-	logger       *slog.Logger
-	dummyHash    string
-	metricsToken string
+	store             store.Store
+	tokens            *auth.TokenManager
+	bus               events.Bus
+	limiter           ratelimit.Limiter
+	media             media.Service
+	verifier          verification.Service
+	apple             appleauth.Verifier
+	presence          presence.Service
+	logger            *slog.Logger
+	dummyHash         string
+	metricsToken      string
+	trustedProxyCIDRs []netip.Prefix
 }
 
-func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, metricsToken string, logger *slog.Logger) *Server {
+func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
 	return &Server{
 		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService,
 		verifier: verifier, apple: apple, presence: presenceService, metricsToken: metricsToken,
-		logger: logger, dummyHash: dummyHash,
+		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
+		logger:            logger, dummyHash: dummyHash,
 	}
 }
 
@@ -184,10 +186,7 @@ func (s *Server) rateLimitIdentity(namespace string, limit int, window time.Dura
 func (s *Server) rateLimit(namespace string, limit int, window time.Duration, failClosed bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				host = r.RemoteAddr
-			}
+			host := clientIPForRateLimit(r, s.trustedProxyCIDRs)
 			key := namespace + ":" + host
 			allowed, err := s.limiter.Allow(r.Context(), key, limit, window)
 			if err != nil {

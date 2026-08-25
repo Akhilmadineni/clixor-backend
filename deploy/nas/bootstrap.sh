@@ -15,6 +15,7 @@ runtime_postgres_root="${project_root}/runtime/postgres-tls"
 runtime_nats_root="${project_root}/runtime/nats-tls"
 deployment_source="${project_root}/repo/deploy/nas"
 runtime_media_root="${project_root}/runtime/media"
+runtime_api_gateway_root="${project_root}/runtime/api-gateway"
 runtime_backup_root="${project_root}/runtime/postgres-backup"
 runtime_prometheus_root="${project_root}/runtime/prometheus"
 runtime_grafana_root="${project_root}/runtime/grafana"
@@ -31,6 +32,7 @@ install -d -m 0750 -o 99 -g 99 "${runtime_tls_root}"
 install -d -m 0750 -o 70 -g 70 "${runtime_postgres_root}"
 install -d -m 0750 -o 1000 -g 1000 "${runtime_nats_root}"
 install -d -m 0750 -o 101 -g 101 "${runtime_media_root}"
+install -d -m 0750 -o 101 -g 101 "${runtime_api_gateway_root}"
 install -d -m 0750 -o 0 -g 0 "${runtime_backup_root}"
 install -d -m 0750 -o 65534 -g 65534 "${runtime_prometheus_root}"
 install -d -m 0750 -o 472 -g 472 "${runtime_grafana_root}"
@@ -141,6 +143,7 @@ install -m 0444 -o 70 -g 70 "${pki_root}/server.crt" "${runtime_postgres_root}/s
 install -m 0400 -o 1000 -g 1000 "${pki_root}/server.key" "${runtime_nats_root}/server.key"
 install -m 0444 -o 1000 -g 1000 "${pki_root}/server.crt" "${runtime_nats_root}/server.crt"
 install -m 0400 -o 101 -g 101 "${deployment_source}/media-nginx.conf" "${runtime_media_root}/nginx.conf"
+install -m 0400 -o 101 -g 101 "${deployment_source}/api-gateway-nginx.conf" "${runtime_api_gateway_root}/nginx.conf"
 install -m 0500 -o 0 -g 0 "${deployment_source}/backup.sh" "${runtime_backup_root}/backup.sh"
 install -m 0400 -o 65534 -g 65534 "${deployment_source}/prometheus.yml" "${runtime_prometheus_root}/prometheus.yml"
 install -m 0400 -o 65534 -g 65534 "${secret_root}/metrics.token" "${runtime_prometheus_root}/metrics.token"
@@ -154,6 +157,7 @@ for required_path in \
   "${runtime_env}" \
   "${pki_root}/ca.crt" \
   "${runtime_tls_root}/haproxy.cfg" \
+  "${runtime_api_gateway_root}/nginx.conf" \
   "${runtime_media_root}/nginx.conf"
 do
   if [ ! -s "${required_path}" ]; then

@@ -29,7 +29,11 @@ func Open(ctx context.Context, databaseURL string, autoMigrate bool) (*Store, er
 	if err != nil {
 		return nil, fmt.Errorf("parse database URL: %w", err)
 	}
-	config.MaxConns = 50
+	// Two production API replicas share a PostgreSQL server capped at 100
+	// connections. Keep 30 connections available for migrations, backups,
+	// monitoring, and operator access instead of allowing the API pools to
+	// consume the entire server limit.
+	config.MaxConns = 35
 	config.MinConns = 5
 	config.MaxConnLifetime = 30 * time.Minute
 	config.MaxConnIdleTime = 5 * time.Minute

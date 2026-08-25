@@ -215,7 +215,7 @@ func main() {
 	}
 	api := httpapi.New(
 		persistence, tokenManager, bus, limiter, mediaService, verifier, appleVerifier,
-		presenceService, cfg.MetricsToken, logger,
+		presenceService, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
 	if durableStore {
 		go outbox.New(persistence, bus, pushService, mediaService, logger).Run(ctx)

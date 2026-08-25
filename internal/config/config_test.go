@@ -1,10 +1,37 @@
 package config
 
 import (
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestTrustedProxyCIDRsAreStrictlyParsed(t *testing.T) {
+	t.Setenv("TEST_TRUSTED_PROXIES", "127.0.0.1/8, ::1/128, 172.31.254.2/32")
+	prefixes, err := envCIDRs("TEST_TRUSTED_PROXIES", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Prefix{
+		netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("::1/128"),
+		netip.MustParsePrefix("172.31.254.2/32"),
+	}
+	if len(prefixes) != len(want) {
+		t.Fatalf("prefix count = %d, want %d", len(prefixes), len(want))
+	}
+	for index := range want {
+		if prefixes[index] != want[index] {
+			t.Fatalf("prefix[%d] = %s, want %s", index, prefixes[index], want[index])
+		}
+	}
+
+	t.Setenv("TEST_TRUSTED_PROXIES", "127.0.0.1")
+	if _, err := envCIDRs("TEST_TRUSTED_PROXIES", ""); err == nil {
+		t.Fatal("expected an address without a CIDR mask to fail")
+	}
+}
 
 func TestProductionConfigurationRequiresEncryptedDependencies(t *testing.T) {
 	cfg := validProductionConfig()

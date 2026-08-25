@@ -623,7 +623,7 @@ func newTestHTTPServerWithVerifier(t *testing.T, verifier verification.Service) 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(New(
 		persistence, tokens, bus, ratelimit.NewMemory(), media.Unavailable{},
-		verifier, appleauth.Unavailable{}, presence.NewMemory(), "", logger,
+		verifier, appleauth.Unavailable{}, presence.NewMemory(), nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)
 	return server

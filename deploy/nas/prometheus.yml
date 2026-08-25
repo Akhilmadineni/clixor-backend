@@ -8,4 +8,4 @@ scrape_configs:
     metrics_path: /metrics
     bearer_token_file: /run/secrets/metrics.token
     static_configs:
-      - targets: ["clustr-api:8080"]
+      - targets: ["api-a:8080", "api-b:8080"]

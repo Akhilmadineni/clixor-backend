@@ -48,7 +48,10 @@ chmod 700 "$release_dir"
 exec 9>"$lock_file"
 flock -n 9 || fail "another Clustr deployment holds $lock_file"
 
-previous_image=$(docker inspect clustr-api --format '{{.Config.Image}}' 2>/dev/null || true)
+previous_image=$(docker inspect clustr-api-a --format '{{.Config.Image}}' 2>/dev/null || true)
+if [ -z "$previous_image" ]; then
+  previous_image=$(docker inspect clustr-api --format '{{.Config.Image}}' 2>/dev/null || true)
+fi
 if [ -f "$compose_file" ]; then
   cp "$compose_file" "$previous_compose"
 fi
@@ -65,7 +68,7 @@ rollback() {
     if [ -n "$previous_image" ] && [ -s "$previous_compose" ]; then
       previous_tag=${previous_image#clustr-api:}
       cp "$previous_compose" "$compose_file"
-      CLUSTER_IMAGE_TAG="$previous_tag" docker compose --file "$compose_file" up -d --no-build
+      CLUSTER_IMAGE_TAG="$previous_tag" docker compose --file "$compose_file" up -d --no-build --remove-orphans
       curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18180/health/ready >/dev/null
       log "application rollback command completed; forward database migrations were not reversed"
     else
@@ -137,17 +140,30 @@ CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" \
   --profile migration run --rm migrate
 
 rollback_needed=1
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build
+CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build api-a api-b
+
+# The original single API owns the public loopback port on the first HA rollout.
+# Both replacement replicas are started before releasing that port so the
+# gateway transition is the only interruption.
+if [ "$(docker inspect clustr-api --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
+  docker stop --time 30 clustr-api
+fi
+CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build --remove-orphans
 
 attempt=1
 until curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18180/health/ready >/dev/null; do
   if [ "$attempt" -ge 60 ]; then
     CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" ps
-    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" logs --tail=100 api
+    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" logs --tail=100 api-a api-b api-gateway
     fail "local readiness did not pass within 120 seconds"
   fi
   attempt=$((attempt + 1))
   sleep 2
+done
+
+for replica in api-a api-b; do
+  docker exec clustr-api-gateway wget --quiet --output-document=/dev/null \
+    "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the ingress network"
 done
 rollback_needed=0
 

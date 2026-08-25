@@ -14,12 +14,14 @@ not contain credentials and will not start with placeholder values.
 └── secrets/    runtime.env and private keys; mode 0700
 ```
 
-The API, media gateway, and Grafana bind only to NAS loopback on ports `18180`,
-`18181`, and `13000`. PostgreSQL, Redis, NATS, and MinIO have no published host
-ports. Dependencies use authenticated private-CA TLS across the internal
-`clustr_internal` and `clustr_data` networks. The HAProxy bridge uses Docker's
-embedded DNS resolver so a recreated Redis or MinIO container does not require a
-bridge restart.
+The API gateway, media gateway, and Grafana bind only to NAS loopback on ports
+`18180`, `18181`, and `13000`. Two API replicas sit behind the API gateway on a
+dedicated internal ingress network; PostgreSQL, Redis, NATS, and MinIO have no
+published host ports. The gateway preserves Cloudflare's `CF-Connecting-IP`
+header and the API trusts it only from the gateway's fixed internal address.
+Dependencies use authenticated private-CA TLS across the internal
+`clustr_internal` and `clustr_data` networks. Both HAProxy and the API gateway
+use Docker's embedded DNS resolver so recreated containers are discovered.
 
 ## UGOS boot ordering
 
@@ -38,6 +40,27 @@ systemctl show docker.service -p After -p Requires
 
 The final command must show `storage_serv.service` in both properties. This avoids
 the boot race where Docker exhausts its restart limit before `/volume1` mounts.
+
+## Cloudflare connector host limits
+
+Install the checked-in connector capacity settings once on the NAS:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/nas/systemd/99-cloudflared-capacity.conf \
+  /etc/sysctl.d/99-cloudflared-capacity.conf
+sudo sysctl --system
+sudo install -d -m 0755 /etc/systemd/system/cloudflared.service.d
+sudo install -o root -g root -m 0644 \
+  deploy/nas/systemd/cloudflared-limits.conf \
+  /etc/systemd/system/cloudflared.service.d/capacity.conf
+sudo systemctl daemon-reload
+sudo systemctl restart cloudflared
+```
+
+Verify `ip_local_port_range` is `11000 60999`, the cloudflared open-file limit is
+at least 70,000, and the tunnel returns to four active HA connections. The restart
+briefly disconnects WebSockets; clients must reconnect and resume automatically.
 
 ## Build and deploy
 
