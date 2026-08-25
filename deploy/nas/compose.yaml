@@ -254,6 +254,11 @@ services:
     networks:
       clustr_ingress:
         ipv4_address: 172.31.254.2
+      # UGOS does not install the loopback port binding for a container that is
+      # attached exclusively to an internal Docker network. This external
+      # bridge supplies the host-reachable path; API traffic still leaves the
+      # gateway over clustr_ingress and its fixed trusted-proxy address.
+      homelab_proxy:
     volumes:
       - /volume1/docker/clustr/runtime/api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
