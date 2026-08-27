@@ -22,7 +22,10 @@ class SmokeFailure(RuntimeError):
     pass
 
 
-def request(
+SMOKE_PASSWORD = "clustr-smoke-password-2026"
+
+
+def request_with_status(
     base_url: str,
     method: str,
     path: str,
@@ -30,7 +33,7 @@ def request(
     token: str | None = None,
     body: object | None = None,
     expected: tuple[int, ...] = (200,),
-) -> object | None:
+) -> tuple[int, object | None]:
     headers = {"Accept": "application/json", "User-Agent": "clustr-smoke/1"}
     payload = None
     if token:
@@ -56,8 +59,28 @@ def request(
                 f"{method} {path}: expected {expected}, got {response.status}: {detail}"
             )
         if not response_payload:
-            return None
-        return json.loads(response_payload)
+            return response.status, None
+        return response.status, json.loads(response_payload)
+
+
+def request(
+    base_url: str,
+    method: str,
+    path: str,
+    *,
+    token: str | None = None,
+    body: object | None = None,
+    expected: tuple[int, ...] = (200,),
+) -> object | None:
+    _, response = request_with_status(
+        base_url,
+        method,
+        path,
+        token=token,
+        body=body,
+        expected=expected,
+    )
+    return response
 
 
 def register(base_url: str, email: str) -> dict[str, object]:
@@ -67,7 +90,7 @@ def register(base_url: str, email: str) -> dict[str, object]:
         "/v1/auth/register",
         body={
             "email": email,
-            "password": "clustr-smoke-password-2026",
+            "password": SMOKE_PASSWORD,
             "display_name": email,
             "device_name": "Smoke iPhone",
             "platform": "ios",
@@ -76,6 +99,74 @@ def register(base_url: str, email: str) -> dict[str, object]:
     )
     assert isinstance(result, dict)
     return result
+
+
+def delete_registered_account(base_url: str, email: str) -> None:
+    """Fresh authentication makes cleanup independent of smoke-session state."""
+    status, auth = request_with_status(
+        base_url,
+        "POST",
+        "/v1/auth/login",
+        body={
+            "email": email,
+            "password": SMOKE_PASSWORD,
+            "device_name": "Smoke cleanup",
+            "platform": "ios",
+        },
+        expected=(200, 401, 404),
+    )
+    # A missing login is the expected result when registration never committed,
+    # or when a prior DELETE committed but its response was lost in transit.
+    if status in (401, 404):
+        return
+    if not isinstance(auth, dict) or not isinstance(auth.get("tokens"), dict):
+        raise SmokeFailure(f"cleanup login returned an invalid response for {email}")
+    access_token = str(auth["tokens"].get("access_token", ""))
+    if not access_token:
+        raise SmokeFailure(f"cleanup login omitted an access token for {email}")
+    request_with_status(
+        base_url,
+        "DELETE",
+        "/v1/me",
+        token=access_token,
+        expected=(204,),
+    )
+    # A 204 is not enough for a production cleanup gate: prove that the same
+    # credentials can no longer establish a session. This also catches a server
+    # that acknowledged deletion without applying the irreversible tombstone.
+    final_status, _ = request_with_status(
+        base_url,
+        "POST",
+        "/v1/auth/login",
+        body={
+            "email": email,
+            "password": SMOKE_PASSWORD,
+            "device_name": "Smoke cleanup verification",
+            "platform": "ios",
+        },
+        expected=(200, 401, 404),
+    )
+    if final_status == 200:
+        raise SmokeFailure(f"cleanup verification could still log in as {email}")
+
+
+def cleanup_registered_accounts(base_url: str, emails: list[str]) -> list[str]:
+    """Attempt every account even when an earlier cleanup operation fails."""
+    failures: list[str] = []
+    for email in reversed(emails):
+        last_error: BaseException | None = None
+        for attempt in range(1, 4):
+            try:
+                delete_registered_account(base_url, email)
+                last_error = None
+                break
+            except BaseException as error:  # Cleanup also runs during interruption.
+                last_error = error
+                if attempt < 3:
+                    time.sleep(attempt)
+        if last_error is not None:
+            failures.append(f"{email}: {last_error}")
+    return failures
 
 
 def assure_adult(base_url: str, auth: dict[str, object]) -> None:
@@ -184,7 +275,11 @@ def websocket_handshake(base_url: str, token: str) -> None:
     connection.close()
 
 
-def run(base_url: str, expected_media_host: str | None) -> str:
+def run_scenario(
+    base_url: str,
+    expected_media_host: str | None,
+    registered_emails: list[str],
+) -> str:
     ready = request(base_url, "GET", "/health/ready")
     if ready != {"status": "ready"}:
         raise SmokeFailure(f"unexpected readiness response: {ready!r}")
@@ -211,9 +306,15 @@ def run(base_url: str, expected_media_host: str | None) -> str:
 
     suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     prefix = f"clustr-smoke-public-{suffix}"
-    alice = register(base_url, f"{prefix}-alice@example.com")
-    bob = register(base_url, f"{prefix}-bob@example.com")
-    eve = register(base_url, f"{prefix}-eve@example.com")
+    alice_email = f"{prefix}-alice@example.com"
+    bob_email = f"{prefix}-bob@example.com"
+    eve_email = f"{prefix}-eve@example.com"
+    registered_emails.append(alice_email)
+    alice = register(base_url, alice_email)
+    registered_emails.append(bob_email)
+    bob = register(base_url, bob_email)
+    registered_emails.append(eve_email)
+    eve = register(base_url, eve_email)
     assure_adult(base_url, alice)
     assure_adult(base_url, bob)
     assure_adult(base_url, eve)
@@ -380,6 +481,43 @@ def run(base_url: str, expected_media_host: str | None) -> str:
     return prefix
 
 
+def run(base_url: str, expected_media_host: str | None) -> str:
+    registered_emails: list[str] = []
+    scenario_error: BaseException | None = None
+    result: str | None = None
+    try:
+        result = run_scenario(base_url, expected_media_host, registered_emails)
+    except BaseException as error:
+        scenario_error = error
+    finally:
+        try:
+            cleanup_failures = cleanup_registered_accounts(base_url, registered_emails)
+        except BaseException as cleanup_error:
+            if scenario_error is not None:
+                raise SmokeFailure(
+                    f"smoke scenario failed: {scenario_error}; "
+                    f"smoke cleanup raised unexpectedly: {cleanup_error}"
+                ) from scenario_error
+            raise
+        if cleanup_failures:
+            cleanup_detail = "; ".join(cleanup_failures)
+            if scenario_error is not None:
+                raise SmokeFailure(
+                    f"smoke scenario failed: {scenario_error}; "
+                    "smoke account cleanup also failed; active test accounts may remain: "
+                    + cleanup_detail
+                ) from scenario_error
+            raise SmokeFailure(
+                "smoke account cleanup failed; active test accounts may remain: "
+                + cleanup_detail
+            )
+    if scenario_error is not None:
+        raise scenario_error.with_traceback(scenario_error.__traceback__)
+    if result is None:
+        raise SmokeFailure("smoke scenario returned no result")
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -391,7 +529,7 @@ def main() -> None:
     print(
         "smoke=passed auth refresh authorization conversation message replay "
         "password-reset-safe-state receipt entity media-upload "
-        "media-download websocket "
+        "media-download websocket account-cleanup "
         f"test_prefix={prefix}"
     )
 

@@ -105,16 +105,28 @@ short-lived checkout token; all application credentials remain in
 `/volume1/docker/clustr/secrets` and are never copied into Actions secrets.
 
 The host script builds immutable revision-labelled API and bootstrap images before
-rollout, serializes deployments with GitHub concurrency and a NAS file lock,
-refreshes root-owned runtime files in a capability-limited local container, and
-captures a mode-0600 PostgreSQL custom-format snapshot before migration. Local
-readiness gates success; a failed rollout restores the previous API image and
-Compose model. Database migrations are intentionally forward-only and must remain
-compatible with the previous API release; restoring a database dump is a separate,
-operator-approved disaster-recovery action, never an automatic rollback.
+rollout and builds mail only when its provider is explicitly enabled. It serializes
+deployments with GitHub concurrency and a NAS file lock, refreshes root-owned
+runtime files in a capability-limited local container, and captures a mode-0600
+PostgreSQL custom-format snapshot before migration. The dump is checksum-verified
+and catalog-validated with PostgreSQL 17 tooling before migrations can start.
 
-The final workflow step verifies the public Cloudflare route independently. The
-repository-scoped runner is installed as `atlanteans-nas-clixor` in
+API A and API B are then updated and verified one at a time. Exact image identity,
+per-replica ingress readiness, local gateway readiness, and the untouched peer are
+checked at each step. This materially reduces interruption risk, but OSS Nginx has
+no request-draining control, so the procedure does not claim a formal zero-error
+cutover.
+
+The prior stable source tree and release-derived runtime configs are snapshotted
+before rsync/bootstrap. Automatic rollback remains armed through public API,
+authentication-boundary, Apple association, and generic invite-page canaries; a
+failure first restores those files and reloads previous non-API services, then
+restores touched replicas in reverse order. Database migrations are intentionally
+forward-only and must remain compatible with the previous API release; restoring a
+database dump is a separate, operator-approved disaster-recovery action, never an
+automatic rollback.
+
+The repository-scoped runner is installed as `atlanteans-nas-clixor` in
 `/volume1/docker/github-runner-clixor` and runs under the enabled
 `github-runner-clixor.service` systemd unit. Keep it registered only to this
 repository and do not reuse the TradingBot or VerifyCore runner credentials.
@@ -175,8 +187,13 @@ python3 deploy/nas/smoke.py \
   --expected-media-host clustr-media.atlanteanz.com
 ```
 
-The test creates uniquely prefixed accounts and data. Remove only that reported
-prefix and its associated object-store keys after validation.
+The test records each candidate address before registration, so even a lost 201
+response is covered. In a `finally` cleanup it obtains a fresh session, calls
+`DELETE /v1/me`, and proves that the credentials can no longer log in. It reports
+success only when no login-capable smoke account remains. Cleanup retries
+treat an absent account as success and combine any cleanup error with the original
+scenario failure; account-deletion tombstones and asynchronous object-deletion
+audit work may remain by design.
 
 ## Outbound email DNS and reputation
 
