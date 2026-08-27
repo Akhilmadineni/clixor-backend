@@ -87,6 +87,24 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	var deletedConversationIDs []uuid.UUID
 	var sharedConversationIDs []uuid.UUID
 	var objectKeys []string
+	profileMediaRows, err := tx.Query(ctx, `
+		DELETE FROM profile_media_objects WHERE owner_id=$1 RETURNING object_key`, userID)
+	if err != nil {
+		return err
+	}
+	for profileMediaRows.Next() {
+		var key string
+		if err := profileMediaRows.Scan(&key); err != nil {
+			profileMediaRows.Close()
+			return err
+		}
+		objectKeys = append(objectKeys, key)
+	}
+	if err := profileMediaRows.Err(); err != nil {
+		profileMediaRows.Close()
+		return err
+	}
+	profileMediaRows.Close()
 	for _, conversation := range conversations {
 		if !conversation.successorID.Valid {
 			mediaRows, err := tx.Query(ctx, `
@@ -205,8 +223,11 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	}{
 		{`DELETE FROM conversation_invites
 		  WHERE invited_by=$1 OR claimed_by=$1 OR ($2<>'' AND phone=$2)`, []any{userID, identity.Phone}},
+		{`UPDATE conversation_invite_links SET revoked_at=COALESCE(revoked_at,now())
+		  WHERE created_by=$1`, []any{userID}},
 		{`DELETE FROM external_identities WHERE user_id=$1`, []any{userID}},
 		{`DELETE FROM age_assurances WHERE user_id=$1`, []any{userID}},
+		{`DELETE FROM password_reset_challenges WHERE user_id=$1`, []any{userID}},
 		{`DELETE FROM sessions WHERE user_id=$1`, []any{userID}},
 		{`DELETE FROM one_time_prekeys
 		  WHERE device_id IN (SELECT id FROM devices WHERE user_id=$1)`, []any{userID}},

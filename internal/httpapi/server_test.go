@@ -17,6 +17,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
+	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
 	"github.com/Akhilmadineni/clixor-backend/internal/ratelimit"
@@ -80,6 +81,36 @@ func TestLegacyLegalHostnameRedirectsToClixor(t *testing.T) {
 	}
 	if location := response.Header.Get("Location"); location != "https://clixor.atlanteanz.com/privacy?source=legacy" {
 		t.Fatalf("location = %q", location)
+	}
+}
+
+type failingOptionalMailService struct{}
+
+func (failingOptionalMailService) SendPasswordReset(context.Context, string, string, time.Duration) error {
+	return clustrmail.ErrUnavailable
+}
+
+func (failingOptionalMailService) SendPasswordChanged(context.Context, string) error {
+	return clustrmail.ErrUnavailable
+}
+
+func (failingOptionalMailService) Ping(context.Context) error {
+	return clustrmail.ErrUnavailable
+}
+
+func TestOptionalMailOutageDoesNotFailCoreReadiness(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServerWithVerifierAndMail(
+		t, verification.Development{Code: "000000"}, failingOptionalMailService{},
+	)
+	response, err := http.Get(server.URL + "/health/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("optional mail outage changed readiness to %d: %s", response.StatusCode, body)
 	}
 }
 
@@ -170,20 +201,68 @@ func TestMessagingLifecycleAndIsolation(t *testing.T) {
 	}
 }
 
-func TestLegacyPlaintextChatEnvelopeIsRejected(t *testing.T) {
+func TestProduction05bTransitionChatEnvelopeIsAcceptedWithoutDeviceIdentity(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
-	user := registerTestUser(t, server.URL, "legacy-chat@example.com")
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	var registered authResponse
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "legacy-chat@example.com", "password": "very-secure-test-password",
+		"display_name": "Legacy Chat", "device_name": "05b iPhone", "platform": "ios",
+	}, http.StatusCreated, &registered)
+	client.token = registered.Tokens.AccessToken
 	var conversation domain.Conversation
-	user.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
-		"kind": "group", "title": "E2EE only",
+	client.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "05b compatibility",
 	}, http.StatusCreated, &conversation)
-	user.do(t, http.MethodPost, "/v1/conversations/"+conversation.ID.String()+"/messages", map[string]any{
+	var message domain.Message
+	client.do(t, http.MethodPost, "/v1/conversations/"+conversation.ID.String()+"/messages", map[string]any{
 		"client_message_id": uuid.NewString(),
 		"content_type":      "text",
 		"ciphertext":        base64.StdEncoding.EncodeToString([]byte(`{"text":"server-readable"}`)),
 		"envelope":          map[string]any{"protocol": "clustr-transition-v1"},
+	}, http.StatusCreated, &message)
+	if message.Seq != 1 || string(message.Envelope) != `{"protocol":"clustr-transition-v1"}` {
+		t.Fatalf("unexpected transition message: %+v", message)
+	}
+}
+
+func TestProduction05bTransitionEnvelopeRejectsMalformedAndExtendedShapes(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	user := registerTestUser(t, server.URL, "legacy-chat-invalid@example.com")
+	var conversation domain.Conversation
+	user.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "Strict transition envelope",
+	}, http.StatusCreated, &conversation)
+	path := "/v1/conversations/" + conversation.ID.String() + "/messages"
+	for _, envelope := range []any{
+		map[string]any{},
+		map[string]any{"protocol": "clustr-transition-v2"},
+		map[string]any{"protocol": "clustr-transition-v1", "version": 1},
+		[]any{"clustr-transition-v1"},
+		"clustr-transition-v1",
+		nil,
+	} {
+		user.do(t, http.MethodPost, path, map[string]any{
+			"client_message_id": uuid.NewString(), "content_type": "text",
+			"ciphertext": base64.StdEncoding.EncodeToString([]byte(`{"text":"server-readable"}`)),
+			"envelope":   envelope,
+		}, http.StatusUnprocessableEntity, nil)
+	}
+	user.do(t, http.MethodPost, path, map[string]any{
+		"client_message_id": uuid.NewString(), "content_type": "text",
+		"ciphertext": "not-base64!",
+		"envelope":   map[string]any{"protocol": "clustr-transition-v1"},
 	}, http.StatusUnprocessableEntity, nil)
+	for _, raw := range []string{
+		`{"protocol":"clustr-transition-v1","protocol":"clustr-transition-v1"}`,
+		`{"protocol":"clustr-transition-v1"} {}`,
+	} {
+		if validProduction05bTransitionEnvelope(json.RawMessage(raw)) {
+			t.Fatalf("non-minimal raw transition envelope was accepted: %s", raw)
+		}
+	}
 }
 
 func TestRealtimeMessageDelivery(t *testing.T) {
@@ -323,7 +402,7 @@ func TestDeleteAccountRevokesIdentityAndPreservesSharedHistory(t *testing.T) {
 
 	alice.do(t, http.MethodPatch, "/v1/me", map[string]any{
 		"display_name": "Alice Delete", "username": username,
-		"avatar_url": "https://media.example/alice.jpg", "bio": "private profile",
+		"bio": "private profile",
 	}, http.StatusOK, nil)
 	alice.do(t, http.MethodPost, "/v1/me/phone/start", map[string]any{
 		"phone": phone,
@@ -555,6 +634,44 @@ func TestProfileCannotMutateVerifiedIdentity(t *testing.T) {
 	}
 }
 
+func TestProfilePatchMergesFieldsAndProtectsServerOwnedMedia(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	user := registerTestUser(t, server.URL, "profile-merge@example.com")
+	var updated domain.User
+	user.client.do(t, http.MethodPatch, "/v1/me", map[string]any{
+		"display_name": "Profile Merge", "username": "@profile_merge",
+		"contact_email": "contact@example.com", "bio": "first bio",
+		"avatar_color": "#123ABC",
+	}, http.StatusOK, &updated)
+	user.client.do(t, http.MethodPatch, "/v1/me", map[string]any{
+		"bio":                  "second bio",
+		"auto_settle_settings": map[string]any{"enabled": true},
+	}, http.StatusOK, &updated)
+
+	var profile map[string]any
+	if err := json.Unmarshal(updated.Profile, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile["username"] != "@profile_merge" || profile["contact_email"] != "contact@example.com" ||
+		profile["avatar_color"] != "#123ABC" || profile["bio"] != "second bio" {
+		t.Fatalf("sparse profile patch replaced unrelated fields: %s", updated.Profile)
+	}
+	if settings, ok := profile["auto_settle_settings"].(map[string]any); !ok || settings["enabled"] != true {
+		t.Fatalf("settings patch was not retained: %s", updated.Profile)
+	}
+
+	for _, invalid := range []map[string]any{
+		{"profile_image_url": "clustr-media://" + uuid.NewString()},
+		{"avatar_url": "https://attacker.example/object"},
+		{"unexpected": "unbounded"},
+		{"avatar_color": "violet"},
+		{"auto_settle_settings": "not-an-object"},
+	} {
+		user.client.do(t, http.MethodPatch, "/v1/me", invalid, http.StatusUnprocessableEntity, nil)
+	}
+}
+
 func TestMultiDevicePreKeyClaimAndDeviceIsolation(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
@@ -639,17 +756,31 @@ func (retryingVerifier) Check(context.Context, string, string) error {
 
 func newTestHTTPServerWithVerifier(t *testing.T, verifier verification.Service) *httptest.Server {
 	t.Helper()
+	return newTestHTTPServerWithVerifierAndMail(t, verifier, clustrmail.Unavailable{})
+}
+
+func newTestHTTPServerWithVerifierAndMail(
+	t *testing.T,
+	verifier verification.Service,
+	mailer clustrmail.Service,
+) *httptest.Server {
+	t.Helper()
 	persistence := memory.New()
 	bus := events.NewMemoryBus()
+	limiter := ratelimit.NewMemory()
+	presenceService := presence.NewMemory()
 	t.Cleanup(func() {
+		presenceService.Close()
+		limiter.Close()
 		bus.Close()
 		persistence.Close()
 	})
 	tokens := auth.NewTokenManager("test", strings.Repeat("s", 48), 15*time.Minute, 30*24*time.Hour, persistence)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(New(
-		persistence, tokens, bus, ratelimit.NewMemory(), media.Unavailable{},
-		verifier, appleauth.Unavailable{}, presence.NewMemory(), nil, "", logger,
+		persistence, tokens, bus, limiter, media.Unavailable{},
+		verifier, appleauth.Unavailable{}, presenceService, mailer,
+		PasswordResetPolicy{}, nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)
 	return server

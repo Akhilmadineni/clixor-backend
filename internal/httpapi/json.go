@@ -54,6 +54,12 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "conflict", "The request conflicts with the current resource state.")
 	case errors.Is(err, domain.ErrInvalid):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_input", "One or more fields are invalid.")
+	case errors.Is(err, domain.ErrInviteRevoked):
+		writeError(w, http.StatusGone, "invite_revoked", "This invitation has been revoked.")
+	case errors.Is(err, domain.ErrInviteExpired):
+		writeError(w, http.StatusGone, "invite_expired", "This invitation has expired.")
+	case errors.Is(err, domain.ErrInviteExhausted):
+		writeError(w, http.StatusGone, "invite_exhausted", "This invitation has reached its usage limit.")
 	default:
 		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred.")
 	}

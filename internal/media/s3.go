@@ -2,7 +2,10 @@ package media
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -69,13 +72,33 @@ func (s *S3) DownloadURL(ctx context.Context, objectKey string, expiry time.Dura
 	return s.publicClient.PresignedGetObject(ctx, s.bucket, objectKey, expiry, nil)
 }
 
-func (s *S3) Verify(ctx context.Context, objectKey string, expectedSize int64) error {
+func (s *S3) Verify(ctx context.Context, objectKey string, expectedSize int64, expectedSHA256 string) error {
 	info, err := s.client.StatObject(ctx, s.bucket, objectKey, minio.StatObjectOptions{})
 	if err != nil {
 		return err
 	}
 	if info.Size != expectedSize {
 		return fmt.Errorf("media size mismatch: expected %d, received %d", expectedSize, info.Size)
+	}
+	if expectedSHA256 == "" {
+		return nil
+	}
+	object, err := s.client.GetObject(ctx, s.bucket, objectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("open media object for verification: %w", err)
+	}
+	defer object.Close()
+	hash := sha256.New()
+	read, err := io.Copy(hash, io.LimitReader(object, expectedSize+1))
+	if err != nil {
+		return fmt.Errorf("hash media object: %w", err)
+	}
+	if read != expectedSize {
+		return fmt.Errorf("media size changed during verification: expected %d, received %d", expectedSize, read)
+	}
+	actualSHA256 := hex.EncodeToString(hash.Sum(nil))
+	if actualSHA256 != expectedSHA256 {
+		return fmt.Errorf("media sha256 mismatch")
 	}
 	return nil
 }

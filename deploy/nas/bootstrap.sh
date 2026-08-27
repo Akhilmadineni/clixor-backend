@@ -9,6 +9,7 @@ fi
 project_root=/volume1/docker/clustr
 secret_root="${project_root}/secrets"
 pki_root="${secret_root}/pki"
+mail_secret_root="${secret_root}/mail"
 runtime_env="${secret_root}/runtime.env"
 runtime_tls_root="${project_root}/runtime/dependency-tls"
 runtime_postgres_root="${project_root}/runtime/postgres-tls"
@@ -19,15 +20,16 @@ runtime_api_gateway_root="${project_root}/runtime/api-gateway"
 runtime_backup_root="${project_root}/runtime/postgres-backup"
 runtime_prometheus_root="${project_root}/runtime/prometheus"
 runtime_grafana_root="${project_root}/runtime/grafana"
+runtime_mail_root="${project_root}/runtime/mail"
 deployment_gid="$(stat -c '%g' "${project_root}")"
 
 install -d -m 0750 "${project_root}/data" "${project_root}/runtime" "${project_root}/backups"
 install -d -m 0710 -o 0 -g "${deployment_gid}" "${secret_root}"
-install -d -m 0700 -o 0 -g 0 "${pki_root}" "${secret_root}/apns"
+install -d -m 0700 -o 0 -g 0 "${pki_root}" "${secret_root}/apns" "${mail_secret_root}"
 chown 0:"${deployment_gid}" "${secret_root}"
 chmod 0710 "${secret_root}"
-chown 0:0 "${pki_root}" "${secret_root}/apns"
-chmod 0700 "${pki_root}" "${secret_root}/apns"
+chown 0:0 "${pki_root}" "${secret_root}/apns" "${mail_secret_root}"
+chmod 0700 "${pki_root}" "${secret_root}/apns" "${mail_secret_root}"
 install -d -m 0750 -o 99 -g 99 "${runtime_tls_root}"
 install -d -m 0750 -o 70 -g 70 "${runtime_postgres_root}"
 install -d -m 0750 -o 1000 -g 1000 "${runtime_nats_root}"
@@ -36,7 +38,8 @@ install -d -m 0750 -o 101 -g 101 "${runtime_api_gateway_root}"
 install -d -m 0750 -o 0 -g 0 "${runtime_backup_root}"
 install -d -m 0750 -o 65534 -g 65534 "${runtime_prometheus_root}"
 install -d -m 0750 -o 472 -g 472 "${runtime_grafana_root}"
-for directory in postgres redis nats minio prometheus grafana; do
+install -d -m 0750 -o 0 -g "${deployment_gid}" "${runtime_mail_root}"
+for directory in postgres redis nats minio prometheus grafana mail-queue; do
   install -d -m 0750 "${project_root}/data/${directory}"
 done
 install -d -m 0750 "${project_root}/backups/postgres"
@@ -74,6 +77,20 @@ if [ ! -f "${pki_root}/ca.crt" ]; then
   chmod 0644 "${pki_root}/ca.crt" "${pki_root}/server.crt"
 fi
 
+if [ ! -s "${mail_secret_root}/dkim.private" ]; then
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+    -out "${mail_secret_root}/dkim.private"
+  chmod 0400 "${mail_secret_root}/dkim.private"
+fi
+dkim_public_key="$(openssl pkey -in "${mail_secret_root}/dkim.private" -pubout -outform DER |
+  base64 -w 0)"
+{
+  printf 'clixor._domainkey.atlanteanz.com. 3600 IN TXT '
+  printf '"v=DKIM1; k=rsa; p=%s"\n' "${dkim_public_key}"
+} > "${runtime_mail_root}/dkim-dns.txt"
+chown 0:"${deployment_gid}" "${runtime_mail_root}/dkim-dns.txt"
+chmod 0640 "${runtime_mail_root}/dkim-dns.txt"
+
 if [ ! -f "${runtime_env}" ]; then
   postgres_password="$(openssl rand -hex 32)"
   redis_password="$(openssl rand -hex 32)"
@@ -82,6 +99,7 @@ if [ ! -f "${runtime_env}" ]; then
   jwt_secret="$(openssl rand -hex 48)"
   metrics_token="$(openssl rand -hex 48)"
   otp_hmac_secret="$(openssl rand -hex 48)"
+  password_reset_hmac_secret="$(openssl rand -hex 48)"
   grafana_password="$(openssl rand -hex 24)"
 
   {
@@ -106,6 +124,13 @@ if [ ! -f "${runtime_env}" ]; then
     printf 'CLUSTER_JWT_ACCESS_SECRET=%s\n' "${jwt_secret}"
     printf 'CLUSTER_METRICS_TOKEN=%s\n' "${metrics_token}"
     printf 'CLUSTER_OTP_HMAC_SECRET=%s\n' "${otp_hmac_secret}"
+    printf 'CLUSTER_MAIL_PROVIDER=disabled\n'
+    printf 'CLUSTER_SMTP_ADDRESS=mail.clustr.internal:25\n'
+    printf 'CLUSTER_MAIL_FROM=Clixor <no-reply@atlanteanz.com>\n'
+    printf 'CLUSTER_PASSWORD_RESET_HMAC_SECRET=%s\n' "${password_reset_hmac_secret}"
+    printf 'CLUSTER_PASSWORD_RESET_TTL=10m\n'
+    printf 'CLUSTER_PASSWORD_RESET_CODE_LENGTH=8\n'
+    printf 'CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS=5\n'
     printf 'CLUSTER_JWT_ISSUER=clustr-api\n'
     printf 'CLUSTER_ACCESS_TTL=15m\n'
     printf 'CLUSTER_REFRESH_TTL=720h\n'
@@ -130,6 +155,32 @@ if ! grep -q '^CLUSTER_OTP_HMAC_SECRET=' "${runtime_env}"; then
   otp_hmac_secret="$(openssl rand -hex 48)"
   printf 'CLUSTER_OTP_HMAC_SECRET=%s\n' "${otp_hmac_secret}" >> "${runtime_env}"
   chmod 0600 "${runtime_env}"
+fi
+
+# Existing installations also receive an independent password-reset HMAC key and
+# an explicit disabled provider. Bootstrap never enables outbound email: preserve
+# a manually selected provider so activation remains an audited operator action.
+if ! grep -q '^CLUSTER_PASSWORD_RESET_HMAC_SECRET=' "${runtime_env}"; then
+  password_reset_hmac_secret="$(openssl rand -hex 48)"
+  printf 'CLUSTER_PASSWORD_RESET_HMAC_SECRET=%s\n' "${password_reset_hmac_secret}" >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_MAIL_PROVIDER=' "${runtime_env}"; then
+  printf 'CLUSTER_MAIL_PROVIDER=disabled\n' >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_SMTP_ADDRESS=' "${runtime_env}"; then
+  printf 'CLUSTER_SMTP_ADDRESS=mail.clustr.internal:25\n' >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_MAIL_FROM=' "${runtime_env}"; then
+  printf 'CLUSTER_MAIL_FROM=Clixor <no-reply@atlanteanz.com>\n' >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_PASSWORD_RESET_TTL=' "${runtime_env}"; then
+  printf 'CLUSTER_PASSWORD_RESET_TTL=10m\n' >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_PASSWORD_RESET_CODE_LENGTH=' "${runtime_env}"; then
+  printf 'CLUSTER_PASSWORD_RESET_CODE_LENGTH=8\n' >> "${runtime_env}"
+fi
+if ! grep -q '^CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS=' "${runtime_env}"; then
+  printf 'CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS=5\n' >> "${runtime_env}"
 fi
 
 sed -i 's/@clustr-tls:5432/@postgres.clustr.internal:5432/' "${runtime_env}"
@@ -158,7 +209,9 @@ for required_path in \
   "${pki_root}/ca.crt" \
   "${runtime_tls_root}/haproxy.cfg" \
   "${runtime_api_gateway_root}/nginx.conf" \
-  "${runtime_media_root}/nginx.conf"
+  "${runtime_media_root}/nginx.conf" \
+  "${mail_secret_root}/dkim.private" \
+  "${runtime_mail_root}/dkim-dns.txt"
 do
   if [ ! -s "${required_path}" ]; then
     echo "Missing NAS runtime file: ${required_path}" >&2
@@ -173,4 +226,5 @@ chown -R 65534:65534 "${project_root}/data/prometheus"
 chown -R 472:472 "${project_root}/data/grafana"
 chmod 0710 "${secret_root}"
 
-echo "Clustr NAS directories, internal PKI, and runtime secrets are ready."
+echo "Clustr NAS directories, internal PKI, mail signing key, and runtime secrets are ready."
+echo "Publish the DKIM TXT value from ${runtime_mail_root}/dkim-dns.txt; never copy the private key."

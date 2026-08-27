@@ -89,6 +89,51 @@ func TestProductionVerificationRequiresExplicitCostAndSecretControls(t *testing.
 	}
 }
 
+func TestPasswordResetCodeLengthMatchesPublicContract(t *testing.T) {
+	for _, length := range []int{6, 12} {
+		cfg := validProductionConfig()
+		cfg.Mail.PasswordResetLength = length
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must be 8") {
+			t.Fatalf("password reset length %d returned %v, want fixed-length validation error", length, err)
+		}
+	}
+}
+
+func TestProductionMayKeepUnverifiedOutboundMailDisabled(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.Mail.Provider = "disabled"
+	cfg.Mail.PasswordResetSecret = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("production with explicitly disabled mail failed validation: %v", err)
+	}
+}
+
+func TestPushDeliveryPolicyIsBounded(t *testing.T) {
+	valid := PushDeliveryConfig{
+		BatchSize: 100, WorkerConcurrency: 16, MaxAttempts: 8,
+		BaseDelay: 2 * time.Second, MaxDelay: 15 * time.Minute,
+		DeliveredRetention: 24 * time.Hour, DeadLetterRetention: 30 * 24 * time.Hour,
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*PushDeliveryConfig)
+	}{
+		{"unbounded attempts", func(policy *PushDeliveryConfig) { policy.MaxAttempts = 21 }},
+		{"excess concurrency", func(policy *PushDeliveryConfig) { policy.WorkerConcurrency = 101 }},
+		{"inverted delay", func(policy *PushDeliveryConfig) { policy.MaxDelay = time.Second }},
+		{"short dead letter retention", func(policy *PushDeliveryConfig) { policy.DeadLetterRetention = time.Hour }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validProductionConfig()
+			cfg.PushDelivery = valid
+			test.mutate(&cfg.PushDelivery)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid push delivery policy was accepted")
+			}
+		})
+	}
+}
+
 func validProductionConfig() Config {
 	return Config{
 		Environment:   "production",
@@ -118,6 +163,13 @@ func validProductionConfig() Config {
 			TelnyxAPIKey:       "key", TelnyxFromNumber: "+13125550100",
 			TelnyxMessagingProfileID: "profile",
 			TelnyxPublicKey:          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		},
+		Mail: MailConfig{
+			Provider: "smtp", SMTPAddress: "mail.clustr.internal:25",
+			From:                "Clixor <no-reply@atlanteanz.com>",
+			PasswordResetSecret: strings.Repeat("r", 48),
+			PasswordResetTTL:    10 * time.Minute, PasswordResetLength: 8,
+			PasswordResetMaxAttempts: 5,
 		},
 		APNS: APNSConfig{
 			TeamID: "team", KeyID: "key", BundleID: "app.bundle",

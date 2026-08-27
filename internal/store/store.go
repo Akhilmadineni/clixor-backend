@@ -44,6 +44,39 @@ type CreateMessageParams struct {
 	ReplyToID       *uuid.UUID
 }
 
+const MaxMessagePageSize = 500
+
+// MaxRetentionPruneBatchSize caps each retention transaction. Multiple relay
+// replicas may prune concurrently, so the stores must also lock candidate rows
+// with SKIP LOCKED rather than relying on this process-level bound alone.
+const MaxRetentionPruneBatchSize = 1000
+
+type ListMessagesParams struct {
+	ConversationID uuid.UUID
+	UserID         uuid.UUID
+	BeforeSeq      *int64
+	AfterSeq       *int64
+	Limit          int
+}
+
+func (p ListMessagesParams) Validate() error {
+	if p.ConversationID == uuid.Nil || p.UserID == uuid.Nil || p.Limit < 1 ||
+		p.Limit > MaxMessagePageSize || (p.BeforeSeq != nil && p.AfterSeq != nil) ||
+		(p.BeforeSeq != nil && *p.BeforeSeq < 1) || (p.AfterSeq != nil && *p.AfterSeq < 0) {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
+type CreateConversationInviteParams struct {
+	ID             uuid.UUID
+	ConversationID uuid.UUID
+	ActorID        uuid.UUID
+	TokenHash      []byte
+	ExpiresAt      time.Time
+	MaxUses        int
+}
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -62,6 +95,9 @@ type Store interface {
 	AgeAssurance(context.Context, uuid.UUID) (domain.AgeAssurance, error)
 	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
+	CreatePasswordResetChallenge(context.Context, domain.PasswordResetChallenge) error
+	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
+	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)
@@ -88,9 +124,13 @@ type Store interface {
 	TransferConversationOwnership(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 	CreateConversationInvites(context.Context, uuid.UUID, uuid.UUID, []string) error
 	ClaimConversationInvites(context.Context, uuid.UUID, string) ([]uuid.UUID, error)
+	CreateConversationInvite(context.Context, CreateConversationInviteParams) (domain.ConversationInvite, error)
+	ConversationInvitePreview(context.Context, []byte, uuid.UUID) (domain.ConversationInvitePreview, error)
+	AcceptConversationInvite(context.Context, []byte, uuid.UUID) (domain.ConversationInviteAcceptance, error)
+	RevokeConversationInvite(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 
 	CreateMessage(context.Context, CreateMessageParams) (domain.Message, []uuid.UUID, error)
-	ListMessages(context.Context, uuid.UUID, uuid.UUID, int64, int) ([]domain.Message, error)
+	ListMessages(context.Context, ListMessagesParams) ([]domain.Message, error)
 	UpsertReceipt(context.Context, domain.Receipt) (domain.Receipt, error)
 	ListReceipts(context.Context, uuid.UUID, uuid.UUID) ([]domain.Receipt, error)
 
@@ -99,9 +139,17 @@ type Store interface {
 	DeleteEntity(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, *int64) (domain.Entity, error)
 
 	CreateMedia(context.Context, domain.MediaObject) (domain.MediaObject, error)
+	CreateProfileMedia(context.Context, domain.MediaObject) (domain.MediaObject, error)
 	Media(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
 	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	DeleteMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
 
 	LockOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
 	MarkOutboxPublished(context.Context, []int64) error
+	EnqueuePushDeliveries(context.Context, domain.PushDelivery, []uuid.UUID) (int, error)
+	LockPushDeliveryBatch(context.Context, int) ([]domain.PushDelivery, error)
+	FinishPushDelivery(context.Context, int64, uuid.UUID, string, time.Time, string) error
+	InvalidatePushDelivery(context.Context, int64, uuid.UUID, uuid.UUID, uuid.UUID, string) error
+	PrunePushDeliveries(context.Context, time.Time, time.Time, int) (int64, error)
+	PrunePublishedOutbox(context.Context, time.Time, int) (int64, error)
 }

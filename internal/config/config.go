@@ -4,6 +4,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
+	netmail "net/mail"
 	"net/netip"
 	"net/url"
 	"os"
@@ -31,8 +33,10 @@ type Config struct {
 	AutoMigrate       bool
 	S3                S3Config
 	Verification      VerificationConfig
+	Mail              MailConfig
 	APNS              APNSConfig
 	APNSSandbox       APNSConfig
+	PushDelivery      PushDeliveryConfig
 }
 
 type S3Config struct {
@@ -69,6 +73,26 @@ type APNSConfig struct {
 	BundleID       string
 	PrivateKeyFile string
 	Environment    string
+}
+
+type PushDeliveryConfig struct {
+	BatchSize           int
+	WorkerConcurrency   int
+	MaxAttempts         int
+	BaseDelay           time.Duration
+	MaxDelay            time.Duration
+	DeliveredRetention  time.Duration
+	DeadLetterRetention time.Duration
+}
+
+type MailConfig struct {
+	Provider                 string
+	SMTPAddress              string
+	From                     string
+	PasswordResetSecret      string
+	PasswordResetTTL         time.Duration
+	PasswordResetLength      int
+	PasswordResetMaxAttempts int
 }
 
 func Load() (Config, error) {
@@ -123,6 +147,46 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	passwordResetTTL, err := envDuration("CLUSTER_PASSWORD_RESET_TTL", "10m")
+	if err != nil {
+		return Config{}, err
+	}
+	passwordResetLength, err := envInt("CLUSTER_PASSWORD_RESET_CODE_LENGTH", 8)
+	if err != nil {
+		return Config{}, err
+	}
+	passwordResetMaxAttempts, err := envInt("CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	pushBatchSize, err := envInt("CLUSTER_PUSH_DELIVERY_BATCH_SIZE", 100)
+	if err != nil {
+		return Config{}, err
+	}
+	pushMaxAttempts, err := envInt("CLUSTER_PUSH_MAX_ATTEMPTS", 8)
+	if err != nil {
+		return Config{}, err
+	}
+	pushWorkerConcurrency, err := envInt("CLUSTER_PUSH_WORKER_CONCURRENCY", 16)
+	if err != nil {
+		return Config{}, err
+	}
+	pushBaseDelay, err := envDuration("CLUSTER_PUSH_RETRY_BASE_DELAY", "2s")
+	if err != nil {
+		return Config{}, err
+	}
+	pushMaxDelay, err := envDuration("CLUSTER_PUSH_RETRY_MAX_DELAY", "15m")
+	if err != nil {
+		return Config{}, err
+	}
+	pushDeliveredRetention, err := envDuration("CLUSTER_PUSH_DELIVERED_RETENTION", "24h")
+	if err != nil {
+		return Config{}, err
+	}
+	pushDeadLetterRetention, err := envDuration("CLUSTER_PUSH_DEAD_LETTER_RETENTION", "720h")
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Environment:       env("CLUSTER_ENV", "development"),
 		HTTPAddr:          env("CLUSTER_HTTP_ADDR", ":8080"),
@@ -162,6 +226,15 @@ func Load() (Config, error) {
 			TelnyxMessagingProfileID: os.Getenv("CLUSTER_TELNYX_MESSAGING_PROFILE_ID"),
 			TelnyxPublicKey:          os.Getenv("CLUSTER_TELNYX_PUBLIC_KEY"),
 		},
+		Mail: MailConfig{
+			Provider:                 env("CLUSTER_MAIL_PROVIDER", "disabled"),
+			SMTPAddress:              env("CLUSTER_SMTP_ADDRESS", "mail.clustr.internal:25"),
+			From:                     env("CLUSTER_MAIL_FROM", "Clixor <no-reply@atlanteanz.com>"),
+			PasswordResetSecret:      os.Getenv("CLUSTER_PASSWORD_RESET_HMAC_SECRET"),
+			PasswordResetTTL:         passwordResetTTL,
+			PasswordResetLength:      passwordResetLength,
+			PasswordResetMaxAttempts: passwordResetMaxAttempts,
+		},
 		APNS: APNSConfig{
 			TeamID:         os.Getenv("CLUSTER_APNS_TEAM_ID"),
 			KeyID:          os.Getenv("CLUSTER_APNS_KEY_ID"),
@@ -175,6 +248,13 @@ func Load() (Config, error) {
 			BundleID:       os.Getenv("CLUSTER_APNS_SANDBOX_BUNDLE_ID"),
 			PrivateKeyFile: os.Getenv("CLUSTER_APNS_SANDBOX_PRIVATE_KEY_FILE"),
 			Environment:    "sandbox",
+		},
+		PushDelivery: PushDeliveryConfig{
+			BatchSize: pushBatchSize, WorkerConcurrency: pushWorkerConcurrency,
+			MaxAttempts: pushMaxAttempts,
+			BaseDelay:   pushBaseDelay, MaxDelay: pushMaxDelay,
+			DeliveredRetention:  pushDeliveredRetention,
+			DeadLetterRetention: pushDeadLetterRetention,
 		},
 	}
 	if cfg.Store == "memory" && cfg.AccessSecret == "" {
@@ -207,6 +287,9 @@ func (cfg Config) Validate() error {
 	if cfg.RefreshTTL < time.Hour || cfg.RefreshTTL > 365*24*time.Hour {
 		return errors.New("CLUSTER_REFRESH_TTL must be between 1h and 8760h")
 	}
+	if err := cfg.validatePushDelivery(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(cfg.JWTIssuer) == "" {
 		return errors.New("CLUSTER_JWT_ISSUER is required")
 	}
@@ -217,6 +300,9 @@ func (cfg Config) Validate() error {
 		return errors.New("production requires CLUSTER_VERIFICATION_PROVIDER=telnyx")
 	}
 	if err := cfg.validateVerification(); err != nil {
+		return err
+	}
+	if err := cfg.validateMail(); err != nil {
 		return err
 	}
 	if cfg.Environment == "production" && strings.TrimSpace(cfg.AppleClientID) == "" {
@@ -268,6 +354,75 @@ func (cfg Config) Validate() error {
 	if sandboxConfigured && (cfg.APNSSandbox.TeamID == "" || cfg.APNSSandbox.KeyID == "" ||
 		cfg.APNSSandbox.BundleID == "" || cfg.APNSSandbox.PrivateKeyFile == "") {
 		return errors.New("sandbox APNs credentials must be configured together")
+	}
+	return nil
+}
+
+func (cfg Config) validatePushDelivery() error {
+	pushDelivery := cfg.PushDelivery
+	// Config values constructed directly in tests or small development tools
+	// retain the same production defaults as Load.
+	if pushDelivery == (PushDeliveryConfig{}) {
+		pushDelivery = PushDeliveryConfig{
+			BatchSize: 100, WorkerConcurrency: 16, MaxAttempts: 8, BaseDelay: 2 * time.Second,
+			MaxDelay: 15 * time.Minute, DeliveredRetention: 24 * time.Hour,
+			DeadLetterRetention: 30 * 24 * time.Hour,
+		}
+	}
+	if pushDelivery.BatchSize < 1 || pushDelivery.BatchSize > 1000 {
+		return errors.New("CLUSTER_PUSH_DELIVERY_BATCH_SIZE must be between 1 and 1000")
+	}
+	if pushDelivery.WorkerConcurrency < 1 || pushDelivery.WorkerConcurrency > 100 {
+		return errors.New("CLUSTER_PUSH_WORKER_CONCURRENCY must be between 1 and 100")
+	}
+	if pushDelivery.MaxAttempts < 1 || pushDelivery.MaxAttempts > 20 {
+		return errors.New("CLUSTER_PUSH_MAX_ATTEMPTS must be between 1 and 20")
+	}
+	if pushDelivery.BaseDelay < 100*time.Millisecond || pushDelivery.BaseDelay > 5*time.Minute {
+		return errors.New("CLUSTER_PUSH_RETRY_BASE_DELAY must be between 100ms and 5m")
+	}
+	if pushDelivery.MaxDelay < pushDelivery.BaseDelay || pushDelivery.MaxDelay > 24*time.Hour {
+		return errors.New("CLUSTER_PUSH_RETRY_MAX_DELAY must be at least the base delay and no more than 24h")
+	}
+	if pushDelivery.DeliveredRetention < time.Hour || pushDelivery.DeliveredRetention > 30*24*time.Hour {
+		return errors.New("CLUSTER_PUSH_DELIVERED_RETENTION must be between 1h and 720h")
+	}
+	if pushDelivery.DeadLetterRetention < 24*time.Hour || pushDelivery.DeadLetterRetention > 365*24*time.Hour {
+		return errors.New("CLUSTER_PUSH_DEAD_LETTER_RETENTION must be between 24h and 8760h")
+	}
+	return nil
+}
+
+func (cfg Config) validateMail() error {
+	mail := cfg.Mail
+	if mail.Provider != "smtp" && mail.Provider != "disabled" {
+		return errors.New("CLUSTER_MAIL_PROVIDER must be smtp or disabled")
+	}
+	if mail.PasswordResetTTL < 5*time.Minute || mail.PasswordResetTTL > 30*time.Minute {
+		return errors.New("CLUSTER_PASSWORD_RESET_TTL must be between 5m and 30m")
+	}
+	if mail.PasswordResetLength != 8 {
+		return errors.New("CLUSTER_PASSWORD_RESET_CODE_LENGTH must be 8")
+	}
+	if mail.PasswordResetMaxAttempts < 3 || mail.PasswordResetMaxAttempts > 10 {
+		return errors.New("CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS must be between 3 and 10")
+	}
+	if mail.Provider != "smtp" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(mail.SMTPAddress)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return errors.New("CLUSTER_SMTP_ADDRESS must be a host:port address")
+	}
+	from, err := netmail.ParseAddress(mail.From)
+	if err != nil || strings.TrimSpace(from.Address) == "" {
+		return errors.New("CLUSTER_MAIL_FROM must contain a valid mailbox")
+	}
+	if len(mail.PasswordResetSecret) < 32 ||
+		mail.PasswordResetSecret == cfg.AccessSecret ||
+		mail.PasswordResetSecret == cfg.MetricsToken ||
+		mail.PasswordResetSecret == cfg.Verification.OTPSecret {
+		return errors.New("CLUSTER_PASSWORD_RESET_HMAC_SECRET must be a distinct secret of at least 32 bytes")
 	}
 	return nil
 }

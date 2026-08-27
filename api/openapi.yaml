@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: Clustr API
   version: 0.1.0
-  description: Production messaging and shared-group API. Message and media content is client-encrypted.
+  description: Production messaging and shared-group API. The current production-05b transition message format is plaintext-equivalent at the server and is not E2EE; clixor-e2ee-v1 is the encrypted successor.
 servers:
   - url: https://api.clustr.example/v1
 security:
@@ -57,6 +57,52 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/TokenPair"}
+  /auth/password/reset/start:
+    post:
+      security: []
+      operationId: startPasswordReset
+      description: Returns the same delayed response for known and unknown accounts. A code is sent only for an existing password account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: {type: string, format: email}
+      responses:
+        "202":
+          description: Generic reset challenge response
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PasswordResetChallenge"}
+        "429": {description: Per-address or per-IP abuse limit reached; an earlier delivered challenge remains valid}
+        "503": {description: Password reset or a dependency is unavailable}
+  /auth/password/reset/confirm:
+    post:
+      security: []
+      operationId: confirmPasswordReset
+      description: Consumes a one-time emailed code, replaces the password, and revokes every existing session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [challenge_id, code, new_password]
+              properties:
+                challenge_id: {type: string, format: uuid}
+                code: {type: string, pattern: "^[0-9]{8}$"}
+                new_password: {type: string, minLength: 10, maxLength: 256}
+      responses:
+        "204": {description: Password changed and sessions revoked}
+        "400": {description: Invalid, expired, consumed, or attempt-limited code}
+        "422": {description: New password does not meet policy}
+        "429": {description: Per-IP abuse limit reached}
+        "503": {description: Password reset or a dependency is unavailable}
   /auth/phone/start:
     post:
       security: []
@@ -142,7 +188,7 @@ paths:
         required: true
         content:
           application/json:
-            schema: {type: object, additionalProperties: true}
+            schema: {$ref: "#/components/schemas/ProfilePatch"}
       responses:
         "200":
           description: Updated user
@@ -184,6 +230,21 @@ paths:
               schema: {$ref: "#/components/schemas/AgeAssurance"}
         "422": {description: Invalid or inconsistent age evidence}
         "429": {description: Underage-to-adult recheck cooldown is active}
+  /me/avatar:
+    post:
+      operationId: createProfileMediaUpload
+      description: Creates a user-scoped profile image upload of at most 20 MiB. Completing the upload verifies both size and SHA-256, then atomically activates it as the current avatar.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ProfileMediaUploadRequest"}
+      responses:
+        "201":
+          description: Short-lived profile image upload URL
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MediaUploadResponse"}
   /me/phone/start:
     post:
       operationId: startPhoneLink
@@ -362,16 +423,115 @@ paths:
                 user_id: {type: string, format: uuid}
       responses:
         "204": {description: Ownership transferred atomically}
+  /conversations/{conversation_id}/invites:
+    post:
+      operationId: createConversationInvite
+      description: Creates a bounded group invite. The high-entropy token is returned once and only its SHA-256 hash is retained.
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expires_in_seconds:
+                  type: integer
+                  format: int64
+                  minimum: 300
+                  maximum: 2592000
+                  default: 604800
+                max_uses:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000
+                  default: 25
+      responses:
+        "201":
+          description: Invite created; token will not be returned again
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConversationInviteCreation"}
+        "403": {description: Owner or admin role required}
+        "422": {description: Invalid bounds or direct conversation}
+  /conversations/{conversation_id}/invites/{invite_id}:
+    delete:
+      operationId: revokeConversationInvite
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {$ref: "#/components/parameters/InviteID"}
+      responses:
+        "204": {description: Invite revoked; repeated revocation is idempotent}
+        "403": {description: Owner or admin role required}
+        "404": {description: Invite does not belong to this conversation}
+  /invites/preview:
+    post:
+      operationId: previewConversationInvite
+      description: Returns a privacy-safe preview without conversation IDs, metadata, creator identity, members, usage counters, or a bearer token in the URL.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ConversationInviteTokenRequest"}
+      responses:
+        "200":
+          description: Active invite preview
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConversationInvitePreview"}
+        "404": {description: Token is malformed or unknown}
+        "410": {description: Invite is revoked, expired, or exhausted}
+  /invites/accept:
+    post:
+      operationId: acceptConversationInvite
+      description: Atomically joins the authenticated user. The bearer remains in the encrypted JSON body; existing membership is an idempotent no-op and does not consume a use.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ConversationInviteTokenRequest"}
+      responses:
+        "200":
+          description: Conversation membership is available
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConversationInviteAcceptance"}
+        "404": {description: Token is malformed or unknown}
+        "410": {description: Invite is revoked, expired, or has no uses available for a new member}
   /conversations/{conversation_id}/messages:
     get:
       operationId: listMessages
       parameters:
         - {$ref: "#/components/parameters/ConversationID"}
-        - {name: after_seq, in: query, schema: {type: integer, format: int64, minimum: 0}}
-        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+        - name: before_seq
+          in: query
+          description: Return the newest messages with sequence numbers lower than this cursor. Mutually exclusive with after_seq.
+          schema: {type: integer, format: int64, minimum: 1}
+        - name: after_seq
+          in: query
+          description: Return the oldest messages with sequence numbers higher than this cursor. Mutually exclusive with before_seq.
+          schema: {type: integer, format: int64, minimum: 0}
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 500, default: 100}
       responses:
         "200":
-          description: Ordered replay page
+          description: Messages in ascending sequence order. With no cursor, returns the latest page. next_cursor is the first sequence for latest/before pages and the last sequence for after pages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Message"}
+                  next_cursor:
+                    type: string
+                    description: Pass as before_seq for history paging or after_seq for catch-up paging.
+        "422": {description: Invalid cursor combination, cursor value, or limit}
     post:
       operationId: sendMessage
       parameters:
@@ -447,20 +607,48 @@ paths:
   /conversations/{conversation_id}/media:
     post:
       operationId: createMediaUpload
+      description: Creates a production-05b-compatible conversation upload of at most 1 GiB. content_type is optional and defaults to application/octet-stream.
       parameters:
         - {$ref: "#/components/parameters/ConversationID"}
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [byte_size, ciphertext_sha256]
-              properties:
-                byte_size: {type: integer, format: int64, minimum: 1, maximum: 1073741824}
-                ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
+            schema: {$ref: "#/components/schemas/ConversationMediaUploadRequest"}
       responses:
-        "201": {description: Short-lived encrypted upload URL}
+        "201":
+          description: Short-lived encrypted upload URL
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MediaUploadResponse"}
+  /media/{media_id}/complete:
+    post:
+      operationId: completeMediaUpload
+      description: Profile media (at most 20 MiB) is verified by size and SHA-256. During production-05b compatibility, conversation media is verified by size only; its declared SHA-256 is stored but not checked by the server. Newer clients authenticate and decrypt conversation ciphertext client-side rather than relying on server digest verification.
+      parameters:
+        - {name: media_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200":
+          description: Media verified and ready
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MediaObject"}
+        "422": {description: Object size does not match, or profile-media SHA-256 does not match, the declaration}
+  /media/{media_id}/download:
+    get:
+      operationId: mediaDownload
+      parameters:
+        - {name: media_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {description: Short-lived download URL}
+  /media/{media_id}:
+    delete:
+      operationId: deleteMedia
+      description: Revokes owner access immediately and queues durable object deletion.
+      parameters:
+        - {name: media_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "204": {description: Media deletion queued}
   /realtime:
     get:
       operationId: realtime
@@ -475,6 +663,7 @@ components:
       bearerFormat: JWT
   parameters:
     ConversationID: {name: conversation_id, in: path, required: true, schema: {type: string, format: uuid}}
+    InviteID: {name: invite_id, in: path, required: true, schema: {type: string, format: uuid}}
     DeviceID: {name: device_id, in: path, required: true, schema: {type: string, format: uuid}}
     UserID: {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
     EntityKind:
@@ -491,6 +680,52 @@ components:
       description: Current version for optimistic concurrency, or 0 when creating
       schema: {type: integer, format: int64, minimum: 0}
   schemas:
+    ConversationMediaUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [byte_size, ciphertext_sha256]
+      properties:
+        byte_size: {type: integer, format: int64, minimum: 1, maximum: 1073741824}
+        ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
+        content_type: {type: string, maxLength: 100}
+    ProfileMediaUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [byte_size, ciphertext_sha256]
+      properties:
+        byte_size: {type: integer, format: int64, minimum: 1, maximum: 20971520}
+        ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/heic, image/webp]
+          default: image/jpeg
+    MediaObject:
+      type: object
+      required: [id, owner_id, scope, content_type, byte_size, ciphertext_sha256, status, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        owner_id: {type: string, format: uuid}
+        conversation_id: {type: string, format: uuid}
+        scope: {type: string, enum: [conversation, profile]}
+        content_type: {type: string}
+        byte_size: {type: integer, format: int64}
+        ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
+        status: {type: string, enum: [pending, ready, deleted]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    MediaUploadResponse:
+      type: object
+      required: [media, upload]
+      properties:
+        media: {$ref: "#/components/schemas/MediaObject"}
+        upload:
+          type: object
+          required: [method, url, headers, expires_at]
+          properties:
+            method: {type: string, const: PUT}
+            url: {type: string, format: uri}
+            headers: {type: object, additionalProperties: {type: string}}
+            expires_at: {type: string, format: date-time}
     Credentials:
       type: object
       required: [email, password, device_name, platform]
@@ -516,6 +751,14 @@ components:
         user: {$ref: "#/components/schemas/User"}
         device: {$ref: "#/components/schemas/Device"}
         tokens: {$ref: "#/components/schemas/TokenPair"}
+    PasswordResetChallenge:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, expires_in_seconds, message]
+      properties:
+        challenge_id: {type: string, format: uuid}
+        expires_in_seconds: {type: integer, minimum: 300, maximum: 1800}
+        message: {type: string}
     User:
       type: object
       required: [id, created_at, updated_at]
@@ -528,6 +771,28 @@ components:
         profile: {type: object, additionalProperties: true}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    ProfilePatch:
+      type: object
+      minProperties: 1
+      additionalProperties: false
+      description: Atomic sparse merge. Omitted fields are preserved; null clears an optional field. New clients change profile media through /me/avatar; production 05b may replay or attach an owned ready media reference with profile_image_url.
+      properties:
+        display_name: {type: string, minLength: 1, maxLength: 100}
+        contact_email:
+          oneOf: [{type: string, format: email, maxLength: 254}, {type: "null"}]
+        contact_phone:
+          oneOf: [{type: string, maxLength: 32}, {type: "null"}]
+        avatar_color:
+          oneOf: [{type: string, pattern: "^#[0-9A-Fa-f]{6}$"}, {type: "null"}]
+        username:
+          oneOf: [{type: string, maxLength: 31}, {type: "null"}]
+        bio:
+          oneOf: [{type: string, maxLength: 500}, {type: "null"}]
+        auto_settle_settings:
+          oneOf: [{type: object, additionalProperties: true}, {type: "null"}]
+        profile_image_url:
+          description: Deprecated compatibility field for the production 05b client. New values must be ready, account-owned clustr-media references; new clients use /me/avatar.
+          oneOf: [{type: string, maxLength: 2048}, {type: "null"}]
     AgeAssurance:
       type: object
       required: [status, minimum_age, policy_version]
@@ -600,6 +865,56 @@ components:
         last_seq: {type: integer, format: int64}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    ConversationInvite:
+      type: object
+      additionalProperties: false
+      required: [id, conversation_id, created_by, max_uses, uses, expires_at, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        conversation_id: {type: string, format: uuid}
+        created_by: {type: string, format: uuid}
+        max_uses: {type: integer, minimum: 1, maximum: 1000}
+        uses: {type: integer, minimum: 0}
+        expires_at: {type: string, format: date-time}
+        revoked_at: {type: string, format: date-time}
+        created_at: {type: string, format: date-time}
+    ConversationInviteCreation:
+      type: object
+      additionalProperties: false
+      required: [token, invite]
+      properties:
+        token:
+          type: string
+          pattern: "^cinv_[A-Za-z0-9_-]{43}$"
+          description: One-time-visible 256-bit bearer secret; do not log or persist it.
+        invite: {$ref: "#/components/schemas/ConversationInvite"}
+    ConversationInviteTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          pattern: "^cinv_[A-Za-z0-9_-]{43}$"
+          description: High-entropy bearer secret carried only in the TLS-protected request body.
+    ConversationInvitePreview:
+      type: object
+      additionalProperties: false
+      required: [invite_id, kind, expires_at, already_member]
+      properties:
+        invite_id: {type: string, format: uuid}
+        kind: {type: string, const: group}
+        title: {type: string}
+        avatar_url: {type: string}
+        expires_at: {type: string, format: date-time}
+        already_member: {type: boolean}
+    ConversationInviteAcceptance:
+      type: object
+      additionalProperties: false
+      required: [conversation, joined]
+      properties:
+        conversation: {$ref: "#/components/schemas/Conversation"}
+        joined: {type: boolean}
     SendMessage:
       type: object
       required: [client_message_id, content_type, ciphertext, envelope]
@@ -608,8 +923,19 @@ components:
         client_message_id: {type: string, minLength: 8, maxLength: 128}
         content_type: {type: string, enum: [text, image, video, audio, file, location]}
         ciphertext: {type: string, contentEncoding: base64}
-        envelope: {$ref: "#/components/schemas/E2EEEnvelope"}
+        envelope:
+          oneOf:
+            - {$ref: "#/components/schemas/E2EEEnvelope"}
+            - {$ref: "#/components/schemas/Production05bTransitionEnvelope"}
         reply_to_id: {type: string, format: uuid}
+    Production05bTransitionEnvelope:
+      type: object
+      deprecated: true
+      additionalProperties: false
+      required: [protocol]
+      description: Temporary compatibility envelope for the installed production-05b app. Ciphertext is base64-encoded JSON, plaintext-equivalent at the server, and not end-to-end encrypted.
+      properties:
+        protocol: {type: string, const: clustr-transition-v1}
     E2EEEnvelope:
       type: object
       additionalProperties: false

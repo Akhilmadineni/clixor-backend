@@ -12,7 +12,7 @@ var ErrUnavailable = errors.New("media service unavailable")
 type Service interface {
 	UploadURL(context.Context, string, string, int64, time.Duration) (*url.URL, error)
 	DownloadURL(context.Context, string, time.Duration) (*url.URL, error)
-	Verify(context.Context, string, int64) error
+	Verify(context.Context, string, int64, string) error
 	Delete(context.Context, string) error
 	Close()
 }
@@ -25,6 +25,6 @@ func (Unavailable) UploadURL(context.Context, string, string, int64, time.Durati
 func (Unavailable) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
 	return nil, ErrUnavailable
 }
-func (Unavailable) Verify(context.Context, string, int64) error { return ErrUnavailable }
-func (Unavailable) Delete(context.Context, string) error        { return ErrUnavailable }
-func (Unavailable) Close()                                      {}
+func (Unavailable) Verify(context.Context, string, int64, string) error { return ErrUnavailable }
+func (Unavailable) Delete(context.Context, string) error                { return ErrUnavailable }
+func (Unavailable) Close()                                              {}

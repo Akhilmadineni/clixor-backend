@@ -8,8 +8,8 @@ not contain credentials and will not start with placeholder values.
 ```text
 /volume1/docker/clustr/
 ├── repo/       application source used only to build a release image
-├── data/       persistent service data
-├── runtime/    generated deployment state
+├── data/       persistent service data, including the outbound mail queue
+├── runtime/    generated deployment state and public DKIM DNS value
 ├── backups/    local backup staging (not the only backup copy)
 └── secrets/    runtime.env and private keys; mode 0700
 ```
@@ -22,6 +22,15 @@ header and the API trusts it only from the gateway's fixed internal address.
 Dependencies use authenticated private-CA TLS across the internal
 `clustr_internal` and `clustr_data` networks. Both HAProxy and the API gateway
 use Docker's embedded DNS resolver so recreated containers are discovered.
+
+The release includes a send-only Postfix/OpenDKIM queue on the isolated
+`clustr_mail` network, but outbound email is disabled by default and the mail
+service stays stopped. After its external delivery gates pass, an operator can
+set `CLUSTER_MAIL_PROVIDER=smtp`; the deploy script then activates the `mail`
+Compose profile. SMTP has no host port, relays only for the two fixed API
+addresses, signs outbound mail with a root-owned DKIM key, and retains deferred
+messages under `data/mail-queue`. This is fully NAS-hosted outbound mail; it is
+not SES and does not expose a general-purpose email API.
 
 ## UGOS boot ordering
 
@@ -83,6 +92,10 @@ sudo env CLUSTER_IMAGE_TAG="${release_tag}" docker compose \
 curl --fail http://127.0.0.1:18180/health/ready
 ```
 
+The manual command above keeps the optional mail profile stopped. After mail is
+explicitly enabled in `secrets/runtime.env`, add `--profile mail` to each Compose
+invocation. Automatic deployment selects the profile from that explicit setting.
+
 ## Automatic deployment
 
 `.github/workflows/deploy-nas.yml` runs only after `CI` succeeds
@@ -133,6 +146,27 @@ dedicated nested-host certificate is provisioned.
 Cloudflare must allow WebSockets. The API sends WebSocket control pings every 25
 seconds, and the Swift client converts the HTTPS API URL to WSS automatically.
 
+The `clixor.atlanteanz.com` origin also serves the iOS universal-link association
+document directly (without redirects) at both Apple-supported paths:
+
+- `/.well-known/apple-app-site-association`
+- `/apple-app-site-association`
+
+Only the exact `/join` path is associated with the production app identifier
+`H9S3BAQ9U8.com.Clustr.Clustr.Clustr`. Share invites in this form:
+
+```text
+https://clixor.atlanteanz.com/join#cinv_<token>
+```
+
+The invite bearer token must remain in the URL fragment. Fragments are handled
+locally by the browser/app and are not sent to Cloudflare, the tunnel, Nginx, or
+the API. Never move the token into the path or query string. Browsers that do not
+open the app receive a static, generic `/join` page that does not inspect or
+reflect invite data. After the app extracts the fragment, it submits the bearer
+only in the JSON body of the fixed `POST /v1/invites/preview` or
+`POST /v1/invites/accept` endpoint; bearer values must never appear in API paths.
+
 Run the public smoke test after every release:
 
 ```bash
@@ -143,6 +177,36 @@ python3 deploy/nas/smoke.py \
 
 The test creates uniquely prefixed accounts and data. Remove only that reported
 prefix and its associated object-store keys after validation.
+
+## Outbound email DNS and reputation
+
+Bootstrap creates the DKIM private key once under `secrets/mail`, writes only its
+publishable TXT record to `runtime/mail/dkim-dns.txt`, and leaves
+`CLUSTER_MAIL_PROVIDER=disabled`. Never copy the private key into DNS, GitHub
+Actions, or the repository. Before enabling password-reset delivery, configure:
+
+1. ISP reverse DNS: `52.124.33.145` must resolve to `mail.atlanteanz.com`.
+2. Cloudflare DNS-only A record: `mail.atlanteanz.com` -> `52.124.33.145`.
+3. Apex SPF TXT: `v=spf1 ip4:52.124.33.145 -all`.
+4. DKIM TXT: publish the exact record from `runtime/mail/dkim-dns.txt`.
+5. Initial DMARC TXT at `_dmarc.atlanteanz.com`: `v=DMARC1; p=none; adkim=s; aspf=s`.
+
+Cloudflare Tunnel/proxy does not carry SMTP. The mail container connects directly
+outbound on TCP 25; no inbound SMTP or router port-forward is required. Validate
+forward/reverse DNS, SPF, DKIM, TLS, queue retry behavior, and delivery to a real
+mailbox before calling reset email production-ready. If the ISP cannot delegate
+matching PTR or later blocks TCP 25, a reputable SMTP relay is required; software
+alone cannot repair receiver reputation policy.
+
+Only after those checks and a real-mailbox delivery canary pass, change the
+root-owned `secrets/runtime.env` value to `CLUSTER_MAIL_PROVIDER=smtp` and run a
+normal deployment. Revert it to `disabled` to make reset endpoints return 503 and
+stop the optional mail profile on the next deployment.
+
+The optional SMTP queue is not part of API `/health/ready`; mail trouble must not
+remove otherwise healthy API replicas from load balancing. Treat reset-send error
+logs, queue health, and the real-mailbox canary as separate activation/operations
+signals. A failed enqueue cancels its challenge so no undelivered code is usable.
 
 ## Clixor legal pages
 
@@ -165,7 +229,14 @@ Before public traffic:
    approved, the sender is assigned to its messaging profile, the API/signing
    credentials and independent OTP HMAC secret are installed, and a real-device
    delivery/verification canary passes. See `PHONE_VERIFICATION_PLAN.md`.
-2. Install a production APNs signing key before enabling push delivery.
+2. Install a production APNs signing key before enabling push delivery. Apply
+   migration 9 first, then verify durable queue metrics, bounded terminal/source
+   pruning, one forced transient retry, and production-to-sandbox fallback on
+   real devices. Migration 9 deliberately leaves push-token uniqueness to the
+   application during the production-05b rolling window. Reserve migration 10
+   for media reservations and add the outbox retention index as migration 11 in
+   the later coordinated release. Add the push-token database constraint as
+   migration 12 after old replicas are drained; never rewrite migration 9.
 3. Replicate PostgreSQL dumps and MinIO data to an independent encrypted backup
    destination; a backup on the same NAS is not a complete disaster-recovery plan.
 4. Run a full Xcode/iOS SDK build and device test.

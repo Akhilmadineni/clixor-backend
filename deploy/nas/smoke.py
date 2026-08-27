@@ -189,6 +189,25 @@ def run(base_url: str, expected_media_host: str | None) -> str:
     if ready != {"status": "ready"}:
         raise SmokeFailure(f"unexpected readiness response: {ready!r}")
     request(base_url, "GET", "/v1/me", expected=(401,))
+    reset_probe = request(
+        base_url,
+        "POST",
+        "/v1/auth/password/reset/start",
+        body={"email": f"clustr-smoke-missing-{uuid.uuid4().hex}@example.com"},
+        expected=(202, 503),
+    )
+    reset_disabled = (
+        isinstance(reset_probe, dict)
+        and isinstance(reset_probe.get("error"), dict)
+        and reset_probe["error"].get("code") == "password_reset_unavailable"
+    )
+    reset_enabled = (
+        isinstance(reset_probe, dict)
+        and bool(reset_probe.get("challenge_id"))
+        and reset_probe.get("expires_in_seconds") == 600
+    )
+    if not reset_disabled and not reset_enabled:
+        raise SmokeFailure(f"password reset start contract failed: {reset_probe!r}")
 
     suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
     prefix = f"clustr-smoke-public-{suffix}"
@@ -371,7 +390,8 @@ def main() -> None:
     prefix = run(args.base_url, args.expected_media_host)
     print(
         "smoke=passed auth refresh authorization conversation message replay "
-        "receipt entity media-upload media-download websocket "
+        "password-reset-safe-state receipt entity media-upload "
+        "media-download websocket "
         f"test_prefix={prefix}"
     )
 

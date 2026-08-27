@@ -74,3 +74,11 @@ jobs:
           tags: clustr-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: deploy/nas/mail
+          file: deploy/nas/mail/Dockerfile
+          push: false
+          tags: clustr-mail:ci
+          cache-from: type=gha,scope=mail
+          cache-to: type=gha,mode=max,scope=mail

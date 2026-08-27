@@ -63,7 +63,7 @@ func TestAgeAssuranceIsOptionalWhileProductGateIsDisabled(t *testing.T) {
 	client.do(t, http.MethodGet, "/v1/conversations/", nil, http.StatusOK, nil)
 	var updated domain.User
 	client.do(t, http.MethodPatch, "/v1/me", map[string]any{
-		"displayName": "Age-gate rollback user", "username": "age_gate_rollback",
+		"display_name": "Age-gate rollback user", "username": "age_gate_rollback",
 	}, http.StatusOK, &updated)
 	if updated.Profile == nil {
 		t.Fatal("freshly registered user could not complete profile without age assurance")

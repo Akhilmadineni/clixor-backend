@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
@@ -76,9 +77,32 @@ func TestPostgresMessagingLifecycle(t *testing.T) {
 		t.Fatalf("message idempotency failed: first=%+v duplicate=%+v recipients=%v err=%v",
 			message, duplicate, recipients, err)
 	}
-	messages, err := persistence.ListMessages(ctx, conversation.ID, bob.ID, 0, 100)
-	if err != nil || len(messages) != 1 {
-		t.Fatalf("message replay failed: messages=%+v err=%v", messages, err)
+	for sequence := int64(2); sequence <= 6; sequence++ {
+		params.ID = uuid.New()
+		params.ClientMessageID = uuid.NewString()
+		if _, _, err := persistence.CreateMessage(ctx, params); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages, err := persistence.ListMessages(ctx, store.ListMessagesParams{
+		ConversationID: conversation.ID, UserID: bob.ID, Limit: 3,
+	})
+	if err != nil || len(messages) != 3 || messages[0].Seq != 4 || messages[2].Seq != 6 {
+		t.Fatalf("latest message page failed: messages=%+v err=%v", messages, err)
+	}
+	before := int64(4)
+	messages, err = persistence.ListMessages(ctx, store.ListMessagesParams{
+		ConversationID: conversation.ID, UserID: bob.ID, BeforeSeq: &before, Limit: 2,
+	})
+	if err != nil || len(messages) != 2 || messages[0].Seq != 2 || messages[1].Seq != 3 {
+		t.Fatalf("older message page failed: messages=%+v err=%v", messages, err)
+	}
+	after := int64(2)
+	messages, err = persistence.ListMessages(ctx, store.ListMessagesParams{
+		ConversationID: conversation.ID, UserID: bob.ID, AfterSeq: &after, Limit: 2,
+	})
+	if err != nil || len(messages) != 2 || messages[0].Seq != 3 || messages[1].Seq != 4 {
+		t.Fatalf("catch-up message page failed: messages=%+v err=%v", messages, err)
 	}
 	if _, err := persistence.UpsertReceipt(ctx, domain.Receipt{
 		ConversationID: conversation.ID, UserID: bob.ID, DeliveredSeq: 1, ReadSeq: 1,
@@ -103,6 +127,483 @@ func TestPostgresMessagingLifecycle(t *testing.T) {
 	)
 	if err != nil || deleted.DeletedAt == nil || deleted.Version != 2 {
 		t.Fatalf("entity tombstone failed: entity=%+v err=%v", deleted, err)
+	}
+}
+
+func TestPostgresPasswordResetIsAtomicAndRevokesSessions(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "pg-reset-" + uuid.NewString() + "@example.com", PasswordHash: "old-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: user.ID, Name: "iPhone", Platform: "ios", CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := domain.Session{
+		ID: uuid.New(), UserID: user.ID, DeviceID: device.ID,
+		RefreshTokenHash: []byte("refresh"), ExpiresAt: time.Now().Add(time.Hour), CreatedAt: time.Now(),
+	}
+	if err := persistence.CreateSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	challenge := domain.PasswordResetChallenge{
+		ID: uuid.New(), UserID: user.ID, CodeHash: []byte("01234567890123456789012345678901"),
+		ExpiresAt: time.Now().Add(10 * time.Minute), CreatedAt: time.Now(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, challenge); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.ConsumePasswordResetChallenge(
+		ctx, challenge.ID, []byte("wrong"), "new-hash", 5,
+	); !errors.Is(err, domain.ErrUnauthenticated) {
+		t.Fatalf("wrong reset code returned %v", err)
+	}
+	email, err := persistence.ConsumePasswordResetChallenge(
+		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
+	)
+	if err != nil || email != user.Email {
+		t.Fatalf("password reset returned email=%q err=%v", email, err)
+	}
+	updated, err := persistence.UserByID(ctx, user.ID)
+	if err != nil || updated.PasswordHash != "new-hash" {
+		t.Fatalf("password was not updated: user=%+v err=%v", updated, err)
+	}
+	active, err := persistence.SessionActive(ctx, session.ID, user.ID, device.ID)
+	if err != nil || active {
+		t.Fatalf("session remained active=%v err=%v", active, err)
+	}
+	if _, err := persistence.ConsumePasswordResetChallenge(
+		ctx, challenge.ID, challenge.CodeHash, "third-hash", 5,
+	); !errors.Is(err, domain.ErrUnauthenticated) {
+		t.Fatalf("replayed reset code returned %v", err)
+	}
+}
+
+func TestPostgresConcurrentPasswordResetStartsSerialize(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email:        "pg-reset-race-" + uuid.NewString() + "@example.com",
+		PasswordHash: "old-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const challengeCount = 8
+	now := time.Now().UTC()
+	challenges := make([]domain.PasswordResetChallenge, challengeCount)
+	for index := range challenges {
+		challengeID := uuid.New()
+		codeHash := sha256.Sum256(challengeID[:])
+		challenges[index] = domain.PasswordResetChallenge{
+			ID: challengeID, UserID: user.ID, CodeHash: codeHash[:],
+			ExpiresAt: now.Add(10 * time.Minute),
+			CreatedAt: now.Add(time.Duration(index) * time.Nanosecond),
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan error, challengeCount)
+	for _, challenge := range challenges {
+		go func(challenge domain.PasswordResetChallenge) {
+			<-start
+			results <- persistence.CreatePasswordResetChallenge(ctx, challenge)
+		}(challenge)
+	}
+	close(start)
+	for range challengeCount {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent reset start returned an observable store error: %v", err)
+		}
+	}
+
+	var totalCount, activeCount int
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT count(*),count(*) FILTER (WHERE consumed_at IS NULL)
+		FROM password_reset_challenges WHERE user_id=$1`, user.ID,
+	).Scan(&totalCount, &activeCount); err != nil {
+		t.Fatal(err)
+	}
+	if totalCount != challengeCount || activeCount != 1 {
+		t.Fatalf("reset rows total=%d active=%d, want total=%d active=1",
+			totalCount, activeCount, challengeCount)
+	}
+	var activeID uuid.UUID
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT id FROM password_reset_challenges
+		WHERE user_id=$1 AND consumed_at IS NULL`, user.ID,
+	).Scan(&activeID); err != nil {
+		t.Fatal(err)
+	}
+	for _, challenge := range challenges {
+		if challenge.ID == activeID {
+			continue
+		}
+		if _, err := persistence.ConsumePasswordResetChallenge(
+			ctx, challenge.ID, challenge.CodeHash, "replacement-hash", 5,
+		); !errors.Is(err, domain.ErrUnauthenticated) {
+			t.Fatalf("superseded challenge %s returned %v, want unauthenticated", challenge.ID, err)
+		}
+	}
+	for _, challenge := range challenges {
+		if challenge.ID != activeID {
+			continue
+		}
+		email, err := persistence.ConsumePasswordResetChallenge(
+			ctx, challenge.ID, challenge.CodeHash, "replacement-hash", 5,
+		)
+		if err != nil || email != user.Email {
+			t.Fatalf("sole active challenge returned email=%q err=%v", email, err)
+		}
+	}
+}
+
+func TestPostgresPasswordResetStartAndConfirmUseOneLockOrder(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email:        "pg-reset-lock-order-" + uuid.NewString() + "@example.com",
+		PasswordHash: "old-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialID := uuid.New()
+	initialHash := sha256.Sum256(initialID[:])
+	initial := domain.PasswordResetChallenge{
+		ID: initialID, UserID: user.ID, CodeHash: initialHash[:],
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	replacementID := uuid.New()
+	replacementHash := sha256.Sum256(replacementID[:])
+	replacement := domain.PasswordResetChallenge{
+		ID: replacementID, UserID: user.ID, CodeHash: replacementHash[:],
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	type consumeResult struct {
+		email string
+		err   error
+	}
+	start := make(chan struct{})
+	createResult := make(chan error, 1)
+	confirmResult := make(chan consumeResult, 1)
+	go func() {
+		<-start
+		createResult <- persistence.CreatePasswordResetChallenge(ctx, replacement)
+	}()
+	go func() {
+		<-start
+		email, err := persistence.ConsumePasswordResetChallenge(
+			ctx, initial.ID, initial.CodeHash, "replacement-hash", 5,
+		)
+		confirmResult <- consumeResult{email: email, err: err}
+	}()
+	close(start)
+	select {
+	case err := <-createResult:
+		if err != nil {
+			t.Fatalf("concurrent reset start returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset start deadlocked with confirmation")
+	}
+	select {
+	case result := <-confirmResult:
+		if result.err != nil && !errors.Is(result.err, domain.ErrUnauthenticated) {
+			t.Fatalf("concurrent reset confirmation returned %v", result.err)
+		}
+		if result.err == nil && result.email != user.Email {
+			t.Fatalf("confirmation email=%q, want %q", result.email, user.Email)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset confirmation deadlocked with start")
+	}
+	var activeCount int
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT count(*) FROM password_reset_challenges
+		WHERE user_id=$1 AND consumed_at IS NULL`, user.ID,
+	).Scan(&activeCount); err != nil || activeCount != 1 {
+		t.Fatalf("active reset challenges=%d, want 1: %v", activeCount, err)
+	}
+}
+
+func TestPostgresLegacyDeleteCannotDeadlockResetStartOrConfirm(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email:        "pg-reset-delete-race-" + uuid.NewString() + "@example.com",
+		PasswordHash: "old-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialID := uuid.New()
+	initialHash := sha256.Sum256(initialID[:])
+	initial := domain.PasswordResetChallenge{
+		ID: initialID, UserID: user.ID, CodeHash: initialHash[:],
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	replacementID := uuid.New()
+	replacementHash := sha256.Sum256(replacementID[:])
+	replacement := domain.PasswordResetChallenge{
+		ID: replacementID, UserID: user.ID, CodeHash: replacementHash[:],
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+
+	deleteTx, err := persistence.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer deleteTx.Rollback(ctx)
+	var lockedUser uuid.UUID
+	if err := deleteTx.QueryRow(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, user.ID).
+		Scan(&lockedUser); err != nil {
+		t.Fatal(err)
+	}
+	type consumeResult struct {
+		err error
+	}
+	start := make(chan struct{})
+	createResult := make(chan error, 1)
+	confirmResult := make(chan consumeResult, 1)
+	go func() {
+		<-start
+		createResult <- persistence.CreatePasswordResetChallenge(ctx, replacement)
+	}()
+	go func() {
+		<-start
+		_, err := persistence.ConsumePasswordResetChallenge(
+			ctx, initial.ID, initial.CodeHash, "replacement-hash", 5,
+		)
+		confirmResult <- consumeResult{err: err}
+	}()
+	close(start)
+	select {
+	case err := <-createResult:
+		t.Fatalf("reset start escaped the held user lock: %v", err)
+	case result := <-confirmResult:
+		t.Fatalf("reset confirmation escaped the held user lock: %v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := deleteTx.Exec(ctx, `
+		UPDATE users SET email=NULL,phone=NULL,display_name=$2,avatar_url='',
+			profile='{"deleted":true}'::jsonb,password_hash='',deleted_at=now(),updated_at=now()
+		WHERE id=$1`, user.ID, store.DeletedUserDisplayName); err != nil {
+		t.Fatal(err)
+	}
+	if err := deleteTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-createResult:
+		if !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("reset start after delete returned %v, want not found", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset start deadlocked with account deletion")
+	}
+	select {
+	case result := <-confirmResult:
+		if !errors.Is(result.err, domain.ErrUnauthenticated) {
+			t.Fatalf("reset confirmation after delete returned %v, want unauthenticated", result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reset confirmation deadlocked with account deletion")
+	}
+}
+
+func TestPostgresLegacyAccountTombstoneCleansNewExtensionState(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+
+	deletedUser, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email:        "pg-legacy-delete-" + uuid.NewString() + "@example.com",
+		DisplayName:  "Legacy Delete",
+		PasswordHash: "legacy-password-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "pg-legacy-delete-owner-" + uuid.NewString() + "@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", Title: "Legacy delete trigger", CreatedBy: owner.ID,
+		MemberIDs: []uuid.UUID{deletedUser.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.AddConversationMember(
+		ctx, conversation.ID, owner.ID, deletedUser.ID, "admin",
+	); err != nil {
+		t.Fatal(err)
+	}
+	tokenHash := sha256.Sum256([]byte("legacy-delete-" + uuid.NewString()))
+	invite, err := persistence.CreateConversationInvite(ctx, store.CreateConversationInviteParams{
+		ConversationID: conversation.ID,
+		ActorID:        deletedUser.ID,
+		TokenHash:      tokenHash[:],
+		ExpiresAt:      time.Now().UTC().Add(time.Hour),
+		MaxUses:        3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetChallenge := domain.PasswordResetChallenge{
+		ID: uuid.New(), UserID: deletedUser.ID,
+		CodeHash:  []byte("01234567890123456789012345678901"),
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, resetChallenge); err != nil {
+		t.Fatal(err)
+	}
+	profileMedia := []domain.MediaObject{
+		{
+			ID: uuid.New(), OwnerID: deletedUser.ID,
+			ObjectKey:   "profiles/legacy-delete/" + uuid.NewString(),
+			ContentType: "image/jpeg", ByteSize: 17,
+			CiphertextSHA256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		},
+		{
+			ID: uuid.New(), OwnerID: deletedUser.ID,
+			ObjectKey:   "profiles/legacy-delete/" + uuid.NewString(),
+			ContentType: "image/png", ByteSize: 23,
+			CiphertextSHA256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+		},
+	}
+	for _, mediaObject := range profileMedia {
+		if _, err := persistence.CreateProfileMedia(ctx, mediaObject); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// This is the final tombstone write made by the production-05b account
+	// deletion transaction. It intentionally bypasses the new DeleteAccount
+	// implementation to prove the migration trigger protects a mixed rollout.
+	command, err := persistence.pool.Exec(ctx, `
+		UPDATE users SET email=NULL,phone=NULL,display_name=$2,avatar_url='',
+			profile='{"deleted":true}'::jsonb,password_hash='',deleted_at=now(),updated_at=now()
+		WHERE id=$1 AND deleted_at IS NULL`, deletedUser.ID, store.DeletedUserDisplayName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.RowsAffected() != 1 {
+		t.Fatalf("legacy tombstone affected %d rows, want 1", command.RowsAffected())
+	}
+
+	var inviteRevoked bool
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT revoked_at IS NOT NULL FROM conversation_invite_links WHERE id=$1`,
+		invite.ID,
+	).Scan(&inviteRevoked); err != nil || !inviteRevoked {
+		t.Fatalf("legacy invite was not revoked: revoked=%t err=%v", inviteRevoked, err)
+	}
+	var resetCount int
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT count(*) FROM password_reset_challenges WHERE user_id=$1`, deletedUser.ID,
+	).Scan(&resetCount); err != nil || resetCount != 0 {
+		t.Fatalf("password reset challenges retained %d rows: %v", resetCount, err)
+	}
+	var profileMediaCount int
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT count(*) FROM profile_media_objects WHERE owner_id=$1`, deletedUser.ID,
+	).Scan(&profileMediaCount); err != nil || profileMediaCount != 0 {
+		t.Fatalf("profile media retained %d rows: %v", profileMediaCount, err)
+	}
+
+	rows, err := persistence.pool.Query(ctx, `
+		SELECT payload FROM outbox_events
+		WHERE topic='media.delete' AND aggregate_id=$1 ORDER BY id`, deletedUser.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	deletedKeys := make(map[string]bool)
+	for rows.Next() {
+		var raw json.RawMessage
+		var payload store.MediaDeletePayload
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, objectKey := range payload.ObjectKeys {
+			deletedKeys[objectKey] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(deletedKeys) != len(profileMedia) {
+		t.Fatalf("media deletion outbox contains %d unique keys, want %d: %v",
+			len(deletedKeys), len(profileMedia), deletedKeys)
+	}
+	for _, mediaObject := range profileMedia {
+		if !deletedKeys[mediaObject.ObjectKey] {
+			t.Fatalf("media deletion outbox omitted %q: %v", mediaObject.ObjectKey, deletedKeys)
+		}
 	}
 }
 
@@ -154,6 +655,13 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	if err := persistence.CreateSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
+	resetChallenge := domain.PasswordResetChallenge{
+		ID: uuid.New(), UserID: deletedUser.ID, CodeHash: []byte("01234567890123456789012345678901"),
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, resetChallenge); err != nil {
+		t.Fatal(err)
+	}
 	if err := persistence.LinkExternalIdentity(ctx, "apple", uuid.NewString(), deletedUser.ID, email); err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +699,12 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 
 	if err := persistence.DeleteAccount(ctx, deletedUser.ID); err != nil {
 		t.Fatal(err)
+	}
+	var resetCount int
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT count(*) FROM password_reset_challenges WHERE user_id=$1`, deletedUser.ID,
+	).Scan(&resetCount); err != nil || resetCount != 0 {
+		t.Fatalf("password reset challenges remained after deletion: count=%d err=%v", resetCount, err)
 	}
 	if _, err := persistence.UserByEmail(ctx, email); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("deleted email lookup returned %v, want not found", err)

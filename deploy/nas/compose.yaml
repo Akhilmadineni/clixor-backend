@@ -148,6 +148,34 @@ services:
       - no-new-privileges:true
     logging: *local-logging
 
+  mail:
+    profiles: ["mail"]
+    image: clustr-mail:${CLUSTER_IMAGE_TAG:?set CLUSTER_IMAGE_TAG to the immutable release tag}
+    pull_policy: never
+    container_name: clustr-mail
+    hostname: mail.atlanteanz.com
+    environment:
+      CLUSTER_MAIL_HOSTNAME: mail.atlanteanz.com
+      CLUSTER_MAIL_DOMAIN: atlanteanz.com
+      CLUSTER_DKIM_SELECTOR: clixor
+    networks:
+      clustr_mail:
+        ipv4_address: 172.31.253.2
+        aliases:
+          - mail.clustr.internal
+      homelab_proxy:
+    volumes:
+      - /volume1/docker/clustr/data/mail-queue:/var/spool/postfix
+      - /volume1/docker/clustr/secrets/mail/dkim.private:/run/secrets/dkim.private:ro
+    restart: unless-stopped
+    init: true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
+    logging: *local-logging
+
   migrate:
     profiles: ["migration"]
     image: clustr-api:${CLUSTER_IMAGE_TAG:?set CLUSTER_IMAGE_TAG to the immutable release tag}
@@ -187,6 +215,8 @@ services:
       - "8080"
     networks:
       clustr_internal:
+      clustr_mail:
+        ipv4_address: 172.31.253.3
       clustr_ingress:
         ipv4_address: 172.31.254.3
     restart: unless-stopped
@@ -222,6 +252,8 @@ services:
       - "8080"
     networks:
       clustr_internal:
+      clustr_mail:
+        ipv4_address: 172.31.253.4
       clustr_ingress:
         ipv4_address: 172.31.254.4
     restart: unless-stopped
@@ -394,6 +426,12 @@ networks:
     ipam:
       config:
         - subnet: 172.31.254.0/29
+  clustr_mail:
+    name: clustr_mail
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.253.0/29
   homelab_proxy:
     name: homelab_proxy
     external: true

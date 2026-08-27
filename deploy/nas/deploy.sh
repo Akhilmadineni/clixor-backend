@@ -7,6 +7,7 @@ stable_root=$project_root/repo
 release_root=$project_root/releases
 lock_file=$project_root/runtime/deploy.lock
 compose_file=$stable_root/deploy/nas/compose.yaml
+runtime_env=$project_root/secrets/runtime.env
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -41,6 +42,7 @@ release_tag="nas-$(printf '%s' "$source_sha" | cut -c1-12)-$run_id"
 release_dir=$release_root/$release_tag
 previous_compose=$release_dir/previous-compose.yaml
 new_image=clustr-api:$release_tag
+mail_image=clustr-mail:$release_tag
 bootstrap_image=clustr-bootstrap:$release_tag
 
 mkdir -p "$stable_root" "$release_dir" "$project_root/runtime"
@@ -68,7 +70,13 @@ rollback() {
     if [ -n "$previous_image" ] && [ -s "$previous_compose" ]; then
       previous_tag=${previous_image#clustr-api:}
       cp "$previous_compose" "$compose_file"
-      CLUSTER_IMAGE_TAG="$previous_tag" docker compose --file "$compose_file" up -d --no-build --remove-orphans
+      if grep -q '^CLUSTER_MAIL_PROVIDER=smtp$' "$runtime_env"; then
+        CLUSTER_IMAGE_TAG="$previous_tag" docker compose --file "$compose_file" --profile mail \
+          up -d --no-build --remove-orphans
+      else
+        CLUSTER_IMAGE_TAG="$previous_tag" docker compose --file "$compose_file" \
+          up -d --no-build --remove-orphans
+      fi
       curl --fail --silent --show-error --max-time 10 http://127.0.0.1:18180/health/ready >/dev/null
       log "application rollback command completed; forward database migrations were not reversed"
     else
@@ -88,6 +96,13 @@ docker build \
   --label "org.opencontainers.image.source=https://github.com/Akhilmadineni/clixor-backend" \
   --tag "$new_image" \
   "$source_root"
+docker build \
+  --pull \
+  --label "org.opencontainers.image.revision=$source_sha" \
+  --label "org.opencontainers.image.source=https://github.com/Akhilmadineni/clixor-backend" \
+  --tag "$mail_image" \
+  --file "$source_root/deploy/nas/mail/Dockerfile" \
+  "$source_root/deploy/nas/mail"
 docker build \
   --pull \
   --tag "$bootstrap_image" \
@@ -116,13 +131,30 @@ docker run --rm \
   --volume "$project_root:$project_root" \
   "$bootstrap_image"
 
+mail_enabled=0
+if grep -q '^CLUSTER_MAIL_PROVIDER=smtp$' "$runtime_env"; then
+  mail_enabled=1
+fi
+
+compose_release() {
+  if [ "$mail_enabled" -eq 1 ]; then
+    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" --profile mail "$@"
+  else
+    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" "$@"
+  fi
+}
+
 for network_name in clustr_internal homelab_proxy; do
   docker network inspect "$network_name" >/dev/null 2>&1 || fail "required external Docker network is missing: $network_name"
 done
 
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" config --quiet
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build \
-  postgres redis nats minio dependency-tls
+compose_release config --quiet
+if [ "$mail_enabled" -eq 1 ]; then
+  compose_release up -d --no-build postgres redis nats minio dependency-tls mail
+else
+  compose_release up -d --no-build postgres redis nats minio dependency-tls
+  CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" --profile mail stop mail >/dev/null 2>&1 || true
+fi
 
 if [ "$(docker inspect clustr-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
   log "capturing a pre-migration PostgreSQL snapshot"
@@ -136,11 +168,10 @@ else
 fi
 
 log "applying transactional, forward-compatible database migrations"
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" \
-  --profile migration run --rm migrate
+compose_release --profile migration run --rm migrate
 
 rollback_needed=1
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build api-a api-b
+compose_release up -d --no-build api-a api-b
 
 # The original single API owns the public loopback port on the first HA rollout.
 # Both replacement replicas are started before releasing that port so the
@@ -148,13 +179,17 @@ CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --n
 if [ "$(docker inspect clustr-api --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
   docker stop --time 30 clustr-api
 fi
-CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" up -d --no-build --remove-orphans
+compose_release up -d --no-build --remove-orphans
 
 attempt=1
 until curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18180/health/ready >/dev/null; do
   if [ "$attempt" -ge 60 ]; then
-    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" ps
-    CLUSTER_IMAGE_TAG="$release_tag" docker compose --file "$compose_file" logs --tail=100 api-a api-b api-gateway
+    compose_release ps
+    if [ "$mail_enabled" -eq 1 ]; then
+      compose_release logs --tail=100 mail api-a api-b api-gateway
+    else
+      compose_release logs --tail=100 api-a api-b api-gateway
+    fi
     fail "local readiness did not pass within 120 seconds"
   fi
   attempt=$((attempt + 1))
