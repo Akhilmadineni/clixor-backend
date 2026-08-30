@@ -53,6 +53,60 @@ func TestProductionConfigurationRequiresEncryptedDependencies(t *testing.T) {
 	}
 }
 
+func TestDatabasePoolLimitsAreValidated(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.DatabaseMaxConns = 0
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "DATABASE_MAX_CONNS") {
+		t.Fatalf("expected zero maximum connections to fail validation, received %v", err)
+	}
+
+	cfg = validProductionConfig()
+	cfg.DatabaseMinConns = cfg.DatabaseMaxConns + 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "DATABASE_MIN_CONNS") {
+		t.Fatalf("expected minimum connections above maximum to fail validation, received %v", err)
+	}
+}
+
+func TestMediaProviderDefaultsToS3(t *testing.T) {
+	t.Setenv("CLUSTER_ENV", "development")
+	t.Setenv("CLUSTER_STORE", "memory")
+	t.Setenv("CLUSTER_MEDIA_PROVIDER", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaProvider != "s3" {
+		t.Fatalf("media provider = %q, want s3", cfg.MediaProvider)
+	}
+}
+
+func TestOCIObjectStorageConfigurationIsValidated(t *testing.T) {
+	cfg := validProductionConfig()
+	cfg.MediaProvider = "oci"
+	cfg.S3 = S3Config{}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "OCI media requires") {
+		t.Fatalf("expected incomplete OCI configuration to fail, received %v", err)
+	}
+
+	cfg.OCIObjectStorage = OCIObjectStorageConfig{
+		Region: "us-phoenix-1", Namespace: "exampletenancy", Bucket: "clixor-media",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid OCI media configuration failed: %v", err)
+	}
+
+	cfg.OCIObjectStorage.Region = "https://attacker.example"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "REGION is invalid") {
+		t.Fatalf("expected invalid OCI region to fail, received %v", err)
+	}
+
+	cfg.OCIObjectStorage.Region = "us-phoenix-1"
+	cfg.MediaProvider = "unsupported"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "CLUSTER_MEDIA_PROVIDER") {
+		t.Fatalf("expected unsupported media provider to fail, received %v", err)
+	}
+}
+
 func TestValidProductionConfiguration(t *testing.T) {
 	if err := validProductionConfig().Validate(); err != nil {
 		t.Fatal(err)
@@ -91,22 +145,26 @@ func TestProductionVerificationRequiresExplicitCostAndSecretControls(t *testing.
 
 func validProductionConfig() Config {
 	return Config{
-		Environment:   "production",
-		PublicBaseURL: "https://api.clustr.app",
-		Store:         "postgres",
-		DatabaseURL:   "postgres://user:pass@db.internal/clustr?sslmode=verify-full",
-		RedisURL:      "rediss://:pass@redis.internal:6379/0",
-		NATSURL:       "tls://nats.internal:4222",
-		JWTIssuer:     "clustr-api",
-		AccessSecret:  strings.Repeat("s", 48),
-		MetricsToken:  strings.Repeat("m", 48),
-		AppleClientID: "com.example.Clustr",
-		AccessTTL:     15 * time.Minute,
-		RefreshTTL:    30 * 24 * time.Hour,
-		AutoMigrate:   false,
+		Environment:      "production",
+		PublicBaseURL:    "https://api.clustr.app",
+		Store:            "postgres",
+		DatabaseURL:      "postgres://user:pass@db.internal/clustr?sslmode=verify-full",
+		DatabaseMaxConns: 12,
+		DatabaseMinConns: 2,
+		RedisURL:         "rediss://:pass@redis.internal:6379/0",
+		NATSURL:          "tls://nats.internal:4222",
+		JWTIssuer:        "clustr-api",
+		AccessSecret:     strings.Repeat("s", 48),
+		MetricsToken:     strings.Repeat("m", 48),
+		AppleClientID:    "com.example.Clustr",
+		AccessTTL:        15 * time.Minute,
+		RefreshTTL:       30 * 24 * time.Hour,
+		AutoMigrate:      false,
+		MediaProvider:    "s3",
 		S3: S3Config{
 			Endpoint: "s3.internal", PublicEndpoint: "media.clustr.app",
-			AccessKey: "access", SecretKey: "secret", Bucket: "clustr-media", UseTLS: true,
+			Region: "us-east-1", AccessKey: "access", SecretKey: "secret",
+			Bucket: "clustr-media", UseTLS: true,
 		},
 		Verification: VerificationConfig{
 			Provider: "telnyx", OTPSecret: strings.Repeat("o", 48), OTPCodeLength: 6,

@@ -57,7 +57,13 @@ func main() {
 		presenceService = presence.NewMemory()
 		logger.Warn("using non-durable memory dependencies; suitable only for tests and local smoke runs")
 	case "postgres":
-		pgStore, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.AutoMigrate)
+		pgStore, err := postgres.OpenWithPool(
+			ctx,
+			cfg.DatabaseURL,
+			cfg.AutoMigrate,
+			cfg.DatabaseMaxConns,
+			cfg.DatabaseMinConns,
+		)
 		if err != nil {
 			logger.Error("open persistence", "error", err)
 			os.Exit(1)
@@ -88,10 +94,22 @@ func main() {
 			os.Exit(1)
 		}
 		presenceService = redisPresence
-		s3Media, err := media.NewS3(
-			ctx, cfg.S3.Endpoint, cfg.S3.PublicEndpoint, cfg.S3.AccessKey, cfg.S3.SecretKey,
-			cfg.S3.Bucket, cfg.S3.UseTLS, cfg.TLSCAFile,
-		)
+		var durableMedia media.Service
+		switch cfg.MediaProvider {
+		case "s3":
+			durableMedia, err = media.NewS3WithRegion(
+				ctx, cfg.S3.Endpoint, cfg.S3.PublicEndpoint, cfg.S3.Region,
+				cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, cfg.S3.UseTLS, cfg.TLSCAFile,
+			)
+		case "oci":
+			durableMedia, err = media.NewOCIObjectStorage(
+				ctx,
+				cfg.OCIObjectStorage.Region,
+				cfg.OCIObjectStorage.Namespace,
+				cfg.OCIObjectStorage.Bucket,
+				logger,
+			)
+		}
 		if err != nil {
 			limiter.Close()
 			presenceService.Close()
@@ -100,7 +118,7 @@ func main() {
 			logger.Error("open media store", "error", err)
 			os.Exit(1)
 		}
-		mediaService = s3Media
+		mediaService = durableMedia
 		if cfg.Verification.Provider == "telnyx" {
 			telnyxSender, err := verification.NewTelnyxSMS(
 				cfg.Verification.TelnyxAPIKey,

@@ -66,11 +66,35 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: false
           tags: clustr-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  oci-terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: deploy/oci/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize the locked OCI provider
+        run: terraform init -backend=false -input=false
+      - name: Validate the OCI Resource Manager stack
+        run: terraform validate -no-color
+      - name: Verify the break-glass upload bundle
+        run: |
+          ./package-stack.sh /tmp/clixor-oci-resource-manager.zip
+          unzip -t /tmp/clixor-oci-resource-manager.zip

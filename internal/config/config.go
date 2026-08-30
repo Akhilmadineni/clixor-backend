@@ -7,10 +7,13 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var ociRegionPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)+$`)
 
 type Config struct {
 	Environment       string
@@ -19,6 +22,8 @@ type Config struct {
 	TLSCAFile         string
 	Store             string
 	DatabaseURL       string
+	DatabaseMaxConns  int
+	DatabaseMinConns  int
 	RedisURL          string
 	NATSURL           string
 	JWTIssuer         string
@@ -29,7 +34,9 @@ type Config struct {
 	AccessTTL         time.Duration
 	RefreshTTL        time.Duration
 	AutoMigrate       bool
+	MediaProvider     string
 	S3                S3Config
+	OCIObjectStorage  OCIObjectStorageConfig
 	Verification      VerificationConfig
 	APNS              APNSConfig
 	APNSSandbox       APNSConfig
@@ -38,10 +45,17 @@ type Config struct {
 type S3Config struct {
 	Endpoint       string
 	PublicEndpoint string
+	Region         string
 	AccessKey      string
 	SecretKey      string
 	Bucket         string
 	UseTLS         bool
+}
+
+type OCIObjectStorageConfig struct {
+	Region    string
+	Namespace string
+	Bucket    string
 }
 
 type VerificationConfig struct {
@@ -76,6 +90,14 @@ func Load() (Config, error) {
 		"CLUSTER_TRUSTED_PROXY_CIDRS",
 		"127.0.0.0/8,::1/128",
 	)
+	if err != nil {
+		return Config{}, err
+	}
+	databaseMaxConns, err := envInt("CLUSTER_DATABASE_MAX_CONNS", 35)
+	if err != nil {
+		return Config{}, err
+	}
+	databaseMinConns, err := envInt("CLUSTER_DATABASE_MIN_CONNS", 5)
 	if err != nil {
 		return Config{}, err
 	}
@@ -130,6 +152,8 @@ func Load() (Config, error) {
 		TLSCAFile:         os.Getenv("CLUSTER_TLS_CA_FILE"),
 		Store:             env("CLUSTER_STORE", "postgres"),
 		DatabaseURL:       env("CLUSTER_DATABASE_URL", "postgres://clustr:clustr@127.0.0.1:5432/clustr?sslmode=disable"),
+		DatabaseMaxConns:  databaseMaxConns,
+		DatabaseMinConns:  databaseMinConns,
 		RedisURL:          env("CLUSTER_REDIS_URL", "redis://127.0.0.1:6379/0"),
 		NATSURL:           env("CLUSTER_NATS_URL", "nats://127.0.0.1:4222"),
 		JWTIssuer:         env("CLUSTER_JWT_ISSUER", "clustr-api"),
@@ -140,13 +164,20 @@ func Load() (Config, error) {
 		AccessTTL:         accessTTL,
 		RefreshTTL:        refreshTTL,
 		AutoMigrate:       envBool("CLUSTER_AUTO_MIGRATE", true),
+		MediaProvider:     env("CLUSTER_MEDIA_PROVIDER", "s3"),
 		S3: S3Config{
 			Endpoint:       env("CLUSTER_S3_ENDPOINT", "127.0.0.1:9000"),
 			PublicEndpoint: os.Getenv("CLUSTER_S3_PUBLIC_ENDPOINT"),
+			Region:         env("CLUSTER_S3_REGION", "us-east-1"),
 			AccessKey:      env("CLUSTER_S3_ACCESS_KEY", "clustr"),
 			SecretKey:      os.Getenv("CLUSTER_S3_SECRET_KEY"),
 			Bucket:         env("CLUSTER_S3_BUCKET", "clustr-media"),
 			UseTLS:         envBool("CLUSTER_S3_USE_TLS", false),
+		},
+		OCIObjectStorage: OCIObjectStorageConfig{
+			Region:    os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_REGION"),
+			Namespace: os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_NAMESPACE"),
+			Bucket:    os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_BUCKET"),
 		},
 		Verification: VerificationConfig{
 			Provider:      env("CLUSTER_VERIFICATION_PROVIDER", "disabled"),
@@ -195,6 +226,12 @@ func (cfg Config) Validate() error {
 	if cfg.Store != "memory" && cfg.Store != "postgres" {
 		return fmt.Errorf("unsupported CLUSTER_STORE %q", cfg.Store)
 	}
+	if cfg.DatabaseMaxConns < 1 || cfg.DatabaseMaxConns > 200 {
+		return errors.New("CLUSTER_DATABASE_MAX_CONNS must be between 1 and 200")
+	}
+	if cfg.DatabaseMinConns < 0 || cfg.DatabaseMinConns > cfg.DatabaseMaxConns {
+		return errors.New("CLUSTER_DATABASE_MIN_CONNS must be between 0 and CLUSTER_DATABASE_MAX_CONNS")
+	}
 	if cfg.Environment == "production" && cfg.Store != "postgres" {
 		return errors.New("production requires CLUSTER_STORE=postgres")
 	}
@@ -209,6 +246,20 @@ func (cfg Config) Validate() error {
 	}
 	if strings.TrimSpace(cfg.JWTIssuer) == "" {
 		return errors.New("CLUSTER_JWT_ISSUER is required")
+	}
+	switch cfg.MediaProvider {
+	case "s3":
+	case "oci":
+		if strings.TrimSpace(cfg.OCIObjectStorage.Region) == "" ||
+			strings.TrimSpace(cfg.OCIObjectStorage.Namespace) == "" ||
+			strings.TrimSpace(cfg.OCIObjectStorage.Bucket) == "" {
+			return errors.New("OCI media requires CLUSTER_OCI_OBJECT_STORAGE_REGION, CLUSTER_OCI_OBJECT_STORAGE_NAMESPACE, and CLUSTER_OCI_OBJECT_STORAGE_BUCKET")
+		}
+		if !ociRegionPattern.MatchString(cfg.OCIObjectStorage.Region) {
+			return errors.New("CLUSTER_OCI_OBJECT_STORAGE_REGION is invalid")
+		}
+	default:
+		return fmt.Errorf("unsupported CLUSTER_MEDIA_PROVIDER %q", cfg.MediaProvider)
 	}
 	if cfg.Verification.Provider != "telnyx" && cfg.Verification.Provider != "disabled" {
 		return errors.New("CLUSTER_VERIFICATION_PROVIDER must be telnyx or disabled")
@@ -252,9 +303,11 @@ func (cfg Config) Validate() error {
 	if err != nil || natsURL.Scheme != "tls" || natsURL.Host == "" {
 		return errors.New("production CLUSTER_NATS_URL must use tls://")
 	}
-	if !cfg.S3.UseTLS || cfg.S3.Endpoint == "" || cfg.S3.PublicEndpoint == "" || cfg.S3.AccessKey == "" ||
-		cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
-		return errors.New("production S3 configuration requires TLS, internal/public endpoints, bucket, and credentials")
+	if cfg.MediaProvider == "s3" {
+		if !cfg.S3.UseTLS || cfg.S3.Endpoint == "" || cfg.S3.PublicEndpoint == "" || cfg.S3.Region == "" || cfg.S3.AccessKey == "" ||
+			cfg.S3.SecretKey == "" || cfg.S3.Bucket == "" {
+			return errors.New("production S3 configuration requires TLS, region, internal/public endpoints, bucket, and credentials")
+		}
 	}
 	if cfg.APNS.TeamID == "" || cfg.APNS.KeyID == "" || cfg.APNS.BundleID == "" ||
 		cfg.APNS.PrivateKeyFile == "" {

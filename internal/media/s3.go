@@ -19,7 +19,22 @@ type S3 struct {
 }
 
 func NewS3(ctx context.Context, endpoint, publicEndpoint, accessKey, secretKey, bucket string, useTLS bool, caFile string) (*S3, error) {
-	const region = "us-east-1"
+	return NewS3WithRegion(
+		ctx, endpoint, publicEndpoint, "us-east-1", accessKey, secretKey, bucket, useTLS, caFile,
+	)
+}
+
+func NewS3WithRegion(
+	ctx context.Context,
+	endpoint string,
+	publicEndpoint string,
+	region string,
+	accessKey string,
+	secretKey string,
+	bucket string,
+	useTLS bool,
+	caFile string,
+) (*S3, error) {
 	tlsConfig, err := tlsconfig.Client(caFile)
 	if err != nil {
 		return nil, err

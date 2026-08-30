@@ -1,0 +1,357 @@
+name: clixor-oci
+
+x-local-logging: &local-logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "5"
+
+x-service-security: &service-security
+  security_opt:
+    - no-new-privileges:true
+  logging: *local-logging
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    container_name: clixor-oci-postgres
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/postgres-tls/server.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/server.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.3
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_timeout=15min
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    networks:
+      clixor_data:
+      clixor_service:
+        aliases:
+          - postgres.clixor.internal
+    volumes:
+      - /srv/clixor/data/postgres:/var/lib/postgresql/data
+      - /srv/clixor/runtime/postgres-tls/server.crt:/run/postgres-tls/server.crt:ro
+      - /srv/clixor/runtime/postgres-tls/server.key:/run/postgres-tls/server.key:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    shm_size: 512m
+    mem_limit: 3g
+    cpus: 1.25
+    <<: *service-security
+
+  redis:
+    image: redis:8.0.3-alpine
+    container_name: clixor-oci-redis
+    user: "999:1000"
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}" --maxmemory 512mb --maxmemory-policy noeviction
+    networks:
+      - clixor_data
+    volumes:
+      - /srv/clixor/data/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping 2>/dev/null | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    mem_limit: 768m
+    cpus: 0.40
+    <<: *service-security
+
+  nats:
+    image: nats:2.11.6-alpine
+    container_name: clixor-oci-nats
+    user: "1000:1000"
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - exec nats-server --jetstream --store_dir=/data --http_port=8222 --auth "$${NATS_AUTH_TOKEN}" --tls --tlscert=/run/nats-tls/server.crt --tlskey=/run/nats-tls/server.key
+    networks:
+      clixor_data:
+      clixor_service:
+        aliases:
+          - nats.clixor.internal
+    volumes:
+      - /srv/clixor/data/nats:/data
+      - /srv/clixor/runtime/nats-tls/server.crt:/run/nats-tls/server.crt:ro
+      - /srv/clixor/runtime/nats-tls/server.key:/run/nats-tls/server.key:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 0.40
+    <<: *service-security
+
+  dependency-tls:
+    image: haproxy:3.2-alpine
+    container_name: clixor-oci-dependency-tls
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      clixor_data:
+      clixor_service:
+        aliases:
+          - clixor-tls
+    volumes:
+      - /srv/clixor/runtime/dependency-tls/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - /srv/clixor/runtime/dependency-tls/server.pem:/run/pki/server.pem:ro
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    cpus: 0.15
+    <<: *service-security
+
+  migrate:
+    profiles: ["migration"]
+    image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
+    pull_policy: never
+    entrypoint: ["/clustr-migrate"]
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    networks:
+      - clixor_service
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    volumes:
+      - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
+    <<: *service-security
+
+  api-a:
+    image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
+    pull_policy: never
+    container_name: clixor-oci-api-a
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    environment:
+      CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    expose:
+      - "8080"
+    networks:
+      clixor_service:
+      clixor_ingress:
+        ipv4_address: 172.30.254.3
+      clixor_egress:
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 768m
+    cpus: 0.75
+    stop_grace_period: 30s
+    volumes:
+      - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
+    <<: *service-security
+
+  api-b:
+    image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
+    pull_policy: never
+    container_name: clixor-oci-api-b
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    environment:
+      CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
+    depends_on:
+      dependency-tls:
+        condition: service_healthy
+    expose:
+      - "8080"
+    networks:
+      clixor_service:
+      clixor_ingress:
+        ipv4_address: 172.30.254.4
+      clixor_egress:
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 768m
+    cpus: 0.75
+    stop_grace_period: 30s
+    volumes:
+      - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
+    <<: *service-security
+
+  api-gateway:
+    image: nginx:1.29-alpine
+    container_name: clixor-oci-api-gateway
+    user: "101:101"
+    depends_on:
+      - api-a
+      - api-b
+    ports:
+      - "127.0.0.1:18180:8080"
+    networks:
+      clixor_ingress:
+        ipv4_address: 172.30.254.2
+    volumes:
+      - /srv/clixor/runtime/api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=32m,uid=101,gid=101,mode=0750
+      - /var/run:size=4m,uid=101,gid=101,mode=0750
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    cpus: 0.15
+    <<: *service-security
+
+  postgres-backup:
+    image: postgres:17.5-alpine
+    container_name: clixor-oci-postgres-backup
+    user: "0:0"
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    entrypoint: ["/bin/sh", "/opt/clixor/backup.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - clixor_service
+    volumes:
+      - /srv/clixor/runtime/postgres-backup/backup.sh:/opt/clixor/backup.sh:ro
+      - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /srv/clixor/backups:/backups
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 0.30
+    <<: *service-security
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v3.5.0
+    container_name: clixor-oci-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=14d
+    networks:
+      - clixor_service
+    volumes:
+      - /srv/clixor/runtime/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - /srv/clixor/runtime/prometheus/metrics.token:/run/secrets/metrics.token:ro
+      - /srv/clixor/data/prometheus:/prometheus
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 768m
+    cpus: 0.30
+    <<: *service-security
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:12.1.0
+    container_name: clixor-oci-grafana
+    env_file:
+      - /srv/clixor/secrets/runtime.env
+    environment:
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SERVER_ROOT_URL: http://127.0.0.1:13000
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:13000:3000"
+    networks:
+      - clixor_service
+    volumes:
+      - /srv/clixor/data/grafana:/var/lib/grafana
+      - /srv/clixor/runtime/grafana/datasource.yml:/etc/grafana/provisioning/datasources/clixor.yml:ro
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.30
+    <<: *service-security
+
+networks:
+  clixor_data:
+    internal: true
+  clixor_service:
+    internal: true
+  clixor_ingress:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.254.0/29
+  # Only the API replicas need outbound APNs, Telnyx, and Apple identity access.
+  # No proxy or data service joins this bridge, preserving the trusted-proxy edge.
+  clixor_egress:

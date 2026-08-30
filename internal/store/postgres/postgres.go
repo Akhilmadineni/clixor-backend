@@ -25,6 +25,19 @@ type Store struct {
 }
 
 func Open(ctx context.Context, databaseURL string, autoMigrate bool) (*Store, error) {
+	return OpenWithPool(ctx, databaseURL, autoMigrate, 35, 5)
+}
+
+func OpenWithPool(
+	ctx context.Context,
+	databaseURL string,
+	autoMigrate bool,
+	maxConns int,
+	minConns int,
+) (*Store, error) {
+	if maxConns < 1 || minConns < 0 || minConns > maxConns {
+		return nil, fmt.Errorf("invalid PostgreSQL pool limits: min=%d max=%d", minConns, maxConns)
+	}
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database URL: %w", err)
@@ -33,8 +46,8 @@ func Open(ctx context.Context, databaseURL string, autoMigrate bool) (*Store, er
 	// connections. Keep 30 connections available for migrations, backups,
 	// monitoring, and operator access instead of allowing the API pools to
 	// consume the entire server limit.
-	config.MaxConns = 35
-	config.MinConns = 5
+	config.MaxConns = int32(maxConns)
+	config.MinConns = int32(minConns)
 	config.MaxConnLifetime = 30 * time.Minute
 	config.MaxConnIdleTime = 5 * time.Minute
 	config.HealthCheckPeriod = 30 * time.Second

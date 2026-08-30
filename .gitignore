@@ -6,3 +6,15 @@ bin/
 coverage.out
 data/
 uploads/
+
+# Terraform local state and generated Resource Manager bundles. State can contain
+# infrastructure metadata and must remain in OCI Resource Manager.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+deploy/oci/terraform/*.zip

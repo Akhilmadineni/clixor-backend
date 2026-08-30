@@ -24,7 +24,13 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	persistence, err := postgres.Open(ctx, cfg.DatabaseURL, true)
+	persistence, err := postgres.OpenWithPool(
+		ctx,
+		cfg.DatabaseURL,
+		true,
+		cfg.DatabaseMaxConns,
+		cfg.DatabaseMinConns,
+	)
 	if err != nil {
 		logger.Error("migration_failed", "error", err)
 		os.Exit(1)
