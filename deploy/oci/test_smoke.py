@@ -344,6 +344,13 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("cloudflare_attempt", deploy)
         self.assertIn('[ "${cloudflare_attempt}" -lt 45 ]', deploy)
         self.assertIn("systemctl restart --no-block cloudflared.service", deploy)
+        self.assertIn(
+            "systemctl start --no-block cloudflared.service", deploy
+        )
+        self.assertIn(
+            "starting the reviewed but currently inactive cloudflared service",
+            deploy,
+        )
         restart_guard = deploy.index(
             'if [ "${cloudflare_secret_changed}" = "true" ] ||'
         )
@@ -351,6 +358,16 @@ class ReleaseHardeningTests(unittest.TestCase):
             "systemctl restart --no-block cloudflared.service", restart_guard
         )
         self.assertLess(restart_guard, restart)
+        inactive_start = deploy.index(
+            "systemctl start --no-block cloudflared.service", restart
+        )
+        inactive_guard = deploy.index(
+            "elif ! systemctl is-active --quiet cloudflared.service; then",
+            restart,
+        )
+        self.assertLess(restart, inactive_start)
+        self.assertLess(inactive_guard, inactive_start)
+        self.assertLess(inactive_start, deploy.index("restore_cloudflared()"))
         self.assertIn("cloudflared=${cloudflare_rollback_failed}", deploy)
         self.assertIn("host-tools=${host_tool_rollback_failed}", deploy)
 
@@ -727,11 +744,37 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(capture, restore)
         self.assertLess(restore, rollback_reconcile)
         public_smoke = deploy.index('verify_public_ingress "${source_sha}"')
-        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        activate_connector = deploy.rindex("\n  activate_cloudflared\n")
+        activate_tools = deploy.index("\nactivate_host_tooling\n", public_smoke)
+        offsite_gate = deploy.index(
+            "systemctl start clixor-offsite-backup.service", activate_tools
+        )
+        restore_gate = deploy.index(
+            "systemctl start clixor-restore-drill.service", offsite_gate
+        )
+        vault_commit = deploy.index(
+            '--commit-candidate-release "${candidate_manifest}"', restore_gate
+        )
         rollback_disarm = deploy.rindex("rollback_needed=0")
-        self.assertLess(public_smoke, release_pointer)
+        self.assertLess(activate_connector, public_smoke)
+        self.assertLess(public_smoke, activate_tools)
+        self.assertLess(activate_tools, offsite_gate)
+        self.assertLess(offsite_gate, restore_gate)
+        self.assertLess(restore_gate, vault_commit)
+        self.assertLess(vault_commit, rollback_disarm)
         self.assertLess(public_smoke, rollback_disarm)
         self.assertIn('verify_public_ingress "${previous_revision}"', deploy)
+        rollback_public_smoke = deploy.index(
+            'if verify_public_ingress "${previous_revision}"'
+        )
+        rollback_public_guard = deploy.rfind(
+            'if [ "${rollback_failed}" -eq 0 ]', 0, rollback_public_smoke
+        )
+        self.assertGreaterEqual(rollback_public_guard, 0)
+        guard_text = deploy[rollback_public_guard:rollback_public_smoke]
+        self.assertIn('previous_cloudflare_active', guard_text)
+        self.assertIn('public_smoke_required', guard_text)
+        self.assertNotIn('cloudflare_rollback_attempted', guard_text)
         self.assertIn('validate-public-smoke.py', deploy)
         self.assertIn('public readiness came from a different release', (
             self.oci_root / "validate-public-smoke.py"

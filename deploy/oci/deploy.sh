@@ -454,9 +454,17 @@ activate_cloudflared() {
     systemctl restart --no-block cloudflared.service
     wait_cloudflared_active || \
       fail "cloudflared did not report readiness within 90 seconds"
+  elif ! systemctl is-active --quiet cloudflared.service; then
+    # A production cutover can arrive here with the exact reviewed unit and token
+    # already staged while the connector is currently inactive. Starting it is
+    # part of this armed transaction; rollback restores the captured service
+    # state on any later gate.
+    log "starting the reviewed but currently inactive cloudflared service"
+    systemctl start --no-block cloudflared.service
+    wait_cloudflared_active || \
+      fail "cloudflared did not report readiness within 90 seconds"
   else
-    systemctl is-active --quiet cloudflared.service || \
-      fail "cloudflared is inactive and no release change authorizes a restart"
+    log "cloudflared already uses the reviewed unit and credential"
   fi
 }
 
@@ -1254,7 +1262,6 @@ rollback() {
       fi
       if [ "${rollback_failed}" -eq 0 ] && \
         [ "${rollback_ready}" = "true" ] && \
-        [ "${cloudflare_rollback_attempted}" = "true" ] && \
         [ "${previous_cloudflare_active}" = "true" ] && \
         [ "${public_smoke_required}" = "true" ]; then
         if verify_public_ingress "${previous_revision}"; then
