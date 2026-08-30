@@ -217,6 +217,15 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertNotIn("protocol: quic", local_config)
         self.assertIn("LoadCredential=cloudflare-token:/etc/cloudflared/token", unit)
 
+    def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
+        raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")
+        config = "\n".join(line.split("#", 1)[0] for line in raw.splitlines())
+        self.assertIn('"path":"$uri"', config)
+        self.assertIn("access_log /dev/stdout clixor_json;", config)
+        self.assertIn("error_log /dev/stderr crit;", config)
+        self.assertNotIn("$request_uri", config)
+        self.assertNotRegex(config, r"\$request(?:\s|;|\")")
+
     def test_terraform_uses_the_deployed_image_ocid_not_latest_lookup(self) -> None:
         terraform_root = self.oci_root / "terraform"
         compute = (terraform_root / "compute.tf").read_text(encoding="utf-8")
