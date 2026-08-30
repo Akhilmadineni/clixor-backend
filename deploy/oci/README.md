@@ -181,6 +181,16 @@ sudo sh deploy/oci/bootstrap.sh
 sudo readlink /run/clixor/secrets/active
 ```
 
+On a raw pre-controller host, this explicit bootstrap reads the exact revision
+label from both live API replicas, fetches that commit from the fixed public
+repository into the root-owned mode-0700 bare object store at
+`/srv/clixor/runtime/actions-source.git`, verifies the Git object graph, and
+archives that exact tree. It never treats the mutable, Git-metadata-free
+`/srv/clixor/repo` directory as source. The release-local boot cohort is added
+only after that identity check. A custom pre-populated object store may be
+selected with an absolute `CLIXOR_LEGACY_GIT_DIR`; missing objects, a drifted
+image label, unsafe ownership/mode, or a mismatched tree fail the transition.
+
 The initial staging-to-Vault transition is an explicit manual release. Complete
 at least one ordinary staging deployment first so
 `/srv/clixor/releases/current` already selects a boot-approved staging release;
@@ -440,6 +450,12 @@ containers happened to exist when the VM lost power.
 `clixor-runtime-reconcile.service` stops ingress and known containers, validates
 only the absolute immediate child selected by `releases/current`, and verifies
 that release's exact staging selection or mapping/cohort-bound Vault generation.
+Staging releases contain a root-only manifest of every runtime-consumed secret
+file's path, ownership, mode, size, and SHA-256 digest. Vault generations contain
+the equivalent release/mapping/cohort-bound integrity inventory, including the
+derived service files, APNs keys, Cloudflare token, and hydration marker. A
+missing, added, metadata-drifted, or content-drifted required artifact is never
+accepted merely because the active symlink and cohort marker still match.
 If a pre-pointer candidate had switched the tmpfs secret link, it runs only the
 current release's checksummed worker to restore the exact approved versions and
 then verifies the selection again before touching runtime files or containers.
@@ -456,6 +472,11 @@ reconciler never copies, restores, removes, or rolls back PostgreSQL data files.
 
 The durable journal is `/srv/clixor/runtime/deploy-transaction.json`. Its file
 and parent are fsynced on creation and every consecutive phase change.
+Before that journal can authorize runtime mutation or migration, the controller
+opens the canonical root-owned pending parent and candidate without following
+links, verifies and fsyncs the dump and exact checksum through directory file
+descriptors, then fsyncs the candidate directory and its pending parent in that
+order. Symlinked or group/world-writable recovery ancestors are rejected.
 `clixor-runtime-watchdog.timer` runs the stable controller every minute. It tries
 the deployment lock without blocking: while a deploy holds the lock it does
 nothing; after SIGKILL or power loss it ignores the uncommitted candidate,

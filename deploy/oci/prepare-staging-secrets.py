@@ -13,7 +13,12 @@ import tempfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().with_name("hydrate-vault-secrets.py")
+SCRIPT = Path(__file__).resolve().with_name("staging-secret-validation.py")
+if not SCRIPT.is_file():
+    # Source-tree execution keeps the implementation under its audited release
+    # name; the host install uses a staging-only name so it can never become the
+    # stable Vault boot authority.
+    SCRIPT = Path(__file__).resolve().with_name("hydrate-vault-secrets.py")
 SPEC = importlib.util.spec_from_file_location("clixor_vault_hydrator", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise SystemExit("staging secret preparation failed")

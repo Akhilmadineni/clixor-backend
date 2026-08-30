@@ -39,6 +39,11 @@ CLOUDFLARED_BINARY = Path("/usr/bin/cloudflared")
 READY_MARKER = Path("/run/clixor/runtime-ready")
 RUNTIME_SECRET_ROOT = Path("/run/clixor/secrets")
 STAGING_SECRET_ROOT = Path("/srv/clixor/secrets")
+STAGING_SECRET_MANIFEST = "staging-secret-integrity.json"
+LEGACY_SOURCE_PROVENANCE = "legacy-source-provenance.json"
+SECRET_INTEGRITY_SCHEMA = 1
+LEGACY_SOURCE_PROVENANCE_SCHEMA = 1
+MAX_SECRET_ARTIFACT_BYTES = 512 * 1024
 KNOWN_CONTAINERS = (
     "clixor-oci-api-gateway",
     "clixor-oci-api-a",
@@ -69,6 +74,7 @@ PHASES = (
 )
 PHASE_INDEX = {phase: index for index, phase in enumerate(PHASES)}
 IMAGE_REF_RE = re.compile(r"^clixor-api:oci-[0-9a-f]{12}-[A-Za-z0-9._-]{1,160}$")
+SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 class ReconcileError(RuntimeError):
@@ -174,86 +180,131 @@ def _regular_file_bytes(
             remaining -= len(chunk)
         if os.read(descriptor, 1):
             raise ReconcileError(f"required release file changed: {path.name}")
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_uid,
+            final.st_gid,
+            final.st_mode,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ):
+            raise ReconcileError(f"required release file changed: {path.name}")
         return b"".join(chunks)
     finally:
         os.close(descriptor)
 
 
-def _digest_and_fsync_regular(
+def _canonical_owned_directory(
     path: Path,
     *,
     expected_uid: int,
     expected_gid: int,
-    expected_mode: int,
-) -> str:
+    exact_mode: int | None = None,
+) -> os.stat_result:
+    if not path.is_absolute():
+        raise ReconcileError("recovery directory path is not absolute")
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
     except OSError:
-        raise ReconcileError(f"recovery artifact is unavailable: {path.name}") from None
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
-            or stat.S_IMODE(metadata.st_mode) != expected_mode
-            or metadata.st_size <= 0
-        ):
-            raise ReconcileError(f"recovery artifact is unsafe: {path.name}")
-        digest = hashlib.sha256()
-        total = 0
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            total += len(chunk)
-        if (
-            total != metadata.st_size
-            or os.fstat(descriptor).st_size != metadata.st_size
-        ):
-            raise ReconcileError(f"recovery artifact changed: {path.name}")
-        os.fsync(descriptor)
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
+        raise ReconcileError("recovery directory is unavailable") from None
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+        or resolved != path
+        or (exact_mode is not None and mode != exact_mode)
+        or (exact_mode is None and mode & 0o022)
+    ):
+        raise ReconcileError("recovery directory is unsafe or noncanonical")
+    return metadata
 
 
-def _read_and_fsync_regular(
-    path: Path,
+def _open_recovery_file_at(
+    directory_descriptor: int,
+    name: str,
     *,
     expected_uid: int,
     expected_gid: int,
     expected_mode: int,
-    maximum_size: int,
+) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+    except OSError:
+        raise ReconcileError(f"recovery artifact is unavailable: {name}") from None
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
+        or metadata.st_size <= 0
+    ):
+        os.close(descriptor)
+        raise ReconcileError(f"recovery artifact is unsafe: {name}")
+    return descriptor, metadata
+
+
+def _read_open_recovery_file(
+    descriptor: int,
+    metadata: os.stat_result,
+    name: str,
+    *,
+    maximum_size: int | None = None,
 ) -> bytes:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except OSError:
-        raise ReconcileError(f"recovery artifact is unavailable: {path.name}") from None
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
-            or stat.S_IMODE(metadata.st_mode) != expected_mode
-            or metadata.st_size <= 0
-            or metadata.st_size > maximum_size
-        ):
-            raise ReconcileError(f"recovery artifact is unsafe: {path.name}")
-        chunks: list[bytes] = []
-        remaining = metadata.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
-            if not chunk:
-                raise ReconcileError(f"recovery artifact changed: {path.name}")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if os.read(descriptor, 1) or os.fstat(descriptor).st_size != metadata.st_size:
-            raise ReconcileError(f"recovery artifact changed: {path.name}")
-        os.fsync(descriptor)
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
+    if maximum_size is not None and metadata.st_size > maximum_size:
+        raise ReconcileError(f"recovery artifact is unsafe: {name}")
+    chunks: list[bytes] = []
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+        if not chunk:
+            raise ReconcileError(f"recovery artifact changed: {name}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise ReconcileError(f"recovery artifact changed: {name}")
+    final = os.fstat(descriptor)
+    if (
+        (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_uid,
+            final.st_gid,
+            final.st_mode,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        )
+        != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    ):
+        raise ReconcileError(f"recovery artifact changed: {name}")
+    return b"".join(chunks)
 
 
 def durably_commit_pre_migration_boundary(
@@ -263,26 +314,103 @@ def durably_commit_pre_migration_boundary(
 
     release_root = _release_root(project_root)
     _validate_release_path(candidate_release, release_root, pending=True)
-    metadata = project_root.lstat()
-    dump = candidate_release / "pre-migration.dump"
-    checksum = candidate_release / "pre-migration.dump.sha256"
-    actual_digest = _digest_and_fsync_regular(
-        dump,
-        expected_uid=metadata.st_uid,
-        expected_gid=metadata.st_gid,
-        expected_mode=0o600,
+    try:
+        project_metadata = project_root.lstat()
+    except OSError:
+        raise ReconcileError("project root is unavailable") from None
+    uid, gid = project_metadata.st_uid, project_metadata.st_gid
+    _canonical_owned_directory(
+        project_root, expected_uid=uid, expected_gid=gid
     )
-    checksum_content = _read_and_fsync_regular(
-        checksum,
-        expected_uid=metadata.st_uid,
-        expected_gid=metadata.st_gid,
-        expected_mode=0o600,
-        maximum_size=256,
+    _canonical_owned_directory(
+        release_root, expected_uid=uid, expected_gid=gid
     )
-    expected_content = f"{actual_digest}  pre-migration.dump\n".encode("ascii")
-    if checksum_content != expected_content:
-        raise ReconcileError("pre-migration recovery checksum is invalid")
-    _fsync(candidate_release)
+    pending_root = release_root / "pending"
+    pending_metadata = _canonical_owned_directory(
+        pending_root,
+        expected_uid=uid,
+        expected_gid=gid,
+        exact_mode=0o700,
+    )
+    candidate_metadata = _canonical_owned_directory(
+        candidate_release,
+        expected_uid=uid,
+        expected_gid=gid,
+        exact_mode=0o700,
+    )
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    pending_descriptor = os.open(pending_root, directory_flags)
+    candidate_descriptor = -1
+    dump_descriptor = -1
+    checksum_descriptor = -1
+    try:
+        opened_pending = os.fstat(pending_descriptor)
+        if (opened_pending.st_dev, opened_pending.st_ino) != (
+            pending_metadata.st_dev,
+            pending_metadata.st_ino,
+        ):
+            raise ReconcileError("pending release root changed during validation")
+        candidate_descriptor = os.open(
+            candidate_release.name,
+            directory_flags,
+            dir_fd=pending_descriptor,
+        )
+        opened_candidate = os.fstat(candidate_descriptor)
+        if (opened_candidate.st_dev, opened_candidate.st_ino) != (
+            candidate_metadata.st_dev,
+            candidate_metadata.st_ino,
+        ):
+            raise ReconcileError("candidate release changed during validation")
+
+        dump_descriptor, dump_metadata = _open_recovery_file_at(
+            candidate_descriptor,
+            "pre-migration.dump",
+            expected_uid=uid,
+            expected_gid=gid,
+            expected_mode=0o600,
+        )
+        dump_content = _read_open_recovery_file(
+            dump_descriptor, dump_metadata, "pre-migration.dump"
+        )
+        actual_digest = hashlib.sha256(dump_content).hexdigest()
+        os.fsync(dump_descriptor)
+
+        checksum_descriptor, checksum_metadata = _open_recovery_file_at(
+            candidate_descriptor,
+            "pre-migration.dump.sha256",
+            expected_uid=uid,
+            expected_gid=gid,
+            expected_mode=0o600,
+        )
+        checksum_content = _read_open_recovery_file(
+            checksum_descriptor,
+            checksum_metadata,
+            "pre-migration.dump.sha256",
+            maximum_size=256,
+        )
+        expected_content = f"{actual_digest}  pre-migration.dump\n".encode(
+            "ascii"
+        )
+        if checksum_content != expected_content:
+            raise ReconcileError("pre-migration recovery checksum is invalid")
+        os.fsync(checksum_descriptor)
+
+        # The child fsync persists both file entries; the parent fsync persists
+        # the newly-created candidate directory entry itself.
+        os.fsync(candidate_descriptor)
+        os.fsync(pending_descriptor)
+    finally:
+        for descriptor in (
+            checksum_descriptor,
+            dump_descriptor,
+            candidate_descriptor,
+            pending_descriptor,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _journal_path(project_root: Path) -> Path:
@@ -658,11 +786,40 @@ def _atomic_install(
 
 
 def _stop_ingress_and_containers(runner: CommandRunner) -> None:
+    errors: list[str] = []
     try:
         READY_MARKER.unlink()
     except FileNotFoundError:
         pass
-    load_state = runner.run(
+    except OSError:
+        errors.append("ready marker could not be removed")
+
+    def attempt(
+        arguments: Sequence[str], *, capture: bool = False
+    ) -> tuple[subprocess.CompletedProcess[bytes], bool]:
+        """Run one best-effort shutdown command without breaking the sequence."""
+
+        try:
+            return (
+                runner.run(
+                    arguments,
+                    check=False,
+                    capture=capture,
+                ),
+                False,
+            )
+        except (OSError, ReconcileError):
+            return (
+                subprocess.CompletedProcess(
+                    list(arguments), 127, stdout=b"", stderr=b""
+                ),
+                True,
+            )
+
+    # Never let an introspection failure skip the actual shutdown attempts. A
+    # failed stop is followed by a hard unit kill, Docker is always stopped, and
+    # all unverifiable state is reported only after those fail-closed actions.
+    load_state, load_state_error = attempt(
         [
             "/usr/bin/systemctl",
             "show",
@@ -670,37 +827,30 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
             "--property=LoadState",
             "--value",
         ],
-        check=False,
         capture=True,
     )
-    if load_state.returncode != 0:
-        raise ReconcileError("cloudflared unit state cannot be verified")
-    try:
-        load_state_value = load_state.stdout.decode("ascii", errors="strict").strip()
-    except UnicodeDecodeError:
-        raise ReconcileError("cloudflared unit state is invalid") from None
-    if load_state_value == "not-found":
-        # First boot legitimately has no unit until a committed runtime bundle
-        # restores it.  Absence is safe only when systemd also confirms that no
-        # unit with that name remains active.
-        active = runner.run(
-            [
-                "/usr/bin/systemctl",
-                "is-active",
-                "--quiet",
-                "cloudflared.service",
-            ],
-            check=False,
-        )
-        if active.returncode == 0:
-            raise ReconcileError("cloudflared ingress remained active without a unit")
-        if active.returncode not in {3, 4}:
-            raise ReconcileError("absent cloudflared activity cannot be verified")
+    load_state_value = ""
+    if not load_state_error and load_state.returncode == 0:
+        try:
+            load_state_value = load_state.stdout.decode(
+                "ascii", errors="strict"
+            ).strip()
+        except UnicodeDecodeError:
+            errors.append("cloudflared unit state is invalid")
+        if load_state_value not in {"not-found", "loaded", "masked"}:
+            errors.append("cloudflared unit state is unsafe")
     else:
-        if load_state_value not in {"loaded", "masked"}:
-            raise ReconcileError("cloudflared unit is in an unsafe load state")
-        runner.run(["/usr/bin/systemctl", "stop", "cloudflared.service"])
-        active_state = runner.run(
+        errors.append("cloudflared unit state cannot be verified")
+
+    stop_result, stop_error = attempt(
+        ["/usr/bin/systemctl", "stop", "cloudflared.service"]
+    )
+    disable_result, disable_error = attempt(
+        ["/usr/bin/systemctl", "disable", "cloudflared.service"]
+    )
+
+    def active_status() -> tuple[bool, bool]:
+        state, state_error = attempt(
             [
                 "/usr/bin/systemctl",
                 "show",
@@ -708,28 +858,67 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
                 "--property=ActiveState",
                 "--value",
             ],
-            check=False,
             capture=True,
         )
-        if active_state.returncode != 0:
-            raise ReconcileError("cloudflared active state cannot be verified")
-        try:
-            active_state_value = active_state.stdout.decode(
-                "ascii", errors="strict"
-            ).strip()
-        except UnicodeDecodeError:
-            raise ReconcileError("cloudflared active state is invalid") from None
-        if active_state_value not in {"inactive", "failed"}:
-            raise ReconcileError("cloudflared ingress did not stop fail-closed")
+        active, active_error = attempt(
+            [
+                "/usr/bin/systemctl",
+                "is-active",
+                "--quiet",
+                "cloudflared.service",
+            ],
+        )
+        state_inactive = False
+        state_value = ""
+        if not state_error and state.returncode == 0:
+            try:
+                state_value = state.stdout.decode("ascii", errors="strict").strip()
+                state_inactive = state_value in {"inactive", "failed"}
+            except UnicodeDecodeError:
+                pass
+        absent_or_inactive = not active_error and active.returncode in {3, 4}
+        safely_inactive = state_inactive and absent_or_inactive
+        return safely_inactive, absent_or_inactive
+
+    inactive, inactive_exit = active_status()
+    if not inactive:
+        _, kill_error = attempt(
+            [
+                "/usr/bin/systemctl",
+                "kill",
+                "--kill-who=all",
+                "--signal=SIGKILL",
+                "cloudflared.service",
+            ],
+        )
+        if kill_error:
+            errors.append("cloudflared hard stop failed")
+        inactive, inactive_exit = active_status()
+
+    verified_absent = load_state_value == "not-found" and inactive_exit
+    if (stop_error or stop_result.returncode != 0) and not verified_absent:
+        errors.append("cloudflared stop failed")
+    if (disable_error or disable_result.returncode != 0) and not verified_absent:
+        errors.append("cloudflared disable failed")
+    if not inactive:
+        errors.append("cloudflared ingress did not stop")
+
     existing: list[str] = []
     for name in KNOWN_CONTAINERS:
-        result = runner.run(["/usr/bin/docker", "inspect", name], check=False)
+        result, inspect_error = attempt(["/usr/bin/docker", "inspect", name])
+        if inspect_error:
+            errors.append(f"runtime container state is unavailable: {name}")
+            continue
         if result.returncode == 0:
             existing.append(name)
     if existing:
-        runner.run(["/usr/bin/docker", "stop", "--time", "30", *existing])
+        stopped, stop_containers_error = attempt(
+            ["/usr/bin/docker", "stop", "--time", "30", *existing]
+        )
+        if stop_containers_error or stopped.returncode != 0:
+            errors.append("runtime container stop failed")
         for name in existing:
-            result = runner.run(
+            result, verify_error = attempt(
                 [
                     "/usr/bin/docker",
                     "inspect",
@@ -739,8 +928,16 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
                 ],
                 capture=True,
             )
-            if result.stdout.decode("ascii", errors="strict").strip() != "false":
-                raise ReconcileError("a runtime container did not stop fail-closed")
+            try:
+                stopped_value = result.stdout.decode("ascii", errors="strict").strip()
+            except UnicodeDecodeError:
+                stopped_value = ""
+            if verify_error or result.returncode != 0 or stopped_value != "false":
+                errors.append("a runtime container did not stop")
+    if errors:
+        raise ReconcileError(
+            "runtime shutdown could not be verified fail-closed: " + "; ".join(errors)
+        )
 
 
 def _release_secret_mode(release: Path, project_root: Path) -> str:
@@ -772,6 +969,300 @@ def _owned_mode_directory(path: Path, uid: int, gid: int, mode: int) -> bool:
     )
 
 
+def _runtime_secret_file_specs(
+    expected_uid: int, expected_gid: int, *, vault: bool
+) -> dict[str, tuple[int, int, int]]:
+    """Return the complete runtime-consumed secret-file contract.
+
+    Production uses fixed container group IDs. Test-root mode cannot chown to
+    those groups, so a non-root owner deliberately collapses the group IDs to
+    the owning test group without changing the file/mode/content checks.
+    """
+
+    def group(container_gid: int) -> int:
+        return container_gid if expected_uid == 0 else expected_gid
+
+    root_mode = 0o400 if vault else 0o600
+    return {
+        "api.env": (expected_uid, group(65532), 0o440),
+        "postgres.env": (expected_uid, expected_gid, root_mode),
+        "redis.env": (expected_uid, expected_gid, root_mode),
+        "nats.env": (expected_uid, expected_gid, root_mode),
+        "grafana.env": (expected_uid, expected_gid, root_mode),
+        "backup.env": (expected_uid, expected_gid, root_mode),
+        "migrate.env": (expected_uid, group(65532), 0o440),
+        "postgres.password": (expected_uid, group(70), 0o440),
+        "postgres.pgpass": (expected_uid, expected_gid, 0o400),
+        "redis.password": (expected_uid, group(1000), 0o440),
+        "redis.acl": (expected_uid, group(1000), 0o440),
+        "nats.conf": (expected_uid, group(1000), 0o440),
+        "grafana.ini": (expected_uid, group(472), 0o440),
+        "metrics.token": (expected_uid, group(65534), 0o440),
+    }
+
+
+def _secret_artifact_record(
+    root: Path,
+    relative: str,
+    expected: tuple[int, int, int],
+) -> dict[str, Any]:
+    uid, gid, mode = expected
+    content = _regular_file_bytes(
+        root / relative,
+        expected_uid=uid,
+        expected_gid=gid,
+        expected_mode=mode,
+        maximum_size=MAX_SECRET_ARTIFACT_BYTES,
+    )
+    return {
+        "path": relative,
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size": len(content),
+        "uid": uid,
+        "gid": gid,
+        "mode": mode,
+    }
+
+
+def _staging_secret_artifact_specs(
+    expected_uid: int, expected_gid: int, staging_root: Path
+) -> dict[str, tuple[int, int, int]]:
+    specs = _runtime_secret_file_specs(expected_uid, expected_gid, vault=False)
+    apns_gid = 65532 if expected_uid == 0 else expected_gid
+    apns_root = staging_root / "apns"
+    if not _owned_mode_directory(apns_root, expected_uid, apns_gid, 0o750):
+        raise ReconcileError("staging APNs secret directory is unsafe")
+    try:
+        entries = list(apns_root.iterdir())
+    except OSError:
+        raise ReconcileError("staging APNs secret directory is unavailable") from None
+    allowed = {"AuthKey.p8", "AuthKey-sandbox.p8"}
+    for entry in entries:
+        if entry.name not in allowed:
+            raise ReconcileError("staging APNs secret directory has an unexpected entry")
+        specs[f"apns/{entry.name}"] = (expected_uid, apns_gid, 0o440)
+    return specs
+
+
+def _build_staging_secret_manifest(
+    release: Path, project_root: Path
+) -> bytes:
+    metadata = project_root.lstat()
+    uid, gid = metadata.st_uid, metadata.st_gid
+    if not _owned_mode_directory(STAGING_SECRET_ROOT, uid, gid, 0o700):
+        raise ReconcileError("staging secret root is unsafe")
+    specs = _staging_secret_artifact_specs(uid, gid, STAGING_SECRET_ROOT)
+    artifacts = [
+        _secret_artifact_record(STAGING_SECRET_ROOT, name, specs[name])
+        for name in sorted(specs)
+    ]
+    document = {
+        "schema": SECRET_INTEGRITY_SCHEMA,
+        "mode": "staging",
+        "release_cohort": release.name,
+        "artifacts": artifacts,
+    }
+    return (
+        json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+
+
+def _validate_staging_secret_manifest(
+    release: Path, project_root: Path
+) -> None:
+    metadata = project_root.lstat()
+    uid, gid = metadata.st_uid, metadata.st_gid
+    manifest_content = _regular_file_bytes(
+        release / STAGING_SECRET_MANIFEST,
+        expected_uid=uid,
+        expected_gid=gid,
+        expected_mode=0o400,
+        maximum_size=64 * 1024,
+    )
+    try:
+        document = json.loads(
+            manifest_content.decode("ascii"), object_pairs_hook=_strict_object
+        )
+    except (UnicodeError, json.JSONDecodeError):
+        raise ReconcileError("staging secret integrity manifest is invalid") from None
+    if not isinstance(document, dict) or set(document) != {
+        "schema",
+        "mode",
+        "release_cohort",
+        "artifacts",
+    }:
+        raise ReconcileError("staging secret integrity manifest is invalid")
+    if (
+        document.get("schema") != SECRET_INTEGRITY_SCHEMA
+        or isinstance(document.get("schema"), bool)
+        or document.get("mode") != "staging"
+        or document.get("release_cohort") != release.name
+        or not isinstance(document.get("artifacts"), list)
+    ):
+        raise ReconcileError("staging secret integrity manifest is invalid")
+    if not _owned_mode_directory(STAGING_SECRET_ROOT, uid, gid, 0o700):
+        raise ReconcileError("staging secret root is unsafe")
+    specs = _staging_secret_artifact_specs(uid, gid, STAGING_SECRET_ROOT)
+    expected_names = sorted(specs)
+    artifacts = document["artifacts"]
+    if len(artifacts) != len(expected_names):
+        raise ReconcileError("staging secret artifact inventory is incomplete")
+    for expected_name, record in zip(expected_names, artifacts):
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "sha256",
+            "size",
+            "uid",
+            "gid",
+            "mode",
+        }:
+            raise ReconcileError("staging secret artifact record is invalid")
+        uid_value, gid_value, mode_value = specs[expected_name]
+        if (
+            record.get("path") != expected_name
+            or record.get("uid") != uid_value
+            or record.get("gid") != gid_value
+            or record.get("mode") != mode_value
+            or isinstance(record.get("size"), bool)
+            or not isinstance(record.get("size"), int)
+            or int(record["size"]) <= 0
+            or int(record["size"]) > MAX_SECRET_ARTIFACT_BYTES
+            or not isinstance(record.get("sha256"), str)
+            or SHA256_RE.fullmatch(str(record["sha256"])) is None
+        ):
+            raise ReconcileError("staging secret artifact record is invalid")
+        actual = _secret_artifact_record(
+            STAGING_SECRET_ROOT, expected_name, specs[expected_name]
+        )
+        if actual != record:
+            raise ReconcileError("staging secret artifact content changed")
+
+
+def snapshot_staging_secret_manifest(release: Path, project_root: Path) -> None:
+    """Bind a staging release to hashes of its complete consumed secret cohort."""
+
+    release_root = _release_root(project_root)
+    pending = release.parent == release_root / "pending"
+    _validate_release_path(release, release_root, pending=pending)
+    if _release_secret_mode(release, project_root) != "staging":
+        raise ReconcileError("only a staging release may snapshot staging secrets")
+    path = release / STAGING_SECRET_MANIFEST
+    if path.exists() or path.is_symlink():
+        _validate_staging_secret_manifest(release, project_root)
+        return
+    _atomic_write(path, _build_staging_secret_manifest(release, project_root), 0o400)
+    _validate_staging_secret_manifest(release, project_root)
+
+
+def _validate_legacy_boot_secret_cohort(
+    release: Path, project_root: Path
+) -> None:
+    metadata = project_root.lstat()
+    uid, gid = metadata.st_uid, metadata.st_gid
+    boot_root = release / "boot-secrets"
+    if not _owned_mode_directory(boot_root, uid, gid, 0o700):
+        raise ReconcileError("legacy boot-secret directory is unsafe")
+    file_modes = {
+        "hydrate-vault-secrets.py": 0o500,
+        "prepare-runtime-secrets.sh": 0o500,
+    }
+    try:
+        actual = {entry.name for entry in boot_root.iterdir()}
+    except OSError:
+        raise ReconcileError("legacy boot-secret directory is unavailable") from None
+    if actual != set(file_modes) | {"SHA256SUMS"}:
+        raise ReconcileError("legacy boot-secret inventory is invalid")
+    lines: list[str] = []
+    for name in sorted(file_modes):
+        content = _regular_file_bytes(
+            boot_root / name,
+            expected_uid=uid,
+            expected_gid=gid,
+            expected_mode=file_modes[name],
+            maximum_size=MAX_SECRET_ARTIFACT_BYTES,
+        )
+        lines.append(f"{hashlib.sha256(content).hexdigest()}  {name}\n")
+    checksums = _regular_file_bytes(
+        boot_root / "SHA256SUMS",
+        expected_uid=uid,
+        expected_gid=gid,
+        expected_mode=0o400,
+        maximum_size=4096,
+    )
+    if checksums != "".join(lines).encode("ascii"):
+        raise ReconcileError("legacy boot-secret checksum manifest is invalid")
+
+
+def _establish_legacy_staging_boot_cohort(
+    release: Path,
+    project_root: Path,
+    boot_files: Mapping[str, bytes],
+) -> None:
+    """Crash-safely extend a raw legacy release with release-local boot tools."""
+
+    metadata = project_root.lstat()
+    uid, gid = metadata.st_uid, metadata.st_gid
+    mode_path = release / "secret-mode"
+    boot_root = release / "boot-secrets"
+    mode_exists = mode_path.exists() or mode_path.is_symlink()
+    boot_exists = boot_root.exists() or boot_root.is_symlink()
+    for forbidden in ("vault-secrets.map", "vault-approved-cohort.json"):
+        path = release / forbidden
+        if path.exists() or path.is_symlink():
+            raise ReconcileError("legacy staging release contains Vault metadata")
+    if mode_exists:
+        if _release_secret_mode(release, project_root) != "staging":
+            raise ReconcileError(
+                "legacy baseline transition is allowed only in staging"
+            )
+        if not boot_exists:
+            raise ReconcileError("legacy release boot-secret cohort is incomplete")
+        _validate_legacy_boot_secret_cohort(release, project_root)
+        return
+    if boot_exists:
+        # This is the only permitted partial state: a crash after the complete
+        # boot directory rename but before the mode marker publication.
+        _validate_legacy_boot_secret_cohort(release, project_root)
+    else:
+        temporary = release / f".boot-secrets.{secrets.token_hex(8)}"
+        temporary.mkdir(mode=0o700)
+        try:
+            lines: list[str] = []
+            for name in (
+                "hydrate-vault-secrets.py",
+                "prepare-runtime-secrets.sh",
+            ):
+                source_content = boot_files.get(name)
+                if (
+                    not isinstance(source_content, bytes)
+                    or not source_content
+                    or len(source_content) > MAX_SECRET_ARTIFACT_BYTES
+                ):
+                    raise ReconcileError(
+                        "legacy Git boot-secret source is incomplete"
+                    )
+                _atomic_write(temporary / name, source_content, 0o500)
+                lines.append(
+                    f"{hashlib.sha256(source_content).hexdigest()}  {name}\n"
+                )
+            _atomic_write(
+                temporary / "SHA256SUMS",
+                "".join(sorted(lines)).encode("ascii"),
+                0o400,
+            )
+            _fsync(temporary)
+            os.replace(temporary, boot_root)
+            _fsync(release)
+        finally:
+            if temporary.exists() and not temporary.is_symlink():
+                shutil.rmtree(temporary, ignore_errors=True)
+    _validate_legacy_boot_secret_cohort(release, project_root)
+    _atomic_write(mode_path, b"staging\n", 0o400)
+    _fsync(release)
+    if _release_secret_mode(release, project_root) != "staging":
+        raise ReconcileError("legacy staging mode publication failed")
+
+
 def _staging_secret_selection_matches(
     release: Path, project_root: Path
 ) -> bool:
@@ -792,12 +1283,19 @@ def _staging_secret_selection_matches(
         target = os.readlink(active)
     except OSError:
         return False
-    return (
+    selected = (
         stat.S_ISLNK(active_metadata.st_mode)
         and (active_metadata.st_uid, active_metadata.st_gid)
         == (metadata.st_uid, metadata.st_gid)
         and target == str(STAGING_SECRET_ROOT)
     )
+    if not selected:
+        return False
+    try:
+        _validate_staging_secret_manifest(release, project_root)
+    except ReconcileError:
+        return False
+    return True
 
 
 def _vault_marker_matches_release(release: Path, project_root: Path) -> bool:
@@ -1557,11 +2055,233 @@ def _command_value(runner: CommandRunner, arguments: Sequence[str]) -> str:
         raise ReconcileError("host command returned invalid text") from None
 
 
+def _legacy_git_arguments(git_directory: Path, *arguments: str) -> list[str]:
+    return [
+        "/usr/bin/git",
+        "--no-replace-objects",
+        f"--git-dir={git_directory}",
+        *arguments,
+    ]
+
+
+def _legacy_git_environment() -> Mapping[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/root",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
+def _legacy_git_tree(
+    project_root: Path,
+    git_directory: Path,
+    source_sha: str,
+    runner: CommandRunner,
+) -> str:
+    metadata = project_root.lstat()
+    _canonical_owned_directory(
+        git_directory,
+        expected_uid=metadata.st_uid,
+        expected_gid=metadata.st_gid,
+        exact_mode=0o700,
+    )
+    environment = _legacy_git_environment()
+    runner.run(
+        _legacy_git_arguments(
+            git_directory, "cat-file", "-e", f"{source_sha}^{{commit}}"
+        ),
+        environment=environment,
+    )
+    runner.run(
+        _legacy_git_arguments(
+            git_directory, "fsck", "--full", "--strict", source_sha
+        ),
+        environment=environment,
+    )
+    completed = runner.run(
+        _legacy_git_arguments(
+            git_directory, "rev-parse", f"{source_sha}^{{tree}}"
+        ),
+        capture=True,
+        environment=environment,
+    )
+    try:
+        tree_sha = completed.stdout.decode("ascii", errors="strict").strip()
+    except UnicodeError:
+        raise ReconcileError("legacy Git tree identity is invalid") from None
+    if runtime_bundle.SOURCE_SHA_RE.fullmatch(tree_sha) is None:
+        raise ReconcileError("legacy Git tree identity is invalid")
+    return tree_sha
+
+
+def _legacy_git_boot_files(
+    git_directory: Path,
+    source_sha: str,
+    runner: CommandRunner,
+) -> Mapping[str, bytes]:
+    environment = _legacy_git_environment()
+    result: dict[str, bytes] = {}
+    for name in (
+        "hydrate-vault-secrets.py",
+        "prepare-runtime-secrets.sh",
+    ):
+        relative = f"deploy/oci/{name}"
+        listing = runner.run(
+            _legacy_git_arguments(
+                git_directory, "ls-tree", source_sha, "--", relative
+            ),
+            capture=True,
+            environment=environment,
+        )
+        try:
+            line = listing.stdout.decode("ascii", errors="strict").strip()
+        except UnicodeError:
+            raise ReconcileError("legacy Git boot-secret tree is invalid") from None
+        match = re.fullmatch(
+            r"100755 blob ([0-9a-f]{40})\t" + re.escape(relative), line
+        )
+        if match is None:
+            raise ReconcileError("legacy Git boot-secret tree is invalid")
+        content = runner.run(
+            _legacy_git_arguments(
+                git_directory, "cat-file", "blob", match.group(1)
+            ),
+            capture=True,
+            environment=environment,
+        ).stdout
+        if not content or len(content) > MAX_SECRET_ARTIFACT_BYTES:
+            raise ReconcileError("legacy Git boot-secret source is incomplete")
+        result[name] = content
+    return result
+
+
+def _legacy_provenance_content(source_sha: str, tree_sha: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema": LEGACY_SOURCE_PROVENANCE_SCHEMA,
+                "source_sha": source_sha,
+                "tree_sha": tree_sha,
+                "source_kind": "root-owned-git-archive",
+            },
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_legacy_source_provenance(
+    release: Path,
+    project_root: Path,
+    source_sha: str,
+    tree_sha: str,
+) -> None:
+    metadata = project_root.lstat()
+    content = _regular_file_bytes(
+        release
+        / runtime_bundle.BUNDLE_DIRECTORY
+        / LEGACY_SOURCE_PROVENANCE,
+        expected_uid=metadata.st_uid,
+        expected_gid=metadata.st_gid,
+        expected_mode=0o400,
+        maximum_size=4096,
+    )
+    if content != _legacy_provenance_content(source_sha, tree_sha):
+        raise ReconcileError("staged legacy source provenance is invalid")
+
+
+def _stage_legacy_source_from_git(
+    release: Path,
+    project_root: Path,
+    controller_source: Path,
+    git_directory: Path,
+    source_sha: str,
+    tree_sha: str,
+    runner: CommandRunner,
+) -> None:
+    runtime_root = project_root / "runtime"
+    metadata = project_root.lstat()
+    _canonical_owned_directory(
+        runtime_root,
+        expected_uid=metadata.st_uid,
+        expected_gid=metadata.st_gid,
+    )
+    temporary = Path(
+        tempfile.mkdtemp(prefix=".legacy-source.", dir=runtime_root)
+    )
+    os.chmod(temporary, 0o700)
+    archive = temporary / "source.tar"
+    source = temporary / "source"
+    source.mkdir(mode=0o700)
+    try:
+        runner.run(
+            _legacy_git_arguments(
+                git_directory,
+                "archive",
+                "--format=tar",
+                f"--output={archive}",
+                source_sha,
+            ),
+            environment=_legacy_git_environment(),
+        )
+        try:
+            archive_metadata = archive.lstat()
+        except OSError:
+            raise ReconcileError("legacy Git source archive is unavailable") from None
+        if (
+            not stat.S_ISREG(archive_metadata.st_mode)
+            or stat.S_ISLNK(archive_metadata.st_mode)
+            or (archive_metadata.st_uid, archive_metadata.st_gid)
+            != (metadata.st_uid, metadata.st_gid)
+            or archive_metadata.st_size <= 0
+        ):
+            raise ReconcileError("legacy Git source archive is unsafe")
+        os.chmod(archive, 0o600)
+        _fsync(archive)
+        runner.run(
+            [
+                "/usr/bin/tar",
+                "--extract",
+                f"--file={archive}",
+                f"--directory={source}",
+                "--no-same-owner",
+                "--no-same-permissions",
+            ],
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/root",
+                "LC_ALL": "C",
+            },
+        )
+        runtime_bundle.stage_source(
+            release,
+            source,
+            source_sha,
+            compose_source=controller_source / "deploy" / "oci" / "compose.yaml",
+        )
+        _atomic_write(
+            release
+            / runtime_bundle.BUNDLE_DIRECTORY
+            / LEGACY_SOURCE_PROVENANCE,
+            _legacy_provenance_content(source_sha, tree_sha),
+            0o400,
+        )
+        _validate_legacy_source_provenance(
+            release, project_root, source_sha, tree_sha
+        )
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
 def establish_legacy_baseline(
     project_root: Path,
     controller_source: Path,
     runner: CommandRunner,
     cloudflared_binary: Path = CLOUDFLARED_BINARY,
+    legacy_git_directory: Path | None = None,
 ) -> Path:
     """Upgrade one existing staging release to the schema-2 runtime contract.
 
@@ -1579,30 +2299,15 @@ def establish_legacy_baseline(
     release = _resolve_current(project_root)
     if release is None:
         raise ReconcileError("legacy baseline requires an existing current release")
-    mode_path = release / "secret-mode"
-    try:
-        mode = mode_path.read_text(encoding="ascii")
-    except (OSError, UnicodeError):
-        raise ReconcileError("legacy baseline secret mode is unavailable") from None
-    if mode != "staging\n":
-        raise ReconcileError("legacy baseline transition is allowed only in staging")
     committed_bundle = release / runtime_bundle.BUNDLE_DIRECTORY
     if committed_bundle.exists() or committed_bundle.is_symlink():
+        if _release_secret_mode(release, project_root) != "staging":
+            raise ReconcileError(
+                "legacy baseline transition is allowed only in staging"
+            )
+        snapshot_staging_secret_manifest(release, project_root)
         _validate_bundle(release, project_root)
         return release
-    pending_root = _release_root(project_root) / "pending"
-    pending_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(pending_root, 0o700)
-    staged_release = pending_root / release.name
-    staged_manifest: Mapping[str, Any] | None = None
-    if staged_release.exists() or staged_release.is_symlink():
-        try:
-            staged_manifest = _validate_bundle(staged_release, project_root)
-        except runtime_bundle.BundleError:
-            quarantine_pending_candidate(project_root, staged_release)
-    if not staged_release.exists():
-        staged_release.mkdir(mode=0o700)
-    stable_source = project_root / "repo"
     image_ref = _command_value(
         runner,
         [
@@ -1645,6 +2350,38 @@ def establish_legacy_baseline(
         or source_sha[:12] != release.name[4:16]
     ):
         raise ReconcileError("legacy API image revision does not match current release")
+    if legacy_git_directory is None:
+        raise ReconcileError(
+            "legacy baseline requires a root-owned Git object directory"
+        )
+    tree_sha = _legacy_git_tree(
+        project_root, legacy_git_directory, source_sha, runner
+    )
+    boot_files = _legacy_git_boot_files(
+        legacy_git_directory, source_sha, runner
+    )
+    # Only after the exact live image commit exists and passes Git object
+    # validation may a raw legacy release gain the new boot-secret authority.
+    _establish_legacy_staging_boot_cohort(
+        release, project_root, boot_files
+    )
+    snapshot_staging_secret_manifest(release, project_root)
+    pending_root = _release_root(project_root) / "pending"
+    pending_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(pending_root, 0o700)
+    staged_release = pending_root / release.name
+    staged_manifest: Mapping[str, Any] | None = None
+    if staged_release.exists() or staged_release.is_symlink():
+        try:
+            staged_manifest = _validate_bundle(staged_release, project_root)
+            _validate_legacy_source_provenance(
+                staged_release, project_root, source_sha, tree_sha
+            )
+        except (OSError, runtime_bundle.BundleError, ReconcileError):
+            quarantine_pending_candidate(project_root, staged_release)
+            staged_manifest = None
+    if not staged_release.exists():
+        staged_release.mkdir(mode=0o700)
     if staged_manifest is not None:
         staged_image = staged_manifest["image"]
         if (
@@ -1653,22 +2390,27 @@ def establish_legacy_baseline(
             or staged_image.get("ref") != image_ref
             or staged_image.get("id") != image_id
         ):
-            raise ReconcileError("staged legacy baseline no longer matches the live release")
-        os.replace(
-            staged_release / runtime_bundle.BUNDLE_DIRECTORY,
-            committed_bundle,
-        )
-        _fsync(release)
-        _fsync(_release_root(project_root))
-        _validate_bundle(release, project_root)
-        return release
-    compose_override = controller_source / "deploy" / "oci" / "compose.yaml"
+            quarantine_pending_candidate(project_root, staged_release)
+            staged_release.mkdir(mode=0o700)
+            staged_manifest = None
+        else:
+            os.replace(
+                staged_release / runtime_bundle.BUNDLE_DIRECTORY,
+                committed_bundle,
+            )
+            _fsync(release)
+            _fsync(_release_root(project_root))
+            _validate_bundle(release, project_root)
+            return release
     if not (staged_release / runtime_bundle.BUNDLE_DIRECTORY).exists():
-        runtime_bundle.stage_source(
+        _stage_legacy_source_from_git(
             staged_release,
-            stable_source,
+            project_root,
+            controller_source,
+            legacy_git_directory,
             source_sha,
-            compose_source=compose_override,
+            tree_sha,
+            runner,
         )
         runtime_bundle.stage_host_tools(
             staged_release, controller_source, cloudflared_binary
@@ -1811,12 +2553,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
     archive.add_argument("--outcome", required=True)
     validate = subparsers.add_parser("validate-release")
     validate.add_argument("--release", required=True, type=Path)
+    staging_snapshot = subparsers.add_parser("snapshot-staging-secrets")
+    staging_snapshot.add_argument("--release", required=True, type=Path)
     commit_dump = subparsers.add_parser("commit-pre-migration-boundary")
     commit_dump.add_argument("--candidate", required=True, type=Path)
     reconcile = subparsers.add_parser("reconcile")
     reconcile.add_argument("--boot", action="store_true")
     baseline = subparsers.add_parser("establish-legacy-baseline")
     baseline.add_argument("--controller-source", required=True, type=Path)
+    baseline.add_argument("--legacy-git-dir", type=Path)
     publish = subparsers.add_parser("publish-release")
     publish.add_argument("--candidate", required=True, type=Path)
     permit = subparsers.add_parser("permit-candidate-ingress")
@@ -1845,13 +2590,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.release, expected_uid=expected_uid, expected_gid=expected_gid
             )
             _boot_bundle_validate(options.release, CommandRunner())
+        elif options.action == "snapshot-staging-secrets":
+            snapshot_staging_secret_manifest(options.release, project_root)
         elif options.action == "commit-pre-migration-boundary":
             durably_commit_pre_migration_boundary(project_root, options.candidate)
         elif options.action == "reconcile":
             reconcile_current(project_root, CommandRunner(), boot=options.boot)
         elif options.action == "establish-legacy-baseline":
             establish_legacy_baseline(
-                project_root, options.controller_source, CommandRunner()
+                project_root,
+                options.controller_source,
+                CommandRunner(),
+                legacy_git_directory=options.legacy_git_dir,
             )
         elif options.action == "publish-release":
             publish_pending_release(project_root, options.candidate, CommandRunner())

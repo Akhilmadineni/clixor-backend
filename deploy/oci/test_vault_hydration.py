@@ -388,6 +388,7 @@ exec /usr/bin/openssl pkey -in "$3" -noout
             "metrics.token": 0o440,
             "cloudflare-token": 0o600,
             ".vault-hydrated": 0o400,
+            ".secret-integrity.json": 0o400,
             "apns/AuthKey.p8": 0o440,
         }
         for relative, expected_mode in expected_modes.items():
@@ -416,6 +417,55 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         self.assertEqual(
             sorted((self.secret_root / "vault-generations").iterdir()), first_generations
         )
+
+    def test_deleted_materialized_secret_is_rejected_then_restored_from_pins(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        (self._active() / "metrics.token").unlink()
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "unavailable"):
+            HYDRATOR.verify_candidate_selection(
+                candidate_manifest_path=(
+                    approved / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=approved.name,
+                secret_root=self.secret_root,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
+        self.oci_log.unlink(missing_ok=True)
+        changed, output = self._boot_release_local(approved)
+        self.assertTrue(changed)
+        self.assertEqual(output, "")
+        self.assertTrue((self._active() / "metrics.token").is_file())
+        HYDRATOR.verify_candidate_selection(
+            candidate_manifest_path=(
+                approved / HYDRATOR.APPROVED_MANIFEST_NAME
+            ),
+            release_cohort=approved.name,
+            secret_root=self.secret_root,
+            expected_uid=self.uid,
+            expected_gid=self.gid,
+        )
+        self.assertNotIn("CURRENT", self.oci_log.read_text())
+        token = self._active() / "metrics.token"
+        original = token.read_bytes()
+        token.chmod(0o600)
+        token.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        token.chmod(0o440)
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "content changed"):
+            HYDRATOR.verify_candidate_selection(
+                candidate_manifest_path=(
+                    approved / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=approved.name,
+                secret_root=self.secret_root,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
+        changed, output = self._boot_release_local(approved)
+        self.assertTrue(changed)
+        self.assertEqual(output, "")
+        self.assertEqual((self._active() / "metrics.token").read_bytes(), original)
 
     def test_rotation_switches_whole_generation(self) -> None:
         self._hydrate()

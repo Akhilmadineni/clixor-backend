@@ -50,7 +50,7 @@ if [ "${CLIXOR_SKIP_PACKAGES:-false}" != "true" ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install --yes --no-install-recommends \
-    ca-certificates curl docker.io docker-buildx docker-compose-v2 openssl python3 rsync unzip util-linux
+    ca-certificates curl docker.io docker-buildx docker-compose-v2 git openssl python3 rsync unzip util-linux
   unset DEBIAN_FRONTEND
 fi
 systemctl enable --now docker
@@ -384,16 +384,32 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
     fi
   fi
 
+  legacy_release_needs_bootstrap=false
   if [ -L "${project_root}/releases/current" ]; then
     selected_boot_release="$(readlink -- "${project_root}/releases/current")"
-    /usr/bin/python3 "${script_root}/prepare-runtime-secrets-launcher.py" \
-      --verify-release-bundle "${selected_boot_release}"
+    selected_boot_mode="${selected_boot_release}/secret-mode"
+    selected_boot_root="${selected_boot_release}/boot-secrets"
+    if [ -e "${selected_boot_mode}" ] || [ -L "${selected_boot_mode}" ] || \
+      [ -e "${selected_boot_root}" ] || [ -L "${selected_boot_root}" ]; then
+      /usr/bin/python3 "${script_root}/prepare-runtime-secrets-launcher.py" \
+        --verify-release-bundle "${selected_boot_release}"
+    elif [ "${selected_secret_mode}" = "staging" ]; then
+      # Raw pre-controller releases have neither marker. The reconciler may
+      # extend this exact current release only after it verifies the live image
+      # commit in the root-owned Git object store.
+      legacy_release_needs_bootstrap=true
+    else
+      echo "Current release lacks its stable boot-secret cohort." >&2
+      exit 1
+    fi
     if [ "${stable_launcher_installed}" = "false" ]; then
-      [ -f "${selected_boot_release}/secret-mode" ] && \
-        [ ! -L "${selected_boot_release}/secret-mode" ] && \
-        [ "$(stat -c '%u:%g:%a' "${selected_boot_release}/secret-mode")" = "0:0:400" ] && \
-        [ "$(wc -l < "${selected_boot_release}/secret-mode" | tr -d '[:space:]')" = "1" ] && \
-        [ "$(sed -n '1p' "${selected_boot_release}/secret-mode")" = "staging" ] || {
+      [ "${legacy_release_needs_bootstrap}" = "true" ] || { \
+        [ -f "${selected_boot_release}/secret-mode" ] && \
+          [ ! -L "${selected_boot_release}/secret-mode" ] && \
+          [ "$(stat -c '%u:%g:%a' "${selected_boot_release}/secret-mode")" = "0:0:400" ] && \
+          [ "$(wc -l < "${selected_boot_release}/secret-mode" | tr -d '[:space:]')" = "1" ] && \
+          [ "$(sed -n '1p' "${selected_boot_release}/secret-mode")" = "staging" ]; \
+      } || {
         echo "Initial stable-launcher transition requires a current staging release; reboot-prove it before Vault cutover." >&2
         exit 1
       }
@@ -409,6 +425,8 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
   install -m 0500 -o 0 -g 0 \
     "${script_root}/prepare-initial-staging-secrets.sh" \
     /usr/local/libexec/clixor/prepare-initial-staging-secrets.sh
+  install -m 0500 -o 0 -g 0 "${script_root}/hydrate-vault-secrets.py" \
+    /usr/local/libexec/clixor/staging-secret-validation.py
   install -m 0755 -o 0 -g 0 "${script_root}/prepare-staging-secrets.py" \
     /usr/local/libexec/clixor/prepare-staging-secrets.py
   install -d -m 0755 -o 0 -g 0 /etc/systemd/system/docker.service.d
@@ -416,6 +434,17 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
     /etc/systemd/system/clixor-runtime-secrets.service
   install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
     /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
+  # The legacy baseline hashes the complete staging cohort. Render derived
+  # files and select that cohort before attempting the one-time transition.
+  if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
+    if [ "${selected_secret_mode}" = "staging" ]; then
+      /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
+    fi
+    if [ "${legacy_release_needs_bootstrap}" = "false" ]; then
+      /usr/bin/python3 \
+        /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
+    fi
+  fi
   # Existing 9e41-style staging releases contain only the boot-secret cohort.
   # Before installing the new boot authority, atomically extend the selected
   # staging release with a complete schema-2 runtime baseline. This explicit
@@ -429,8 +458,69 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
       exit 1
     }
     controller_source_root="$(CDPATH= cd -- "${script_root}/../.." && pwd)"
+    legacy_git_directory=${CLIXOR_LEGACY_GIT_DIR:-${project_root}/runtime/actions-source.git}
+    case "${legacy_git_directory}" in
+      /*) ;;
+      *)
+        echo "CLIXOR_LEGACY_GIT_DIR must be an absolute path." >&2
+        exit 1
+        ;;
+    esac
+    if [ "${legacy_release_needs_bootstrap}" = "true" ]; then
+      [ -x /usr/bin/git ] || {
+        echo "Git is required for the raw legacy source transition." >&2
+        exit 1
+      }
+      if [ -e "${legacy_git_directory}" ] || [ -L "${legacy_git_directory}" ]; then
+        [ -d "${legacy_git_directory}" ] && [ ! -L "${legacy_git_directory}" ] && \
+          [ "$(readlink -f -- "${legacy_git_directory}")" = "${legacy_git_directory}" ] && \
+          [ "$(stat -c '%u:%g:%a' "${legacy_git_directory}")" = "0:0:700" ] || {
+          echo "Legacy Git object directory is unsafe." >&2
+          exit 1
+        }
+      else
+        install -d -m 0700 -o 0 -g 0 "${legacy_git_directory}"
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+          /usr/bin/git init --bare --initial-branch=main \
+          "${legacy_git_directory}" >/dev/null
+      fi
+      legacy_image="clixor-api:${selected_boot_release##*/}"
+      legacy_source_sha="$(docker image inspect "${legacy_image}" \
+        --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+      case "${legacy_source_sha}" in
+        ''|*[!0-9a-f]*)
+          echo "Legacy image revision is not a lowercase Git object ID." >&2
+          exit 1
+          ;;
+      esac
+      [ "${#legacy_source_sha}" -eq 40 ] && \
+        [ "$(printf '%s' "${legacy_source_sha}" | cut -c1-12)" = \
+          "$(printf '%s' "${selected_boot_release##*/}" | cut -c5-16)" ] || {
+        echo "Legacy image revision does not match the current release." >&2
+        exit 1
+      }
+      trusted_git() {
+        /usr/bin/env -i PATH=/usr/bin:/bin HOME=/root LC_ALL=C \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+          /usr/bin/git --git-dir="${legacy_git_directory}" "$@"
+      }
+      trusted_git remote remove origin >/dev/null 2>&1 || true
+      trusted_git remote add origin \
+        https://github.com/Akhilmadineni/clixor-backend.git
+      trusted_git fetch --force --no-tags origin \
+        "+${legacy_source_sha}:refs/clixor/legacy-baseline"
+      trusted_git fsck --full --strict "${legacy_source_sha}" >/dev/null
+    fi
     /usr/bin/python3 "${script_root}/runtime-reconciler.py" \
-      establish-legacy-baseline --controller-source "${controller_source_root}"
+      establish-legacy-baseline \
+      --controller-source "${controller_source_root}" \
+      --legacy-git-dir "${legacy_git_directory}"
+    if [ "${legacy_release_needs_bootstrap}" = "true" ] && \
+      [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
+      /usr/bin/python3 \
+        /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
+    fi
   fi
   install -m 0500 -o 0 -g 0 "${script_root}/runtime_bundle.py" \
     /usr/local/libexec/clixor/runtime_bundle.py
@@ -444,13 +534,6 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
     install -m 0644 -o 0 -g 0 "${script_root}/${runtime_unit}" \
       "/etc/systemd/system/${runtime_unit}"
   done
-  if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
-    if [ "${selected_secret_mode}" = "staging" ]; then
-      /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
-    fi
-    /usr/bin/python3 \
-      /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
-  fi
   systemctl daemon-reload
   systemctl enable \
     clixor-runtime-secrets.service \

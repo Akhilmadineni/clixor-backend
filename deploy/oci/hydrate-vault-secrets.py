@@ -38,6 +38,8 @@ MANIFEST_SCHEMA = 1
 GENERATION_ROOT_NAME = "vault-generations"
 ACTIVE_NAME = "active"
 MARKER_NAME = ".vault-hydrated"
+MATERIALIZED_MANIFEST_NAME = ".secret-integrity.json"
+MATERIALIZED_MANIFEST_SCHEMA = 1
 MAX_ENV_BYTES = 256 * 1024
 MAX_APNS_BYTES = 16 * 1024
 MAX_TOKEN_BYTES = 8 * 1024
@@ -561,6 +563,223 @@ def _parse_marker(content: bytes) -> dict[str, str]:
         if SHA256_RE.fullmatch(parsed[key]) is None:
             raise HydrationError("Vault hydration marker digest is invalid")
     return parsed
+
+
+def _materialized_file_specs(
+    expected_uid: int, expected_gid: int, *, has_sandbox_bundle: bool
+) -> dict[str, tuple[int, int, int]]:
+    def group(container_gid: int) -> int:
+        return container_gid if expected_uid == 0 else expected_gid
+
+    specs = {
+        "api.env": (expected_uid, group(65532), 0o440),
+        "postgres.env": (expected_uid, expected_gid, 0o400),
+        "redis.env": (expected_uid, expected_gid, 0o400),
+        "nats.env": (expected_uid, expected_gid, 0o400),
+        "grafana.env": (expected_uid, expected_gid, 0o400),
+        "backup.env": (expected_uid, expected_gid, 0o400),
+        "migrate.env": (expected_uid, group(65532), 0o440),
+        "postgres.password": (expected_uid, group(70), 0o440),
+        "postgres.pgpass": (expected_uid, expected_gid, 0o400),
+        "redis.password": (expected_uid, group(1000), 0o440),
+        "redis.acl": (expected_uid, group(1000), 0o440),
+        "nats.conf": (expected_uid, group(1000), 0o440),
+        "grafana.ini": (expected_uid, group(472), 0o440),
+        "metrics.token": (expected_uid, group(65534), 0o440),
+        "apns/AuthKey.p8": (expected_uid, group(65532), 0o440),
+        "cloudflare-token": (expected_uid, expected_gid, 0o600),
+        MARKER_NAME: (expected_uid, expected_gid, 0o400),
+    }
+    if has_sandbox_bundle:
+        specs["apns/AuthKey-sandbox.p8"] = (
+            expected_uid,
+            group(65532),
+            0o440,
+        )
+    return specs
+
+
+def _read_materialized_file(
+    root: Path,
+    relative: str,
+    expected: tuple[int, int, int],
+) -> tuple[bytes, os.stat_result]:
+    uid, gid, mode = expected
+    path = root / relative
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise HydrationError(f"materialized secret is unavailable: {relative}") from None
+    try:
+        metadata = os.fstat(descriptor)
+        maximum = MAX_APNS_BYTES if relative.startswith("apns/") else MAX_ENV_BYTES
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != (uid, gid)
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or metadata.st_size <= 0
+            or metadata.st_size > maximum
+        ):
+            raise HydrationError(f"materialized secret is unsafe: {relative}")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise HydrationError(f"materialized secret changed: {relative}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        final = os.fstat(descriptor)
+        if os.read(descriptor, 1) or (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_uid,
+            final.st_gid,
+            final.st_mode,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        ):
+            raise HydrationError(f"materialized secret changed: {relative}")
+        return b"".join(chunks), metadata
+    finally:
+        os.close(descriptor)
+
+
+def _materialized_artifact_records(
+    generation: Path,
+    specs: Mapping[str, tuple[int, int, int]],
+) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for relative in sorted(specs):
+        content, metadata = _read_materialized_file(
+            generation, relative, specs[relative]
+        )
+        records.append(
+            {
+                "path": relative,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size": metadata.st_size,
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "mode": stat.S_IMODE(metadata.st_mode),
+            }
+        )
+    return records
+
+
+def _write_materialized_integrity_manifest(
+    generation: Path,
+    *,
+    release_cohort: str,
+    mapping_sha256: str,
+    cohort_sha256: str,
+    has_sandbox_bundle: bool,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    specs = _materialized_file_specs(
+        expected_uid, expected_gid, has_sandbox_bundle=has_sandbox_bundle
+    )
+    document = {
+        "schema": MATERIALIZED_MANIFEST_SCHEMA,
+        "release_cohort": release_cohort,
+        "mapping_sha256": mapping_sha256,
+        "cohort_sha256": cohort_sha256,
+        "artifacts": _materialized_artifact_records(generation, specs),
+    }
+    content = (
+        json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    _write_file(
+        generation / MATERIALIZED_MANIFEST_NAME,
+        content,
+        0o400,
+        expected_uid,
+        expected_gid,
+    )
+
+
+def _validate_materialized_integrity_manifest(
+    generation: Path,
+    *,
+    release_cohort: str,
+    mapping_sha256: str,
+    cohort_sha256: str,
+    has_sandbox_bundle: bool,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    manifest_content = _read_release_file(
+        generation / MATERIALIZED_MANIFEST_NAME,
+        expected_uid,
+        expected_gid,
+        0o400,
+        "materialized secret integrity manifest",
+        MAX_MANIFEST_BYTES,
+    )
+    document = _load_strict_json(
+        manifest_content, "materialized secret integrity manifest"
+    )
+    if not isinstance(document, dict) or set(document) != {
+        "schema",
+        "release_cohort",
+        "mapping_sha256",
+        "cohort_sha256",
+        "artifacts",
+    }:
+        raise HydrationError("materialized secret integrity manifest is invalid")
+    if (
+        document.get("schema") != MATERIALIZED_MANIFEST_SCHEMA
+        or isinstance(document.get("schema"), bool)
+        or document.get("release_cohort") != release_cohort
+        or document.get("mapping_sha256") != mapping_sha256
+        or document.get("cohort_sha256") != cohort_sha256
+        or not isinstance(document.get("artifacts"), list)
+    ):
+        raise HydrationError("materialized secret integrity manifest is invalid")
+
+    specs = _materialized_file_specs(
+        expected_uid, expected_gid, has_sandbox_bundle=has_sandbox_bundle
+    )
+    expected_records = _materialized_artifact_records(generation, specs)
+    if document["artifacts"] != expected_records:
+        raise HydrationError("materialized secret artifact content changed")
+
+    apns_gid = 65532 if expected_uid == 0 else expected_gid
+    apns = generation / "apns"
+    metadata = _safe_lstat(apns)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (expected_uid, apns_gid)
+        or stat.S_IMODE(metadata.st_mode) != 0o750
+    ):
+        raise HydrationError("materialized APNs directory is unsafe")
+    expected_apns = {
+        Path(path).name for path in specs if path.startswith("apns/")
+    }
+    try:
+        actual_apns = {entry.name for entry in apns.iterdir()}
+        actual_root = {entry.name for entry in generation.iterdir()}
+    except OSError:
+        raise HydrationError("materialized secret inventory is unavailable") from None
+    if actual_apns != expected_apns:
+        raise HydrationError("materialized APNs secret inventory changed")
+    expected_root = {
+        Path(path).parts[0] for path in specs if not path.startswith("apns/")
+    } | {"apns", MATERIALIZED_MANIFEST_NAME}
+    if actual_root != expected_root:
+        raise HydrationError("materialized secret inventory changed")
 
 
 def _atomic_publish_release_file(
@@ -1347,6 +1566,7 @@ def hydrate(
 
         apns = staged / "apns"
         apns.mkdir(mode=0o750)
+        os.chmod(apns, 0o750)
         if os.geteuid() == 0:
             os.chown(apns, expected_uid, 65532)
         production_key = apns / "AuthKey.p8"
@@ -1398,6 +1618,15 @@ def hydrate(
             + "\n"
         ).encode("ascii")
         _write_file(staged / MARKER_NAME, marker, 0o400, expected_uid, expected_gid)
+        _write_materialized_integrity_manifest(
+            staged,
+            release_cohort=release_cohort,
+            mapping_sha256=hashlib.sha256(mapping_content).hexdigest(),
+            cohort_sha256=manifest_cohort_sha256,
+            has_sandbox_bundle=has_sandbox_bundle,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
         _fsync_directory(apns)
         _fsync_directory(staged)
 
@@ -1420,6 +1649,7 @@ def hydrate(
             *((Path("apns/AuthKey-sandbox.p8"),) if has_sandbox_bundle else ()),
             Path("cloudflare-token"),
             Path(MARKER_NAME),
+            Path(MATERIALIZED_MANIFEST_NAME),
         )
         _reject_implicit_postgres_credential_rotation(active, staged)
         _reject_implicit_stateful_secret_rotation(active, staged, api_values)
@@ -1515,6 +1745,15 @@ def verify_candidate_selection(
         raise HydrationError("active Vault generation uses another mapping")
     if marker["cohort_sha256"] != cohort_sha256:
         raise HydrationError("active Vault generation uses another cohort")
+    _validate_materialized_integrity_manifest(
+        active,
+        release_cohort=release_cohort,
+        mapping_sha256=hashlib.sha256(mapping_content).hexdigest(),
+        cohort_sha256=cohort_sha256,
+        has_sandbox_bundle="apns_sandbox_p8" in mapping,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
 
 
 def _fsync_regular_file(path: Path, expected_uid: int, expected_gid: int) -> None:

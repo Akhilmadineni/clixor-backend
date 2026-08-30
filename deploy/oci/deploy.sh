@@ -831,6 +831,9 @@ done
 /usr/bin/python3 "${stable_runtime_controller}" --help 2>/dev/null | \
   grep -q 'commit-pre-migration-boundary' || \
   fail "stable runtime controller is outdated; rerun the explicit bootstrap transition"
+/usr/bin/python3 "${stable_runtime_controller}" --help 2>/dev/null | \
+  grep -q 'snapshot-staging-secrets' || \
+  fail "stable runtime controller lacks staging integrity support; rerun the explicit bootstrap transition"
 
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
@@ -947,6 +950,11 @@ stage_release_boot_tooling
 stage_host_tooling
 capture_host_tooling
 capture_cloudflared_state
+if [ "${candidate_secret_mode}" = "staging" ]; then
+  /usr/bin/python3 "${stable_runtime_controller}" snapshot-staging-secrets \
+    --release "${release_dir}" || \
+    fail "could not bind the staging release to its complete secret cohort"
+fi
 
 previous_image="$(docker inspect clixor-oci-api-a --format '{{.Config.Image}}' 2>/dev/null || true)"
 previous_postgres_id="$(docker inspect clixor-oci-postgres --format '{{.Id}}' 2>/dev/null || true)"
