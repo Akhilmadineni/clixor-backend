@@ -37,6 +37,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	versions := make(map[int64]string)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
@@ -46,6 +47,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("invalid migration name %q", entry.Name())
 		}
+		if previous, exists := versions[version]; exists {
+			return fmt.Errorf("duplicate migration version %d in %q and %q", version, previous, entry.Name())
+		}
+		versions[version] = entry.Name()
 		var applied bool
 		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&applied); err != nil {
 			return err
@@ -81,6 +86,7 @@ func ValidateMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	var required int64
+	versions := make(map[int64]string)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
@@ -90,6 +96,10 @@ func ValidateMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("invalid migration name %q", entry.Name())
 		}
+		if previous, exists := versions[version]; exists {
+			return fmt.Errorf("duplicate migration version %d in %q and %q", version, previous, entry.Name())
+		}
+		versions[version] = entry.Name()
 		if version > required {
 			required = version
 		}

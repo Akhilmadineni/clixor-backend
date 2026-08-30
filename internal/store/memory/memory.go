@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,47 +19,59 @@ import (
 type Store struct {
 	mu sync.RWMutex
 
-	users          map[uuid.UUID]domain.User
-	emailToUser    map[string]uuid.UUID
-	phoneToUser    map[string]uuid.UUID
-	usernameToUser map[string]uuid.UUID
-	externalUsers  map[string]uuid.UUID
-	ageAssurances  map[uuid.UUID]domain.AgeAssurance
-	devices        map[uuid.UUID]domain.Device
-	preKeys        map[uuid.UUID][]domain.OneTimePreKey
-	sessions       map[uuid.UUID]domain.Session
-	conversations  map[uuid.UUID]domain.Conversation
-	members        map[uuid.UUID]map[uuid.UUID]domain.ConversationMember
-	invites        map[uuid.UUID]map[string]uuid.UUID
-	messages       map[uuid.UUID][]domain.Message
-	clientMessages map[string]domain.Message
-	receipts       map[string]domain.Receipt
-	entities       map[string]domain.Entity
-	media          map[uuid.UUID]domain.MediaObject
-	outbox         []domain.OutboxEvent
-	nextOutboxID   int64
+	users                     map[uuid.UUID]domain.User
+	emailToUser               map[string]uuid.UUID
+	phoneToUser               map[string]uuid.UUID
+	usernameToUser            map[string]uuid.UUID
+	externalUsers             map[string]uuid.UUID
+	ageAssurances             map[uuid.UUID]domain.AgeAssurance
+	passwordResets            map[uuid.UUID]domain.PasswordResetChallenge
+	devices                   map[uuid.UUID]domain.Device
+	preKeys                   map[uuid.UUID][]domain.OneTimePreKey
+	sessions                  map[uuid.UUID]domain.Session
+	conversations             map[uuid.UUID]domain.Conversation
+	members                   map[uuid.UUID]map[uuid.UUID]domain.ConversationMember
+	invites                   map[uuid.UUID]map[string]uuid.UUID
+	inviteLinks               map[string]domain.ConversationInvite
+	inviteLinkKeys            map[uuid.UUID]string
+	messages                  map[uuid.UUID][]domain.Message
+	clientMessages            map[string]domain.Message
+	receipts                  map[string]domain.Receipt
+	entities                  map[string]domain.Entity
+	media                     map[uuid.UUID]domain.MediaObject
+	outbox                    []domain.OutboxEvent
+	nextOutboxID              int64
+	pushDeliveries            map[int64]domain.PushDelivery
+	pushDeliveryByEventDevice map[string]int64
+	nextPushDeliveryID        int64
 }
 
 func New() *Store {
 	return &Store{
-		users:          make(map[uuid.UUID]domain.User),
-		emailToUser:    make(map[string]uuid.UUID),
-		phoneToUser:    make(map[string]uuid.UUID),
-		usernameToUser: make(map[string]uuid.UUID),
-		externalUsers:  make(map[string]uuid.UUID),
-		ageAssurances:  make(map[uuid.UUID]domain.AgeAssurance),
-		devices:        make(map[uuid.UUID]domain.Device),
-		preKeys:        make(map[uuid.UUID][]domain.OneTimePreKey),
-		sessions:       make(map[uuid.UUID]domain.Session),
-		conversations:  make(map[uuid.UUID]domain.Conversation),
-		members:        make(map[uuid.UUID]map[uuid.UUID]domain.ConversationMember),
-		invites:        make(map[uuid.UUID]map[string]uuid.UUID),
-		messages:       make(map[uuid.UUID][]domain.Message),
-		clientMessages: make(map[string]domain.Message),
-		receipts:       make(map[string]domain.Receipt),
-		entities:       make(map[string]domain.Entity),
-		media:          make(map[uuid.UUID]domain.MediaObject),
-		nextOutboxID:   1,
+		users:                     make(map[uuid.UUID]domain.User),
+		emailToUser:               make(map[string]uuid.UUID),
+		phoneToUser:               make(map[string]uuid.UUID),
+		usernameToUser:            make(map[string]uuid.UUID),
+		externalUsers:             make(map[string]uuid.UUID),
+		ageAssurances:             make(map[uuid.UUID]domain.AgeAssurance),
+		passwordResets:            make(map[uuid.UUID]domain.PasswordResetChallenge),
+		devices:                   make(map[uuid.UUID]domain.Device),
+		preKeys:                   make(map[uuid.UUID][]domain.OneTimePreKey),
+		sessions:                  make(map[uuid.UUID]domain.Session),
+		conversations:             make(map[uuid.UUID]domain.Conversation),
+		members:                   make(map[uuid.UUID]map[uuid.UUID]domain.ConversationMember),
+		invites:                   make(map[uuid.UUID]map[string]uuid.UUID),
+		inviteLinks:               make(map[string]domain.ConversationInvite),
+		inviteLinkKeys:            make(map[uuid.UUID]string),
+		messages:                  make(map[uuid.UUID][]domain.Message),
+		clientMessages:            make(map[string]domain.Message),
+		receipts:                  make(map[string]domain.Receipt),
+		entities:                  make(map[string]domain.Entity),
+		media:                     make(map[uuid.UUID]domain.MediaObject),
+		nextOutboxID:              1,
+		pushDeliveries:            make(map[int64]domain.PushDelivery),
+		pushDeliveryByEventDevice: make(map[string]int64),
+		nextPushDeliveryID:        1,
 	}
 }
 
@@ -261,41 +274,54 @@ func (s *Store) UpdateUserProfile(_ context.Context, id uuid.UUID, profile json.
 	if !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.User{}, domain.ErrNotFound
 	}
-	var p struct {
-		DisplayName string `json:"display_name"`
-		AvatarURL   string `json:"avatar_url"`
-		Username    string `json:"username"`
+	var patch map[string]any
+	if err := json.Unmarshal(profile, &patch); err != nil || patch == nil {
+		return domain.User{}, domain.ErrInvalid
 	}
-	_ = json.Unmarshal(profile, &p)
-	if p.Username != "" {
-		normalized := normalizeUsernameMemory(p.Username)
-		if len(normalized) < 3 || len(normalized) > 30 {
-			return domain.User{}, domain.ErrInvalid
+	var existing map[string]any
+	if len(user.Profile) > 0 && json.Unmarshal(user.Profile, &existing) != nil {
+		return domain.User{}, domain.ErrInvalid
+	}
+	if existing == nil {
+		existing = make(map[string]any)
+	}
+	if rawUsername, present := patch["username"]; present {
+		old := profileUsername(user.Profile)
+		newUsername := ""
+		if rawUsername != nil {
+			username, ok := rawUsername.(string)
+			if !ok {
+				return domain.User{}, domain.ErrInvalid
+			}
+			normalized := normalizeUsernameMemory(username)
+			if normalized != "" {
+				if len(normalized) < 3 || len(normalized) > 30 {
+					return domain.User{}, domain.ErrInvalid
+				}
+				if owner, exists := s.usernameToUser[normalized]; exists && owner != id {
+					return domain.User{}, domain.ErrConflict
+				}
+				patch["username"] = "@" + normalized
+				newUsername = normalized
+			}
 		}
-		if existing, exists := s.usernameToUser[normalized]; exists && existing != id {
-			return domain.User{}, domain.ErrConflict
-		}
-		if old := profileUsername(user.Profile); old != "" && old != normalized {
+		if old != "" && old != newUsername {
 			delete(s.usernameToUser, old)
 		}
-		var raw map[string]any
-		if err := json.Unmarshal(profile, &raw); err != nil {
-			return domain.User{}, domain.ErrInvalid
+		if newUsername != "" {
+			s.usernameToUser[newUsername] = id
 		}
-		raw["username"] = "@" + normalized
-		encoded, err := json.Marshal(raw)
-		if err != nil {
-			return domain.User{}, err
-		}
-		profile = encoded
-		s.usernameToUser[normalized] = id
 	}
-	user.Profile = cloneJSON(profile)
-	if p.DisplayName != "" {
-		user.DisplayName = p.DisplayName
+	for key, value := range patch {
+		existing[key] = value
 	}
-	if p.AvatarURL != "" {
-		user.AvatarURL = p.AvatarURL
+	merged, err := json.Marshal(existing)
+	if err != nil {
+		return domain.User{}, err
+	}
+	user.Profile = merged
+	if displayName, ok := patch["display_name"].(string); ok && displayName != "" {
+		user.DisplayName = displayName
 	}
 	user.UpdatedAt = time.Now().UTC()
 	s.users[id] = user
@@ -402,7 +428,8 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 		}
 	}
 	for id, mediaObject := range s.media {
-		if _, deleted := deletedConversations[mediaObject.ConversationID]; deleted {
+		_, conversationDeleted := deletedConversations[mediaObject.ConversationID]
+		if conversationDeleted || (mediaObject.Scope == domain.MediaScopeProfile && mediaObject.OwnerID == userID) {
 			objectKeys = append(objectKeys, mediaObject.ObjectKey)
 			delete(s.media, id)
 		}
@@ -417,12 +444,29 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			delete(s.invites, conversationID)
 		}
 	}
+	for tokenKey, invite := range s.inviteLinks {
+		if _, deleted := deletedConversations[invite.ConversationID]; deleted {
+			delete(s.inviteLinks, tokenKey)
+			delete(s.inviteLinkKeys, invite.ID)
+			continue
+		}
+		if invite.CreatedBy == userID && invite.RevokedAt == nil {
+			revokedAt := now
+			invite.RevokedAt = &revokedAt
+			s.inviteLinks[tokenKey] = invite
+		}
+	}
 	for key, linkedUserID := range s.externalUsers {
 		if linkedUserID == userID {
 			delete(s.externalUsers, key)
 		}
 	}
 	delete(s.ageAssurances, userID)
+	for challengeID, challenge := range s.passwordResets {
+		if challenge.UserID == userID {
+			delete(s.passwordResets, challengeID)
+		}
+	}
 	for sessionID, session := range s.sessions {
 		if session.UserID == userID {
 			delete(s.sessions, sessionID)
@@ -453,14 +497,23 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 	s.users[userID] = user
 
 	filtered := s.outbox[:0]
+	removedOutboxIDs := make(map[int64]struct{})
 	needles := [][]byte{[]byte(userID.String()), []byte(identity.Email), []byte(identity.Phone), []byte(identity.Username)}
 	for _, event := range s.outbox {
 		if _, deleted := deletedConversations[event.AggregateID]; deleted || containsAny(event.Payload, needles) {
+			removedOutboxIDs[event.ID] = struct{}{}
 			continue
 		}
 		filtered = append(filtered, event)
 	}
 	s.outbox = filtered
+	for deliveryID, delivery := range s.pushDeliveries {
+		if _, removed := removedOutboxIDs[delivery.OutboxEventID]; !removed {
+			continue
+		}
+		delete(s.pushDeliveries, deliveryID)
+		delete(s.pushDeliveryByEventDevice, pushDeliveryKey(delivery.OutboxEventID, delivery.DeviceID))
+	}
 	for _, entity := range updatedEntities {
 		payload, _ := json.Marshal(entity)
 		s.appendOutbox("entity.updated", entity.ConversationID, payload)
@@ -502,6 +555,7 @@ func containsAny(payload []byte, needles [][]byte) bool {
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
 	if device.ID == uuid.Nil {
 		device.ID = uuid.New()
 	}
@@ -522,6 +576,17 @@ func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.De
 	}
 	if device.CreatedAt.IsZero() {
 		device.CreatedAt = time.Now().UTC()
+	}
+	if device.PushToken != "" {
+		// A nonempty APNs token identifies one installation. Moving it to this
+		// authenticated device atomically removes it from every previous row.
+		for existingID, existing := range s.devices {
+			if existingID == device.ID || existing.PushToken != device.PushToken {
+				continue
+			}
+			existing.PushToken = ""
+			s.devices[existingID] = existing
+		}
 	}
 	device.LastSeenAt = time.Now().UTC()
 	s.devices[device.ID] = device
@@ -773,6 +838,12 @@ func (s *Store) DeleteConversation(_ context.Context, conversationID, actorID uu
 	delete(s.conversations, conversationID)
 	delete(s.members, conversationID)
 	delete(s.invites, conversationID)
+	for tokenKey, invite := range s.inviteLinks {
+		if invite.ConversationID == conversationID {
+			delete(s.inviteLinks, tokenKey)
+			delete(s.inviteLinkKeys, invite.ID)
+		}
+	}
 	delete(s.messages, conversationID)
 	return nil
 }
@@ -917,6 +988,141 @@ func (s *Store) ClaimConversationInvites(_ context.Context, userID uuid.UUID, ph
 	return claimed, nil
 }
 
+func (s *Store) CreateConversationInvite(_ context.Context, p store.CreateConversationInviteParams) (domain.ConversationInvite, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(p.TokenHash) != 32 || p.MaxUses < 1 || p.MaxUses > 1000 || !p.ExpiresAt.After(time.Now()) {
+		return domain.ConversationInvite{}, domain.ErrInvalid
+	}
+	conversation, exists := s.conversations[p.ConversationID]
+	actor, member := s.members[p.ConversationID][p.ActorID]
+	if !exists || !member || (actor.Role != "owner" && actor.Role != "admin") {
+		return domain.ConversationInvite{}, domain.ErrForbidden
+	}
+	if conversation.Kind != "group" {
+		return domain.ConversationInvite{}, domain.ErrInvalid
+	}
+	if p.ID == uuid.Nil {
+		p.ID = uuid.New()
+	}
+	tokenKey := string(p.TokenHash)
+	if _, duplicate := s.inviteLinks[tokenKey]; duplicate {
+		return domain.ConversationInvite{}, domain.ErrConflict
+	}
+	if _, duplicate := s.inviteLinkKeys[p.ID]; duplicate {
+		return domain.ConversationInvite{}, domain.ErrConflict
+	}
+	now := time.Now().UTC()
+	invite := domain.ConversationInvite{
+		ID: p.ID, ConversationID: p.ConversationID, CreatedBy: p.ActorID,
+		MaxUses: p.MaxUses, ExpiresAt: p.ExpiresAt.UTC(), CreatedAt: now,
+	}
+	s.inviteLinks[tokenKey] = invite
+	s.inviteLinkKeys[invite.ID] = tokenKey
+	return invite, nil
+}
+
+func (s *Store) ConversationInvitePreview(_ context.Context, tokenHash []byte, userID uuid.UUID) (domain.ConversationInvitePreview, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	invite, ok := s.inviteLinks[string(tokenHash)]
+	if !ok {
+		return domain.ConversationInvitePreview{}, domain.ErrNotFound
+	}
+	if err := conversationInviteActiveError(invite, time.Now()); err != nil {
+		return domain.ConversationInvitePreview{}, err
+	}
+	conversation, ok := s.conversations[invite.ConversationID]
+	if !ok {
+		return domain.ConversationInvitePreview{}, domain.ErrNotFound
+	}
+	_, alreadyMember := s.members[invite.ConversationID][userID]
+	return domain.ConversationInvitePreview{
+		InviteID: invite.ID, Kind: conversation.Kind, Title: conversation.Title,
+		AvatarURL: conversation.AvatarURL, ExpiresAt: invite.ExpiresAt,
+		AlreadyMember: alreadyMember,
+	}, nil
+}
+
+func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, userID uuid.UUID) (domain.ConversationInviteAcceptance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tokenKey := string(tokenHash)
+	invite, ok := s.inviteLinks[tokenKey]
+	if !ok {
+		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
+	}
+	now := time.Now().UTC()
+	if invite.RevokedAt != nil {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
+	}
+	conversation, ok := s.conversations[invite.ConversationID]
+	if !ok {
+		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
+	}
+	members := s.members[invite.ConversationID]
+	if _, alreadyMember := members[userID]; alreadyMember {
+		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
+	}
+	if invite.Uses >= invite.MaxUses {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExhausted
+	}
+	if conversation.Kind != "group" || len(members) >= 1024 {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInvalid
+	}
+	members[userID] = domain.ConversationMember{
+		ConversationID: conversation.ID, UserID: userID, Role: "member", JoinedAt: now,
+	}
+	invite.Uses++
+	s.inviteLinks[tokenKey] = invite
+	conversation.UpdatedAt = now
+	s.conversations[conversation.ID] = conversation
+	payload, _ := json.Marshal(domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: userID, UserID: userID,
+	})
+	s.appendOutbox("conversation.member_added", conversation.ID, payload)
+	return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: true}, nil
+}
+
+func (s *Store) RevokeConversationInvite(_ context.Context, conversationID, actorID, inviteID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	actor, ok := s.members[conversationID][actorID]
+	if !ok || (actor.Role != "owner" && actor.Role != "admin") {
+		return domain.ErrForbidden
+	}
+	tokenKey, ok := s.inviteLinkKeys[inviteID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	invite := s.inviteLinks[tokenKey]
+	if invite.ConversationID != conversationID {
+		return domain.ErrNotFound
+	}
+	if invite.RevokedAt == nil {
+		now := time.Now().UTC()
+		invite.RevokedAt = &now
+		s.inviteLinks[tokenKey] = invite
+	}
+	return nil
+}
+
+func conversationInviteActiveError(invite domain.ConversationInvite, now time.Time) error {
+	if invite.RevokedAt != nil {
+		return domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ErrInviteExpired
+	}
+	if invite.Uses >= invite.MaxUses {
+		return domain.ErrInviteExhausted
+	}
+	return nil
+}
+
 func (s *Store) RemoveConversationMember(_ context.Context, conversationID, actorID, userID uuid.UUID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1008,21 +1214,38 @@ func (s *Store) CreateMessage(_ context.Context, p store.CreateMessageParams) (d
 	return message, memberIDs(members), nil
 }
 
-func (s *Store) ListMessages(_ context.Context, conversationID, userID uuid.UUID, afterSeq int64, limit int) ([]domain.Message, error) {
+func (s *Store) ListMessages(_ context.Context, p store.ListMessagesParams) ([]domain.Message, error) {
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if _, ok := s.members[conversationID][userID]; !ok {
+	if _, ok := s.members[p.ConversationID][p.UserID]; !ok {
 		return nil, domain.ErrForbidden
 	}
-	var result []domain.Message
-	for _, message := range s.messages[conversationID] {
-		if message.Seq > afterSeq {
+	messages := s.messages[p.ConversationID]
+	result := make([]domain.Message, 0, min(p.Limit, len(messages)))
+	if p.AfterSeq != nil {
+		for _, message := range messages {
+			if message.Seq <= *p.AfterSeq {
+				continue
+			}
 			result = append(result, message)
-			if len(result) == limit {
+			if len(result) == p.Limit {
 				break
 			}
 		}
+		return result, nil
 	}
+
+	end := len(messages)
+	if p.BeforeSeq != nil {
+		end = sort.Search(len(messages), func(index int) bool {
+			return messages[index].Seq >= *p.BeforeSeq
+		})
+	}
+	start := max(0, end-p.Limit)
+	result = append(result, messages[start:end]...)
 	return result, nil
 }
 
@@ -1140,6 +1363,23 @@ func (s *Store) CreateMedia(_ context.Context, media domain.MediaObject) (domain
 	if _, ok := s.members[media.ConversationID][media.OwnerID]; !ok {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	media.Scope = domain.MediaScopeConversation
+	return s.createMediaLocked(media)
+}
+
+func (s *Store) CreateProfileMedia(_ context.Context, media domain.MediaObject) (domain.MediaObject, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[media.OwnerID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.MediaObject{}, domain.ErrNotFound
+	}
+	media.Scope = domain.MediaScopeProfile
+	media.ConversationID = uuid.Nil
+	return s.createMediaLocked(media)
+}
+
+func (s *Store) createMediaLocked(media domain.MediaObject) (domain.MediaObject, error) {
 	if _, exists := s.media[media.ID]; exists {
 		return domain.MediaObject{}, domain.ErrConflict
 	}
@@ -1153,8 +1393,14 @@ func (s *Store) Media(_ context.Context, id, actorID uuid.UUID) (domain.MediaObj
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	media, ok := s.media[id]
-	if !ok {
+	if !ok || media.Status == "deleted" {
 		return domain.MediaObject{}, domain.ErrNotFound
+	}
+	if media.Scope == domain.MediaScopeProfile {
+		if media.Status != "ready" && media.OwnerID != actorID {
+			return domain.MediaObject{}, domain.ErrForbidden
+		}
+		return media, nil
 	}
 	if _, ok := s.members[media.ConversationID][actorID]; !ok {
 		return domain.MediaObject{}, domain.ErrForbidden
@@ -1172,19 +1418,107 @@ func (s *Store) MarkMediaReady(_ context.Context, id, actorID uuid.UUID) (domain
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	if media.Status != "pending" {
+		return domain.MediaObject{}, domain.ErrConflict
+	}
 	media.Status = "ready"
 	media.UpdatedAt = time.Now().UTC()
 	s.media[id] = media
+	if media.Scope == domain.MediaScopeProfile {
+		reference := "clustr-media://" + media.ID.String()
+		user := s.users[actorID]
+		oldReference := user.AvatarURL
+		user.AvatarURL = reference
+		user.Profile = setProfileMediaReference(user.Profile, reference)
+		user.UpdatedAt = media.UpdatedAt
+		s.users[actorID] = user
+		if oldID := profileMediaID(oldReference); oldID != uuid.Nil && oldID != media.ID {
+			if old, ok := s.media[oldID]; ok && old.OwnerID == actorID && old.Scope == domain.MediaScopeProfile && old.Status != "deleted" {
+				old.Status = "deleted"
+				old.UpdatedAt = media.UpdatedAt
+				s.media[oldID] = old
+				s.appendMediaDelete(actorID, old.ObjectKey)
+			}
+		}
+	}
 	return media, nil
+}
+
+func (s *Store) DeleteMedia(_ context.Context, id, actorID uuid.UUID) (domain.MediaObject, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	media, ok := s.media[id]
+	if !ok || media.Status == "deleted" {
+		return domain.MediaObject{}, domain.ErrNotFound
+	}
+	if media.OwnerID != actorID {
+		return domain.MediaObject{}, domain.ErrForbidden
+	}
+	media.Status = "deleted"
+	media.UpdatedAt = time.Now().UTC()
+	s.media[id] = media
+	if media.Scope == domain.MediaScopeProfile {
+		user := s.users[actorID]
+		if profileMediaID(user.AvatarURL) == id {
+			user.AvatarURL = ""
+			user.Profile = setProfileMediaReference(user.Profile, "")
+			user.UpdatedAt = media.UpdatedAt
+			s.users[actorID] = user
+		}
+	}
+	s.appendMediaDelete(actorID, media.ObjectKey)
+	return media, nil
+}
+
+func (s *Store) appendMediaDelete(aggregateID uuid.UUID, objectKey string) {
+	payload, _ := json.Marshal(store.MediaDeletePayload{ObjectKeys: []string{objectKey}})
+	s.appendOutbox("media.delete", aggregateID, payload)
+}
+
+func profileMediaID(reference string) uuid.UUID {
+	const prefix = "clustr-media://"
+	if !strings.HasPrefix(reference, prefix) {
+		return uuid.Nil
+	}
+	id, _ := uuid.Parse(strings.TrimPrefix(reference, prefix))
+	return id
+}
+
+func setProfileMediaReference(profile json.RawMessage, reference string) json.RawMessage {
+	value := make(map[string]any)
+	if len(profile) > 0 {
+		_ = json.Unmarshal(profile, &value)
+	}
+	delete(value, "profileImageURL")
+	if reference == "" {
+		delete(value, "profile_image_url")
+	} else {
+		value["profile_image_url"] = reference
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return profile
+	}
+	return encoded
 }
 
 func (s *Store) LockOutboxBatch(_ context.Context, limit int) ([]domain.OutboxEvent, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if limit > len(s.outbox) {
-		limit = len(s.outbox)
+	if limit < 1 {
+		return nil, domain.ErrInvalid
 	}
-	return append([]domain.OutboxEvent(nil), s.outbox[:limit]...), nil
+	result := make([]domain.OutboxEvent, 0, min(limit, len(s.outbox)))
+	for _, event := range s.outbox {
+		if event.PublishedAt != nil {
+			continue
+		}
+		result = append(result, event)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (s *Store) MarkOutboxPublished(_ context.Context, ids []int64) error {
@@ -1194,14 +1528,271 @@ func (s *Store) MarkOutboxPublished(_ context.Context, ids []int64) error {
 	for _, id := range ids {
 		set[id] = struct{}{}
 	}
-	filtered := s.outbox[:0]
-	for _, event := range s.outbox {
-		if _, ok := set[event.ID]; !ok {
-			filtered = append(filtered, event)
+	now := time.Now().UTC()
+	for index := range s.outbox {
+		if _, ok := set[s.outbox[index].ID]; ok && s.outbox[index].PublishedAt == nil {
+			publishedAt := now
+			s.outbox[index].PublishedAt = &publishedAt
 		}
 	}
-	s.outbox = filtered
 	return nil
+}
+
+func (s *Store) EnqueuePushDeliveries(
+	_ context.Context,
+	delivery domain.PushDelivery,
+	recipientIDs []uuid.UUID,
+) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if delivery.OutboxEventID < 1 || delivery.ConversationID == uuid.Nil ||
+		delivery.EntityID == uuid.Nil || strings.TrimSpace(delivery.NotificationID) == "" {
+		return 0, domain.ErrInvalid
+	}
+	recipients := make(map[uuid.UUID]struct{}, len(recipientIDs))
+	for _, recipientID := range recipientIDs {
+		if recipientID != uuid.Nil {
+			recipients[recipientID] = struct{}{}
+		}
+	}
+	inserted := 0
+	now := time.Now().UTC()
+	for deviceID, device := range s.devices {
+		if _, eligible := recipients[device.UserID]; !eligible ||
+			device.Platform != "ios" || device.PushToken == "" {
+			continue
+		}
+		key := pushDeliveryKey(delivery.OutboxEventID, deviceID)
+		if _, duplicate := s.pushDeliveryByEventDevice[key]; duplicate {
+			continue
+		}
+		queued := delivery
+		queued.DeviceID = deviceID
+		queued.ID = s.nextPushDeliveryID
+		s.nextPushDeliveryID++
+		queued.Status = domain.PushDeliveryPending
+		queued.Attempts = 0
+		queued.NextAttemptAt = now
+		queued.CreatedAt = now
+		queued.LeaseToken = uuid.Nil
+		queued.LockedUntil = time.Time{}
+		s.pushDeliveries[queued.ID] = queued
+		s.pushDeliveryByEventDevice[key] = queued.ID
+		inserted++
+	}
+	return inserted, nil
+}
+
+func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.PushDelivery, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit < 1 {
+		return nil, domain.ErrInvalid
+	}
+	now := time.Now().UTC()
+	ids := make([]int64, 0, len(s.pushDeliveries))
+	for id, delivery := range s.pushDeliveries {
+		if delivery.Status == domain.PushDeliveryPending &&
+			!delivery.NextAttemptAt.After(now) &&
+			(delivery.LockedUntil.IsZero() || !delivery.LockedUntil.After(now)) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := s.pushDeliveries[ids[i]], s.pushDeliveries[ids[j]]
+		if !left.NextAttemptAt.Equal(right.NextAttemptAt) {
+			return left.NextAttemptAt.Before(right.NextAttemptAt)
+		}
+		return ids[i] < ids[j]
+	})
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	claimed := make([]domain.PushDelivery, 0, len(ids))
+	for _, id := range ids {
+		delivery := s.pushDeliveries[id]
+		delivery.Attempts++
+		delivery.LeaseToken = uuid.New()
+		delivery.LockedUntil = now.Add(2 * time.Minute)
+		if device, ok := s.devices[delivery.DeviceID]; ok {
+			delivery.UserID = device.UserID
+			delivery.PushToken = device.PushToken
+		}
+		s.pushDeliveries[id] = delivery
+		claimed = append(claimed, delivery)
+	}
+	return claimed, nil
+}
+
+func (s *Store) FinishPushDelivery(
+	_ context.Context,
+	id int64,
+	leaseToken uuid.UUID,
+	result string,
+	nextAttemptAt time.Time,
+	errorClass string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delivery, ok := s.pushDeliveries[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if delivery.Status != domain.PushDeliveryPending || delivery.LeaseToken != leaseToken {
+		return domain.ErrConflict
+	}
+	now := time.Now().UTC()
+	switch result {
+	case domain.PushDeliveryPending:
+		if nextAttemptAt.IsZero() {
+			nextAttemptAt = now
+		}
+		delivery.NextAttemptAt = nextAttemptAt
+	case domain.PushDeliveryDelivered, domain.PushDeliveryInvalidToken, domain.PushDeliveryCanceled:
+		delivery.Status = result
+		delivery.DeliveredAt = &now
+	case domain.PushDeliveryDeadLetter:
+		delivery.Status = result
+		delivery.DeadLetteredAt = &now
+	default:
+		return domain.ErrInvalid
+	}
+	delivery.LastErrorClass = errorClass
+	delivery.LeaseToken = uuid.Nil
+	delivery.LockedUntil = time.Time{}
+	s.pushDeliveries[id] = delivery
+	return nil
+}
+
+func (s *Store) InvalidatePushDelivery(
+	_ context.Context,
+	id int64,
+	leaseToken, userID, deviceID uuid.UUID,
+	pushToken string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delivery, ok := s.pushDeliveries[id]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	if delivery.Status != domain.PushDeliveryPending || delivery.LeaseToken != leaseToken ||
+		delivery.DeviceID != deviceID {
+		return domain.ErrConflict
+	}
+	device, ok := s.devices[deviceID]
+	if !ok || device.UserID != userID {
+		return domain.ErrNotFound
+	}
+	if device.PushToken == pushToken {
+		device.PushToken = ""
+		s.devices[deviceID] = device
+	}
+	now := time.Now().UTC()
+	delivery.Status = domain.PushDeliveryInvalidToken
+	delivery.DeliveredAt = &now
+	delivery.LastErrorClass = "invalid_token"
+	delivery.LeaseToken = uuid.Nil
+	delivery.LockedUntil = time.Time{}
+	s.pushDeliveries[id] = delivery
+	return nil
+}
+
+func (s *Store) PrunePushDeliveries(
+	_ context.Context,
+	deliveredBefore, deadLetterBefore time.Time,
+	limit int,
+) (int64, error) {
+	if limit < 1 || limit > store.MaxRetentionPruneBatchSize {
+		return 0, domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unpublishedOutbox := make(map[int64]struct{}, len(s.outbox))
+	for _, event := range s.outbox {
+		if event.PublishedAt == nil {
+			unpublishedOutbox[event.ID] = struct{}{}
+		}
+	}
+	candidates := make([]domain.PushDelivery, 0, len(s.pushDeliveries))
+	for id, delivery := range s.pushDeliveries {
+		if _, sourcePending := unpublishedOutbox[delivery.OutboxEventID]; sourcePending {
+			continue
+		}
+		remove := (delivery.Status == domain.PushDeliveryDelivered ||
+			delivery.Status == domain.PushDeliveryInvalidToken ||
+			delivery.Status == domain.PushDeliveryCanceled) &&
+			delivery.DeliveredAt != nil && delivery.DeliveredAt.Before(deliveredBefore)
+		remove = remove || (delivery.Status == domain.PushDeliveryDeadLetter &&
+			delivery.DeadLetteredAt != nil && delivery.DeadLetteredAt.Before(deadLetterBefore))
+		if !remove {
+			continue
+		}
+		delivery.ID = id
+		candidates = append(candidates, delivery)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, right := terminalPushTime(candidates[i]), terminalPushTime(candidates[j])
+		if !left.Equal(right) {
+			return left.Before(right)
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	for _, delivery := range candidates {
+		delete(s.pushDeliveries, delivery.ID)
+		delete(s.pushDeliveryByEventDevice, pushDeliveryKey(delivery.OutboxEventID, delivery.DeviceID))
+	}
+	return int64(len(candidates)), nil
+}
+
+func (s *Store) PrunePublishedOutbox(
+	_ context.Context,
+	publishedBefore time.Time,
+	limit int,
+) (int64, error) {
+	if limit < 1 || limit > store.MaxRetentionPruneBatchSize {
+		return 0, domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	referenced := make(map[int64]struct{}, len(s.pushDeliveries))
+	for _, delivery := range s.pushDeliveries {
+		referenced[delivery.OutboxEventID] = struct{}{}
+	}
+	candidates := make([]domain.OutboxEvent, 0, len(s.outbox))
+	for _, event := range s.outbox {
+		if event.PublishedAt == nil || !event.PublishedAt.Before(publishedBefore) {
+			continue
+		}
+		if _, retained := referenced[event.ID]; retained {
+			continue
+		}
+		candidates = append(candidates, event)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if !candidates[i].PublishedAt.Equal(*candidates[j].PublishedAt) {
+			return candidates[i].PublishedAt.Before(*candidates[j].PublishedAt)
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	selected := make(map[int64]struct{}, len(candidates))
+	for _, event := range candidates {
+		selected[event.ID] = struct{}{}
+	}
+	retained := s.outbox[:0]
+	for _, event := range s.outbox {
+		if _, remove := selected[event.ID]; !remove {
+			retained = append(retained, event)
+		}
+	}
+	s.outbox = retained
+	return int64(len(candidates)), nil
 }
 
 func (s *Store) appendOutbox(topic string, aggregateID uuid.UUID, payload []byte) {
@@ -1210,6 +1801,20 @@ func (s *Store) appendOutbox(topic string, aggregateID uuid.UUID, payload []byte
 		Payload: cloneJSON(payload), CreatedAt: time.Now().UTC(),
 	})
 	s.nextOutboxID++
+}
+
+func pushDeliveryKey(outboxEventID int64, deviceID uuid.UUID) string {
+	return strconv.FormatInt(outboxEventID, 10) + ":" + deviceID.String()
+}
+
+func terminalPushTime(delivery domain.PushDelivery) time.Time {
+	if delivery.DeadLetteredAt != nil {
+		return *delivery.DeadLetteredAt
+	}
+	if delivery.DeliveredAt != nil {
+		return *delivery.DeliveredAt
+	}
+	return time.Time{}
 }
 
 func entityKey(conversationID uuid.UUID, kind string, id uuid.UUID) string {

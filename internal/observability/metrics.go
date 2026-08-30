@@ -26,6 +26,11 @@ var (
 		Help: "Current authenticated WebSocket connections.",
 	})
 
+	LegacyTransitionMessages = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "messaging", Name: "transition_messages_total",
+		Help: "Accepted production-05b transition messages whose payload is not end-to-end encrypted.",
+	})
+
 	OutboxEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "clustr", Subsystem: "outbox", Name: "events_total",
 		Help: "Transactional outbox processing outcomes.",
@@ -40,6 +45,22 @@ var (
 	PushFailures = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "clustr", Subsystem: "push", Name: "failures_total",
 		Help: "Push notification delivery failures.",
+	})
+
+	PushDeliveries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "push", Name: "deliveries_total",
+		Help: "Durable push delivery lifecycle outcomes.",
+	}, []string{"result"})
+
+	PushDeliveryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "push", Name: "delivery_failures_total",
+		Help: "Durable push delivery failures by bounded, token-free class.",
+	}, []string{"class"})
+
+	PushDeliveryLag = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "clustr", Subsystem: "push", Name: "delivery_lag_seconds",
+		Help:    "Time from durable push creation to APNs acceptance.",
+		Buckets: []float64{0.25, 0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600},
 	})
 
 	VerificationEvents = promauto.NewCounterVec(prometheus.CounterOpts{

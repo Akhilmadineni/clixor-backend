@@ -1,0 +1,18 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appIDs": [
+          "H9S3BAQ9U8.com.Clustr.Clustr.Clustr"
+        ],
+        "components": [
+          {
+            "/": "/join",
+            "comment": "Matches only the fixed Clixor invite landing path."
+          }
+        ]
+      }
+    ]
+  }
+}

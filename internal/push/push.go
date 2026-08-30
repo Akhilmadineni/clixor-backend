@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 )
 
 type Service interface {
@@ -18,6 +19,23 @@ func (Disabled) Send(context.Context, string, string, string, map[string]string,
 	return nil
 }
 func (Disabled) Close() {}
+
+// IsDisabled lets durable workers distinguish an intentionally absent provider
+// from a successful send. Disabled.Send remains a no-op for simple callers, but
+// a queue must not acknowledge work that never reached APNs.
+func IsDisabled(service Service) bool {
+	if service == nil {
+		return true
+	}
+	switch candidate := service.(type) {
+	case Disabled, *Disabled:
+		return true
+	case *EnvironmentFallback:
+		return IsDisabled(candidate.Primary) && IsDisabled(candidate.Fallback)
+	default:
+		return false
+	}
+}
 
 type APS struct {
 	Alert Alert  `json:"alert"`
@@ -71,6 +89,51 @@ func IsInvalidToken(err error) bool {
 	default:
 		return false
 	}
+}
+
+// IsRetryable reports whether a delivery can reasonably succeed later. APNs
+// throttling and provider failures are transient; invalid tokens and other
+// request rejections require registration or configuration changes instead.
+func IsRetryable(err error) bool {
+	if err == nil || IsInvalidToken(err) {
+		return false
+	}
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) {
+		return delivery.StatusCode == 429 || delivery.StatusCode >= 500
+	}
+	return true
+}
+
+// ErrorClass returns a bounded, token-free category safe for metrics and
+// durable operator diagnostics. Provider response bodies and raw tokens are
+// deliberately excluded.
+func ErrorClass(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if IsInvalidToken(err) {
+		return "invalid_token"
+	}
+	var delivery *DeliveryError
+	if errors.As(err, &delivery) {
+		switch {
+		case delivery.StatusCode == 429:
+			return "throttled"
+		case delivery.StatusCode >= 500:
+			return "provider_5xx"
+		default:
+			return "provider_4xx"
+		}
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return "context"
+	}
+	return "network"
 }
 
 // EnvironmentFallback supports both production and sandbox device tokens

@@ -15,6 +15,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
+	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/observability"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
@@ -33,6 +34,7 @@ type Server struct {
 	bus               events.Bus
 	limiter           ratelimit.Limiter
 	media             media.Service
+	mailer            clustrmail.Service
 	verifier          verification.Service
 	apple             appleauth.Verifier
 	presence          presence.Service
@@ -40,20 +42,24 @@ type Server struct {
 	dummyHash         string
 	metricsToken      string
 	trustedProxyCIDRs []netip.Prefix
+	passwordReset     PasswordResetPolicy
 }
 
-const (
-	realtimeRoute = "/realtime"
-	realtimePath  = "/v1" + realtimeRoute
-)
+type PasswordResetPolicy struct {
+	Enabled     bool
+	HMACSecret  string
+	CodeLength  int
+	TTL         time.Duration
+	MaxAttempts int
+}
 
-func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
+func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailer clustrmail.Service, passwordReset PasswordResetPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
 	return &Server{
-		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService,
+		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService, mailer: mailer,
 		verifier: verifier, apple: apple, presence: presenceService, metricsToken: metricsToken,
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
-		logger:            logger, dummyHash: dummyHash,
+		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset,
 	}
 }
 
@@ -62,18 +68,20 @@ func (s *Server) Router() http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(s.requestIDHeader)
 	router.Use(middleware.Recoverer)
-	router.Use(timeoutRESTRequests(30 * time.Second))
+	router.Use(requestTimeoutByRoute(30*time.Second, 2*time.Minute))
 	router.Use(s.securityHeaders)
 	router.Use(s.requestLogger)
 	router.Use(s.rateLimit("api", 600, time.Minute, false))
 
 	router.Get("/health/live", s.live)
 	router.Get("/health/ready", s.ready)
-	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
 	router.Get("/", s.legal)
 	router.Get("/privacy", s.legal)
 	router.Get("/legal", s.legal)
 	router.Get("/terms", s.legal)
+	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
+	router.Get("/apple-app-site-association", s.appleAppSiteAssociation)
+	router.Get("/join", s.joinLanding)
 	router.Handle("/metrics", s.protectMetrics(promhttp.Handler()))
 
 	router.Route("/v1", func(router chi.Router) {
@@ -82,6 +90,10 @@ func (s *Server) Router() http.Handler {
 			router.Use(s.rateLimit("auth", 20, 5*time.Minute, true))
 			router.Post("/register", s.register)
 			router.Post("/login", s.login)
+			router.With(s.rateLimit("password-reset-start", 5, time.Hour, true)).
+				Post("/password/reset/start", s.startPasswordReset)
+			router.With(s.rateLimit("password-reset-confirm", 15, 15*time.Minute, true)).
+				Post("/password/reset/confirm", s.confirmPasswordReset)
 			router.Post("/refresh", s.refresh)
 			router.Post("/phone/start", s.startPhoneVerification)
 			router.Post("/phone/verify", s.verifyPhone)
@@ -100,6 +112,8 @@ func (s *Server) Router() http.Handler {
 				Put("/me/age-assurance", s.putAgeAssurance)
 
 			router.Patch("/me", s.updateProfile)
+			router.With(s.rateLimitIdentity("profile-avatar", 20, time.Hour)).
+				Post("/me/avatar", s.createProfileMediaUpload)
 			router.Post("/me/phone/start", s.startPhoneLink)
 			router.Post("/me/phone/verify", s.verifyPhoneLink)
 			router.Post("/users/lookup", s.lookupUsers)
@@ -123,6 +137,10 @@ func (s *Server) Router() http.Handler {
 					router.Delete("/members/me", s.removeSelfMember)
 					router.Delete("/members/{userID}", s.removeMember)
 					router.Put("/owner", s.transferOwner)
+					router.With(s.rateLimitIdentity("conversation-invite-write", 120, time.Hour)).
+						Post("/invites", s.createConversationInvite)
+					router.With(s.rateLimitIdentity("conversation-invite-write", 120, time.Hour)).
+						Delete("/invites/{inviteID}", s.revokeConversationInvite)
 					router.Get("/messages", s.listMessages)
 					router.Post("/messages", s.createMessage)
 					router.Get("/receipts", s.listReceipts)
@@ -133,27 +151,52 @@ func (s *Server) Router() http.Handler {
 					router.Delete("/entities/{kind}/{entityID}", s.deleteEntity)
 				})
 			})
+			router.With(s.rateLimitIdentity("conversation-invite-preview", 120, time.Minute)).
+				Post("/invites/preview", s.getConversationInvite)
+			router.With(s.rateLimitIdentity("conversation-invite-accept", 30, time.Minute)).
+				Post("/invites/accept", s.acceptConversationInvite)
 			router.Post("/media/{mediaID}/complete", s.completeMediaUpload)
 			router.Get("/media/{mediaID}/download", s.mediaDownload)
-			router.Get(realtimeRoute, s.realtime)
+			router.Delete("/media/{mediaID}", s.deleteMedia)
+			router.Get("/realtime", s.realtime)
 		})
 	})
 	return router
 }
 
-func timeoutRESTRequests(timeout time.Duration) func(http.Handler) http.Handler {
+func requestTimeoutByRoute(
+	defaultTimeout time.Duration,
+	mediaCompletionTimeout time.Duration,
+) func(http.Handler) http.Handler {
+	withDefaultTimeout := middleware.Timeout(defaultTimeout)
+	withMediaCompletionTimeout := middleware.Timeout(mediaCompletionTimeout)
 	return func(next http.Handler) http.Handler {
-		withTimeout := middleware.Timeout(timeout)(next)
+		defaultTimed := withDefaultTimeout(next)
+		mediaCompletionTimed := withMediaCompletionTimeout(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Realtime connections have their own heartbeat and socket deadlines and
-			// must remain open beyond the REST request budget.
-			if r.URL.Path == realtimePath {
+			if r.URL.Path == "/v1/realtime" {
 				next.ServeHTTP(w, r)
 				return
 			}
-			withTimeout.ServeHTTP(w, r)
+			if isMediaCompletionRequest(r) {
+				mediaCompletionTimed.ServeHTTP(w, r)
+				return
+			}
+			defaultTimed.ServeHTTP(w, r)
 		})
 	}
+}
+
+func isMediaCompletionRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "media" || parts[3] != "complete" {
+		return false
+	}
+	_, err := uuid.Parse(parts[2])
+	return err == nil
 }
 
 func (s *Server) requestIDHeader(next http.Handler) http.Handler {

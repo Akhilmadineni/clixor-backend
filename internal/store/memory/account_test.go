@@ -12,6 +12,49 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestUpdateUserProfileMergesSparsePatches(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	t.Cleanup(persistence.Close)
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "profile-merge@example.com", DisplayName: "Original", PasswordHash: "hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err = persistence.UpdateUserProfile(ctx, user.ID, json.RawMessage(
+		`{"display_name":"Merged","username":"@merge_user","bio":"first"}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err = persistence.UpdateUserProfile(ctx, user.ID, json.RawMessage(
+		`{"bio":"second","auto_settle_settings":{"enabled":true}}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile map[string]any
+	if err := json.Unmarshal(user.Profile, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile["username"] != "@merge_user" || profile["display_name"] != "Merged" ||
+		profile["bio"] != "second" {
+		t.Fatalf("sparse update replaced unrelated fields: %s", user.Profile)
+	}
+	users, err := persistence.UsersByUsernames(ctx, []string{"@merge_user"})
+	if err != nil || len(users) != 1 {
+		t.Fatalf("username index was not preserved: users=%+v err=%v", users, err)
+	}
+	if _, err := persistence.UpdateUserProfile(ctx, user.ID, json.RawMessage(`{"username":null}`)); err != nil {
+		t.Fatal(err)
+	}
+	users, err = persistence.UsersByUsernames(ctx, []string{"@merge_user"})
+	if err != nil || len(users) != 0 {
+		t.Fatalf("cleared username remained indexed: users=%+v err=%v", users, err)
+	}
+}
+
 func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testing.T) {
 	ctx := context.Background()
 	persistence := New()
@@ -52,6 +95,13 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 	if err := persistence.CreateSession(ctx, session); err != nil {
 		t.Fatal(err)
 	}
+	resetChallenge := domain.PasswordResetChallenge{
+		ID: uuid.New(), UserID: user.ID, CodeHash: []byte("reset-secret"),
+		ExpiresAt: time.Now().UTC().Add(10 * time.Minute), CreatedAt: time.Now().UTC(),
+	}
+	if err := persistence.CreatePasswordResetChallenge(ctx, resetChallenge); err != nil {
+		t.Fatal(err)
+	}
 	personal, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
 		Kind: "group", Title: "Private", CreatedBy: user.ID,
 	})
@@ -68,6 +118,9 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 
 	if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := persistence.passwordResets[resetChallenge.ID]; ok {
+		t.Fatal("password reset challenge remained after account deletion")
 	}
 	for label, lookup := range map[string]func() error{
 		"email": func() error { _, err := persistence.UserByEmail(ctx, user.Email); return err },

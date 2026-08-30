@@ -14,6 +14,9 @@ var (
 	ErrForbidden       = errors.New("forbidden")
 	ErrUnauthenticated = errors.New("unauthenticated")
 	ErrInvalid         = errors.New("invalid input")
+	ErrInviteRevoked   = errors.New("invite revoked")
+	ErrInviteExpired   = errors.New("invite expired")
+	ErrInviteExhausted = errors.New("invite exhausted")
 )
 
 type User struct {
@@ -65,6 +68,18 @@ type Session struct {
 	CreatedAt                time.Time
 }
 
+// PasswordResetChallenge contains only a one-way verifier for the emailed
+// code. The raw code is never stored in PostgreSQL, Redis, logs, or events.
+type PasswordResetChallenge struct {
+	ID         uuid.UUID
+	UserID     uuid.UUID
+	CodeHash   []byte
+	Attempts   int
+	ExpiresAt  time.Time
+	ConsumedAt *time.Time
+	CreatedAt  time.Time
+}
+
 type OneTimePreKey struct {
 	ID        int64      `json:"-"`
 	DeviceID  uuid.UUID  `json:"-"`
@@ -106,6 +121,36 @@ type ConversationMemberAdded struct {
 	UserID         uuid.UUID `json:"user_id"`
 }
 
+// ConversationInvite contains only persisted invite metadata. The raw invite
+// token is deliberately absent: it is returned once by the create endpoint and
+// only its SHA-256 digest crosses the store boundary.
+type ConversationInvite struct {
+	ID             uuid.UUID  `json:"id"`
+	ConversationID uuid.UUID  `json:"conversation_id"`
+	CreatedBy      uuid.UUID  `json:"created_by"`
+	MaxUses        int        `json:"max_uses"`
+	Uses           int        `json:"uses"`
+	ExpiresAt      time.Time  `json:"expires_at"`
+	RevokedAt      *time.Time `json:"revoked_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+}
+
+// ConversationInvitePreview intentionally excludes the conversation ID,
+// metadata, creator identity, membership list, and usage counters.
+type ConversationInvitePreview struct {
+	InviteID      uuid.UUID `json:"invite_id"`
+	Kind          string    `json:"kind"`
+	Title         string    `json:"title,omitempty"`
+	AvatarURL     string    `json:"avatar_url,omitempty"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	AlreadyMember bool      `json:"already_member"`
+}
+
+type ConversationInviteAcceptance struct {
+	Conversation Conversation `json:"conversation"`
+	Joined       bool         `json:"joined"`
+}
+
 type Message struct {
 	ID               uuid.UUID       `json:"id"`
 	ClientMessageID  string          `json:"client_message_id"`
@@ -145,6 +190,7 @@ type MediaObject struct {
 	ID               uuid.UUID `json:"id"`
 	OwnerID          uuid.UUID `json:"owner_id"`
 	ConversationID   uuid.UUID `json:"conversation_id"`
+	Scope            string    `json:"scope"`
 	ObjectKey        string    `json:"-"`
 	ContentType      string    `json:"content_type"`
 	ByteSize         int64     `json:"byte_size"`
@@ -154,12 +200,53 @@ type MediaObject struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+const (
+	MediaScopeConversation = "conversation"
+	MediaScopeProfile      = "profile"
+)
+
 type OutboxEvent struct {
 	ID          int64
 	Topic       string
 	AggregateID uuid.UUID
 	Payload     json.RawMessage
 	CreatedAt   time.Time
+	PublishedAt *time.Time
+}
+
+const (
+	PushDeliveryPending      = "pending"
+	PushDeliveryDelivered    = "delivered"
+	PushDeliveryInvalidToken = "invalid_token"
+	PushDeliveryDeadLetter   = "dead_letter"
+	PushDeliveryCanceled     = "canceled"
+)
+
+// PushDelivery is a durable, per-device APNs delivery derived idempotently
+// from a transactional outbox event. PushToken is resolved from the device at
+// claim time instead of persisted with the notification so a token reassigned
+// to another account cannot be used by an old delivery.
+type PushDelivery struct {
+	ID             int64
+	OutboxEventID  int64
+	DeviceID       uuid.UUID
+	UserID         uuid.UUID
+	PushToken      string
+	Title          string
+	Body           string
+	Kind           string
+	ConversationID uuid.UUID
+	EntityID       uuid.UUID
+	NotificationID string
+	Status         string
+	Attempts       int
+	NextAttemptAt  time.Time
+	LeaseToken     uuid.UUID
+	LockedUntil    time.Time
+	CreatedAt      time.Time
+	DeliveredAt    *time.Time
+	DeadLetteredAt *time.Time
+	LastErrorClass string
 }
 
 type RealtimeEvent struct {

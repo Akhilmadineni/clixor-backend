@@ -2,6 +2,8 @@ package media
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -24,6 +26,10 @@ type fakeOCIObjectStorageClient struct {
 	headObjectResponse objectstorage.HeadObjectResponse
 	headObjectError    error
 	headObjectRequests []objectstorage.HeadObjectRequest
+
+	getObjectResponse objectstorage.GetObjectResponse
+	getObjectError    error
+	getObjectRequests []objectstorage.GetObjectRequest
 
 	deleteObjectError    error
 	deleteObjectRequests []objectstorage.DeleteObjectRequest
@@ -81,6 +87,14 @@ func (f *fakeOCIObjectStorageClient) HeadObject(
 ) (objectstorage.HeadObjectResponse, error) {
 	f.headObjectRequests = append(f.headObjectRequests, request)
 	return f.headObjectResponse, f.headObjectError
+}
+
+func (f *fakeOCIObjectStorageClient) GetObject(
+	_ context.Context,
+	request objectstorage.GetObjectRequest,
+) (objectstorage.GetObjectResponse, error) {
+	f.getObjectRequests = append(f.getObjectRequests, request)
+	return f.getObjectResponse, f.getObjectError
 }
 
 func (f *fakeOCIObjectStorageClient) DeleteObject(
@@ -184,7 +198,7 @@ func TestOCIVerifyDeletesMismatchedObject(t *testing.T) {
 		headObjectResponse: objectstorage.HeadObjectResponse{ContentLength: &actualSize},
 	}
 	store := newTestOCIStore(t, client)
-	err := store.Verify(context.Background(), "conversations/id/media", 42)
+	err := store.Verify(context.Background(), "conversations/id/media", 42, "")
 	if err == nil || !strings.Contains(err.Error(), "media size mismatch") {
 		t.Fatalf("expected a size mismatch, received %v", err)
 	}
@@ -200,7 +214,7 @@ func TestOCIVerifyAcceptsMatchingObjectWithoutDeletingIt(t *testing.T) {
 		headObjectResponse: objectstorage.HeadObjectResponse{ContentLength: &actualSize},
 	}
 	store := newTestOCIStore(t, client)
-	if err := store.Verify(context.Background(), "conversations/id/media", actualSize); err != nil {
+	if err := store.Verify(context.Background(), "conversations/id/media", actualSize, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.deleteObjectRequests) != 0 {
@@ -215,9 +229,54 @@ func TestOCIVerifyReportsMismatchedObjectCleanupFailure(t *testing.T) {
 		deleteObjectError:  errors.New("delete failed"),
 	}
 	store := newTestOCIStore(t, client)
-	err := store.Verify(context.Background(), "conversations/id/media", 42)
+	err := store.Verify(context.Background(), "conversations/id/media", 42, "")
 	if err == nil || !strings.Contains(err.Error(), "media size mismatch") || !strings.Contains(err.Error(), "delete failed") {
 		t.Fatalf("expected both mismatch and cleanup errors, received %v", err)
+	}
+}
+
+func TestOCIVerifyStreamsAndAcceptsMatchingSHA256(t *testing.T) {
+	content := []byte("encrypted-avatar")
+	contentLength := int64(len(content))
+	digest := sha256.Sum256(content)
+	client := &fakeOCIObjectStorageClient{
+		getObjectResponse: objectstorage.GetObjectResponse{
+			ContentLength: &contentLength,
+			Content:       io.NopCloser(strings.NewReader(string(content))),
+		},
+	}
+	store := newTestOCIStore(t, client)
+	if err := store.Verify(
+		context.Background(), "users/id/avatars/media", contentLength,
+		hex.EncodeToString(digest[:]),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.getObjectRequests) != 1 || len(client.deleteObjectRequests) != 0 {
+		t.Fatalf("unexpected verification calls: get=%d delete=%d", len(client.getObjectRequests), len(client.deleteObjectRequests))
+	}
+}
+
+func TestOCIVerifyDeletesObjectWithMismatchedSHA256(t *testing.T) {
+	content := []byte("tampered-avatar")
+	contentLength := int64(len(content))
+	expected := sha256.Sum256([]byte("expected-avatar"))
+	client := &fakeOCIObjectStorageClient{
+		getObjectResponse: objectstorage.GetObjectResponse{
+			ContentLength: &contentLength,
+			Content:       io.NopCloser(strings.NewReader(string(content))),
+		},
+	}
+	store := newTestOCIStore(t, client)
+	err := store.Verify(
+		context.Background(), "users/id/avatars/media", contentLength,
+		hex.EncodeToString(expected[:]),
+	)
+	if err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
+		t.Fatalf("expected SHA-256 mismatch, received %v", err)
+	}
+	if len(client.deleteObjectRequests) != 1 {
+		t.Fatalf("mismatched object delete count = %d, want 1", len(client.deleteObjectRequests))
 	}
 }
 

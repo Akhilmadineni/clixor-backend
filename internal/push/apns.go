@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,8 @@ type APNS struct {
 	cachedToken string
 	tokenExpiry time.Time
 }
+
+const notificationRetention = 24 * time.Hour
 
 func NewAPNS(teamID, keyID, bundleID, privateKeyFile, environment string) (*APNS, error) {
 	keyData, err := os.ReadFile(privateKeyFile)
@@ -84,7 +87,7 @@ func (a *APNS) Send(ctx context.Context, deviceToken, title, body string, data m
 			}
 		}
 		lastErr = a.sendOnce(ctx, deviceToken, payload, notificationID)
-		if lastErr == nil || !retryable(lastErr) {
+		if lastErr == nil || !IsRetryable(lastErr) {
 			return lastErr
 		}
 	}
@@ -106,7 +109,14 @@ func (a *APNS) sendOnce(ctx context.Context, deviceToken string, payload []byte,
 	request.Header.Set("apns-topic", a.bundleID)
 	request.Header.Set("apns-push-type", "alert")
 	request.Header.Set("apns-priority", "10")
-	request.Header.Set("apns-expiration", "0")
+	// A zero expiration tells APNs to try only once and never store the alert,
+	// which loses notifications whenever a phone is temporarily offline. Keep a
+	// bounded window instead; the app still catches up authoritative state after
+	// reconnect, so older alerts are deliberately allowed to expire.
+	request.Header.Set(
+		"apns-expiration",
+		strconv.FormatInt(time.Now().UTC().Add(notificationRetention).Unix(), 10),
+	)
 	request.Header.Set("apns-id", notificationID)
 	// APNs coalesces pending retries for the same entity instead of displaying
 	// a burst if the durable outbox is replayed after a transient failure.
@@ -125,14 +135,6 @@ func (a *APNS) sendOnce(ctx context.Context, deviceToken string, payload []byte,
 	}
 	_ = json.Unmarshal(raw, &failure)
 	return &DeliveryError{StatusCode: response.StatusCode, Reason: failure.Reason}
-}
-
-func retryable(err error) bool {
-	var delivery *DeliveryError
-	if errors.As(err, &delivery) {
-		return delivery.StatusCode >= 500 && delivery.StatusCode <= 599
-	}
-	return true
 }
 
 func (a *APNS) providerToken() (string, error) {

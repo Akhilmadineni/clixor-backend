@@ -27,11 +27,32 @@ Redis keys, durable storage, metrics, and logs.
 - A transactional outbox prevents committed messages from being lost between
   PostgreSQL and the event/push pipeline.
 - WebSocket events are at-least-once; clients deduplicate by event/message ID.
+- Eligible APNs deliveries are materialized idempotently per outbox event and
+  device before realtime publication. APNs failures therefore retry from a
+  separate durable queue without republishing the realtime event. Exponential
+  backoff is bounded; exhausted and permanent failures enter a retained dead
+  letter state, while invalid/unregistered tokens are removed transactionally.
+- A nonempty APNs token has exactly one device owner. Registration transfers
+  token ownership atomically across accounts, and delivery resolves the current
+  token from that authenticated device instead of persisting a stale token copy.
+- Published outbox rows are transport replay state, not an unbounded audit log.
+  Hourly bounded retention removes terminal per-device rows first, then removes
+  source rows older than the longest push retention window only when no delivery
+  still references them. Partial indexes and `SKIP LOCKED` keep concurrent
+  retention scans bounded across API replicas.
 - The API and database are designed to treat message bodies and media as opaque
   ciphertext and never require server-side decryption.
 - The current Swift transition codec base64-encodes JSON message data and uploads
   raw media bytes. Until audited client cryptography replaces that codec, the
   deployed system does receive plaintext-equivalent content and is not E2EE.
+- The compatibility API accepts that codec only with the exact one-field
+  `{protocol: clustr-transition-v1}` envelope. It does not apply the E2EE device
+  identity or recipient checks because production 05b never published those
+  keys. `clustr_messaging_transition_messages_total` measures remaining use; do
+  not remove the compatibility path until upgraded-client adoption is verified.
+- APNs acceptance and final user presentation are not exactly-once guarantees.
+  A worker crash after APNs accepts a request but before PostgreSQL records the
+  acknowledgement can resend the same collapse/notification ID.
 
 ## End-to-end encryption boundary
 

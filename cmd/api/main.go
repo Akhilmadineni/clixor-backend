@@ -16,6 +16,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/config"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	"github.com/Akhilmadineni/clixor-backend/internal/httpapi"
+	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/outbox"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
@@ -45,6 +46,18 @@ func main() {
 	var verifier verification.Service
 	var pushService push.Service
 	var presenceService presence.Service
+	var mailService clustrmail.Service = clustrmail.Unavailable{}
+	if cfg.Mail.Provider == "smtp" {
+		smtpService, err := clustrmail.NewSMTP(cfg.Mail.SMTPAddress, cfg.Mail.From)
+		if err != nil {
+			logger.Error("configure NAS mail queue", "error", err)
+			os.Exit(1)
+		}
+		mailService = smtpService
+		logger.Info("password reset email provider enabled", "provider", "smtp")
+	} else {
+		logger.Warn("password reset email is disabled until the NAS mail queue is configured")
+	}
 	durableStore := false
 	switch cfg.Store {
 	case "memory":
@@ -233,10 +246,25 @@ func main() {
 	}
 	api := httpapi.New(
 		persistence, tokenManager, bus, limiter, mediaService, verifier, appleVerifier,
-		presenceService, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
+		presenceService, mailService, httpapi.PasswordResetPolicy{
+			Enabled: cfg.Mail.Provider == "smtp", HMACSecret: cfg.Mail.PasswordResetSecret,
+			CodeLength: cfg.Mail.PasswordResetLength, TTL: cfg.Mail.PasswordResetTTL,
+			MaxAttempts: cfg.Mail.PasswordResetMaxAttempts,
+		}, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
 	if durableStore {
-		go outbox.New(persistence, bus, pushService, mediaService, logger).Run(ctx)
+		go outbox.NewWithPushRetryPolicy(
+			persistence, bus, pushService, mediaService, logger,
+			outbox.PushRetryPolicy{
+				BatchSize:           cfg.PushDelivery.BatchSize,
+				WorkerConcurrency:   cfg.PushDelivery.WorkerConcurrency,
+				MaxAttempts:         cfg.PushDelivery.MaxAttempts,
+				BaseDelay:           cfg.PushDelivery.BaseDelay,
+				MaxDelay:            cfg.PushDelivery.MaxDelay,
+				DeliveredRetention:  cfg.PushDelivery.DeliveredRetention,
+				DeadLetterRetention: cfg.PushDelivery.DeadLetterRetention,
+			},
+		).Run(ctx)
 	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

@@ -3,10 +3,12 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
@@ -19,28 +21,90 @@ import (
 )
 
 type Relay struct {
-	store  store.Store
-	bus    events.Bus
-	logger *slog.Logger
-	push   push.Service
-	media  media.Service
+	store     store.Store
+	bus       events.Bus
+	logger    *slog.Logger
+	push      push.Service
+	media     media.Service
+	policy    PushRetryPolicy
+	now       func() time.Time
+	lastPrune time.Time
+}
+
+type PushRetryPolicy struct {
+	BatchSize           int
+	WorkerConcurrency   int
+	MaxAttempts         int
+	BaseDelay           time.Duration
+	MaxDelay            time.Duration
+	DeliveredRetention  time.Duration
+	DeadLetterRetention time.Duration
+}
+
+const (
+	genericPushTitle = "Clixor"
+	genericPushBody  = "You have new activity. Open the app to view it."
+	genericPushKind  = "activity"
+)
+
+func DefaultPushRetryPolicy() PushRetryPolicy {
+	return PushRetryPolicy{
+		BatchSize: 100, WorkerConcurrency: 16, MaxAttempts: 8, BaseDelay: 2 * time.Second,
+		MaxDelay: 15 * time.Minute, DeliveredRetention: 24 * time.Hour,
+		DeadLetterRetention: 30 * 24 * time.Hour,
+	}
 }
 
 func New(store store.Store, bus events.Bus, pushService push.Service, mediaService media.Service, logger *slog.Logger) *Relay {
-	return &Relay{store: store, bus: bus, push: pushService, media: mediaService, logger: logger}
+	return NewWithPushRetryPolicy(store, bus, pushService, mediaService, logger, DefaultPushRetryPolicy())
+}
+
+func NewWithPushRetryPolicy(
+	persistence store.Store,
+	bus events.Bus,
+	pushService push.Service,
+	mediaService media.Service,
+	logger *slog.Logger,
+	policy PushRetryPolicy,
+) *Relay {
+	now := time.Now
+	return &Relay{
+		store: persistence, bus: bus, push: pushService, media: mediaService,
+		logger: logger, policy: policy, now: now, lastPrune: now().UTC(),
+	}
 }
 
 func (r *Relay) Run(ctx context.Context) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.flush(ctx)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.flush(ctx)
+			}
 		}
-	}
+	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.flushPush(ctx)
+				r.pruneRetention(ctx)
+			}
+		}
+	}()
+	workers.Wait()
 }
 
 func (r *Relay) flush(ctx context.Context) {
@@ -68,12 +132,16 @@ func (r *Relay) flush(ctx context.Context) {
 			observability.OutboxEvents.WithLabelValues("translate_failed").Inc()
 			continue
 		}
+		if err := r.enqueuePush(ctx, item, recipients); err != nil {
+			observability.PushDeliveries.WithLabelValues("queue_failed").Inc()
+			r.logger.Error("push_queue_failed", "error", err, "outbox_id", item.ID)
+			continue
+		}
 		if err := r.bus.Publish(ctx, recipients, event); err != nil {
 			observability.OutboxEvents.WithLabelValues("publish_failed").Inc()
 			r.logger.Error("outbox_publish_failed", "error", err, "outbox_id", item.ID)
 			continue
 		}
-		r.sendPush(ctx, item, recipients)
 		observability.OutboxEvents.WithLabelValues("published").Inc()
 		observability.OutboxLag.Observe(time.Since(item.CreatedAt).Seconds())
 		published = append(published, item.ID)
@@ -104,43 +172,203 @@ func (r *Relay) deleteMedia(ctx context.Context, item domain.OutboxEvent) error 
 	return nil
 }
 
-func (r *Relay) sendPush(ctx context.Context, item domain.OutboxEvent, recipients []uuid.UUID) {
-	notification, ok := r.notificationFor(ctx, item, recipients)
-	if !ok {
-		return
+func (r *Relay) enqueuePush(ctx context.Context, item domain.OutboxEvent, recipients []uuid.UUID) error {
+	notification, ok, err := r.notificationFor(ctx, item, recipients)
+	if err != nil {
+		return err
 	}
+	if !ok {
+		return nil
+	}
+	pushRecipients := make([]uuid.UUID, 0, len(recipients))
 	for _, userID := range recipients {
 		if userID == notification.actorID {
 			continue
 		}
-		devices, err := r.store.ListDevices(ctx, userID)
-		if err != nil {
-			r.logger.Error("push_devices_failed", "error", err, "user_id", userID)
-			continue
+		pushRecipients = append(pushRecipients, userID)
+	}
+	inserted, err := r.store.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+		OutboxEventID: item.ID,
+		Title:         notification.title, Body: notification.body, Kind: notification.kind,
+		ConversationID: notification.conversationID, EntityID: notification.entityID,
+		NotificationID: notification.entityID.String(),
+	}, pushRecipients)
+	if err != nil {
+		return err
+	}
+	if inserted > 0 {
+		observability.PushDeliveries.WithLabelValues("queued").Add(float64(inserted))
+	}
+	return nil
+}
+
+func (r *Relay) flushPush(ctx context.Context) {
+	if push.IsDisabled(r.push) {
+		// Keep queued work pending when APNs credentials are intentionally absent.
+		// A later process with a configured provider can claim the same durable
+		// rows; treating Disabled.Send's no-op as success would lose them forever.
+		return
+	}
+	limit := min(r.policy.BatchSize, r.policy.WorkerConcurrency)
+	if limit < 1 {
+		limit = 1
+	}
+	batch, err := r.store.LockPushDeliveryBatch(ctx, limit)
+	if err != nil {
+		observability.PushDeliveries.WithLabelValues("lock_failed").Inc()
+		r.logger.Error("push_delivery_lock_failed", "error", err)
+		return
+	}
+	var workers sync.WaitGroup
+	workers.Add(len(batch))
+	for _, delivery := range batch {
+		delivery := delivery
+		go func() {
+			defer workers.Done()
+			r.deliverPush(ctx, delivery)
+		}()
+	}
+	workers.Wait()
+}
+
+func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
+	if strings.TrimSpace(delivery.PushToken) == "" {
+		if err := r.store.FinishPushDelivery(
+			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryCanceled,
+			time.Time{}, "token_missing",
+		); err != nil {
+			r.logger.Error("push_delivery_cancel_failed", "error", err, "delivery_id", delivery.ID)
+			return
 		}
-		for _, device := range devices {
-			if strings.TrimSpace(device.PushToken) == "" || device.Platform != "ios" {
-				continue
-			}
-			err := r.push.Send(
-				ctx, device.PushToken, notification.title, notification.body,
-				map[string]string{
-					"type":     notification.kind,
-					"groupId":  notification.conversationID.String(),
-					"entityId": notification.entityID.String(),
-				},
-				notification.entityID.String(),
+		observability.PushDeliveries.WithLabelValues("canceled").Inc()
+		return
+	}
+	err := r.push.Send(
+		ctx, delivery.PushToken, genericPushTitle, genericPushBody,
+		map[string]string{"type": genericPushKind},
+		delivery.NotificationID,
+	)
+	if err == nil {
+		if finishErr := r.store.FinishPushDelivery(
+			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryDelivered,
+			time.Time{}, "",
+		); finishErr != nil {
+			r.logger.Error("push_delivery_ack_failed", "error", finishErr, "delivery_id", delivery.ID)
+			return
+		}
+		observability.PushDeliveries.WithLabelValues("delivered").Inc()
+		observability.PushDeliveryLag.Observe(r.now().UTC().Sub(delivery.CreatedAt).Seconds())
+		return
+	}
+
+	observability.PushFailures.Inc()
+	errorClass := push.ErrorClass(err)
+	observability.PushDeliveryFailures.WithLabelValues(errorClass).Inc()
+	// Never log a token or APNs response body; the bounded error class and
+	// identifiers are sufficient to operate the retry queue.
+	r.logger.Error(
+		"push_send_failed", "error_class", errorClass,
+		"delivery_id", delivery.ID, "device_id", delivery.DeviceID,
+		"attempt", delivery.Attempts,
+	)
+	if push.IsInvalidToken(err) {
+		if invalidateErr := r.store.InvalidatePushDelivery(
+			ctx, delivery.ID, delivery.LeaseToken, delivery.UserID,
+			delivery.DeviceID, delivery.PushToken,
+		); invalidateErr != nil {
+			r.logger.Error(
+				"push_token_invalidate_failed", "error", invalidateErr,
+				"delivery_id", delivery.ID, "device_id", delivery.DeviceID,
 			)
-			if err != nil {
-				observability.PushFailures.Inc()
-				r.logger.Error("push_send_failed", "error", err, "device_id", device.ID)
-				if push.IsInvalidToken(err) {
-					if clearErr := r.store.ClearDevicePushToken(ctx, userID, device.ID); clearErr != nil {
-						r.logger.Error("push_token_clear_failed", "error", clearErr, "device_id", device.ID)
-					}
-				}
-			}
+			return
 		}
+		observability.PushDeliveries.WithLabelValues("invalid_token").Inc()
+		return
+	}
+
+	if ctx.Err() != nil {
+		// A graceful shutdown releases the lease immediately instead of waiting
+		// two minutes or incorrectly dead-lettering the delivery.
+		releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = r.store.FinishPushDelivery(
+			releaseContext, delivery.ID, delivery.LeaseToken,
+			domain.PushDeliveryPending, r.now().UTC(), "shutdown",
+		)
+		return
+	}
+	if !push.IsRetryable(err) || delivery.Attempts >= r.policy.MaxAttempts {
+		if finishErr := r.store.FinishPushDelivery(
+			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryDeadLetter,
+			time.Time{}, errorClass,
+		); finishErr != nil {
+			r.logger.Error("push_dead_letter_failed", "error", finishErr, "delivery_id", delivery.ID)
+			return
+		}
+		observability.PushDeliveries.WithLabelValues("dead_letter").Inc()
+		return
+	}
+	nextAttempt := r.now().UTC().Add(r.retryDelay(delivery))
+	if finishErr := r.store.FinishPushDelivery(
+		ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryPending,
+		nextAttempt, errorClass,
+	); finishErr != nil {
+		r.logger.Error("push_retry_schedule_failed", "error", finishErr, "delivery_id", delivery.ID)
+		return
+	}
+	observability.PushDeliveries.WithLabelValues("retry_scheduled").Inc()
+}
+
+func (r *Relay) retryDelay(delivery domain.PushDelivery) time.Duration {
+	delay := r.policy.BaseDelay
+	for attempt := 1; attempt < delivery.Attempts && delay < r.policy.MaxDelay; attempt++ {
+		if delay > r.policy.MaxDelay/2 {
+			delay = r.policy.MaxDelay
+			break
+		}
+		delay *= 2
+	}
+	if delay > r.policy.MaxDelay {
+		delay = r.policy.MaxDelay
+	}
+	if delay <= 0 {
+		return 0
+	}
+	// Stable 50-100% jitter spreads a provider recovery surge without making
+	// delivery tests probabilistic.
+	seed := uint64(delivery.ID)*1103515245 + uint64(delivery.Attempts)*12345
+	return delay/2 + time.Duration(seed%501)*delay/1000
+}
+
+func (r *Relay) pruneRetention(ctx context.Context) {
+	now := r.now().UTC()
+	if now.Sub(r.lastPrune) < time.Hour {
+		return
+	}
+	r.lastPrune = now
+	pushDeleted, err := r.store.PrunePushDeliveries(
+		ctx, now.Add(-r.policy.DeliveredRetention), now.Add(-r.policy.DeadLetterRetention),
+		store.MaxRetentionPruneBatchSize,
+	)
+	if err != nil {
+		observability.PushDeliveries.WithLabelValues("prune_failed").Inc()
+		r.logger.Error("push_delivery_prune_failed", "error", err)
+	} else if pushDeleted > 0 {
+		observability.PushDeliveries.WithLabelValues("pruned").Add(float64(pushDeleted))
+	}
+
+	// Source rows outlive both terminal push retention windows. A source with a
+	// pending or retained terminal delivery is protected again by the store's
+	// no-child predicate and foreign key, including during concurrent pruning.
+	outboxRetention := max(r.policy.DeliveredRetention, r.policy.DeadLetterRetention)
+	outboxDeleted, err := r.store.PrunePublishedOutbox(
+		ctx, now.Add(-outboxRetention), store.MaxRetentionPruneBatchSize,
+	)
+	if err != nil {
+		observability.OutboxEvents.WithLabelValues("prune_failed").Inc()
+		r.logger.Error("outbox_prune_failed", "error", err)
+	} else if outboxDeleted > 0 {
+		observability.OutboxEvents.WithLabelValues("pruned").Add(float64(outboxDeleted))
 	}
 }
 
@@ -157,16 +385,19 @@ func (r *Relay) notificationFor(
 	ctx context.Context,
 	item domain.OutboxEvent,
 	recipients []uuid.UUID,
-) (activityNotification, bool) {
+) (activityNotification, bool, error) {
 	switch item.Topic {
 	case "message.created":
 		var message domain.Message
 		if json.Unmarshal(item.Payload, &message) != nil {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
-		conversation, ok := r.conversationFor(ctx, message.ConversationID, message.SenderID, recipients)
-		if !ok {
-			return activityNotification{}, false
+		conversation, err := r.conversationFor(ctx, message.ConversationID, message.SenderID, recipients)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrForbidden) {
+				return activityNotification{}, false, nil
+			}
+			return activityNotification{}, false, err
 		}
 		return activityNotification{
 			actorID: message.SenderID, conversationID: message.ConversationID,
@@ -174,19 +405,22 @@ func (r *Relay) notificationFor(
 			// Message ciphertext is end-to-end encrypted, so the server deliberately
 			// uses privacy-safe copy instead of attempting to expose a preview.
 			body: clip(displayName(r, ctx, message.SenderID)+" sent a message", 180),
-		}, true
+		}, true, nil
 
 	case "entity.updated":
 		var entity domain.Entity
 		if json.Unmarshal(item.Payload, &entity) != nil || entity.Version != 1 {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
 		if entity.Kind != "expense" && entity.Kind != "task" {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
-		conversation, ok := r.conversationFor(ctx, entity.ConversationID, entity.CreatedBy, recipients)
-		if !ok {
-			return activityNotification{}, false
+		conversation, err := r.conversationFor(ctx, entity.ConversationID, entity.CreatedBy, recipients)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrForbidden) {
+				return activityNotification{}, false, nil
+			}
+			return activityNotification{}, false, err
 		}
 		payload := decodedObject(entity.Payload)
 		// A subscription-pod create emits its own durable event immediately
@@ -196,7 +430,7 @@ func (r *Relay) notificationFor(
 			entity.CreatedAt.Sub(conversation.CreatedAt) >= 0 &&
 			entity.CreatedAt.Sub(conversation.CreatedAt) < 10*time.Minute &&
 			isInitialSubscriptionCharge(conversation, payload) {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
 		actor := displayName(r, ctx, entity.CreatedBy)
 		body := ""
@@ -221,33 +455,39 @@ func (r *Relay) notificationFor(
 			actorID: entity.CreatedBy, conversationID: entity.ConversationID,
 			entityID: entity.ID, kind: entity.Kind, title: conversationTitle(conversation),
 			body: clip(body, 180),
-		}, true
+		}, true, nil
 
 	case "conversation.created":
 		var conversation domain.Conversation
 		if json.Unmarshal(item.Payload, &conversation) != nil || !isSubscription(conversation) {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
 		return subscriptionNotification(
 			conversation, conversation.CreatedBy, conversation.ID,
 			displayName(r, ctx, conversation.CreatedBy),
-		), true
+		), true, nil
 
 	case "conversation.member_added":
 		var added domain.ConversationMemberAdded
 		if json.Unmarshal(item.Payload, &added) != nil {
-			return activityNotification{}, false
+			return activityNotification{}, false, nil
 		}
-		conversation, ok := r.conversationFor(ctx, added.ConversationID, added.ActorID, recipients)
-		if !ok || !isSubscription(conversation) {
-			return activityNotification{}, false
+		conversation, err := r.conversationFor(ctx, added.ConversationID, added.ActorID, recipients)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrForbidden) {
+				return activityNotification{}, false, nil
+			}
+			return activityNotification{}, false, err
+		}
+		if !isSubscription(conversation) {
+			return activityNotification{}, false, nil
 		}
 		return subscriptionNotification(
 			conversation, added.ActorID, conversation.ID,
 			displayName(r, ctx, added.ActorID),
-		), true
+		), true, nil
 	default:
-		return activityNotification{}, false
+		return activityNotification{}, false, nil
 	}
 }
 
@@ -255,18 +495,28 @@ func (r *Relay) conversationFor(
 	ctx context.Context,
 	conversationID, actorID uuid.UUID,
 	recipients []uuid.UUID,
-) (domain.Conversation, bool) {
-	conversation, err := r.store.Conversation(ctx, conversationID, actorID)
-	if err == nil {
-		return conversation, true
-	}
-	for _, recipient := range recipients {
-		conversation, err = r.store.Conversation(ctx, conversationID, recipient)
+) (domain.Conversation, error) {
+	candidates := make([]uuid.UUID, 0, len(recipients)+1)
+	candidates = append(candidates, actorID)
+	candidates = append(candidates, recipients...)
+	seen := make(map[uuid.UUID]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == uuid.Nil {
+			continue
+		}
+		if _, duplicate := seen[candidate]; duplicate {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		conversation, err := r.store.Conversation(ctx, conversationID, candidate)
 		if err == nil {
-			return conversation, true
+			return conversation, nil
+		}
+		if !errors.Is(err, domain.ErrNotFound) && !errors.Is(err, domain.ErrForbidden) {
+			return domain.Conversation{}, fmt.Errorf("load notification conversation %s: %w", conversationID, err)
 		}
 	}
-	return domain.Conversation{}, false
+	return domain.Conversation{}, domain.ErrNotFound
 }
 
 func subscriptionNotification(
