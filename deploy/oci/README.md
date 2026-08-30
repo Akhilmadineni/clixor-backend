@@ -7,15 +7,17 @@ It is a safe beta topology, not a multi-host high-availability design.
 Two small API processes sit behind an internal Nginx gateway. PostgreSQL,
 Redis, and NATS are single-instance services with no published ports. The API
 uses authenticated private-CA TLS for each dependency and accesses a private OCI
-Object Storage media bucket with its instance principal. Only the API gateway
-binds to host loopback; Cloudflare Tunnel is the sole HTTP ingress.
+Object Storage media bucket with its instance principal. The API gateway has a
+fixed address on an internal Docker bridge; Cloudflare Tunnel is the sole HTTP
+ingress and reaches that bridge from the host.
 
 ## Security and availability boundaries
 
 - On the bundled private-subnet foundation, allow SSH only from the OCI Bastion
-  private endpoint. Do not open 80, 443, 18180, 3000, 5432, 6379, or 4222 in
+  private endpoint. Do not open 80, 443, 8080, 3000, 5432, 6379, or 4222 in
   the VCN security list, network security group, or Ubuntu firewall.
-- Cloudflare Tunnel connects outbound only to `127.0.0.1:18180`.
+- Host `cloudflared` connects only to the internal gateway at
+  `172.30.254.2:8080`; the gateway has no egress network or published host port.
 - The two API replicas survive one API-process failure, but not VM, boot-volume,
   availability-domain, PostgreSQL, Redis, or NATS failure. OCI Object Storage is
   outside the VM failure domain but still depends on regional OCI availability.
@@ -86,7 +88,7 @@ The deploy script:
 4. starts and health-checks the internal dependencies;
 5. captures a mode-0600 pre-migration PostgreSQL dump;
 6. runs the one-shot migration command;
-7. starts both API replicas and the loopback gateway; and
+7. starts both API replicas and the internal gateway; and
 8. requires gateway and per-replica readiness before recording success.
 
 A failed application rollout restores the previous Compose model and API image
@@ -96,7 +98,7 @@ reversed. The very first deployment has no previous release to restore.
 Check local state:
 
 ```sh
-curl --fail http://127.0.0.1:18180/health/ready
+curl --fail http://172.30.254.2:8080/health/ready
 sudo env CLIXOR_IMAGE_TAG="$(basename "$(readlink /srv/clixor/releases/current)")" \
   docker compose --file /srv/clixor/repo/deploy/oci/compose.yaml ps
 ```
@@ -126,8 +128,8 @@ Copy `cloudflared-config.yml.example` to `/etc/cloudflared/config.yml`, substitu
 the new tunnel UUID, and install the generated credentials JSON under
 `/etc/cloudflared` as root with mode 0600. Route these names to the new tunnel:
 
-- `clustr-api.atlanteanz.com` -> `http://127.0.0.1:18180`
-- `clixor.atlanteanz.com` -> `http://127.0.0.1:18180`
+- `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
+- `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
 
 Start and enable the `cloudflared` service, then verify four outbound tunnel
 connections and test:

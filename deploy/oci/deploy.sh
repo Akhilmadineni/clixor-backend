@@ -8,6 +8,7 @@ release_root="${project_root}/releases"
 runtime_env="${project_root}/secrets/runtime.env"
 lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
+gateway_readiness_url=http://172.30.254.2:8080/health/ready
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -91,7 +92,7 @@ rollback() {
       CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
         --file "${compose_file}" up -d --no-build --remove-orphans
       curl --fail --silent --show-error --max-time 10 \
-        http://127.0.0.1:18180/health/ready >/dev/null
+        "${gateway_readiness_url}" >/dev/null
       log "application rollback completed; database migrations were not reversed"
     else
       log "no previous OCI release was available for automatic rollback"
@@ -148,7 +149,7 @@ CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d 
 
 attempt=1
 until curl --fail --silent --show-error --max-time 5 \
-  http://127.0.0.1:18180/health/ready >/dev/null; do
+  "${gateway_readiness_url}" >/dev/null; do
   if [ "${attempt}" -ge 60 ]; then
     CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" ps
     CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \

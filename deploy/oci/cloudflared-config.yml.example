@@ -7,7 +7,7 @@ protocol: quic
 
 ingress:
   - hostname: clustr-api.atlanteanz.com
-    service: http://127.0.0.1:18180
+    service: http://172.30.254.2:8080
   - hostname: clixor.atlanteanz.com
-    service: http://127.0.0.1:18180
+    service: http://172.30.254.2:8080
   - service: http_status:404
