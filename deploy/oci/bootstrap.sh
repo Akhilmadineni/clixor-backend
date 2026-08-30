@@ -53,6 +53,7 @@ secret_root="${project_root}/secrets"
 pki_root="${secret_root}/pki"
 apns_root="${secret_root}/apns"
 runtime_env="${secret_root}/runtime.env"
+api_env="${secret_root}/api.env"
 runtime_root="${project_root}/runtime"
 
 install -d -m 0750 "${project_root}" "${project_root}/repo" \
@@ -197,9 +198,15 @@ if [ ! -f "${runtime_env}" ]; then
   chmod 0600 "${runtime_env}"
 fi
 
-metrics_token="$(sed -n 's/^CLUSTER_METRICS_TOKEN=//p' "${runtime_env}" | tail -n 1)"
+# Split the legacy all-service environment into least-privilege service files.
+# The helper publishes files atomically, is idempotent, and never evaluates or
+# prints their values. runtime.env remains only as a non-consumed migration
+# checkpoint for unknown legacy entries.
+sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
+
+metrics_token="$(sed -n 's/^CLUSTER_METRICS_TOKEN=//p' "${api_env}" | tail -n 1)"
 [ -n "${metrics_token}" ] || {
-  echo "CLUSTER_METRICS_TOKEN is missing from ${runtime_env}." >&2
+  echo "CLUSTER_METRICS_TOKEN is missing from ${api_env}." >&2
   exit 1
 }
 printf '%s' "${metrics_token}" > "${runtime_root}/prometheus/metrics.token"
@@ -241,10 +248,20 @@ chown 1000:1000 "${project_root}/data/nats"
 chown 65534:65534 "${project_root}/data/prometheus"
 chown 472:472 "${project_root}/data/grafana"
 chmod 0600 "${runtime_env}"
+for scoped_env in api postgres redis nats grafana backup migrate; do
+  chmod 0600 "${secret_root}/${scoped_env}.env"
+done
 chmod 0750 "${apns_root}"
 
 for required_path in \
   "${runtime_env}" \
+  "${api_env}" \
+  "${secret_root}/postgres.env" \
+  "${secret_root}/redis.env" \
+  "${secret_root}/nats.env" \
+  "${secret_root}/grafana.env" \
+  "${secret_root}/backup.env" \
+  "${secret_root}/migrate.env" \
   "${pki_root}/ca.crt" \
   "${runtime_root}/dependency-tls/haproxy.cfg" \
   "${runtime_root}/api-gateway/nginx.conf"

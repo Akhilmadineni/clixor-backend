@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"net/netip"
 	"strings"
 	"testing"
@@ -192,12 +193,77 @@ func TestSMTPRequiresAuthenticatedTLSSubmissionConfiguration(t *testing.T) {
 		func(cfg *Config) { cfg.Mail.SMTPUsername = "" },
 		func(cfg *Config) { cfg.Mail.SMTPPassword = "" },
 		func(cfg *Config) { cfg.Mail.SMTPServerName = "127.0.0.1" },
+		func(cfg *Config) { cfg.Mail.SMTPTransport = "opportunistic" },
+		func(cfg *Config) { cfg.Mail.QueueEncryptionKey = "not-base64" },
+		func(cfg *Config) {
+			cfg.AccessSecret = strings.Repeat("a", 32)
+			cfg.Mail.QueueEncryptionKey = base64.StdEncoding.EncodeToString([]byte(cfg.AccessSecret))
+		},
+		func(cfg *Config) {
+			cfg.Mail.SMTPPassword = strings.Repeat("q", 32)
+		},
+		func(cfg *Config) {
+			cfg.Mail.SMTPPassword = strings.Repeat("p", 48)
+			cfg.Mail.PasswordResetSecret = cfg.Mail.SMTPPassword
+		},
 	} {
 		cfg := validProductionConfig()
 		mutate(&cfg)
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("unsafe SMTP submission configuration was accepted")
 		}
+	}
+}
+
+func TestMailQueueDeliveryPolicyIsBounded(t *testing.T) {
+	for _, mutate := range []func(*MailConfig){
+		func(mail *MailConfig) { mail.QueueBatchSize = 1001 },
+		func(mail *MailConfig) { mail.QueueWorkerConcurrency = 51 },
+		func(mail *MailConfig) { mail.QueueMaxAttempts = 21 },
+		func(mail *MailConfig) { mail.QueueMaxDelay = time.Second },
+		func(mail *MailConfig) { mail.QueueDeadLetterRetention = time.Hour },
+	} {
+		cfg := validProductionConfig()
+		mutate(&cfg.Mail)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("unsafe mail queue policy was accepted")
+		}
+	}
+}
+
+func TestLoadMigrationNeedsOnlyDatabaseConfiguration(t *testing.T) {
+	t.Setenv("CLUSTER_DATABASE_URL", "postgres://clixor:secret@postgres.internal/clixor?sslmode=require")
+	t.Setenv("CLUSTER_DATABASE_MAX_CONNS", "9")
+	t.Setenv("CLUSTER_DATABASE_MIN_CONNS", "1")
+	// Prove malformed API-only values are outside the migration command's
+	// credential and validation boundary.
+	t.Setenv("CLUSTER_MAIL_PROVIDER", "unsafe-value")
+	t.Setenv("CLUSTER_JWT_ACCESS_SECRET", "")
+	cfg, err := LoadMigration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DatabaseMaxConns != 9 || cfg.DatabaseMinConns != 1 || cfg.DatabaseURL == "" {
+		t.Fatalf("unexpected migration config: %+v", cfg)
+	}
+}
+
+func TestLoadMigrationRejectsMissingOrUnsafeDatabaseConfiguration(t *testing.T) {
+	for name, values := range map[string][3]string{
+		"missing":       {"", "12", "2"},
+		"wrong-scheme":  {"https://postgres.internal/clixor", "12", "2"},
+		"missing-host":  {"postgres:///clixor", "12", "2"},
+		"bad-max":       {"postgres://host/db", "zero", "2"},
+		"inverted-pool": {"postgres://host/db", "2", "3"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("CLUSTER_DATABASE_URL", values[0])
+			t.Setenv("CLUSTER_DATABASE_MAX_CONNS", values[1])
+			t.Setenv("CLUSTER_DATABASE_MIN_CONNS", values[2])
+			if _, err := LoadMigration(); err == nil {
+				t.Fatal("unsafe migration configuration was accepted")
+			}
+		})
 	}
 }
 
@@ -347,12 +413,18 @@ func validProductionConfig() Config {
 			TelnyxPublicKey:          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 		},
 		Mail: MailConfig{
-			Provider: "smtp", SMTPAddress: "smtp.email.us-phoenix-1.oci.oraclecloud.com:587",
+			Provider: "smtp", SMTPAddress: "smtp.email.us-phoenix-1.oci.oraclecloud.com:465",
 			SMTPUsername: "smtp-user", SMTPPassword: "smtp-password",
-			SMTPServerName:      "smtp.email.us-phoenix-1.oci.oraclecloud.com",
-			From:                "Clixor <no-reply@atlanteanz.com>",
-			PasswordResetSecret: strings.Repeat("r", 48),
-			PasswordResetTTL:    10 * time.Minute, PasswordResetLength: 8,
+			SMTPServerName:     "smtp.email.us-phoenix-1.oci.oraclecloud.com",
+			SMTPTransport:      "implicit_tls",
+			From:               "Clixor <no-reply@mail.atlanteanz.com>",
+			QueueEncryptionKey: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("q", 32))),
+			QueueBatchSize:     50, QueueWorkerConcurrency: 4, QueueMaxAttempts: 8,
+			QueueBaseDelay: 5 * time.Second, QueueMaxDelay: 30 * time.Minute,
+			QueueDeliveredRetention:  24 * time.Hour,
+			QueueDeadLetterRetention: 30 * 24 * time.Hour,
+			PasswordResetSecret:      strings.Repeat("r", 48),
+			PasswordResetTTL:         10 * time.Minute, PasswordResetLength: 8,
 			PasswordResetMaxAttempts: 5,
 		},
 		APNS: APNSConfig{

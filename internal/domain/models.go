@@ -261,6 +261,36 @@ type PushDelivery struct {
 	LastErrorClass string
 }
 
+const (
+	MailDeliveryPasswordReset   = "password_reset"
+	MailDeliveryPasswordChanged = "password_changed"
+
+	MailDeliveryPending    = "pending"
+	MailDeliveryDelivered  = "delivered"
+	MailDeliveryDeadLetter = "dead_letter"
+	MailDeliveryCanceled   = "canceled"
+)
+
+// MailDelivery contains only encrypted application payload. Purpose is a
+// bounded operational label; recipient addresses, reset codes, subjects, and
+// bodies are sealed before this value reaches persistent storage.
+type MailDelivery struct {
+	ID             uuid.UUID
+	ChallengeID    uuid.UUID
+	Purpose        string
+	Ciphertext     []byte
+	Status         string
+	Attempts       int
+	NextAttemptAt  time.Time
+	LeaseToken     uuid.UUID
+	LockedUntil    time.Time
+	CreatedAt      time.Time
+	DeliveredAt    *time.Time
+	DeadLetteredAt *time.Time
+	CanceledAt     *time.Time
+	LastErrorClass string
+}
+
 type RealtimeEvent struct {
 	ID             string          `json:"id"`
 	Type           string          `json:"type"`

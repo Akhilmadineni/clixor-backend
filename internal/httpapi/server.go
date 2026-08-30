@@ -34,7 +34,7 @@ type Server struct {
 	bus               events.Bus
 	limiter           ratelimit.Limiter
 	media             media.Service
-	mailer            clustrmail.Service
+	mailQueue         clustrmail.QueueSealer
 	verifier          verification.Service
 	apple             appleauth.Verifier
 	presence          presence.Service
@@ -73,7 +73,7 @@ func DefaultMediaPolicy() MediaPolicy {
 	}
 }
 
-func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailer clustrmail.Service, passwordReset PasswordResetPolicy, mediaPolicy MediaPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
+func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailQueue clustrmail.QueueSealer, passwordReset PasswordResetPolicy, mediaPolicy MediaPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
 	if mediaPolicy.ConversationMaxBytes == 0 {
 		mediaPolicy = DefaultMediaPolicy()
@@ -84,7 +84,7 @@ func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter r
 		mediaPolicy.VerificationConcurrency = DefaultMediaPolicy().VerificationConcurrency
 	}
 	return &Server{
-		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService, mailer: mailer,
+		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService, mailQueue: mailQueue,
 		verifier: verifier, apple: apple, presence: presenceService, metricsToken: metricsToken,
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
 		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset, mediaPolicy: mediaPolicy,

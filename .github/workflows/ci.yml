@@ -99,7 +99,16 @@ jobs:
       - name: Validate the OCI Resource Manager stack
         run: terraform validate -no-color
       - name: Check OCI deployment entrypoints
-        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh
+        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../test_secret_split.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh
+      - name: Test least-privilege secret split and Compose exposure
+        run: sh ../test_secret_split.sh
+      - name: Validate scoped OCI Compose YAML
+        run: |
+          sudo install -d -m 0700 /srv/clixor/secrets
+          for name in api postgres redis nats grafana backup migrate; do
+            sudo install -m 0600 "../${name}.env.example" "/srv/clixor/secrets/${name}.env"
+          done
+          CLIXOR_IMAGE_TAG=ci docker compose --file ../compose.yaml config --quiet
       - name: Test OCI public smoke harness offline
         run: python3 -m unittest -v ../test_smoke.py
       - name: Check the data-volume mount helper

@@ -84,24 +84,24 @@ func TestLegacyLegalHostnameRedirectsToClixor(t *testing.T) {
 	}
 }
 
-type failingOptionalMailService struct{}
+type failingOptionalMailQueue struct{}
 
-func (failingOptionalMailService) SendPasswordReset(context.Context, string, string, time.Duration) error {
-	return clustrmail.ErrUnavailable
+func (failingOptionalMailQueue) SealPasswordReset(
+	uuid.UUID, string, string, time.Duration,
+) (domain.MailDelivery, error) {
+	return domain.MailDelivery{}, clustrmail.ErrUnavailable
 }
 
-func (failingOptionalMailService) SendPasswordChanged(context.Context, string) error {
-	return clustrmail.ErrUnavailable
-}
-
-func (failingOptionalMailService) Ping(context.Context) error {
-	return clustrmail.ErrUnavailable
+func (failingOptionalMailQueue) SealPasswordChanged(
+	uuid.UUID, string,
+) (domain.MailDelivery, error) {
+	return domain.MailDelivery{}, clustrmail.ErrUnavailable
 }
 
 func TestOptionalMailOutageDoesNotFailCoreReadiness(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServerWithVerifierAndMail(
-		t, verification.Development{Code: "000000"}, failingOptionalMailService{},
+		t, verification.Development{Code: "000000"}, failingOptionalMailQueue{},
 	)
 	response, err := http.Get(server.URL + "/health/ready")
 	if err != nil {
@@ -783,13 +783,13 @@ func (retryingVerifier) Check(context.Context, string, string) error {
 
 func newTestHTTPServerWithVerifier(t *testing.T, verifier verification.Service) *httptest.Server {
 	t.Helper()
-	return newTestHTTPServerWithVerifierAndMail(t, verifier, clustrmail.Unavailable{})
+	return newTestHTTPServerWithVerifierAndMail(t, verifier, clustrmail.UnavailableQueue())
 }
 
 func newTestHTTPServerWithVerifierAndMail(
 	t *testing.T,
 	verifier verification.Service,
-	mailer clustrmail.Service,
+	mailQueue clustrmail.QueueSealer,
 ) *httptest.Server {
 	t.Helper()
 	persistence := memory.New()
@@ -806,7 +806,7 @@ func newTestHTTPServerWithVerifierAndMail(
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := httptest.NewServer(New(
 		persistence, tokens, bus, limiter, media.Unavailable{},
-		verifier, appleauth.Unavailable{}, presenceService, mailer,
+		verifier, appleauth.Unavailable{}, presenceService, mailQueue,
 		PasswordResetPolicy{}, MediaPolicy{}, nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)

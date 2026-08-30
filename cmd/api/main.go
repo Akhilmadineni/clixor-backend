@@ -46,18 +46,27 @@ func main() {
 	var verifier verification.Service
 	var pushService push.Service
 	var presenceService presence.Service
-	var mailService clustrmail.Service = clustrmail.Unavailable{}
+	var mailSender clustrmail.Service = clustrmail.Unavailable{}
+	var mailQueue clustrmail.QueueSealer = clustrmail.UnavailableQueue()
+	var mailCipher *clustrmail.QueueCipher
 	if cfg.Mail.Provider == "smtp" {
+		mailCipher, err = clustrmail.NewQueueCipher(cfg.Mail.QueueEncryptionKey)
+		if err != nil {
+			logger.Error("configure encrypted mail queue", "error_class", "invalid_key")
+			os.Exit(1)
+		}
 		smtpService, err := clustrmail.NewAuthenticatedSMTP(clustrmail.SMTPConfig{
 			Address: cfg.Mail.SMTPAddress, From: cfg.Mail.From,
 			Username: cfg.Mail.SMTPUsername, Password: cfg.Mail.SMTPPassword,
 			ServerName: cfg.Mail.SMTPServerName, CAFile: cfg.Mail.SMTPCAFile,
+			Transport: cfg.Mail.SMTPTransport,
 		})
 		if err != nil {
 			logger.Error("configure authenticated SMTP submission", "error", err)
 			os.Exit(1)
 		}
-		mailService = smtpService
+		mailSender = smtpService
+		mailQueue = mailCipher
 		logger.Info("password reset email provider enabled", "provider", "smtp")
 	} else {
 		logger.Warn("password reset email is disabled until authenticated SMTP is configured")
@@ -250,7 +259,7 @@ func main() {
 	}
 	api := httpapi.New(
 		persistence, tokenManager, bus, limiter, mediaService, verifier, appleVerifier,
-		presenceService, mailService, httpapi.PasswordResetPolicy{
+		presenceService, mailQueue, httpapi.PasswordResetPolicy{
 			Enabled: cfg.Mail.Provider == "smtp", HMACSecret: cfg.Mail.PasswordResetSecret,
 			CodeLength: cfg.Mail.PasswordResetLength, TTL: cfg.Mail.PasswordResetTTL,
 			MaxAttempts: cfg.Mail.PasswordResetMaxAttempts,
@@ -288,6 +297,19 @@ func main() {
 		go media.RunPendingCleanup(
 			ctx, persistence, cfg.Media.CleanupInterval, cfg.Media.CleanupBatchSize, logger,
 		)
+	}
+	if mailCipher != nil {
+		go clustrmail.NewWorker(
+			persistence, mailSender, mailCipher, logger,
+			clustrmail.DeliveryPolicy{
+				BatchSize:         cfg.Mail.QueueBatchSize,
+				WorkerConcurrency: cfg.Mail.QueueWorkerConcurrency,
+				MaxAttempts:       cfg.Mail.QueueMaxAttempts,
+				BaseDelay:         cfg.Mail.QueueBaseDelay, MaxDelay: cfg.Mail.QueueMaxDelay,
+				DeliveredRetention:  cfg.Mail.QueueDeliveredRetention,
+				DeadLetterRetention: cfg.Mail.QueueDeadLetterRetention,
+			},
+		).Run(ctx)
 	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,

@@ -35,27 +35,54 @@ type resetMailRecorder struct {
 	changeCount int
 	resetErr    error
 	resetCodes  []string
+	sealDelay   time.Duration
 }
 
-func (r *resetMailRecorder) SendPasswordReset(_ context.Context, to, code string, _ time.Duration) error {
+func (r *resetMailRecorder) SealPasswordReset(
+	challengeID uuid.UUID,
+	to, code string,
+	_ time.Duration,
+) (domain.MailDelivery, error) {
+	r.mu.Lock()
+	delay := r.sealDelay
+	r.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.resetTo = to
 	r.resetCode = code
 	r.resetCount++
 	r.resetCodes = append(r.resetCodes, code)
-	return r.resetErr
+	if r.resetErr != nil {
+		return domain.MailDelivery{}, r.resetErr
+	}
+	now := time.Now().UTC()
+	return domain.MailDelivery{
+		ID: uuid.New(), ChallengeID: challengeID,
+		Purpose:    domain.MailDeliveryPasswordReset,
+		Ciphertext: make([]byte, 29), Status: domain.MailDeliveryPending,
+		NextAttemptAt: now, CreatedAt: now,
+	}, nil
 }
 
-func (r *resetMailRecorder) SendPasswordChanged(_ context.Context, to string) error {
+func (r *resetMailRecorder) SealPasswordChanged(
+	challengeID uuid.UUID,
+	to string,
+) (domain.MailDelivery, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.changedTo = to
 	r.changeCount++
-	return nil
+	now := time.Now().UTC()
+	return domain.MailDelivery{
+		ID: uuid.New(), ChallengeID: challengeID,
+		Purpose:    domain.MailDeliveryPasswordChanged,
+		Ciphertext: make([]byte, 29), Status: domain.MailDeliveryPending,
+		NextAttemptAt: now, CreatedAt: now,
+	}, nil
 }
-
-func (r *resetMailRecorder) Ping(context.Context) error { return nil }
 
 func TestPasswordResetRequiresEmailedCodeAndRevokesSessions(t *testing.T) {
 	server, recorder := newPasswordResetHTTPServer(t)
@@ -117,7 +144,7 @@ func TestPasswordResetRequiresEmailedCodeAndRevokesSessions(t *testing.T) {
 }
 
 func TestPasswordResetStartDoesNotEnumerateAccounts(t *testing.T) {
-	server, recorder := newPasswordResetHTTPServer(t)
+	server, recorder, persistence := newPasswordResetHTTPServerWithStore(t)
 	client := testClient{baseURL: server.URL, client: http.DefaultClient}
 	var response passwordResetStartResponse
 	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
@@ -128,8 +155,73 @@ func TestPasswordResetStartDoesNotEnumerateAccounts(t *testing.T) {
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
-	if recorder.resetCount != 0 {
-		t.Fatal("unknown account generated outbound mail")
+	if recorder.resetCount != 1 {
+		t.Fatal("unknown account did not perform the same discarded local seal")
+	}
+	queued, err := persistence.LockMailDeliveryBatch(context.Background(), 10)
+	if err != nil || len(queued) != 0 {
+		t.Fatalf("unknown account persisted outbound mail: %+v err=%v", queued, err)
+	}
+}
+
+func TestPasswordResetStartKnownAndUnknownLatencyStayOnSameBoundedPath(t *testing.T) {
+	server, recorder := newPasswordResetHTTPServer(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "timing@example.com", "password": "original-password-123",
+		"display_name": "Timing", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+	recorder.mu.Lock()
+	recorder.sealDelay = 100 * time.Millisecond
+	recorder.mu.Unlock()
+
+	measure := func(email string) time.Duration {
+		started := time.Now()
+		client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+			"email": email,
+		}, http.StatusAccepted, nil)
+		return time.Since(started)
+	}
+	known := measure("timing@example.com")
+	unknown := measure("missing-timing@example.com")
+	difference := known - unknown
+	if difference < 0 {
+		difference = -difference
+	}
+	if known < 450*time.Millisecond || unknown < 450*time.Millisecond || difference > 200*time.Millisecond {
+		t.Fatalf("reset timing known=%s unknown=%s difference=%s", known, unknown, difference)
+	}
+}
+
+type aliasedPasswordResetStore struct {
+	store.Store
+	user domain.User
+}
+
+func (s aliasedPasswordResetStore) UserByEmail(context.Context, string) (domain.User, error) {
+	return s.user, nil
+}
+
+func TestPasswordResetSealsLockedAccountEmailNotLookupInput(t *testing.T) {
+	persistence := memory.New()
+	t.Cleanup(persistence.Close)
+	user, err := persistence.CreateUser(context.Background(), store.CreateUserParams{
+		Email: "canonical@example.com", PasswordHash: "existing-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, recorder := newPasswordResetHTTPServerForStore(t, aliasedPasswordResetStore{
+		Store: persistence, user: user,
+	})
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "prelookup-alias@example.com",
+	}, http.StatusAccepted, nil)
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.resetTo != user.Email {
+		t.Fatalf("queued recipient=%q want locked account email %q", recorder.resetTo, user.Email)
 	}
 }
 
@@ -225,6 +317,14 @@ type resetCreateNotFoundStore struct {
 func (resetCreateNotFoundStore) CreatePasswordResetChallenge(
 	context.Context,
 	domain.PasswordResetChallenge,
+) error {
+	return domain.ErrNotFound
+}
+
+func (resetCreateNotFoundStore) CreatePasswordResetChallengeWithMail(
+	context.Context,
+	domain.PasswordResetChallenge,
+	store.MailDeliveryBuilder,
 ) error {
 	return domain.ErrNotFound
 }

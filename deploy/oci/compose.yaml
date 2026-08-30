@@ -40,7 +40,7 @@ services:
       - -c
       - checkpoint_timeout=15min
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/postgres.env
     networks:
       clixor_data:
       clixor_service:
@@ -66,7 +66,7 @@ services:
     container_name: clixor-oci-redis
     user: "999:1000"
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/redis.env
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}" --maxmemory 512mb --maxmemory-policy noeviction
@@ -91,7 +91,7 @@ services:
     container_name: clixor-oci-nats
     user: "1000:1000"
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/nats.env
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - exec nats-server --jetstream --store_dir=/data --http_port=8222 --auth "$${NATS_AUTH_TOKEN}" --tls --tlscert=/run/nats-tls/server.crt --tlskey=/run/nats-tls/server.key
@@ -155,7 +155,7 @@ services:
     pull_policy: never
     entrypoint: ["/clustr-migrate"]
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/migrate.env
     depends_on:
       dependency-tls:
         condition: service_healthy
@@ -168,7 +168,6 @@ services:
       - ALL
     volumes:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
-      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
     <<: *service-security
 
   api-a:
@@ -176,7 +175,7 @@ services:
     pull_policy: never
     container_name: clixor-oci-api-a
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/api.env
     environment:
       CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
     depends_on:
@@ -210,7 +209,7 @@ services:
     pull_policy: never
     container_name: clixor-oci-api-b
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/api.env
     environment:
       CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
     depends_on:
@@ -273,7 +272,7 @@ services:
     container_name: clixor-oci-postgres-backup
     user: "0:0"
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/backup.env
     entrypoint: ["/bin/sh", "/opt/clixor/backup.sh"]
     depends_on:
       postgres:
@@ -321,7 +320,7 @@ services:
     image: grafana/grafana:12.1.0
     container_name: clixor-oci-grafana
     env_file:
-      - /srv/clixor/secrets/runtime.env
+      - /srv/clixor/secrets/grafana.env
     environment:
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"

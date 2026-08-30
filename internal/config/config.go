@@ -126,11 +126,55 @@ type MailConfig struct {
 	SMTPPassword             string
 	SMTPServerName           string
 	SMTPCAFile               string
+	SMTPTransport            string
 	From                     string
+	QueueEncryptionKey       string
+	QueueBatchSize           int
+	QueueWorkerConcurrency   int
+	QueueMaxAttempts         int
+	QueueBaseDelay           time.Duration
+	QueueMaxDelay            time.Duration
+	QueueDeliveredRetention  time.Duration
+	QueueDeadLetterRetention time.Duration
 	PasswordResetSecret      string
 	PasswordResetTTL         time.Duration
 	PasswordResetLength      int
 	PasswordResetMaxAttempts int
+}
+
+// MigrationConfig is deliberately database-only. The one-shot schema command
+// must not need (or receive) JWT, OTP, APNs, SMTP, or mail-queue credentials.
+type MigrationConfig struct {
+	DatabaseURL      string
+	DatabaseMaxConns int
+	DatabaseMinConns int
+}
+
+func LoadMigration() (MigrationConfig, error) {
+	databaseMaxConns, err := envInt("CLUSTER_DATABASE_MAX_CONNS", 12)
+	if err != nil {
+		return MigrationConfig{}, err
+	}
+	databaseMinConns, err := envInt("CLUSTER_DATABASE_MIN_CONNS", 2)
+	if err != nil {
+		return MigrationConfig{}, err
+	}
+	if databaseMaxConns < 1 || databaseMaxConns > 200 || databaseMinConns < 0 ||
+		databaseMinConns > databaseMaxConns {
+		return MigrationConfig{}, errors.New("invalid migration database pool limits")
+	}
+	databaseURL := strings.TrimSpace(os.Getenv("CLUSTER_DATABASE_URL"))
+	if databaseURL == "" {
+		return MigrationConfig{}, errors.New("CLUSTER_DATABASE_URL is required for migrations")
+	}
+	parsed, err := url.Parse(databaseURL)
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" {
+		return MigrationConfig{}, errors.New("CLUSTER_DATABASE_URL must be a PostgreSQL URL")
+	}
+	return MigrationConfig{
+		DatabaseURL: databaseURL, DatabaseMaxConns: databaseMaxConns,
+		DatabaseMinConns: databaseMinConns,
+	}, nil
 }
 
 func Load() (Config, error) {
@@ -202,6 +246,34 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	passwordResetMaxAttempts, err := envInt("CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS", 5)
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueBatchSize, err := envInt("CLUSTER_MAIL_QUEUE_BATCH_SIZE", 50)
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueWorkerConcurrency, err := envInt("CLUSTER_MAIL_QUEUE_WORKER_CONCURRENCY", 4)
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueMaxAttempts, err := envInt("CLUSTER_MAIL_QUEUE_MAX_ATTEMPTS", 8)
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueBaseDelay, err := envDuration("CLUSTER_MAIL_QUEUE_RETRY_BASE_DELAY", "5s")
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueMaxDelay, err := envDuration("CLUSTER_MAIL_QUEUE_RETRY_MAX_DELAY", "30m")
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueDeliveredRetention, err := envDuration("CLUSTER_MAIL_QUEUE_DELIVERED_RETENTION", "24h")
+	if err != nil {
+		return Config{}, err
+	}
+	mailQueueDeadLetterRetention, err := envDuration("CLUSTER_MAIL_QUEUE_DEAD_LETTER_RETENTION", "720h")
 	if err != nil {
 		return Config{}, err
 	}
@@ -370,7 +442,16 @@ func Load() (Config, error) {
 			SMTPPassword:             os.Getenv("CLUSTER_SMTP_PASSWORD"),
 			SMTPServerName:           os.Getenv("CLUSTER_SMTP_SERVER_NAME"),
 			SMTPCAFile:               os.Getenv("CLUSTER_SMTP_CA_FILE"),
-			From:                     env("CLUSTER_MAIL_FROM", "Clixor <no-reply@atlanteanz.com>"),
+			SMTPTransport:            env("CLUSTER_SMTP_TRANSPORT", "starttls"),
+			From:                     env("CLUSTER_MAIL_FROM", "Clixor <no-reply@mail.atlanteanz.com>"),
+			QueueEncryptionKey:       os.Getenv("CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY"),
+			QueueBatchSize:           mailQueueBatchSize,
+			QueueWorkerConcurrency:   mailQueueWorkerConcurrency,
+			QueueMaxAttempts:         mailQueueMaxAttempts,
+			QueueBaseDelay:           mailQueueBaseDelay,
+			QueueMaxDelay:            mailQueueMaxDelay,
+			QueueDeliveredRetention:  mailQueueDeliveredRetention,
+			QueueDeadLetterRetention: mailQueueDeadLetterRetention,
 			PasswordResetSecret:      os.Getenv("CLUSTER_PASSWORD_RESET_HMAC_SECRET"),
 			PasswordResetTTL:         passwordResetTTL,
 			PasswordResetLength:      passwordResetLength,
@@ -631,21 +712,62 @@ func (cfg Config) validateMail() error {
 	if mail.PasswordResetMaxAttempts < 3 || mail.PasswordResetMaxAttempts > 10 {
 		return errors.New("CLUSTER_PASSWORD_RESET_MAX_ATTEMPTS must be between 3 and 10")
 	}
+	queueBatchSize := mail.QueueBatchSize
+	queueWorkerConcurrency := mail.QueueWorkerConcurrency
+	queueMaxAttempts := mail.QueueMaxAttempts
+	queueBaseDelay := mail.QueueBaseDelay
+	queueMaxDelay := mail.QueueMaxDelay
+	queueDeliveredRetention := mail.QueueDeliveredRetention
+	queueDeadLetterRetention := mail.QueueDeadLetterRetention
+	if queueBatchSize == 0 && queueWorkerConcurrency == 0 && queueMaxAttempts == 0 &&
+		queueBaseDelay == 0 && queueMaxDelay == 0 && queueDeliveredRetention == 0 &&
+		queueDeadLetterRetention == 0 {
+		queueBatchSize, queueWorkerConcurrency, queueMaxAttempts = 50, 4, 8
+		queueBaseDelay, queueMaxDelay = 5*time.Second, 30*time.Minute
+		queueDeliveredRetention, queueDeadLetterRetention = 24*time.Hour, 30*24*time.Hour
+	}
+	if queueBatchSize < 1 || queueBatchSize > 1000 {
+		return errors.New("CLUSTER_MAIL_QUEUE_BATCH_SIZE must be between 1 and 1000")
+	}
+	if queueWorkerConcurrency < 1 || queueWorkerConcurrency > 50 {
+		return errors.New("CLUSTER_MAIL_QUEUE_WORKER_CONCURRENCY must be between 1 and 50")
+	}
+	if queueMaxAttempts < 1 || queueMaxAttempts > 20 {
+		return errors.New("CLUSTER_MAIL_QUEUE_MAX_ATTEMPTS must be between 1 and 20")
+	}
+	if queueBaseDelay < 100*time.Millisecond || queueBaseDelay > 5*time.Minute {
+		return errors.New("CLUSTER_MAIL_QUEUE_RETRY_BASE_DELAY must be between 100ms and 5m")
+	}
+	if queueMaxDelay < queueBaseDelay || queueMaxDelay > 24*time.Hour {
+		return errors.New("CLUSTER_MAIL_QUEUE_RETRY_MAX_DELAY must be at least the base delay and no more than 24h")
+	}
+	if queueDeliveredRetention < time.Hour || queueDeliveredRetention > 30*24*time.Hour {
+		return errors.New("CLUSTER_MAIL_QUEUE_DELIVERED_RETENTION must be between 1h and 720h")
+	}
+	if queueDeadLetterRetention < 24*time.Hour || queueDeadLetterRetention > 365*24*time.Hour {
+		return errors.New("CLUSTER_MAIL_QUEUE_DEAD_LETTER_RETENTION must be between 24h and 8760h")
+	}
 	if mail.Provider != "smtp" {
 		return nil
 	}
-	host, _, err := net.SplitHostPort(mail.SMTPAddress)
-	if err != nil || strings.TrimSpace(host) == "" {
+	host, portText, err := net.SplitHostPort(mail.SMTPAddress)
+	port, portErr := strconv.Atoi(portText)
+	if err != nil || strings.TrimSpace(host) == "" || portErr != nil || port < 1 || port > 65535 ||
+		(net.ParseIP(host) == nil && !validSMTPHostname(host)) {
 		return errors.New("CLUSTER_SMTP_ADDRESS must be a host:port address")
 	}
-	if strings.TrimSpace(mail.SMTPUsername) == "" || mail.SMTPPassword == "" {
+	if strings.TrimSpace(mail.SMTPUsername) == "" || mail.SMTPPassword == "" ||
+		strings.ContainsAny(mail.SMTPUsername, "\x00\r\n") || strings.Contains(mail.SMTPPassword, "\x00") {
 		return errors.New("CLUSTER_SMTP_USERNAME and CLUSTER_SMTP_PASSWORD are required")
+	}
+	if mail.SMTPTransport != "starttls" && mail.SMTPTransport != "implicit_tls" {
+		return errors.New("CLUSTER_SMTP_TRANSPORT must be starttls or implicit_tls")
 	}
 	serverName := strings.TrimSpace(mail.SMTPServerName)
 	if serverName == "" {
 		serverName = host
 	}
-	if net.ParseIP(serverName) != nil || strings.ContainsAny(serverName, "\r\n/:@") {
+	if !validSMTPHostname(serverName) {
 		return errors.New("CLUSTER_SMTP_SERVER_NAME must be a DNS hostname")
 	}
 	from, err := netmail.ParseAddress(mail.From)
@@ -655,10 +777,49 @@ func (cfg Config) validateMail() error {
 	if len(mail.PasswordResetSecret) < 32 ||
 		mail.PasswordResetSecret == cfg.AccessSecret ||
 		mail.PasswordResetSecret == cfg.MetricsToken ||
-		mail.PasswordResetSecret == cfg.Verification.OTPSecret {
+		mail.PasswordResetSecret == cfg.Verification.OTPSecret ||
+		mail.PasswordResetSecret == cfg.Verification.TelnyxAPIKey ||
+		mail.PasswordResetSecret == mail.SMTPPassword {
 		return errors.New("CLUSTER_PASSWORD_RESET_HMAC_SECRET must be a distinct secret of at least 32 bytes")
 	}
+	queueKey, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(mail.QueueEncryptionKey))
+	if err != nil || len(queueKey) != 32 {
+		return errors.New("CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY must be a base64-encoded 32-byte key")
+	}
+	defer func() {
+		for index := range queueKey {
+			queueKey[index] = 0
+		}
+	}()
+	for _, otherSecret := range []string{
+		cfg.AccessSecret, cfg.MetricsToken, cfg.Verification.OTPSecret,
+		cfg.Verification.TelnyxAPIKey, mail.PasswordResetSecret, mail.SMTPPassword,
+	} {
+		if mail.QueueEncryptionKey == otherSecret || string(queueKey) == otherSecret {
+			return errors.New("CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY must be distinct from all other secrets")
+		}
+	}
 	return nil
+}
+
+func validSMTPHostname(value string) bool {
+	if value == "" || len(value) > 253 || net.ParseIP(value) != nil ||
+		strings.ContainsAny(value, "\x00\r\n/:@ ") {
+		return false
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(value, "."), ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if (character < 'a' || character > 'z') &&
+				(character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') && character != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (cfg Config) validateVerification() error {

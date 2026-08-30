@@ -23,7 +23,10 @@ ingress and reaches that bridge from the host.
   outside the VM failure domain but still depends on regional OCI availability.
 - `/srv/clixor/backups` is on the same VM. It is useful for operator mistakes,
   but is not disaster recovery until copied to a versioned off-instance bucket.
-- Secrets live only in root-owned runtime paths outside the repository. Never
+- Secrets live only in root-owned, per-service environment files outside the
+  repository. PostgreSQL, Redis, NATS, backup, Grafana, migration, and the API
+  each receive only their allowlisted configuration; only the API receives JWT,
+  OTP/Telnyx, APNs, SMTP, reset-HMAC, and mail-queue keys. Never
   use OCI user data, GitHub variables, Compose YAML, shell history, or issue logs
   for production credentials.
 - Confirm the OCI VCN does not use `172.30.254.0/29`; that subnet is reserved for
@@ -60,7 +63,21 @@ The script verifies ARM64, 2 OCPUs, and approximately 12 GB RAM; installs Docker
 its Compose plugin, and OCI CLI 3.91.0 through a checksum-pinned official installer; creates the
 data/runtime tree; resolves Object Storage namespace/region through the instance
 principal and OCI metadata; generates an internal CA; and creates
-`/srv/clixor/secrets/runtime.env` with random local credentials.
+root-owned scoped files under `/srv/clixor/secrets` with random local
+credentials. `runtime.env` is retained only as a non-consumed migration
+checkpoint for unknown legacy entries.
+
+On an existing VM, bootstrap performs a one-time safe upgrade from the former
+all-service `runtime.env`: it rejects symbolic links and duplicate assignments,
+copies exact values without evaluating or printing them, validates every scoped
+allowlist, publishes mode-0600 files atomically, and removes scoped assignments
+from the legacy file only after every new file is ready. Rerunning it is
+idempotent. During this Compose boundary only, application rollback uses the new
+scoped model with the prior API image so provider credentials are not re-exposed
+to data containers. Existing data, backup, and Grafana containers whose immutable
+Docker configuration still contains legacy `CLUSTER_*` values are force-replaced
+once (a stopped Grafana container is removed); persistent data volumes are not
+deleted.
 
 The first configuration is deliberately `CLUSTER_ENV=staging` with Telnyx and
 APNs disabled. This does not relax the application's production checks. Changing
@@ -68,8 +85,8 @@ APNs disabled. This does not relax the application's production checks. Changing
 APNs, native OCI media, metrics, and token configuration or the API refuses to
 start.
 
-Do not copy `production.env.example` over the generated runtime file. It is a
-field-complete reference containing placeholders, not a secret generator.
+Do not copy an `*.env.example` file over a generated secret file. The examples
+contain placeholders and are references, not secret generators.
 
 ## 3. Deploy an immutable source revision
 
@@ -198,7 +215,7 @@ sudo ./svc.sh status
 
 Keep the runner repository-scoped and dedicated to production. Do not add the
 custom production label to the retired NAS runner or any shared runner. Leave the
-OCI runner offline until `/srv/clixor/secrets/runtime.env`, native OCI media,
+OCI runner offline until all scoped files under `/srv/clixor/secrets`, native OCI media,
 backups, and the Cloudflare tunnel have passed their manual release gates. If the
 runner installation path, repository name, or work-directory name changes, update
 and reinstall the root-owned validation entrypoint before enabling it.
@@ -258,14 +275,34 @@ for Apple application `H9S3BAQ9U8.com.Clustr.Clustr.Clustr`. It must return
 directly with HTTP 200 and `Content-Type: application/json`; do not put a login,
 HTML error page, or redirect in front of it.
 
-Password-reset mail must use authenticated STARTTLS submission. For OCI Email
-Delivery in Phoenix, configure `smtp.email.us-phoenix-1.oci.oraclecloud.com:587`,
-the manually generated SMTP username/password, the Terraform-managed approved
-sender `no-reply@mail.atlanteanz.com`, and a distinct password-reset HMAC secret
-in the protected runtime secret. Keep `CLUSTER_MAIL_PROVIDER=disabled` until
-SPF, DKIM, DMARC, suppression
-handling, and a real-mailbox reset/confirmation canary pass; the reset endpoints
-then return 503 instead of offering an unsafe shortcut.
+Password-reset mail is first AES-256-GCM sealed and transactionally inserted in
+PostgreSQL with the challenge; request handlers never wait for remote SMTP.
+Workers use `FOR UPDATE SKIP LOCKED` leases, bounded exponential retry with
+jitter, dead-lettering, and bounded retention. For OCI Email Delivery in
+Phoenix, use authenticated implicit TLS at
+`smtp.email.us-phoenix-1.oci.oraclecloud.com:465`, or mandatory STARTTLS at port
+587. Configure the SMTP credential, approved `no-reply@mail.atlanteanz.com` sender,
+distinct reset HMAC, and padded-base64 32-byte queue key only in
+`/srv/clixor/secrets/api.env`. Keep `CLUSTER_MAIL_PROVIDER=disabled` until SPF,
+DKIM, DMARC, suppression handling, and real-mailbox reset/change canaries pass;
+the reset endpoints then return 503 instead of offering an unsafe shortcut.
+
+The queue currently has one encryption key, not a keyring. Never hot-rotate
+`CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY`: old queued ciphertext would become
+undecryptable. With the old key/provider still active, first let workers drain
+until this query returns zero:
+
+```sql
+SELECT status, count(*) FROM mail_deliveries
+WHERE status = 'pending' GROUP BY status;
+```
+
+Then set the provider to disabled and restart both APIs to prevent new enqueue,
+and run the query again. If it is nonzero, restore the old key/provider and drain;
+do not rotate. Once the frozen queue is empty, retain the old key in the approved
+break-glass secret store, install the new key with SMTP re-enabled, restart both
+replicas, and run a real-mailbox reset canary. A key change while pending rows
+exist is a cutover stop condition.
 
 Never leave the old NAS and new OCI connectors serving the same hostnames against
 different databases. That creates split-brain writes and inconsistent sessions.
@@ -285,9 +322,10 @@ revokes it, conditionally renames the verified staging object to a backend-only
 stores that key and queues staging cleanup. Migrations 10, 11, and 14 must be
 applied before this binary starts; migration 10 adds media
 reservations, immutable upload expiry, verification leases, and deletion
-scheduling, migration 11 adds the bounded published-outbox retention index, and
-migration 14 closes write-PAR replay during publication. Versions 12 and 13 are
-reserved for the independently delivered mail and push migrations.
+scheduling, migration 11 adds the bounded published-outbox retention index,
+migration 12 adds encrypted durable mail delivery, migration 13 enforces unique
+APNs token ownership, and migration 14 closes write-PAR replay during
+publication.
 
 ## 5. Provider credentials and production promotion
 
@@ -305,8 +343,9 @@ UID/GID 65532 is the distroless API identity. Bootstrap keeps the APNs directory
 traversable only by root and that identity and fixes every `.p8` key to
 `root:65532` mode `0440`.
 
-Use `sudoedit /srv/clixor/secrets/runtime.env` to add the Telnyx and Apple values
-described in `production.env.example`. Use distinct random secrets. Before setting
+Use `sudoedit /srv/clixor/secrets/api.env` to add the Telnyx, Apple, and mail
+values described in `api.env.example`. The database/cache/bus/backup/Grafana
+examples are separate and must stay separate. Use distinct random secrets. Before setting
 `CLUSTER_ENV=production`, complete all of these:
 
 - Telnyx sender registration, API/signing credentials, allowed country prefixes,

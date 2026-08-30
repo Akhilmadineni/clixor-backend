@@ -37,16 +37,18 @@ Migration 9 adds the durable APNs delivery queue without constraining the existi
 `devices.push_token` column. This is deliberate: production-05b replicas can keep
 serving device updates throughout the rolling deployment. The new store serializes
 token transfers with an advisory lock. Deduplication and a database uniqueness
-constraint require coordinated migration 12 after all 05b replicas are drained;
-do not rewrite already-applied migration 9.
+constraint requires its own later migration after all 05b replicas are drained;
+do not rewrite already-applied migration 9. Migration 12 is mail-only and creates
+the encrypted durable delivery queue after media-owned migrations 10 and 11.
 
 Migration 10 adds bounded media reservations, stored-media quota indexes, pending
 expiry, verification leases, and delayed object-deletion scheduling. Migration 11
-adds the published-outbox retention index. Migration 14 persists upload-capability
-identity and makes legacy account deletion cover both OCI staging and immutable
-published keys; 12 and 13 remain reserved for mail and push work. Apply every
-available migration in numeric order before rolling out this binary. Never publish
-a different migration body under an already-applied version.
+adds the published-outbox retention index. Migration 12 adds the encrypted durable
+mail-delivery queue. Migration 13 enforces unique ownership of APNs device tokens.
+Migration 14 persists upload-capability identity and makes legacy account deletion
+cover both OCI staging and immutable published keys. Apply every available
+migration in numeric order before rolling out this binary. Never publish a
+different migration body under an already-applied version.
 The migration's ready-row constraint prevents a production-05b replica from
 publishing a capability-bearing upload without revocation. Drain old replicas
 before promotion so newly created and legacy in-flight OCI uploads complete on
@@ -59,15 +61,32 @@ remove the strict one-field compatibility envelope only after upgraded-client
 adoption is verified and a coordinated minimum-version policy is active.
 
 Outbound reset email fails closed while `CLUSTER_MAIL_PROVIDER=disabled`.
-The OCI deployment uses an authenticated SMTP submission service over mandatory
-STARTTLS; it never sends credentials or reset codes to a plaintext relay. Enable
-SMTP only after the approved sender, SPF, DKIM, DMARC, provider suppression
-handling, and real-mailbox delivery canaries pass. A successful SMTP handshake
-alone does not prove Internet delivery.
+The OCI deployment supports authenticated implicit TLS on port 465 and mandatory
+STARTTLS on port 587; TLS 1.2+, CA/hostname validation, and post-TLS AUTH are
+required in both modes. It never sends credentials or reset codes to a plaintext
+relay. Enable SMTP only after the approved sender, SPF, DKIM, DMARC, provider
+suppression handling, and real-mailbox delivery canaries pass. A successful SMTP
+handshake alone does not prove Internet delivery.
 SMTP is intentionally not a core `/health/ready` dependency: an email outage must
-not eject both API replicas from service. Monitor reset queue failures separately;
-activation requires the explicit real-mailbox canary below, and a failed enqueue
-causes the just-created challenge to be canceled.
+not eject both API replicas from service. The challenge and AES-256-GCM queue row
+are inserted in one transaction; remote delivery happens only in a leased worker.
+Monitor `clustr_mail_deliveries_total` and
+`clustr_mail_delivery_failures_total` separately. Expired, consumed, superseded,
+or permanently dead-lettered reset-code mail is canceled/suppressed, and reset
+codes, recipients, subjects, and bodies never exist as plaintext database fields.
+
+SMTP, reset, queue, JWT, OTP/Telnyx, APNs, and media provider values belong only
+in `/srv/clixor/secrets/api.env`. Data services, backup, Grafana, and the migration
+job each use separate allowlisted files. `runtime.env` is a non-consumed upgrade
+checkpoint; any scoped assignment found there is a deployment stop condition.
+
+Queue-key rotation is drain-only because this release intentionally has one key.
+With the old key/provider active, drain until
+`SELECT count(*) FROM mail_deliveries WHERE status='pending'` returns zero. Then
+disable mail, restart both APIs to freeze enqueue, and verify zero again. If rows
+appeared, restore the old configuration and drain. Only with the queue frozen and
+empty may you retain the old key in break-glass storage, install the new padded-
+base64 32-byte key, re-enable mail, restart, and complete a real-mailbox canary.
 
 ## APNs delivery operations
 

@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -89,8 +88,10 @@ func (s *Server) startPasswordReset(w http.ResponseWriter, r *http.Request) {
 	codeHash := passwordResetCodeHash(s.passwordReset.HMACSecret, challengeID, code)
 	user, userErr := s.store.UserByEmail(r.Context(), email)
 	if errors.Is(userErr, domain.ErrNotFound) || (userErr == nil && user.PasswordHash == "") {
-		// Perform the same code/HMAC work but do not persist a challenge or send
-		// mail for unknown and passwordless identities.
+		// Match the local encryption work performed for a real account, but discard
+		// the result. The real delivery is always sealed later from the user email
+		// locked inside the challenge transaction.
+		_, _ = s.mailQueue.SealPasswordReset(challengeID, email, code, s.passwordReset.TTL)
 		respond()
 		return
 	}
@@ -104,34 +105,27 @@ func (s *Server) startPasswordReset(w http.ResponseWriter, r *http.Request) {
 		ID: challengeID, UserID: user.ID, CodeHash: codeHash,
 		ExpiresAt: now.Add(s.passwordReset.TTL), CreatedAt: now,
 	}
-	if err := s.store.CreatePasswordResetChallenge(r.Context(), challenge); errors.Is(err, domain.ErrNotFound) {
+	if err := s.store.CreatePasswordResetChallengeWithMail(
+		r.Context(), challenge,
+		func(lockedEmail string) (domain.MailDelivery, error) {
+			return s.mailQueue.SealPasswordReset(
+				challengeID, lockedEmail, code, s.passwordReset.TTL,
+			)
+		},
+	); errors.Is(err, domain.ErrNotFound) {
 		// Account deletion may win after the lookup. Preserve the same delayed,
 		// generic response as an unknown or passwordless address.
 		respond()
 		return
 	} else if err != nil {
-		s.logger.Error("password_reset_challenge_create_failed", "error", err)
-		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
-		return
-	}
-	if err := s.mailer.SendPasswordReset(r.Context(), user.Email, code, s.passwordReset.TTL); err != nil {
-		s.logger.Error("password_reset_mail_queue_failed", "challenge_id", challengeID, "error", err)
-		// A reset challenge is usable only after the mail transport accepts the
-		// message. Remove it on queue failure so a later request can issue a fresh
-		// code instead of leaving an active challenge the user never received. Use
-		// a bounded context detached from the request because client cancellation
-		// is itself a common reason for the mail submission to fail.
-		cleanupContext, cleanupCancel := context.WithTimeout(
-			context.WithoutCancel(r.Context()), 5*time.Second,
+		// A storage failure on the known-account path must not turn the generic
+		// start endpoint into an account-existence oracle. The challenge and queue
+		// insert share one transaction, so returning the generic response is safe.
+		s.logger.Error(
+			"password_reset_queue_transaction_failed",
+			"challenge_id", challengeID,
+			"error_class", "storage",
 		)
-		defer cleanupCancel()
-		if cancelErr := s.store.CancelPasswordResetChallenge(cleanupContext, challengeID); cancelErr != nil {
-			s.logger.Error(
-				"password_reset_challenge_cancel_failed",
-				"challenge_id", challengeID,
-				"error", cancelErr,
-			)
-		}
 	}
 	respond()
 }
@@ -158,8 +152,11 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 	codeHash := passwordResetCodeHash(
 		s.passwordReset.HMACSecret, challengeID, strings.TrimSpace(request.Code),
 	)
-	email, err := s.store.ConsumePasswordResetChallenge(
+	_, err = s.store.ConsumePasswordResetChallengeWithMail(
 		r.Context(), challengeID, codeHash, newPasswordHash, s.passwordReset.MaxAttempts,
+		func(recipient string) (domain.MailDelivery, error) {
+			return s.mailQueue.SealPasswordChanged(challengeID, recipient)
+		},
 	)
 	if errors.Is(err, domain.ErrUnauthenticated) || errors.Is(err, domain.ErrNotFound) {
 		writeError(w, http.StatusBadRequest, "invalid_reset_code", "The reset code is invalid or expired.")
@@ -169,11 +166,6 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("password_reset_consume_failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
 		return
-	}
-	if email != "" {
-		if err := s.mailer.SendPasswordChanged(r.Context(), email); err != nil {
-			s.logger.Error("password_changed_mail_queue_failed", "error", err)
-		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -38,11 +38,6 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	}
 	for want := int64(1); want <= maximum; want++ {
 		if _, exists := versions[want]; !exists {
-			if want == 12 || want == 13 {
-				// Reserved for durable mail and push-token uniqueness. This
-				// independently cherry-pickable media migration must remain 14.
-				continue
-			}
 			t.Fatalf("missing migration version %d", want)
 		}
 	}
@@ -187,6 +182,33 @@ func TestOutboxRetentionMigrationHasPartialPublishedIndex(t *testing.T) {
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("outbox retention migration is missing %q", required)
+		}
+	}
+}
+
+func TestMailMigrationStoresOnlyEncryptedPayloadAndCascadesPrivacyState(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000012_encrypted_mail_delivery.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"CREATE TABLE mail_deliveries",
+		"encrypted_payload bytea NOT NULL",
+		"ON DELETE CASCADE",
+		"mail_deliveries_pending_idx",
+		"dead_letter",
+		"canceled",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("mail migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"recipient text", "email text", "reset_code", "subject text", "body text",
+	} {
+		if strings.Contains(strings.ToLower(sql), forbidden) {
+			t.Fatalf("mail migration stores plaintext field %q", forbidden)
 		}
 	}
 }

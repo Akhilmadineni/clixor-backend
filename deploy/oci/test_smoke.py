@@ -188,7 +188,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         bootstrap = script.index('CLIXOR_SKIP_PACKAGES=true sh')
         sync = script.index('log "syncing the approved revision')
         dependency_reconcile = script.index(
-            'docker compose --file "${compose_file}" up -d --no-build \\\n  postgres redis nats dependency-tls'
+            'if [ "${legacy_dependency_scope}" = "true" ]'
         )
         migration = script.index('log "applying transactional forward migrations"')
 
@@ -197,6 +197,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(rollback_arm, sync)
         self.assertLess(rollback_arm, dependency_reconcile)
         self.assertLess(rollback_arm, migration)
+        self.assertEqual(script.count("CLIXOR_SKIP_PACKAGES=true sh"), 1)
         self.assertIn('printf \'first-deploy\\n\'', script)
         self.assertIn("database files and forward migrations were not restored", script)
         self.assertNotIn("pg_restore", script)

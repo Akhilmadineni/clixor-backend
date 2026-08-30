@@ -6,6 +6,13 @@ project_root=/srv/clixor
 stable_root="${project_root}/repo"
 release_root="${project_root}/releases"
 runtime_env="${project_root}/secrets/runtime.env"
+api_env="${project_root}/secrets/api.env"
+postgres_env="${project_root}/secrets/postgres.env"
+redis_env="${project_root}/secrets/redis.env"
+nats_env="${project_root}/secrets/nats.env"
+grafana_env="${project_root}/secrets/grafana.env"
+backup_env="${project_root}/secrets/backup.env"
+migrate_env="${project_root}/secrets/migrate.env"
 lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
@@ -46,9 +53,42 @@ mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
 
+# Detect containers created by the retired all-secrets Compose model without
+# printing their environments. Docker stores container configuration immutably,
+# so changing files alone is insufficient: affected containers must be replaced
+# once to remove API/provider credentials from docker inspect.
+legacy_dependency_scope=false
+legacy_backup_scope=false
+legacy_grafana_scope=false
+legacy_grafana_running=false
+for container_name in \
+  clixor-oci-postgres clixor-oci-redis clixor-oci-nats \
+  clixor-oci-postgres-backup clixor-oci-grafana
+do
+  if docker inspect "${container_name}" \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
+    grep -q '^CLUSTER_'; then
+    case "${container_name}" in
+      clixor-oci-postgres|clixor-oci-redis|clixor-oci-nats)
+        legacy_dependency_scope=true
+        ;;
+      clixor-oci-postgres-backup)
+        legacy_backup_scope=true
+        ;;
+      clixor-oci-grafana)
+        legacy_grafana_scope=true
+        if [ "$(docker inspect "${container_name}" --format '{{.State.Running}}')" = "true" ]; then
+          legacy_grafana_running=true
+        fi
+        ;;
+    esac
+  fi
+done
+
 release_tag="oci-$(printf '%s' "${source_sha}" | cut -c1-12)-${run_id}"
 release_dir="${release_root}/${release_tag}"
 previous_compose="${release_dir}/previous-compose.yaml"
+rollback_compose="${previous_compose}"
 pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
@@ -111,8 +151,10 @@ rollback() {
     set +e
     if [ "${first_deploy}" = "false" ]; then
       log "deployment failed; attempting application rollback to ${previous_image}"
+      [ -s "${rollback_compose}" ] || \
+        log "ERROR: rollback Compose model is unavailable" >&2
       previous_tag=${previous_image#clixor-api:}
-      cp "${previous_compose}" "${compose_file}"
+      cp "${rollback_compose}" "${compose_file}"
       CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
         --file "${compose_file}" up -d --no-build --remove-orphans
 
@@ -160,6 +202,17 @@ docker buildx build --load \
 image_architecture="$(docker image inspect "${new_image}" --format '{{.Architecture}}')"
 [ "${image_architecture}" = "arm64" ] || fail "built ${image_architecture}, expected arm64"
 
+# The one-time secret split makes the retired all-secrets Compose model
+# unusable for rollback. Capture the new scoped model before bootstrap mutates
+# runtime.env, so even an early failure can keep the previous API image on
+# least-privilege service files.
+if [ "${first_deploy}" = "false" ] && \
+  ! grep -q '/srv/clixor/secrets/api.env' "${previous_compose}"; then
+  rollback_compose="${release_dir}/rollback-compose.yaml"
+  cp "${source_root}/deploy/oci/compose.yaml" "${rollback_compose}"
+  [ -s "${rollback_compose}" ] || fail "scoped rollback Compose model is empty"
+fi
+
 # Everything below can mutate the active runtime. Arm application rollback
 # before refreshing configuration, syncing Compose, reconciling dependencies,
 # or running a forward migration. The captured dump is for operator recovery;
@@ -169,18 +222,36 @@ rollback_needed=1
 # Idempotently refresh permissions, certificates and checked-in runtime config.
 # Package installation belongs to the explicit first bootstrap, not every deploy.
 CLIXOR_SKIP_PACKAGES=true sh "${source_root}/deploy/oci/bootstrap.sh"
-[ -s "${runtime_env}" ] || fail "runtime configuration is missing"
-if grep -Eiq 'REPLACE_(WITH|ME)|replace-with' "${runtime_env}"; then
+for scoped_env in \
+  "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
+  "${grafana_env}" "${backup_env}" "${migrate_env}"
+do
+  [ -s "${scoped_env}" ] || fail "scoped configuration is missing"
+done
+if grep -Eiq 'REPLACE_(WITH|ME)|replace-with' \
+  "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
+  "${grafana_env}" "${backup_env}" "${migrate_env}"; then
   fail "runtime configuration still contains a placeholder"
 fi
-grep -q '^CLUSTER_MEDIA_PROVIDER=oci$' "${runtime_env}" || \
+if grep -Eq '^(CLUSTER_[A-Z0-9_]+|POSTGRES_(DB|USER|PASSWORD)|REDIS_PASSWORD|NATS_AUTH_TOKEN|GF_SECURITY_ADMIN_(USER|PASSWORD))=' "${runtime_env}"; then
+  fail "legacy runtime.env still contains a scoped credential"
+fi
+for required_key in \
+  CLUSTER_MAIL_PROVIDER \
+  CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY \
+  CLUSTER_PASSWORD_RESET_HMAC_SECRET
+do
+  grep -Eq "^${required_key}=.+" "${api_env}" || \
+    fail "API-only configuration is missing ${required_key}"
+done
+grep -q '^CLUSTER_MEDIA_PROVIDER=oci$' "${api_env}" || \
   fail "OCI deployment requires CLUSTER_MEDIA_PROVIDER=oci"
 for required_key in \
   CLUSTER_OCI_OBJECT_STORAGE_NAMESPACE \
   CLUSTER_OCI_OBJECT_STORAGE_BUCKET \
   CLUSTER_OCI_OBJECT_STORAGE_REGION
 do
-  grep -Eq "^${required_key}=.+" "${runtime_env}" || \
+  grep -Eq "^${required_key}=.+" "${api_env}" || \
     fail "runtime configuration is missing ${required_key}"
 done
 
@@ -193,8 +264,14 @@ rsync -a --delete \
   "${source_root}/" "${stable_root}/"
 
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" config --quiet
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
-  postgres redis nats dependency-tls
+if [ "${legacy_dependency_scope}" = "true" ]; then
+  log "replacing legacy data containers to remove inherited API credentials"
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    up -d --no-build --force-recreate postgres redis nats dependency-tls
+else
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
+    postgres redis nats dependency-tls
+fi
 
 if [ "${first_deploy}" = "true" ]; then
   [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
@@ -212,6 +289,23 @@ CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d 
   api-a api-b
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
   --remove-orphans
+
+if [ "${legacy_backup_scope}" = "true" ]; then
+  log "replacing legacy backup container to remove inherited API credentials"
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    up -d --no-build --no-deps --force-recreate postgres-backup
+fi
+if [ "${legacy_grafana_scope}" = "true" ]; then
+  if [ "${legacy_grafana_running}" = "true" ]; then
+    log "replacing legacy Grafana container to remove inherited API credentials"
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+      --profile observability up -d --no-build --no-deps --force-recreate grafana
+  else
+    # The persistent Grafana data directory is untouched; only the stopped
+    # immutable container configuration containing old secrets is removed.
+    docker rm clixor-oci-grafana >/dev/null
+  fi
+fi
 
 attempt=1
 until curl --fail --silent --show-error --max-time 5 \

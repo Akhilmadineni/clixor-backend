@@ -471,7 +471,7 @@ func newTestHTTPServerWithMediaStore(
 	server := httptest.NewServer(New(
 		persistence, tokens, bus, ratelimit.NewMemory(), mediaService,
 		verification.Development{Code: "000000"}, appleauth.Unavailable{},
-		presence.NewMemory(), clustrmail.Unavailable{}, PasswordResetPolicy{}, policy, nil, "", logger,
+		presence.NewMemory(), clustrmail.UnavailableQueue(), PasswordResetPolicy{}, policy, nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)
 	return server, persistence

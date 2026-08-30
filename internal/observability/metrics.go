@@ -68,6 +68,22 @@ var (
 		Buckets: []float64{0.25, 0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600},
 	})
 
+	MailDeliveries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "mail", Name: "deliveries_total",
+		Help: "Encrypted durable mail delivery lifecycle outcomes.",
+	}, []string{"result"})
+
+	MailDeliveryFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "mail", Name: "delivery_failures_total",
+		Help: "Mail delivery failures by bounded payload-free class.",
+	}, []string{"class"})
+
+	MailDeliveryLag = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "clustr", Subsystem: "mail", Name: "delivery_lag_seconds",
+		Help:    "Time from encrypted queue creation to SMTP acceptance.",
+		Buckets: []float64{0.25, 0.5, 1, 2, 5, 10, 30, 60, 300, 900, 3600},
+	})
+
 	VerificationEvents = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "clustr", Subsystem: "verification", Name: "events_total",
 		Help: "Phone verification lifecycle outcomes.",

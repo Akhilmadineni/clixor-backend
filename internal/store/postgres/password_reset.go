@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -14,6 +15,25 @@ import (
 func (s *Store) CreatePasswordResetChallenge(
 	ctx context.Context,
 	challenge domain.PasswordResetChallenge,
+) error {
+	return s.createPasswordResetChallenge(ctx, challenge, nil)
+}
+
+func (s *Store) CreatePasswordResetChallengeWithMail(
+	ctx context.Context,
+	challenge domain.PasswordResetChallenge,
+	buildMail store.MailDeliveryBuilder,
+) error {
+	if buildMail == nil {
+		return domain.ErrInvalid
+	}
+	return s.createPasswordResetChallenge(ctx, challenge, buildMail)
+}
+
+func (s *Store) createPasswordResetChallenge(
+	ctx context.Context,
+	challenge domain.PasswordResetChallenge,
+	buildMail store.MailDeliveryBuilder,
 ) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -23,12 +43,33 @@ func (s *Store) CreatePasswordResetChallenge(
 	// Serialize replacement of the partial-unique active challenge. The user row
 	// is locked before challenge rows to match account deletion and confirmation;
 	// this avoids both uniqueness-based enumeration and lock-order deadlocks.
-	if _, err := lockPasswordResetUser(ctx, tx, challenge.UserID); err != nil {
+	email, err := lockPasswordResetUser(ctx, tx, challenge.UserID)
+	if err != nil {
 		return err
 	}
+	var delivery *domain.MailDelivery
+	if buildMail != nil {
+		built, err := buildMail(email)
+		if err != nil {
+			return err
+		}
+		if err := validateMailDelivery(built, domain.MailDeliveryPasswordReset, challenge.ID); err != nil {
+			return err
+		}
+		delivery = &built
+	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE password_reset_challenges SET consumed_at=now()
-		WHERE user_id=$1 AND consumed_at IS NULL`, challenge.UserID); err != nil {
+		WITH replaced AS (
+			UPDATE password_reset_challenges SET consumed_at=now()
+			WHERE user_id=$1 AND consumed_at IS NULL
+			RETURNING id
+		)
+		UPDATE mail_deliveries AS delivery
+		SET status='canceled',locked_until=NULL,lease_token=NULL,
+			canceled_at=now(),updated_at=now(),last_error_class='superseded'
+		WHERE delivery.status='pending'
+		  AND delivery.password_reset_challenge_id IN (SELECT id FROM replaced)`,
+		challenge.UserID); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
@@ -39,6 +80,11 @@ func (s *Store) CreatePasswordResetChallenge(
 		challenge.ExpiresAt, challenge.CreatedAt)
 	if err != nil {
 		return mapError(err)
+	}
+	if delivery != nil {
+		if err := insertMailDelivery(ctx, tx, *delivery); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -54,6 +100,33 @@ func (s *Store) ConsumePasswordResetChallenge(
 	codeHash []byte,
 	newPasswordHash string,
 	maxAttempts int,
+) (string, error) {
+	return s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, nil)
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMail(
+	ctx context.Context,
+	id uuid.UUID,
+	codeHash []byte,
+	newPasswordHash string,
+	maxAttempts int,
+	buildMail store.MailDeliveryBuilder,
+) (string, error) {
+	if buildMail == nil {
+		return "", domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(
+		ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail,
+	)
+}
+
+func (s *Store) consumePasswordResetChallenge(
+	ctx context.Context,
+	id uuid.UUID,
+	codeHash []byte,
+	newPasswordHash string,
+	maxAttempts int,
+	buildMail store.MailDeliveryBuilder,
 ) (string, error) {
 	// Read only the owner needed to choose the per-user lock. Do not lock the
 	// challenge first: account deletion locks users before its cleanup trigger
@@ -110,6 +183,29 @@ func (s *Store) ConsumePasswordResetChallenge(
 		}
 		return "", domain.ErrUnauthenticated
 	}
+	var delivery *domain.MailDelivery
+	if buildMail != nil {
+		built, err := buildMail(email)
+		if err != nil {
+			return "", err
+		}
+		if err := validateMailDelivery(built, domain.MailDeliveryPasswordChanged, id); err != nil {
+			return "", err
+		}
+		delivery = &built
+	}
+	// Once a reset code is consumed, any still-pending copy of that code must
+	// never leave the queue. A concurrently leased worker will lose its lease
+	// acknowledgement if this update wins; provider acceptance before the commit
+	// cannot be recalled, but the code is already single-use at that point.
+	if _, err := tx.Exec(ctx, `
+			UPDATE mail_deliveries
+			SET status='canceled',locked_until=NULL,lease_token=NULL,
+				canceled_at=now(),updated_at=now(),last_error_class='challenge_consumed'
+			WHERE password_reset_challenge_id=$1
+			  AND purpose='password_reset' AND status='pending'`, id); err != nil {
+		return "", err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE users SET password_hash=$2,updated_at=$3 WHERE id=$1`,
 		userID, newPasswordHash, now); err != nil {
@@ -124,6 +220,11 @@ func (s *Store) ConsumePasswordResetChallenge(
 		UPDATE password_reset_challenges SET consumed_at=$2
 		WHERE user_id=$1 AND consumed_at IS NULL`, userID, now); err != nil {
 		return "", err
+	}
+	if delivery != nil {
+		if err := insertMailDelivery(ctx, tx, *delivery); err != nil {
+			return "", err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err

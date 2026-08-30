@@ -27,6 +27,7 @@ type Store struct {
 	externalUsers             map[string]uuid.UUID
 	ageAssurances             map[uuid.UUID]domain.AgeAssurance
 	passwordResets            map[uuid.UUID]domain.PasswordResetChallenge
+	mailDeliveries            map[uuid.UUID]domain.MailDelivery
 	devices                   map[uuid.UUID]domain.Device
 	preKeys                   map[uuid.UUID][]domain.OneTimePreKey
 	sessions                  map[uuid.UUID]domain.Session
@@ -57,6 +58,7 @@ func New() *Store {
 		externalUsers:             make(map[string]uuid.UUID),
 		ageAssurances:             make(map[uuid.UUID]domain.AgeAssurance),
 		passwordResets:            make(map[uuid.UUID]domain.PasswordResetChallenge),
+		mailDeliveries:            make(map[uuid.UUID]domain.MailDelivery),
 		devices:                   make(map[uuid.UUID]domain.Device),
 		preKeys:                   make(map[uuid.UUID][]domain.OneTimePreKey),
 		sessions:                  make(map[uuid.UUID]domain.Session),
@@ -473,6 +475,11 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 	for challengeID, challenge := range s.passwordResets {
 		if challenge.UserID == userID {
 			delete(s.passwordResets, challengeID)
+			for deliveryID, delivery := range s.mailDeliveries {
+				if delivery.ChallengeID == challengeID {
+					delete(s.mailDeliveries, deliveryID)
+				}
+			}
 		}
 	}
 	for sessionID, session := range s.sessions {

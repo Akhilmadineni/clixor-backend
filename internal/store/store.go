@@ -120,6 +120,12 @@ func (l MediaReservationLimits) Validate() error {
 	return nil
 }
 
+// MailDeliveryBuilder is invoked inside the password-reset transaction after
+// the live recipient address has been locked. Implementations must be local,
+// deterministic except for cryptographic nonce generation, and must never
+// perform network I/O.
+type MailDeliveryBuilder func(string) (domain.MailDelivery, error)
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -139,8 +145,10 @@ type Store interface {
 	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
 	CreatePasswordResetChallenge(context.Context, domain.PasswordResetChallenge) error
+	CreatePasswordResetChallengeWithMail(context.Context, domain.PasswordResetChallenge, MailDeliveryBuilder) error
 	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
 	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
+	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (string, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)
@@ -205,4 +213,7 @@ type Store interface {
 	InvalidatePushDelivery(context.Context, int64, uuid.UUID, uuid.UUID, uuid.UUID, string) error
 	PrunePushDeliveries(context.Context, time.Time, time.Time, int) (int64, error)
 	PrunePublishedOutbox(context.Context, time.Time, int) (int64, error)
+	LockMailDeliveryBatch(context.Context, int) ([]domain.MailDelivery, error)
+	FinishMailDelivery(context.Context, uuid.UUID, uuid.UUID, string, time.Time, string) error
+	PruneMailDeliveries(context.Context, time.Time, time.Time, time.Time, int) (int64, error)
 }
