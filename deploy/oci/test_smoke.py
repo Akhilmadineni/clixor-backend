@@ -213,7 +213,7 @@ class ReleaseHardeningTests(unittest.TestCase):
             script.count("CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true"), 1
         )
         self.assertIn('printf \'first-deploy\\n\'', script)
-        self.assertIn("database files and forward migrations were not restored", script)
+        self.assertIn("database migrations were not reversed", script)
         self.assertIn("pg_restore --list", script)
         self.assertIn("sha256sum --check", script)
         self.assertNotIn("pg_restore --clean", script)
@@ -229,7 +229,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         release_complete = script.rindex("rollback_needed=0")
         self.assertLess(release_pointer, release_complete)
 
-    def test_vault_rotation_is_transactional_for_every_secret_consumer(self) -> None:
+    def test_vault_rotation_rejects_single_node_credential_changes(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
         bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
         exit_trap = deploy.index("trap rollback 0")
@@ -258,12 +258,26 @@ class ReleaseHardeningTests(unittest.TestCase):
             "Vault-backed deployments require durable SMTP password-reset delivery",
             deploy,
         )
-        for consumer in ("postgres", "redis", "nats"):
-            self.assertIn(f"vault_{consumer}_secret_activated=true", deploy)
-        self.assertIn("cloudflare_secret_activated=true", deploy)
+        self.assertIn("vault_postgres_secret_activated=true", deploy)
+        self.assertIn(
+            "credential changes require an explicit single-node maintenance operation",
+            deploy,
+        )
+        self.assertIn("reject_live_dependency_credential_change", deploy)
+        self.assertIn("/run/secrets/redis.acl", deploy)
+        self.assertIn("/run/secrets/nats.conf", deploy)
+        self.assertIn('docker exec "${dependency_container}"', deploy)
+        self.assertIn('sha256sum "${mounted_secret}"', deploy)
+        redis_reject = deploy.index(
+            "reject_live_dependency_credential_change \\\n  Redis"
+        )
+        nats_reject = deploy.index(
+            "reject_live_dependency_credential_change \\\n  NATS"
+        )
+        image_build = deploy.index('log "building ARM64 release')
+        self.assertLess(redis_reject, image_build)
+        self.assertLess(nats_reject, image_build)
         self.assertIn("rollback secret consumers did not restart", deploy)
-        self.assertIn("systemctl restart cloudflared.service", deploy)
-        self.assertIn("restored cloudflared with the previous credential", deploy)
 
         release_pointer = deploy.index(
             'mv -Tf "${release_dir}/current-link.pending"'
@@ -272,16 +286,31 @@ class ReleaseHardeningTests(unittest.TestCase):
         vault_disarm = deploy.index(
             "vault_generation_changed=false", rollback_disarm
         )
-        staging_cleanup = deploy.rindex(
-            "retire_persistent_staging_secrets ||"
-        )
         self.assertLess(release_pointer, rollback_disarm)
         self.assertLess(rollback_disarm, vault_disarm)
-        self.assertLess(vault_disarm, staging_cleanup)
+        self.assertNotIn("retire_persistent_staging_secrets", deploy)
+        self.assertNotIn("quarantine-staging-secrets.sh", deploy)
+
+        quarantine = (
+            self.oci_root / "quarantine-staging-secrets.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn('action=${1:-}', quarantine)
+        self.assertIn('[ "${action}" = "quarantine" ]', quarantine)
+        self.assertIn("pre_reboot_boot_id", quarantine)
+        self.assertIn("pre-retirement-boot-id", quarantine)
+        self.assertIn("approved_mapping_sha256", quarantine)
         self.assertIn(
-            'vault-generations/gen-[0-9]*-[0-9a-f]*) retire_staging_copies=true',
-            deploy,
+            'provider_canaries}" = "apns,cloudflare,oci-media,smtp,telnyx"',
+            quarantine,
         )
+        self.assertIn("RESTORE_DRILL_LAST_SUCCESS", quarantine)
+        self.assertIn("staging-secret-maintenance.log", quarantine)
+        self.assertIn("no quarantined data was deleted", quarantine)
+        self.assertNotRegex(quarantine, r"(?m)^\s*rm(?:\s|$)")
+        ci = (
+            self.oci_root.parent.parent / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("quarantine-staging-secrets.sh", ci)
 
     def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
         installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
@@ -301,6 +330,50 @@ class ReleaseHardeningTests(unittest.TestCase):
             "LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token",
             unit,
         )
+
+    def test_cloudflared_unit_and_state_are_release_transactional(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("systemd-analyze verify", deploy)
+        self.assertIn("sha256sum systemd/cloudflared.service", deploy)
+        self.assertIn("capture_cloudflared_state", deploy)
+        self.assertIn("cloudflared.service.sha256", deploy)
+        self.assertIn("enabled-state", deploy)
+        self.assertIn("active-state", deploy)
+        self.assertIn("restore_cloudflared", deploy)
+        self.assertIn("restored_checksum", deploy)
+        self.assertIn("cloudflare_attempt", deploy)
+        self.assertIn('[ "${cloudflare_attempt}" -lt 45 ]', deploy)
+        self.assertIn("systemctl restart --no-block cloudflared.service", deploy)
+        restart_guard = deploy.index(
+            'if [ "${cloudflare_secret_changed}" = "true" ] ||'
+        )
+        restart = deploy.index(
+            "systemctl restart --no-block cloudflared.service", restart_guard
+        )
+        self.assertLess(restart_guard, restart)
+        self.assertIn("cloudflared=${cloudflare_rollback_failed}", deploy)
+        self.assertIn("host-tools=${host_tool_rollback_failed}", deploy)
+
+        rollback = deploy.index("rollback() {")
+        restore_vault = deploy.index("if restore_previous_vault_target; then", rollback)
+        restore_connector = deploy.index("if restore_cloudflared; then", rollback)
+        restore_tools = deploy.index("if ! restore_host_tooling; then", rollback)
+        restore_application = deploy.index(
+            "deployment failed; attempting application rollback", rollback
+        )
+        self.assertLess(restore_vault, restore_connector)
+        self.assertLess(restore_connector, restore_tools)
+        self.assertLess(restore_tools, restore_application)
+
+        rollback_arm = deploy.index("\nrollback_needed=1\n")
+        activate = deploy.rindex("\n  activate_cloudflared\n")
+        public_gate = deploy.index(
+            'if [ "${public_smoke_required}" = "true" ]; then', activate
+        )
+        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        self.assertLess(rollback_arm, activate)
+        self.assertLess(activate, public_gate)
+        self.assertLess(public_gate, release_pointer)
 
     def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
         raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")
@@ -605,6 +678,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         )
         restart_backup = deploy.index("--force-recreate postgres-backup")
         offsite_gate = deploy.index("systemctl start clixor-offsite-backup.service")
+        activate_tools = deploy.rindex("\nactivate_host_tooling\n")
         newer_proof = deploy.index(
             '-newer "${backup_gate_start}"', restart_backup
         )
@@ -612,6 +686,7 @@ class ReleaseHardeningTests(unittest.TestCase):
             "systemctl enable --now \\\n  clixor-offsite-backup.timer"
         )
         release_complete = deploy.rindex("rollback_needed=0")
+        self.assertLess(activate_tools, fresh_gate)
         self.assertLess(fresh_gate, restart_backup)
         self.assertLess(restart_backup, newer_proof)
         self.assertLess(newer_proof, offsite_gate)
@@ -700,11 +775,20 @@ class ReleaseHardeningTests(unittest.TestCase):
         bootstrap_call = deploy.index("CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true")
         restore_gate = deploy.index("systemctl start clixor-restore-drill.service")
         activate_call = deploy.rindex("\nactivate_host_tooling\n")
+        offsite_gate = deploy.index("systemctl start clixor-offsite-backup.service")
+        freeze_timers = deploy.index("for host_gate_timer in")
+        reject_old_job = deploy.index("for host_gate_service in")
+        publish_tool = deploy.index(
+            '"${host_tool_stage}/bin/${tool_name}"', freeze_timers
+        )
         health_gate = deploy.index("systemctl start clixor-backup-health.service")
         release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
         self.assertLess(stage_call, capture_call)
         self.assertLess(capture_call, bootstrap_call)
-        self.assertLess(restore_gate, activate_call)
+        self.assertLess(freeze_timers, reject_old_job)
+        self.assertLess(reject_old_job, publish_tool)
+        self.assertLess(activate_call, offsite_gate)
+        self.assertLess(activate_call, restore_gate)
         self.assertLess(activate_call, health_gate)
         self.assertLess(health_gate, release_pointer)
 

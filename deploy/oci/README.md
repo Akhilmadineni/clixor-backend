@@ -226,12 +226,68 @@ missing/unsafe generation marker. A manual staging deploy may use the explicit
 `/run/.../active -> /srv/clixor/secrets` fallback and locally generated
 credentials.
 
-The initial cutover retains the former persistent files under
-`/srv/clixor/secrets` for one full release. A subsequent successful
-Vault-to-Vault production release retires those staging copies only after public
-ingress, backup, restore, and secret-consumer canaries pass and rollback is
-disarmed. Hydration itself never removes them. Never remove the externally
-recoverable Vault versions referenced by retained release manifests.
+An upgraded host may still contain the former persistent production files under
+`/srv/clixor/secrets` for a deliberately bounded rollback window. Ordinary
+hydration and deployment never retire, quarantine, or delete them. Retirement is
+the separate, explicit `quarantine-staging-secrets.sh` maintenance workflow
+described below; it requires proof of an approved-manifest reboot, a current-boot
+restore drill, and all provider canaries. It moves values to root-only quarantine
+and never purges them. Never remove the externally recoverable Vault versions.
+
+### Explicit staging-secret quarantine maintenance
+
+This workflow is never called by bootstrap, hydration, Actions, or deploy. Run it
+only under an approved change ticket after the path-only production release has
+been stable. Before reboot, record the current boot ID in a root-only file:
+
+```sh
+sudo install -m 0600 -o 0 -g 0 /proc/sys/kernel/random/boot_id \
+  /etc/clixor/pre-retirement-boot-id
+```
+
+Reboot the VM. Confirm that the boot ID changed, the `active` link selects a
+`vault-generations/...` directory whose `.vault-hydrated` marker has the SHA-256
+of the reviewed `/etc/clixor/vault-secrets.map`, and the approved release is still
+current. During this new boot, run a fresh offsite backup and isolated restore
+drill. Then complete real Telnyx OTP, APNs production/sandbox notification, SMTP
+reset-mailbox, OCI media upload/verify/download/delete, and both Cloudflare
+hostname canaries. A paper review or local readiness alone is not a provider
+canary.
+
+After those checks pass, create
+`/etc/clixor/staging-secret-retirement.approval` with `sudoedit`. It must contain
+exactly these non-secret fields, be owned by `root:root`, and have mode `0600`:
+
+```text
+schema=1
+change_ticket=CHANGE-1234
+approved_mapping_sha256=<64 lowercase hex characters>
+pre_reboot_boot_id=<boot ID recorded before reboot>
+approved_boot_id=<current boot ID>
+approved_release=/srv/clixor/releases/oci-<approved release tag>
+provider_canaries=apns,cloudflare,oci-media,smtp,telnyx
+provider_canaries_passed_at=2026-08-30T18:30:00Z
+```
+
+The canary timestamp must be after the current boot, and the restore success
+marker must also be newer than that boot. Recheck the approval and run the only
+supported retirement entrypoint explicitly:
+
+```sh
+sudo chmod 0600 /etc/clixor/staging-secret-retirement.approval
+sudo sh deploy/oci/quarantine-staging-secrets.sh quarantine \
+  /etc/clixor/staging-secret-retirement.approval
+```
+
+The script revalidates every precondition, current local API readiness, Docker,
+cloudflared, file types, ownership, checksums, boot IDs, and release pointer. It
+moves `/srv/clixor/secrets` candidates to a unique mode-0700 directory below
+`/srv/clixor/quarantine/staging-secrets` and the legacy connector token to a
+matching directory below `/etc/cloudflared/quarantine`. It appends a non-secret,
+root-only result to `/var/log/clixor/staging-secret-maintenance.log`. It never
+deletes quarantined content and offers no purge mode. Any later secure deletion
+requires a second change ticket, quarantine inventory review, confirmed Vault
+recovery, and a separately implemented operator procedure.
 
 ## 4. Deploy an immutable source revision
 
@@ -254,9 +310,11 @@ The deploy script:
    on `/srv/clixor`, and at least 6 GiB free on Docker's filesystem, before
    creating a release or snapshot; when both paths share one filesystem, the
    requirements are added rather than counted twice;
-3. writes the release-local secret mode, stages and checksums that release's
-   host backup/restore/health programs and systemd units, and captures the active
-   versions plus timer state;
+3. writes the release-local secret mode; stages and checksums that release's
+   host backup/restore/health programs, systemd units, and
+   `cloudflared.service`; validates the connector unit with systemd; captures
+   the exact effective old connector-unit content/checksum and enabled/active
+   state; and captures the active backup-tool versions plus timer state;
 4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
    --list` and SHA-256 verification before changing the active runtime; a clean
@@ -264,38 +322,46 @@ The deploy script:
 5. for Vault, atomically fetches content and OCI version for every mapped
    artifact, writes and revalidates the strict mapping-bound candidate manifest,
    then selects its complete tmpfs generation while secret rollback is armed;
-6. builds and verifies an ARM64 API image tagged with the source revision;
-7. arms application rollback before refreshing runtime configuration,
+6. rejects live Redis or NATS credential changes on an existing singleton;
+7. builds and verifies an ARM64 API image tagged with the full source revision;
+8. arms application rollback before refreshing runtime configuration,
    synchronizing source, or reconciling containers;
-8. refreshes the independent dependency TLS leaves, synchronizes that exact
+9. refreshes the independent dependency TLS leaves, synchronizes that exact
    source to `/srv/clixor/repo`, and restarts dependencies that need a new image,
    scoped secret boundary, or certificate; the small HAProxy TLS edge is always
    replaced because it reads its bind-mounted configuration only at startup;
-9. runs the one-shot migration command, verifies the previous release still
+10. runs the one-shot migration command, verifies the previous release still
    passes readiness on the expanded schema, then replaces `api-a` and `api-b`
    one at a time, requiring direct readiness before replacing the next replica;
-10. reconciles the gateway only after both replicas are ready, validates its
+11. reconciles the gateway only after both replicas are ready, validates its
    reviewed configuration, and performs a graceful Nginx reload when recreation
    is unnecessary; running observability consumers are replaced separately;
-11. for production, verifies both public Cloudflare hostnames while rollback is
-   still armed;
-12. creates and uploads a fresh post-migration backup, restores it into an
-    isolated PostgreSQL container, and runs integrity checks;
-13. only after those gates, atomically publishes each staged host-tool and unit
-    file, reloads systemd, enables the verified timers, and runs backup health;
-14. records the dependency PKI state and atomically advances the current-release
-    pointer, thereby approving the app and exact Vault cohort together, before
-    disarming rollback; and
-15. after the fresh offsite marker and successful release are durable, retains
+12. for production, atomically publishes the reviewed connector unit, reloads
+    systemd, and restarts cloudflared only when its token or unit changed; the
+    service must report `Type=notify` readiness within 90 seconds before both
+    public Cloudflare hostnames are checked against the exact deployed revision;
+13. while rollback is still armed, atomically publishes the new backup/restore
+    programs and units and reloads systemd so every following gate uses the exact
+    candidate-release tooling;
+14. creates and uploads a fresh post-migration backup, restores it into an
+    isolated PostgreSQL container, runs integrity checks, enables the verified
+    timers, and runs backup health;
+15. records the dependency PKI state and atomically advances the current-release
+    pointer, thereby approving the application and exact Vault cohort together,
+    before disarming rollback; and
+16. after the fresh offsite marker and successful release are durable, retains
     the current and immediate previous rollback boundaries plus three small audit
     releases, deletes pre-migration dumps from non-boundary audit releases, and
     removes unused Clixor API image tags except the current and previous images.
 
-A failed upgrade, when a previous release exists, first restores the captured
-host programs, systemd units, and timer state if activation began, then restores
-its Compose model, API image, and captured startup configuration. A failed first
-deployment performs the same host-tool restoration and stops the incomplete
-stack without deleting its bind-mounted data. Database migrations are
+A failed upgrade restores the prior Vault selection, the exact captured
+cloudflared unit checksum plus enabled/active state, the captured host programs,
+systemd units, and timer state, then its Compose model, API image, and captured
+startup configuration. Connector readiness and public ingress are rechecked when
+the prior connector was active. Cloudflared or host-tool restoration failures are
+part of the final rollback verdict rather than warnings. A failed first
+deployment performs the same host restoration and stops the incomplete stack
+without deleting its bind-mounted data. Database migrations are
 forward-only: neither path automatically runs `pg_restore`, reverses migrations,
 or deletes database files. The pre-change dump is an operator recovery artifact,
 not an automatic rollback mechanism.
@@ -465,21 +531,25 @@ specific.
 
 ## 5. Move Cloudflare ingress
 
-Install cloudflared **2025.4.0 or newer** from Cloudflare's signed package
-repository; `--token-file` is unavailable in older releases and the installer
-rejects them. Create a new, remotely managed tunnel for this VM; do not reuse a
-NAS connector connected to a different database. Configure these public
+Install the cloudflared binary **2025.4.0 or newer** from Cloudflare's signed
+package repository; `--token-file` is unavailable in older releases and deploy
+rejects older binaries. Create a new, remotely managed tunnel for this VM; do not
+reuse a NAS connector connected to a different database. Configure these public
 hostname routes on that tunnel:
 
 - `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
 - `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
 
-After selecting the production Vault generation, install the hardened connector
-unit. It loads the token from the same atomic `active` generation:
+After selecting the production Vault generation, run the normal immutable
+release. `deploy.sh` checksum-stages and systemd-validates the hardened unit,
+captures the exact effective old fragment and state, atomically publishes the
+candidate, and reloads systemd. It loads the token from the same atomic `active`
+generation. It enables the unit but restarts it only if the reviewed unit or
+token changed, using a bounded 90-second readiness gate:
 
 ```sh
-sudo sh deploy/oci/install-cloudflared-service.sh \
-  "$PWD/deploy/oci/cloudflared.service"
+revision="$(git rev-parse HEAD)"
+sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-cloudflare-cutover
 sudo systemctl status --no-pager cloudflared.service
 ```
 
@@ -585,9 +655,18 @@ version to `CURRENT`, then run one candidate deployment; do not invoke boot
 hydration directly. A PostgreSQL password is
 not rotated by changing `POSTGRES_PASSWORD_FILE` on an initialized database:
 change the database role password in the same controlled operation or the API
-will be locked out. Redis/NATS credential changes recreate their containers;
-APNs and API-provider changes require both API replicas to restart; a Cloudflare
-token change requires a connector restart after the new tunnel token is proven.
+will be locked out. A normal release rejects a Redis or NATS credential change
+when that single-node dependency already exists; silently recreating either one
+would violate the zero-downtime release contract. Rotate either credential only
+as an explicit maintenance operation: announce a window, drain ingress and both
+APIs, preserve the prior Vault generation, update the server and client bundle
+together, recreate the affected dependency and both APIs, then prove local
+readiness and provider canaries before reopening ingress. On failure, reselect
+the prior Vault generation and recreate every affected consumer. Do not bypass
+the normal-release rejection because there is no redundant Redis or NATS node in
+this topology. APNs and API-provider changes require both API replicas to
+restart; a Cloudflare token change requires a connector restart after the new
+tunnel token is proven.
 JWT rotation invalidates sessions. The mail-queue key has the stricter drain
 procedure above. Any inconsistent dependency URL/credential bundle, pending mail
 during queue-key rotation, unverified Cloudflare token, or failed real-device
@@ -607,10 +686,13 @@ The initial operator bootstrap installs root-owned backup programs in
 deployment, bootstrap explicitly defers changes to those host programs and
 units. `deploy.sh` instead stores a checksum-verified version under that
 release's mode-0700 directory, captures the installed files and timer state, and
-keeps the old programs active for the offsite and restore gates. It publishes
-the staged files only after both gates pass. Any later release failure restores
-the captured files, reloads systemd, and restores the exact enabled/active timer
-state before application rollback proceeds.
+publishes the candidate tooling while rollback is armed and before starting the
+offsite or restore gates. Thus both synchronous gates execute the new release's
+programs and units. It first stops the three timers and refuses activation while
+an old backup, restore, or health job is running, closing the race where a gate
+could attach to a pre-release process. Any gate or later release failure restores
+the captured files, reloads systemd, restores the exact enabled/active timer
+state, and carries any restoration failure into the final rollback verdict.
 
 Once created, that file is the durable backup target. Later bootstraps preserve
 it and fail on conflicting transient `CLIXOR_OCI_BACKUP_BUCKET` or

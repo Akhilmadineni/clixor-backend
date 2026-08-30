@@ -22,6 +22,7 @@ pki_desired="${project_root}/runtime/dependency-pki.desired"
 pki_applied="${project_root}/runtime/dependency-pki.applied"
 backup_tool_root=/usr/local/libexec/clixor
 systemd_unit_root=/etc/systemd/system
+cloudflare_unit_path="${systemd_unit_root}/cloudflared.service"
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
 public_api_readiness_url=${CLIXOR_PUBLIC_API_READINESS_URL:-https://clustr-api.atlanteanz.com/health/ready}
 public_association_url=${CLIXOR_PUBLIC_ASSOCIATION_URL:-https://clixor.atlanteanz.com/.well-known/apple-app-site-association}
@@ -157,6 +158,31 @@ read_effective_secret_mode() {
   esac
 }
 
+reject_live_dependency_credential_change() {
+  dependency_label=$1
+  dependency_container=$2
+  mounted_secret=$3
+  desired_secret=$4
+  docker inspect "${dependency_container}" >/dev/null 2>&1 || return 0
+  [ "$(docker inspect "${dependency_container}" \
+    --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
+    fail "${dependency_label} already exists but is not running; use an explicit maintenance operation"
+  [ -f "${desired_secret}" ] && [ ! -L "${desired_secret}" ] || \
+    fail "desired ${dependency_label} credential file is unsafe"
+  running_secret_sha256="$(docker exec "${dependency_container}" \
+    sha256sum "${mounted_secret}" 2>/dev/null | awk 'NR == 1 {print $1}')"
+  desired_secret_sha256="$(sha256sum "${desired_secret}" | \
+    awk 'NR == 1 {print $1}')"
+  case "${running_secret_sha256}:${desired_secret_sha256}" in
+    *[!0-9a-f:]*) fail "could not verify the running ${dependency_label} credential digest" ;;
+  esac
+  [ "${#running_secret_sha256}" -eq 64 ] && \
+    [ "${#desired_secret_sha256}" -eq 64 ] || \
+    fail "could not verify the running ${dependency_label} credential digest"
+  [ "${running_secret_sha256}" = "${desired_secret_sha256}" ] || \
+    fail "${dependency_label} credential changes require an explicit single-node maintenance operation; normal releases preserve zero-downtime"
+}
+
 preflight_disk_capacity() {
   postgres_size_kb="$(du -sk "${project_root}/data/postgres" | awk 'NR == 1 {print $1}')"
   data_available_kb="$(df -Pk "${project_root}" | awk 'NR == 2 {print $4}')"
@@ -231,6 +257,13 @@ stage_host_tooling() {
       sha256sum "systemd/${unit_name}"
     ) >> "${host_tool_stage}/SHA256SUMS.partial"
   done
+  install -m 0644 -o 0 -g 0 \
+    "${source_root}/deploy/oci/cloudflared.service" \
+    "${host_tool_stage}/systemd/cloudflared.service"
+  (
+    cd "${host_tool_stage}"
+    sha256sum systemd/cloudflared.service
+  ) >> "${host_tool_stage}/SHA256SUMS.partial"
   chmod 0600 "${host_tool_stage}/SHA256SUMS.partial"
   mv "${host_tool_stage}/SHA256SUMS.partial" \
     "${host_tool_stage}/SHA256SUMS"
@@ -238,7 +271,62 @@ stage_host_tooling() {
     cd "${host_tool_stage}"
     sha256sum --check SHA256SUMS >/dev/null
   ) || fail "staged host backup tooling failed checksum verification"
+  grep -Fxq \
+    'LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token' \
+    "${host_tool_stage}/systemd/cloudflared.service" || \
+    fail "staged cloudflared unit does not use the approved credential path"
+  grep -Fq -- '--token-file %d/cloudflare-token' \
+    "${host_tool_stage}/systemd/cloudflared.service" || \
+    fail "staged cloudflared unit does not use systemd credentials"
   printf 'staged\n' > "${release_dir}/host-tools-state"
+}
+
+capture_cloudflared_state() {
+  install -d -m 0700 -o 0 -g 0 "${previous_cloudflare_root}"
+  previous_cloudflare_fragment="$(systemctl show \
+    --property=FragmentPath --value cloudflared.service 2>/dev/null || true)"
+  case "${previous_cloudflare_fragment}" in
+    '')
+      printf 'absent\n' > "${previous_cloudflare_root}/unit-state"
+      ;;
+    /*)
+      [ -f "${previous_cloudflare_fragment}" ] && \
+        [ ! -L "${previous_cloudflare_fragment}" ] || \
+        fail "effective cloudflared unit is not a regular file"
+      install -m 0600 -o 0 -g 0 "${previous_cloudflare_fragment}" \
+        "${previous_cloudflare_root}/cloudflared.service"
+      sha256sum "${previous_cloudflare_root}/cloudflared.service" > \
+        "${previous_cloudflare_root}/cloudflared.service.sha256"
+      sha256sum --check \
+        "${previous_cloudflare_root}/cloudflared.service.sha256" >/dev/null
+      stat -c '%u:%g:%a' "${previous_cloudflare_fragment}" > \
+        "${previous_cloudflare_root}/unit-metadata"
+      printf '%s\n' "${previous_cloudflare_fragment}" > \
+        "${previous_cloudflare_root}/unit-state"
+      ;;
+    *) fail "systemd returned an unsafe cloudflared fragment path" ;;
+  esac
+
+  previous_cloudflare_enabled_state="$(systemctl is-enabled \
+    cloudflared.service 2>/dev/null || true)"
+  case "${previous_cloudflare_enabled_state}" in
+    enabled|disabled|static|indirect|not-found) ;;
+    *) fail "cloudflared has an unsupported enabled state: ${previous_cloudflare_enabled_state:-unknown}" ;;
+  esac
+  previous_cloudflare_active_state="$(systemctl is-active \
+    cloudflared.service 2>/dev/null || true)"
+  case "${previous_cloudflare_active_state}" in
+    active|inactive) ;;
+    *) fail "cloudflared must be stably active or inactive before deployment" ;;
+  esac
+  previous_cloudflare_active=false
+  [ "${previous_cloudflare_active_state}" = "active" ] && \
+    previous_cloudflare_active=true
+  printf '%s\n' "${previous_cloudflare_enabled_state}" > \
+    "${previous_cloudflare_root}/enabled-state"
+  printf '%s\n' "${previous_cloudflare_active_state}" > \
+    "${previous_cloudflare_root}/active-state"
+  chmod 0600 "${previous_cloudflare_root}"/*
 }
 
 capture_host_tooling() {
@@ -311,11 +399,188 @@ publish_host_file() {
   rm -f -- "${pending_path}"
   install -m "${file_mode}" -o 0 -g 0 "${source_path}" "${pending_path}"
   mv -Tf "${pending_path}" "${target_path}"
+  cmp -s "${source_path}" "${target_path}"
+}
+
+wait_cloudflared_active() {
+  cloudflare_attempt=1
+  while :; do
+    systemctl is-active --quiet cloudflared.service && return 0
+    [ "${cloudflare_attempt}" -lt 45 ] || return 1
+    cloudflare_attempt=$((cloudflare_attempt + 1))
+    sleep 2
+  done
+}
+
+validate_cloudflared_runtime() {
+  [ -x /usr/bin/cloudflared ] || \
+    fail "production requires the signed cloudflared package"
+  [ -x /usr/bin/dpkg ] || fail "dpkg is required to validate cloudflared"
+  cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
+    sed -n 's/^cloudflared version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+  [ -n "${cloudflared_version}" ] || fail "could not parse cloudflared --version"
+  /usr/bin/dpkg --compare-versions "${cloudflared_version}" ge 2025.4.0 || \
+    fail "cloudflared 2025.4.0 or newer is required for --token-file"
+  systemd-analyze verify \
+    "${host_tool_stage}/systemd/cloudflared.service" >/dev/null || \
+    fail "staged cloudflared unit failed systemd verification"
+}
+
+activate_cloudflared() {
+  staged_cloudflare_unit="${host_tool_stage}/systemd/cloudflared.service"
+  cloudflare_unit_changed=false
+  if [ ! -f "${cloudflare_unit_path}" ] || \
+    [ -L "${cloudflare_unit_path}" ] || \
+    ! cmp -s "${staged_cloudflare_unit}" "${cloudflare_unit_path}"; then
+    cloudflare_unit_changed=true
+  fi
+
+  # Set this before the first host mutation so a partial publish, enable, or
+  # restart is restored by the exit trap.
+  cloudflare_state_activated=true
+  if [ "${cloudflare_unit_changed}" = "true" ]; then
+    log "publishing the reviewed cloudflared unit from this release"
+    publish_host_file "${staged_cloudflare_unit}" \
+      "${cloudflare_unit_path}" 0644
+    cmp -s "${staged_cloudflare_unit}" "${cloudflare_unit_path}" || \
+      fail "published cloudflared unit failed content verification"
+    systemctl daemon-reload
+  fi
+  systemctl enable cloudflared.service >/dev/null
+
+  if [ "${cloudflare_secret_changed}" = "true" ] || \
+    [ "${cloudflare_unit_changed}" = "true" ]; then
+    log "restarting cloudflared for its changed credential or reviewed unit"
+    systemctl restart --no-block cloudflared.service
+    wait_cloudflared_active || \
+      fail "cloudflared did not report readiness within 90 seconds"
+  else
+    systemctl is-active --quiet cloudflared.service || \
+      fail "cloudflared is inactive and no release change authorizes a restart"
+  fi
+}
+
+restore_cloudflared() {
+  restore_status=0
+  saved_fragment="$(sed -n '1p' \
+    "${previous_cloudflare_root}/unit-state" 2>/dev/null || true)"
+  saved_enabled="$(sed -n '1p' \
+    "${previous_cloudflare_root}/enabled-state" 2>/dev/null || true)"
+  saved_active="$(sed -n '1p' \
+    "${previous_cloudflare_root}/active-state" 2>/dev/null || true)"
+  case "${saved_enabled}" in
+    enabled|disabled|static|indirect|not-found) ;;
+    *) return 1 ;;
+  esac
+  case "${saved_active}" in
+    active|inactive) ;;
+    *) return 1 ;;
+  esac
+
+  log "restoring the exact prior cloudflared unit and service state"
+  rm -f -- "${cloudflare_unit_path}.pending.${release_tag}" || restore_status=1
+  if [ "${saved_active}" = "inactive" ]; then
+    systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
+  fi
+  if [ "${saved_enabled}" != "enabled" ]; then
+    systemctl disable cloudflared.service >/dev/null 2>&1 || restore_status=1
+  fi
+
+  case "${saved_fragment}" in
+    absent)
+      rm -f -- "${cloudflare_unit_path}" || restore_status=1
+      ;;
+    /*)
+      if [ "${saved_fragment}" = "${cloudflare_unit_path}" ]; then
+        saved_metadata="$(sed -n '1p' \
+          "${previous_cloudflare_root}/unit-metadata" 2>/dev/null || true)"
+        saved_uid=${saved_metadata%%:*}
+        metadata_remainder=${saved_metadata#*:}
+        saved_gid=${metadata_remainder%%:*}
+        saved_mode=${saved_metadata##*:}
+        case "${saved_uid}" in
+          ''|*[!0-9]*) restore_status=1 ;;
+        esac
+        case "${saved_gid}" in
+          ''|*[!0-9]*) restore_status=1 ;;
+        esac
+        case "${saved_mode}" in
+          [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+          *) restore_status=1 ;;
+        esac
+        if [ "${restore_status}" -eq 0 ]; then
+          pending_path="${cloudflare_unit_path}.pending.${release_tag}"
+          rm -f -- "${pending_path}" || restore_status=1
+          install -m "${saved_mode}" -o "${saved_uid}" -g "${saved_gid}" \
+            "${previous_cloudflare_root}/cloudflared.service" \
+            "${pending_path}" || restore_status=1
+          mv -Tf "${pending_path}" "${cloudflare_unit_path}" || restore_status=1
+        fi
+      else
+        # The prior effective unit came from the vendor unit directory. Removing
+        # this release's /etc override exposes that exact fragment again.
+        rm -f -- "${cloudflare_unit_path}" || restore_status=1
+      fi
+      ;;
+    *) restore_status=1 ;;
+  esac
+  systemctl daemon-reload || restore_status=1
+
+  if [ "${saved_enabled}" = "enabled" ]; then
+    systemctl enable cloudflared.service >/dev/null 2>&1 || restore_status=1
+  fi
+  if [ "${saved_active}" = "active" ]; then
+    systemctl restart --no-block cloudflared.service || restore_status=1
+    wait_cloudflared_active || restore_status=1
+  else
+    systemctl is-active --quiet cloudflared.service && restore_status=1
+  fi
+
+  restored_fragment="$(systemctl show --property=FragmentPath --value \
+    cloudflared.service 2>/dev/null || true)"
+  if [ "${saved_fragment}" = "absent" ]; then
+    [ -z "${restored_fragment}" ] || restore_status=1
+  else
+    [ "${restored_fragment}" = "${saved_fragment}" ] || restore_status=1
+    if [ -f "${restored_fragment}" ] && [ ! -L "${restored_fragment}" ]; then
+      restored_checksum="$(sha256sum "${restored_fragment}" | awk '{print $1}')"
+      saved_checksum="$(awk 'NR == 1 {print $1}' \
+        "${previous_cloudflare_root}/cloudflared.service.sha256")"
+      [ "${restored_checksum}" = "${saved_checksum}" ] || restore_status=1
+    else
+      restore_status=1
+    fi
+  fi
+  restored_enabled_state="$(systemctl is-enabled \
+    cloudflared.service 2>/dev/null || true)"
+  [ "${restored_enabled_state}" = "${saved_enabled}" ] || restore_status=1
+  return "${restore_status}"
 }
 
 activate_host_tooling() {
   host_tools_activated=true
-  log "activating release-versioned backup tooling after backup and restore gates"
+  log "activating release-versioned backup tooling before backup and restore gates"
+  # Freeze schedules before swapping their programs and units. If a previous
+  # job is still running, fail rather than let a gate attach to old tooling.
+  for host_gate_timer in \
+    clixor-offsite-backup.timer \
+    clixor-restore-drill.timer \
+    clixor-backup-health.timer
+  do
+    if systemctl is-active --quiet "${host_gate_timer}"; then
+      systemctl stop "${host_gate_timer}"
+    fi
+    systemctl is-active --quiet "${host_gate_timer}" && \
+      fail "${host_gate_timer} did not stop before host-tool activation"
+  done
+  for host_gate_service in \
+    clixor-offsite-backup.service \
+    clixor-restore-drill.service \
+    clixor-backup-health.service
+  do
+    systemctl is-active --quiet "${host_gate_service}" && \
+      fail "${host_gate_service} is already running; retry after the old job completes"
+  done
   for tool_name in \
     offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
   do
@@ -345,6 +610,7 @@ restore_host_tooling() {
     offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
   do
     target_path="${backup_tool_root}/${tool_name}"
+    rm -f -- "${target_path}.pending.${release_tag}" || restore_status=1
     if grep -qx "bin/${tool_name}=present" \
       "${previous_host_tool_root}/file-state"; then
       publish_host_file \
@@ -352,6 +618,8 @@ restore_host_tooling() {
         restore_status=1
     else
       rm -f -- "${target_path}" || restore_status=1
+      [ ! -e "${target_path}" ] && [ ! -L "${target_path}" ] || \
+        restore_status=1
     fi
   done
   for unit_name in \
@@ -363,6 +631,7 @@ restore_host_tooling() {
     clixor-restore-drill.timer
   do
     target_path="${systemd_unit_root}/${unit_name}"
+    rm -f -- "${target_path}.pending.${release_tag}" || restore_status=1
     if grep -qx "systemd/${unit_name}=present" \
       "${previous_host_tool_root}/file-state"; then
       publish_host_file \
@@ -370,6 +639,8 @@ restore_host_tooling() {
         "${target_path}" 0644 || restore_status=1
     else
       rm -f -- "${target_path}" || restore_status=1
+      [ ! -e "${target_path}" ] && [ ! -L "${target_path}" ] || \
+        restore_status=1
     fi
   done
   systemctl daemon-reload || restore_status=1
@@ -388,6 +659,14 @@ restore_host_tooling() {
     else
       systemctl stop "${timer_name}" || restore_status=1
     fi
+    actual_timer_enabled=false
+    actual_timer_active=false
+    systemctl is-enabled --quiet "${timer_name}" >/dev/null 2>&1 && \
+      actual_timer_enabled=true
+    systemctl is-active --quiet "${timer_name}" >/dev/null 2>&1 && \
+      actual_timer_active=true
+    [ "${actual_timer_enabled}" = "${timer_enabled}" ] || restore_status=1
+    [ "${actual_timer_active}" = "${timer_active}" ] || restore_status=1
   done < "${previous_host_tool_root}/timer-state"
   printf 'rolled-back\n' > "${release_dir}/host-tools-state" || restore_status=1
   return "${restore_status}"
@@ -499,7 +778,7 @@ esac
 
 for command_name in \
   awk cmp curl df docker du find findmnt flock grep install mktemp mv python3 \
-  readlink rm rsync sed sha256sum sort stat systemctl touch tr wc
+  readlink rm rsync sed sha256sum sort stat systemctl systemd-analyze touch tr wc
 do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
@@ -537,7 +816,6 @@ fi
 
 vault_generation_changed=false
 cloudflare_secret_changed=false
-cloudflare_secret_activated=false
 vault_postgres_secret_changed=false
 vault_postgres_secret_activated=false
 vault_redis_secret_changed=false
@@ -586,6 +864,7 @@ scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
 previous_runtime_root="${release_dir}/previous-runtime"
 host_tool_stage="${release_dir}/host-tools"
 previous_host_tool_root="${release_dir}/previous-host-tools"
+previous_cloudflare_root="${release_dir}/previous-cloudflared"
 pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
@@ -601,6 +880,7 @@ chown 0:0 "${release_dir}/secret-mode.partial"
 mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
 stage_host_tooling
 capture_host_tooling
+capture_cloudflared_state
 
 previous_image="$(docker inspect clixor-oci-api-a --format '{{.Config.Image}}' 2>/dev/null || true)"
 previous_postgres_id="$(docker inspect clixor-oci-postgres --format '{{.Id}}' 2>/dev/null || true)"
@@ -724,6 +1004,7 @@ fi
 
 rollback_needed=0
 host_tools_activated=false
+cloudflare_state_activated=false
 restore_previous_vault_target() {
   [ "${vault_generation_changed}" = "true" ] || return 0
   if [ -n "${current_vault_target}" ]; then
@@ -773,49 +1054,6 @@ scoped_runtime_ready() {
     "${runtime_env}"
 }
 
-retire_persistent_staging_secrets() {
-  for persistent_name in \
-    api.env postgres.env redis.env nats.env grafana.env backup.env migrate.env \
-    metrics.token postgres.password postgres.pgpass redis.password redis.acl \
-    nats.conf grafana.ini cloudflare-token
-  do
-    persistent_path="${project_root}/secrets/${persistent_name}"
-    if [ -e "${persistent_path}" ] || [ -L "${persistent_path}" ]; then
-      [ -f "${persistent_path}" ] && [ ! -L "${persistent_path}" ] || return 1
-      rm -f -- "${persistent_path}" || return 1
-    fi
-  done
-  for persistent_apns_key in "${project_root}/secrets/apns"/*.p8; do
-    [ -e "${persistent_apns_key}" ] || continue
-    [ -f "${persistent_apns_key}" ] && [ ! -L "${persistent_apns_key}" ] || \
-      return 1
-    rm -f -- "${persistent_apns_key}" || return 1
-  done
-  legacy_cloudflare_token=/etc/cloudflared/token
-  if [ -e "${legacy_cloudflare_token}" ] || [ -L "${legacy_cloudflare_token}" ]; then
-    [ -f "${legacy_cloudflare_token}" ] && \
-      [ ! -L "${legacy_cloudflare_token}" ] && \
-      [ "$(stat -c '%u:%g:%a' "${legacy_cloudflare_token}")" = "0:0:600" ] || \
-      return 1
-    rm -f -- "${legacy_cloudflare_token}" || return 1
-  fi
-  for residual_secret_dir in \
-    "${project_root}/secrets"/.split-runtime.* \
-    "${project_root}/secrets"/.staging-runtime-*
-  do
-    [ -e "${residual_secret_dir}" ] || continue
-    [ -d "${residual_secret_dir}" ] && [ ! -L "${residual_secret_dir}" ] && \
-      [ "$(stat -c '%u:%g:%a' "${residual_secret_dir}")" = "0:0:700" ] || \
-      return 1
-    case "${residual_secret_dir}" in
-      "${project_root}/secrets"/.split-runtime.*|\
-      "${project_root}/secrets"/.staging-runtime-*) ;;
-      *) return 1 ;;
-    esac
-    rm -rf -- "${residual_secret_dir}" || return 1
-  done
-}
-
 rollback() {
   status=$?
   trap - 0
@@ -831,38 +1069,36 @@ rollback() {
   fi
   secret_rollback_failed=0
   cloudflare_rollback_failed=0
+  host_tool_rollback_failed=0
+  application_rollback_failed=0
+  cloudflare_rollback_attempted=false
   if [ "${status}" -ne 0 ] && [ "${vault_generation_changed}" = "true" ]; then
     set +e
     if restore_previous_vault_target; then
       log "restored the previous runtime-secret generation after deployment failure"
-      if [ "${cloudflare_secret_activated}" = "true" ]; then
-        if [ -n "${previous_vault_target}" ]; then
-          if systemctl restart cloudflared.service && \
-            systemctl is-active --quiet cloudflared.service; then
-            log "restored cloudflared with the previous credential"
-          else
-            log "ERROR: cloudflared did not recover with the previous credential" >&2
-            cloudflare_rollback_failed=1
-          fi
-        else
-          if systemctl stop cloudflared.service; then
-            log "stopped cloudflared because no prior credential existed"
-          else
-            log "ERROR: cloudflared did not stop after first-deploy failure" >&2
-            cloudflare_rollback_failed=1
-          fi
-        fi
-      fi
     else
       log "ERROR: could not restore the previous runtime-secret generation" >&2
       secret_rollback_failed=1
     fi
+  fi
+  if [ "${status}" -ne 0 ] && \
+    [ "${cloudflare_state_activated}" = "true" ]; then
+    set +e
+    cloudflare_rollback_attempted=true
+    if restore_cloudflared; then
+      log "restored cloudflared's prior unit checksum and enabled/active state"
+    else
+      log "ERROR: rollback could not restore and verify cloudflared" >&2
+      cloudflare_rollback_failed=1
+    fi
+    cloudflare_state_activated=false
   fi
   if [ "${status}" -ne 0 ] && [ "${rollback_needed}" -eq 1 ]; then
     set +e
     if [ "${host_tools_activated}" = "true" ]; then
       if ! restore_host_tooling; then
         log "ERROR: rollback could not restore the prior host backup tooling" >&2
+        host_tool_rollback_failed=1
       fi
       host_tools_activated=false
     fi
@@ -1018,30 +1254,40 @@ rollback() {
       fi
       if [ "${rollback_failed}" -eq 0 ] && \
         [ "${rollback_ready}" = "true" ] && \
+        [ "${cloudflare_rollback_attempted}" = "true" ] && \
+        [ "${previous_cloudflare_active}" = "true" ] && \
         [ "${public_smoke_required}" = "true" ]; then
         if verify_public_ingress "${previous_revision}"; then
+          log "verified public ingress after connector rollback"
           cloudflare_rollback_failed=0
         else
           log "ERROR: public ingress did not recover after connector rollback" >&2
           cloudflare_rollback_failed=1
         fi
       fi
-      if [ "${rollback_failed}" -eq 0 ] && \
-        [ "${secret_rollback_failed}" -eq 0 ] && \
-        [ "${cloudflare_rollback_failed}" -eq 0 ] && \
-        [ "${rollback_ready}" = "true" ]; then
-        log "application rollback completed; database migrations were not reversed"
-      else
-        log "ERROR: application rollback did not restore and verify the prior release" >&2
+      if [ "${rollback_failed}" -ne 0 ] || \
+        [ "${rollback_ready}" != "true" ]; then
+        application_rollback_failed=1
       fi
     else
       log "first deployment failed; stopping the incomplete application stack"
       if [ -s "${compose_file}" ]; then
-        CLIXOR_IMAGE_TAG="${release_tag}" docker compose \
-          --file "${compose_file}" down --remove-orphans
-        rm -f -- "${compose_file}"
+        if ! CLIXOR_IMAGE_TAG="${release_tag}" docker compose \
+          --file "${compose_file}" down --remove-orphans; then
+          application_rollback_failed=1
+        fi
+        rm -f -- "${compose_file}" || application_rollback_failed=1
       fi
-      log "first-deploy cleanup completed; database files and forward migrations were not restored or deleted"
+    fi
+  fi
+  if [ "${status}" -ne 0 ]; then
+    if [ "${secret_rollback_failed}" -eq 0 ] && \
+      [ "${cloudflare_rollback_failed}" -eq 0 ] && \
+      [ "${host_tool_rollback_failed}" -eq 0 ] && \
+      [ "${application_rollback_failed}" -eq 0 ]; then
+      log "rollback verdict: prior release state restored and verified; database migrations were not reversed"
+    else
+      log "ERROR: rollback verdict: incomplete (application=${application_rollback_failed} secrets=${secret_rollback_failed} cloudflared=${cloudflare_rollback_failed} host-tools=${host_tool_rollback_failed})" >&2
     fi
   fi
   exit "${status}"
@@ -1105,6 +1351,16 @@ if [ "${vault_hydration_mode}" = "true" ]; then
     done
   fi
 fi
+
+# Compare the desired credential with the file actually mounted in each running
+# singleton. This also catches a Vault generation selected before this deploy,
+# when the hydrator would otherwise report an unchanged active symlink.
+reject_live_dependency_credential_change \
+  Redis clixor-oci-redis /run/secrets/redis.acl \
+  "${active_secret_root}/redis.acl"
+reject_live_dependency_credential_change \
+  NATS clixor-oci-nats /run/secrets/nats.conf \
+  "${active_secret_root}/nats.conf"
 
 log "building ARM64 release ${new_image}"
 docker buildx build --load \
@@ -1385,12 +1641,11 @@ for replica in api-a api-b; do
     "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the gateway"
 done
 log "both API replicas completed native OCI media-provider startup and readiness"
-if [ "${cloudflare_secret_changed}" = "true" ]; then
-  log "restarting cloudflared to activate the rotated tmpfs credential"
-  cloudflare_secret_activated=true
-  systemctl restart cloudflared.service
-  systemctl is-active --quiet cloudflared.service || \
-    fail "cloudflared did not become active with the rotated credential"
+if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
+  validate_cloudflared_runtime
+  activate_cloudflared
+else
+  log "cloudflared unit activation is deferred for this non-production staging deployment"
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"
@@ -1398,6 +1653,7 @@ else
   log "public ingress smoke is deferred for this non-production staging deployment"
 fi
 
+activate_host_tooling
 log "forcing a fresh post-migration backup for the isolated restore release gate"
 backup_gate_start="${release_dir}/post-migration-backup-gate-start"
 touch "${backup_gate_start}"
@@ -1434,7 +1690,6 @@ systemctl start clixor-restore-drill.service
   [ -n "$(find "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" \
     -newer "${backup_gate_start}" -print 2>/dev/null)" ] || \
   fail "the isolated restore drill did not produce a fresh success marker"
-activate_host_tooling
 systemctl enable --now \
   clixor-offsite-backup.timer \
   clixor-restore-drill.timer \
@@ -1463,29 +1718,6 @@ rollback_needed=0
 vault_generation_changed=false
 [ "${release_commit_status}" -eq 0 ] || \
   fail "release pointer committed but durable commit verification failed"
-
-# Retire durable staging copies only after the release is committed and its
-# rollback trap is disarmed. A staging-to-Vault cutover deliberately retains
-# the prior files for one full release; the next successful Vault-to-Vault
-# release removes them after proving both the application and connector.
-retire_staging_copies=false
-if [ "${initial_vault_cutover}" = "true" ]; then
-  # Keep the durable cohort as an operator fallback through one subsequent
-  # approved Vault-to-Vault release. The boot decision already changed
-  # atomically with releases/current; this copy is not selected automatically.
-  retire_staging_copies=false
-elif [ "${first_deploy}" = "true" ]; then
-  retire_staging_copies=true
-else
-  case "${previous_vault_target}" in
-    vault-generations/gen-[0-9]*-[0-9a-f]*) retire_staging_copies=true ;;
-  esac
-fi
-if grep -qx 'CLUSTER_ENV=production' "${api_env}" && \
-  [ "${retire_staging_copies}" = "true" ]; then
-  retire_persistent_staging_secrets || \
-    fail "release is live but persistent staging credential retirement failed"
-fi
 log "deployed ${new_image}; API readiness passed"
 if ! prune_release_history; then
   log "WARNING: bounded post-release retention did not complete; capacity preflight remains authoritative"
