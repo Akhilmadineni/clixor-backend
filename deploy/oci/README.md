@@ -233,6 +233,14 @@ for Apple application `H9S3BAQ9U8.com.Clustr.Clustr.Clustr`. It must return
 directly with HTTP 200 and `Content-Type: application/json`; do not put a login,
 HTML error page, or redirect in front of it.
 
+Password-reset mail must use authenticated STARTTLS submission. For OCI Email
+Delivery in Phoenix, configure `smtp.email.us-phoenix-1.oci.oraclecloud.com:587`,
+the generated SMTP username/password, an approved `no-reply@atlanteanz.com`
+sender, and a distinct password-reset HMAC secret in the protected runtime
+secret. Keep `CLUSTER_MAIL_PROVIDER=disabled` until SPF, DKIM, DMARC, suppression
+handling, and a real-mailbox reset/confirmation canary pass; the reset endpoints
+then return 503 instead of offering an unsafe shortcut.
+
 Never leave the old NAS and new OCI connectors serving the same hostnames against
 different databases. That creates split-brain writes and inconsistent sessions.
 Cloudflare must allow WebSockets. Media transfer URLs are short-lived,

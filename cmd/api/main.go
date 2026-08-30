@@ -48,15 +48,19 @@ func main() {
 	var presenceService presence.Service
 	var mailService clustrmail.Service = clustrmail.Unavailable{}
 	if cfg.Mail.Provider == "smtp" {
-		smtpService, err := clustrmail.NewSMTP(cfg.Mail.SMTPAddress, cfg.Mail.From)
+		smtpService, err := clustrmail.NewAuthenticatedSMTP(clustrmail.SMTPConfig{
+			Address: cfg.Mail.SMTPAddress, From: cfg.Mail.From,
+			Username: cfg.Mail.SMTPUsername, Password: cfg.Mail.SMTPPassword,
+			ServerName: cfg.Mail.SMTPServerName, CAFile: cfg.Mail.SMTPCAFile,
+		})
 		if err != nil {
-			logger.Error("configure NAS mail queue", "error", err)
+			logger.Error("configure authenticated SMTP submission", "error", err)
 			os.Exit(1)
 		}
 		mailService = smtpService
 		logger.Info("password reset email provider enabled", "provider", "smtp")
 	} else {
-		logger.Warn("password reset email is disabled until the NAS mail queue is configured")
+		logger.Warn("password reset email is disabled until authenticated SMTP is configured")
 	}
 	durableStore := false
 	switch cfg.Store {

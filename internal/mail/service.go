@@ -8,8 +8,8 @@ import (
 
 var ErrUnavailable = errors.New("mail delivery unavailable")
 
-// Service submits transactional messages to the private NAS mail queue. It
-// deliberately exposes no generic arbitrary-message API.
+// Service submits only Clixor transactional mail. It deliberately exposes no
+// generic arbitrary-message API.
 type Service interface {
 	SendPasswordReset(context.Context, string, string, time.Duration) error
 	SendPasswordChanged(context.Context, string) error

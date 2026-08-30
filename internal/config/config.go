@@ -102,6 +102,10 @@ type PushDeliveryConfig struct {
 type MailConfig struct {
 	Provider                 string
 	SMTPAddress              string
+	SMTPUsername             string
+	SMTPPassword             string
+	SMTPServerName           string
+	SMTPCAFile               string
 	From                     string
 	PasswordResetSecret      string
 	PasswordResetTTL         time.Duration
@@ -259,7 +263,11 @@ func Load() (Config, error) {
 		},
 		Mail: MailConfig{
 			Provider:                 env("CLUSTER_MAIL_PROVIDER", "disabled"),
-			SMTPAddress:              env("CLUSTER_SMTP_ADDRESS", "mail.clustr.internal:25"),
+			SMTPAddress:              os.Getenv("CLUSTER_SMTP_ADDRESS"),
+			SMTPUsername:             os.Getenv("CLUSTER_SMTP_USERNAME"),
+			SMTPPassword:             os.Getenv("CLUSTER_SMTP_PASSWORD"),
+			SMTPServerName:           os.Getenv("CLUSTER_SMTP_SERVER_NAME"),
+			SMTPCAFile:               os.Getenv("CLUSTER_SMTP_CA_FILE"),
 			From:                     env("CLUSTER_MAIL_FROM", "Clixor <no-reply@atlanteanz.com>"),
 			PasswordResetSecret:      os.Getenv("CLUSTER_PASSWORD_RESET_HMAC_SECRET"),
 			PasswordResetTTL:         passwordResetTTL,
@@ -466,6 +474,16 @@ func (cfg Config) validateMail() error {
 	host, _, err := net.SplitHostPort(mail.SMTPAddress)
 	if err != nil || strings.TrimSpace(host) == "" {
 		return errors.New("CLUSTER_SMTP_ADDRESS must be a host:port address")
+	}
+	if strings.TrimSpace(mail.SMTPUsername) == "" || mail.SMTPPassword == "" {
+		return errors.New("CLUSTER_SMTP_USERNAME and CLUSTER_SMTP_PASSWORD are required")
+	}
+	serverName := strings.TrimSpace(mail.SMTPServerName)
+	if serverName == "" {
+		serverName = host
+	}
+	if net.ParseIP(serverName) != nil || strings.ContainsAny(serverName, "\r\n/:@") {
+		return errors.New("CLUSTER_SMTP_SERVER_NAME must be a DNS hostname")
 	}
 	from, err := netmail.ParseAddress(mail.From)
 	if err != nil || strings.TrimSpace(from.Address) == "" {

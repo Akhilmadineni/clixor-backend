@@ -162,6 +162,20 @@ func TestProductionMayKeepUnverifiedOutboundMailDisabled(t *testing.T) {
 	}
 }
 
+func TestSMTPRequiresAuthenticatedTLSSubmissionConfiguration(t *testing.T) {
+	for _, mutate := range []func(*Config){
+		func(cfg *Config) { cfg.Mail.SMTPUsername = "" },
+		func(cfg *Config) { cfg.Mail.SMTPPassword = "" },
+		func(cfg *Config) { cfg.Mail.SMTPServerName = "127.0.0.1" },
+	} {
+		cfg := validProductionConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("unsafe SMTP submission configuration was accepted")
+		}
+	}
+}
+
 func TestPushDeliveryPolicyIsBounded(t *testing.T) {
 	valid := PushDeliveryConfig{
 		BatchSize: 100, WorkerConcurrency: 16, MaxAttempts: 8,
@@ -223,7 +237,9 @@ func validProductionConfig() Config {
 			TelnyxPublicKey:          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 		},
 		Mail: MailConfig{
-			Provider: "smtp", SMTPAddress: "mail.clustr.internal:25",
+			Provider: "smtp", SMTPAddress: "smtp.email.us-phoenix-1.oci.oraclecloud.com:587",
+			SMTPUsername: "smtp-user", SMTPPassword: "smtp-password",
+			SMTPServerName:      "smtp.email.us-phoenix-1.oci.oraclecloud.com",
 			From:                "Clixor <no-reply@atlanteanz.com>",
 			PasswordResetSecret: strings.Repeat("r", 48),
 			PasswordResetTTL:    10 * time.Minute, PasswordResetLength: 8,

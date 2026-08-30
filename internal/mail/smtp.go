@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	netmail "net/mail"
 	"net/smtp"
+	"os"
 	"strings"
 	"time"
 )
@@ -21,6 +24,17 @@ type SMTP struct {
 	hostname     string
 	from         *netmail.Address
 	envelopeFrom string
+	auth         smtp.Auth
+	tlsConfig    *tls.Config
+}
+
+type SMTPConfig struct {
+	Address    string
+	From       string
+	Username   string
+	Password   string
+	ServerName string
+	CAFile     string
 }
 
 func NewSMTP(address, from string) (*SMTP, error) {
@@ -37,6 +51,59 @@ func NewSMTP(address, from string) (*SMTP, error) {
 		address: address, hostname: host, from: parsedFrom,
 		envelopeFrom: parsedFrom.Address,
 	}, nil
+}
+
+// NewAuthenticatedSMTP configures an Internet SMTP submission endpoint. The
+// connection must advertise STARTTLS and AUTH; credentials are never sent on a
+// plaintext connection. CAFile is optional and augments the host's system trust
+// store when a private relay is explicitly used.
+func NewAuthenticatedSMTP(config SMTPConfig) (*SMTP, error) {
+	address := strings.TrimSpace(config.Address)
+	host, _, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("invalid SMTP address %q", address)
+	}
+	username := strings.TrimSpace(config.Username)
+	if username == "" || config.Password == "" || strings.ContainsAny(username, "\r\n") {
+		return nil, errors.New("authenticated SMTP requires a username and password")
+	}
+	serverName := strings.TrimSpace(config.ServerName)
+	if serverName == "" {
+		serverName = host
+	}
+	if net.ParseIP(serverName) != nil || strings.ContainsAny(serverName, "\r\n/:@") {
+		return nil, errors.New("SMTP TLS server name must be a DNS hostname")
+	}
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system SMTP trust store: %w", err)
+	}
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+	if caFile := strings.TrimSpace(config.CAFile); caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read SMTP CA file: %w", err)
+		}
+		if !rootCAs.AppendCertsFromPEM(pem) {
+			return nil, errors.New("SMTP CA file did not contain a valid certificate")
+		}
+	}
+	sender, err := NewSMTP(address, config.From)
+	if err != nil {
+		return nil, err
+	}
+	// net/smtp passes this name to Auth as the peer identity. Keep it aligned
+	// with the DNS name verified by TLS even when the dial address is an IP.
+	sender.hostname = serverName
+	sender.auth = smtp.PlainAuth("", username, config.Password, serverName)
+	sender.tlsConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: serverName,
+		RootCAs:    rootCAs,
+	}
+	return sender, nil
 }
 
 func (s *SMTP) Ping(ctx context.Context) error {
@@ -163,6 +230,28 @@ func (s *SMTP) connect(ctx context.Context) (*smtp.Client, net.Conn, error) {
 	if err != nil {
 		conn.Close()
 		return nil, nil, fmt.Errorf("open SMTP session: %w", err)
+	}
+	if s.tlsConfig != nil {
+		if supported, _ := client.Extension("STARTTLS"); !supported {
+			client.Close()
+			conn.Close()
+			return nil, nil, errors.New("SMTP submission endpoint does not advertise STARTTLS")
+		}
+		if err := client.StartTLS(s.tlsConfig.Clone()); err != nil {
+			client.Close()
+			conn.Close()
+			return nil, nil, fmt.Errorf("start SMTP TLS: %w", err)
+		}
+		if supported, _ := client.Extension("AUTH"); !supported {
+			client.Close()
+			conn.Close()
+			return nil, nil, errors.New("SMTP submission endpoint does not advertise AUTH after TLS")
+		}
+		if err := client.Auth(s.auth); err != nil {
+			client.Close()
+			conn.Close()
+			return nil, nil, fmt.Errorf("authenticate SMTP submission: %w", err)
+		}
 	}
 	return client, conn, nil
 }

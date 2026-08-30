@@ -53,11 +53,12 @@ plaintext-equivalent at the server, and not E2EE. Track the counter by release;
 remove the strict one-field compatibility envelope only after upgraded-client
 adoption is verified and a coordinated minimum-version policy is active.
 
-Outbound reset email is prepared but intentionally disabled for this release.
-With `CLUSTER_MAIL_PROVIDER=disabled`, both reset endpoints fail closed with 503
-and the NAS mail profile remains stopped. Enable SMTP only after PTR, DNS-only A,
-SPF, DKIM, DMARC, outbound TCP 25, queue retry, and real-mailbox delivery canaries
-pass; local SMTP readiness alone does not prove Internet delivery.
+Outbound reset email fails closed while `CLUSTER_MAIL_PROVIDER=disabled`.
+The OCI deployment uses an authenticated SMTP submission service over mandatory
+STARTTLS; it never sends credentials or reset codes to a plaintext relay. Enable
+SMTP only after the approved sender, SPF, DKIM, DMARC, provider suppression
+handling, and real-mailbox delivery canaries pass. A successful SMTP handshake
+alone does not prove Internet delivery.
 SMTP is intentionally not a core `/health/ready` dependency: an email outage must
 not eject both API replicas from service. Monitor reset queue failures separately;
 activation requires the explicit real-mailbox canary below, and a failed enqueue
