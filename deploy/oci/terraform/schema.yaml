@@ -183,7 +183,7 @@ outputs:
     title: "Mail SPF TXT value"
   mail_smtp_endpoint:
     type: copyableString
-    title: "Mail SMTP STARTTLS endpoint"
+    title: "Mail SMTP implicit-TLS endpoint"
   mail_smtp_user_id:
     type: copyableString
     title: "Dedicated SMTP IAM user OCID"

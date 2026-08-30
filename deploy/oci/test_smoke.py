@@ -293,6 +293,8 @@ class ReleaseHardeningTests(unittest.TestCase):
 
         self.assertIn('mail_domain        = "mail.atlanteanz.com"', email)
         self.assertIn('mail_sender        = "no-reply@${local.mail_domain}"', email)
+        self.assertIn('mail_smtp_endpoint = "smtp.email.${var.region}.oci.oraclecloud.com:465"', email)
+        self.assertNotIn("oraclecloud.com:587", email)
         for resource_type in (
             "oci_email_email_domain",
             "oci_email_dkim",

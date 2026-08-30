@@ -3,7 +3,7 @@ locals {
   mail_sender        = "no-reply@${local.mail_domain}"
   mail_dkim_selector = "clixor-phx-20260830"
   mail_spf_txt_value = "v=spf1 include:rp.oracleemaildelivery.com ~all"
-  mail_smtp_endpoint = "smtp.email.${var.region}.oci.oraclecloud.com:587"
+  mail_smtp_endpoint = "smtp.email.${var.region}.oci.oraclecloud.com:465"
 }
 
 resource "oci_email_email_domain" "transactional_mail" {

@@ -99,7 +99,7 @@ output "mail_spf_txt_value" {
 }
 
 output "mail_smtp_endpoint" {
-  description = "OCI Email Delivery STARTTLS submission endpoint and port."
+  description = "OCI Email Delivery implicit-TLS submission endpoint and port."
   value       = local.mail_smtp_endpoint
 }
 

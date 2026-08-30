@@ -146,11 +146,12 @@ does not create, read, rotate, or destroy that credential. Rotate it manually,
 with an overlap canary, and retain no more than the two OCI credentials allowed
 per user.
 
-Configure the application for mandatory STARTTLS using the
-`mail_smtp_endpoint` output and `no-reply@mail.atlanteanz.com`. Keep outbound
-mail disabled until an external mailbox receives a complete password-reset
-canary and DKIM/SPF headers pass. Add DMARC only after a monitored reporting
-mailbox exists; OCI Email Delivery does not provide an inbox for DMARC reports.
+Configure the application for mandatory implicit TLS using the
+`mail_smtp_endpoint` output (port 465), `CLUSTER_SMTP_TRANSPORT=implicit_tls`,
+and `no-reply@mail.atlanteanz.com`. Keep outbound mail disabled until an
+external mailbox receives a complete password-reset canary and DKIM/SPF headers
+pass. Add DMARC only after a monitored reporting mailbox exists; OCI Email
+Delivery does not provide an inbox for DMARC reports.
 
 For an audited break-glass import when GitHub is unavailable, generate the
 equivalent upload bundle locally and verify its checksum before upload:
