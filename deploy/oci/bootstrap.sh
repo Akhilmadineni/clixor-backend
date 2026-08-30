@@ -114,7 +114,7 @@ if [ ! -f "${runtime_env}" ]; then
   oci_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get --query data --raw-output)"
   oci_region="$(curl --fail --silent --show-error \
     --header 'Authorization: Bearer Oracle' \
-    http://169.254.169.254/opc/v2/instance/region | tr -d '"[:space:]')"
+    http://169.254.169.254/opc/v2/instance/canonicalRegionName | tr -d '[:space:]')"
   oci_media_bucket=${CLIXOR_OCI_MEDIA_BUCKET:-clixor-prod-media}
   [ -n "${oci_namespace}" ] || {
     echo "Could not resolve the OCI Object Storage namespace with instance principal." >&2
