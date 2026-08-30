@@ -113,8 +113,10 @@ fi
 if [ ! -f "${runtime_env}" ]; then
   oci_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get --query data --raw-output)"
   oci_region="$(curl --fail --silent --show-error \
+    --connect-timeout 5 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
     --header 'Authorization: Bearer Oracle' \
-    http://169.254.169.254/opc/v2/instance/canonicalRegionName | tr -d '[:space:]')"
+    http://169.254.169.254/opc/v2/instance/canonicalRegionName)"
+  oci_region="$(printf '%s' "${oci_region}" | tr -d '[:space:]')"
   oci_media_bucket=${CLIXOR_OCI_MEDIA_BUCKET:-clixor-prod-media}
   [ -n "${oci_namespace}" ] || {
     echo "Could not resolve the OCI Object Storage namespace with instance principal." >&2
