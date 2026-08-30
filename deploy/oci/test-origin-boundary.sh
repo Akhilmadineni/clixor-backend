@@ -5,12 +5,12 @@ root="$(mktemp -d /tmp/clixor-origin-test.XXXXXX)"
 chmod 0711 "${root}"
 cleanup() { kill "${server_pid:-0}" 2>/dev/null || true; rm -rf -- "${root}"; }
 trap cleanup EXIT HUP INT TERM
-install -d -m 0750 -o 101 -g 987 "${root}/origin"
+install -d -m 0750 -o 986 -g 987 "${root}/origin"
 
 # Faithful kernel boundary: the gateway owner creates a 0770 Unix socket; only
 # a process carrying connector GID 987 can connect. Other host/runner identities
 # cannot traverse the directory or replace the socket entry.
-setpriv --reuid=101 --regid=987 --clear-groups python3 - "${root}/origin/gateway.sock" <<'PY' &
+setpriv --reuid=986 --regid=987 --clear-groups python3 - "${root}/origin/gateway.sock" <<'PY' &
 import os, socket, sys
 os.umask(0o007)
 s = socket.socket(socket.AF_UNIX)
@@ -20,8 +20,8 @@ for _ in range(1):
 PY
 server_pid=$!
 for _ in $(seq 1 50); do [ -S "${root}/origin/gateway.sock" ] && break; sleep .05; done
-[ "$(stat -c '%u:%g:%a' "${root}/origin")" = "101:987:750" ]
-[ "$(stat -c '%u:%g:%a' "${root}/origin/gateway.sock")" = "101:987:770" ]
+[ "$(stat -c '%u:%g:%a' "${root}/origin")" = "986:987:750" ]
+[ "$(stat -c '%u:%g:%a' "${root}/origin/gateway.sock")" = "986:987:770" ]
 [ "$(setpriv --reuid=65530 --regid=65530 --groups=987 python3 - "${root}/origin/gateway.sock" <<'PY'
 import socket, sys
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(64).decode().strip())
@@ -37,6 +37,25 @@ fi
 if setpriv --reuid=65530 --regid=65530 --groups=987 \
   rm -f -- "${root}/origin/gateway.sock" 2>/dev/null; then
   echo "connector group could replace the gateway socket" >&2; exit 1
+fi
+setpriv --reuid=986 --regid=987 --clear-groups rm -f -- "${root}/origin/gateway.sock"
+[ ! -e "${root}/origin/gateway.sock" ]
+
+# The bootstrap's collision guard is exact: any pre-existing numeric owner with
+# another name is a terminal condition, never silently adopted.
+python3 - "$(dirname "$0")/bootstrap.sh" <<'PY'
+import pathlib, sys
+raw=pathlib.Path(sys.argv[1]).read_text()
+assert 'getent passwd "${gateway_uid}"' in raw
+assert 'already assigned outside the gateway boundary' in raw
+assert 'passwd --lock "${gateway_user}"' in raw
+assert '/usr/sbin/nologin' in raw and '/nonexistent' in raw
+PY
+if python3 "$(dirname "$0")/validate-origin-identity.py" \
+  --passwd-record 'occupied:x:986:987::/nonexistent:/usr/sbin/nologin' \
+  --group-record 'clixor-origin:x:987:' --shadow-status 'clixor-gateway L' \
+  >/dev/null 2>&1; then
+  echo "pre-existing UID collision was accepted" >&2; exit 1
 fi
 
 # The checked-in TCP server is health-only and cannot pass a forged identity.

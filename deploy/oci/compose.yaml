@@ -263,7 +263,7 @@ services:
     container_name: clixor-oci-api-gateway
     # GID 987 is the host clixor-origin group. The gateway creates its Unix
     # socket group-accessible only to the connector identity.
-    user: "101:987"
+    user: "986:987"
     command: ["/bin/sh", "-c", "umask 007 && exec nginx -g 'daemon off;'"]
     depends_on:
       - api-a
@@ -288,8 +288,8 @@ services:
     restart: "no"
     read_only: true
     tmpfs:
-      - /var/cache/nginx:size=32m,uid=101,gid=101,mode=0750
-      - /var/run:size=4m,uid=101,gid=101,mode=0750
+      - /var/cache/nginx:size=32m,uid=986,gid=987,mode=0750
+      - /var/run:size=4m,uid=986,gid=987,mode=0750
       - /tmp:size=16m
     cap_drop:
       - ALL

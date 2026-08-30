@@ -12,7 +12,8 @@ connector-authenticated Unix-socket origin boundary: the public API is not
 reachable on a host TCP port and only the systemd cloudflared identity belongs
 to `clixor-origin`. The TCP listener serves exact health paths, clears
 `CF-Connecting-IP`, and returns 404 for every application route.
-Systemd tmpfiles creates the UID-101-owned, connector-group boundary before Docker at cold boot;
+Systemd tmpfiles creates the dedicated locked `clixor-gateway` (UID 986),
+`clixor-origin` (GID 987) boundary before Docker at cold boot;
 Compose has `create_host_path: false`, so a missing boundary stops the gateway
 instead of silently replacing it with daemon-default permissions.
 
@@ -29,34 +30,43 @@ only Tunnel Configuration Edit and DNS Edit for this account/zone; materialize
 it as root-owned mode 0400 tmpfs and pass it as a systemd credential, never as
 environment, argv, shell history, logs, or the connector token:
 
+```json
+{"mode":"promote","change_window":"FROZEN-CHANGE-1234","account":"ACCOUNT_ID","zone":"ZONE_ID","old_tunnel":"OLD_TUNNEL_UUID","candidate_tunnel":"OCI_TUNNEL_UUID","old_target":"OLD_TUNNEL_UUID.cfargotunnel.com","candidate_target":"OCI_TUNNEL_UUID.cfargotunnel.com","old_revision":"OLD_RELEASE_SHA","revision":"NEW_RELEASE_SHA","old_config_sha":"REVIEWED_SHA256","candidate_config_sha":"REVIEWED_SHA256","evidence":"/srv/clixor/releases/oci-EXACT-TAG/canary-public-smoke.txt"}
 ```
-systemd-run --unit=clixor-cloudflare-promotion --wait --pipe --collect \
-  -p LoadCredential=cloudflare-control-token:/run/operator/cloudflare-control-token \
-  python3 /srv/clixor/repo/deploy/oci/cloudflare-promote.py promote \
-  --account ACCOUNT_ID --zone ZONE_ID \
-  --old-tunnel OLD_TUNNEL_ID --candidate-tunnel OCI_TUNNEL_ID \
-  --old-target OLD_TUNNEL_ID.cfargotunnel.com \
-  --candidate-target OCI_TUNNEL_ID.cfargotunnel.com \
-  --old-config-sha REVIEWED_SHA256 --candidate-config-sha REVIEWED_SHA256 \
-  --old-revision OLD_RELEASE_SHA --revision NEW_RELEASE_SHA \
-  --evidence /srv/clixor/releases/current/canary-public-smoke.txt
+
+Install that exact JSON as `/run/operator/cloudflare-promotion-request.json`
+and the scoped token as `/run/operator/cloudflare-control-token`, both
+`root:root` mode 0400, then run only the installed hardened unit:
+The evidence path must name the canonical release directory directly; the
+promoter rejects the mutable `current` symlink and every symlinked parent.
+
+```sh
+sudo systemctl start clixor-cloudflare-promote.service
+sudo systemctl status clixor-cloudflare-promote.service
 ```
 
 Promotion is a control-plane ownership transfer, never another deploy. The
-state machine CAS-checks both tunnel configurations and both proxied CNAMEs,
+state machine detects drift by exact re-reads around both tunnel configurations
+and both proxied CNAMEs. Cloudflare offers no conditional update primitive, so
+this is detection, not provider-side CAS: both tunnels must be dedicated to this
+change, the named change window must be externally frozen, and no other token or
+operator may modify them until completion. It then
 fences writes with `http_status:503` on both tunnels, and changes both records
 with Cloudflare's transactional DNS batch. Edge KV propagation is not atomic,
 so the fence stays until both hostnames repeatedly return the exact API/AASA
 revision. Mixed observations retain the fence and journal for operator action.
 Automatic rollback occurs only if both records still select the exact candidate;
-manual rollback uses `cloudflare-promote.py rollback` with the same identifiers,
-revision, and state. Never configure live production routes on two tunnels or
+manual rollback changes `mode` to `rollback` in the exact request credential and
+restarts the same hardened service. Never configure live production routes on two tunnels or
 load balance them. Remove canary only after retaining production evidence.
 
 The remotely managed canary route must point to
 `unix:/run/clixor-origin/gateway.sock`; the checked-in example is the reviewed
 route shape. The tunnel token exists only in the Vault-selected tmpfs cohort and
 is passed with systemd `LoadCredential`; `/etc/cloudflared/token` is unsupported.
+The promoter is installed from the authenticated release archive at mode 0555;
+its root-owned checksum is verified by `ExecStartPre`. Never execute a copy from
+`/srv/clixor/repo` or an Actions checkout with the control credential.
 
 ## Security and availability boundaries
 

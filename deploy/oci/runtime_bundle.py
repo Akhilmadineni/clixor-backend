@@ -137,8 +137,8 @@ RUNTIME_ARTIFACTS = (
         "runtime",
         "api-gateway/nginx.conf",
         "/srv/clixor/runtime/api-gateway/nginx.conf",
-        101,
-        101,
+        986,
+        987,
         0o400,
     ),
     RuntimeArtifact(

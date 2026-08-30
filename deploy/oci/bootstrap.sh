@@ -223,8 +223,12 @@ install -d -m 0750 -o 0 -g 65532 "${apns_root}"
 install -d -m 0750 -o 0 -g 99 "${runtime_root}/dependency-tls"
 install -d -m 0750 -o 0 -g 70 "${runtime_root}/postgres-tls"
 install -d -m 0750 -o 0 -g 1000 "${runtime_root}/nats-tls"
-install -d -m 0750 -o 101 -g 101 "${runtime_root}/api-gateway"
-if getent group 987 >/dev/null 2>&1; then
+install -d -m 0750 -o 986 -g 987 "${runtime_root}/api-gateway"
+gateway_uid=986
+origin_gid=987
+gateway_user=clixor-gateway
+origin_group=clixor-origin
+if getent group "${origin_gid}" >/dev/null 2>&1; then
   [ "$(getent group 987 | cut -d: -f1)" = "clixor-origin" ] || {
     echo "Host GID 987 is already assigned outside the connector boundary." >&2
     exit 1
@@ -235,13 +239,31 @@ elif getent group clixor-origin >/dev/null 2>&1; then
     exit 1
   }
 else
-  groupadd --system --gid 987 clixor-origin
+  groupadd --system --gid "${origin_gid}" "${origin_group}"
 fi
+if getent passwd "${gateway_uid}" >/dev/null 2>&1; then
+  [ "$(getent passwd "${gateway_uid}" | cut -d: -f1)" = "${gateway_user}" ] || {
+    echo "Host UID ${gateway_uid} is already assigned outside the gateway boundary." >&2; exit 1;
+  }
+elif getent passwd "${gateway_user}" >/dev/null 2>&1; then
+  [ "$(getent passwd "${gateway_user}" | cut -d: -f3)" = "${gateway_uid}" ] || {
+    echo "${gateway_user} must use reviewed UID ${gateway_uid}." >&2; exit 1;
+  }
+else
+  useradd --system --uid "${gateway_uid}" --gid "${origin_group}" \
+    --home-dir /nonexistent --shell /usr/sbin/nologin "${gateway_user}"
+  passwd --lock "${gateway_user}" >/dev/null
+fi
+gateway_record="$(getent passwd "${gateway_user}")"
+python3 "${script_root}/validate-origin-identity.py" \
+  --passwd-record "${gateway_record}" \
+  --group-record "$(getent group "${origin_group}")" \
+  --shadow-status "$(passwd --status "${gateway_user}")"
 install -m 0644 -o 0 -g 0 "${script_root}/clixor-origin.conf" \
   /etc/tmpfiles.d/clixor-origin.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/clixor-origin.conf
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
-  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "101:987:750" ] || {
+  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || {
   echo "Connector origin tmpfs boundary is unsafe." >&2
   exit 1
 }
@@ -615,8 +637,17 @@ fi
 
 install -m 0400 -o 99 -g 99 "${script_root}/haproxy.cfg" \
   "${runtime_root}/dependency-tls/haproxy.cfg"
-install -m 0400 -o 101 -g 101 "${script_root}/api-gateway-nginx.conf" \
+install -m 0400 -o 986 -g 987 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"
+install -d -m 0755 -o 0 -g 0 /usr/local/libexec/clixor
+install -m 0555 -o 0 -g 0 "${script_root}/cloudflare-promote.py" \
+  /usr/local/libexec/clixor/cloudflare-promote.py
+sha256sum /usr/local/libexec/clixor/cloudflare-promote.py > \
+  /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+chown 0:0 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+chmod 0444 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-promote.service" \
+  /etc/systemd/system/clixor-cloudflare-promote.service
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
   "${runtime_root}/postgres-backup/backup.sh"
 if [ "${defer_host_tool_activation}" = "false" ]; then

@@ -35,7 +35,7 @@ token_mode="$(stat -c '%a' "${token_file}")"
 [ "$(readlink -- /run/clixor/secrets/active)" != "/srv/clixor/secrets" ] || \
   fail "production connector credentials must be selected from a Vault tmpfs generation"
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
-  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "101:987:750" ] || \
+  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || \
   fail "connector-only origin boundary is missing or unsafe"
 
 install -m 0644 -o 0 -g 0 "${unit_source}" /etc/systemd/system/cloudflared.service

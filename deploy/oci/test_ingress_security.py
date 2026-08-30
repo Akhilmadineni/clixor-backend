@@ -15,11 +15,12 @@ class IngressBoundaryTests(unittest.TestCase):
         self.assertIn("location / { return 404; }", health_server)
         compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
         unit = (ROOT / "cloudflared.service").read_text(encoding="utf-8")
-        self.assertIn('user: "101:987"', compose)
+        self.assertIn('user: "986:987"', compose)
+        self.assertIn("uid=986,gid=987", compose)
         self.assertIn("umask 007", compose)
         self.assertIn("create_host_path: false", compose)
         self.assertIn("SupplementaryGroups=clixor-origin", unit)
-        self.assertIn("ExecStartPre=+/usr/bin/install -d -m 0750 -o 101 -g 987", unit)
+        self.assertIn("ExecStartPre=+/usr/bin/install -d -m 0750 -o 986 -g 987", unit)
         route = (ROOT / "cloudflared-config.yml.example").read_text(encoding="utf-8")
         self.assertIn("service: unix:/run/clixor-origin/gateway.sock", route)
         self.assertNotIn("172.30.254.2:8080", route)
@@ -31,7 +32,7 @@ class IngressBoundaryTests(unittest.TestCase):
         compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
         self.assertEqual(
             [line for line in tmpfiles.splitlines() if line and not line.startswith("#")],
-            ["d /run/clixor-origin 0750 101 clixor-origin -"],
+            ["d /run/clixor-origin 0750 clixor-gateway clixor-origin -"],
         )
         install_at = bootstrap.index("/etc/tmpfiles.d/clixor-origin.conf")
         create_at = bootstrap.index("systemd-tmpfiles --create", install_at)
@@ -59,6 +60,16 @@ class IngressBoundaryTests(unittest.TestCase):
         self.assertIn('verify_production_not_candidate "${source_sha}"', deploy)
         self.assertIn("candidate connector unexpectedly owns the production hostname", deploy)
         self.assertIn('run_disposable_public_smoke "${source_sha}"', deploy)
+
+    def test_promoter_is_immutable_installed_and_hardened(self) -> None:
+        bootstrap=(ROOT/"bootstrap.sh").read_text()
+        unit=(ROOT/"clixor-cloudflare-promote.service").read_text()
+        self.assertIn('install -m 0555 -o 0 -g 0 "${script_root}/cloudflare-promote.py"',bootstrap)
+        self.assertIn("cloudflare-promote.py.sha256",bootstrap)
+        self.assertIn("ExecStartPre=/usr/bin/sha256sum --check --strict",unit)
+        self.assertIn("ExecStart=/usr/local/libexec/clixor/cloudflare-promote.py execute",unit)
+        self.assertIn("LoadCredential=cloudflare-control-token:",unit)
+        self.assertNotIn("/srv/clixor/repo",unit)
 
 if __name__ == "__main__":
     unittest.main()

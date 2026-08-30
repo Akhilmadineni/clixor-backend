@@ -1,0 +1,30 @@
+[Unit]
+Description=Clixor manual Cloudflare ownership promotion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+LoadCredential=cloudflare-control-token:/run/operator/cloudflare-control-token
+LoadCredential=promotion-request:/run/operator/cloudflare-promotion-request.json
+ExecStartPre=/usr/bin/sha256sum --check --strict /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+ExecStart=/usr/local/libexec/clixor/cloudflare-promote.py execute
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/clixor
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
