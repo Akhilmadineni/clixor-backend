@@ -1,12 +1,16 @@
 package outbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -264,7 +268,8 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 		ID: uuid.New(), OwnerID: user.ID, ConversationID: conversation.ID,
 		ObjectKey: "private/delete-me", ContentType: "image/jpeg", ByteSize: 1,
 	}
-	if _, err := persistence.CreateMedia(ctx, object); err != nil {
+	created, err := persistence.CreateMedia(ctx, object, store.DefaultMediaReservationLimits())
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
@@ -274,7 +279,19 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	mediaRecorder := &recordingMedia{deleteErr: errors.New("minio temporarily unavailable")}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	relay := New(persistence, nil, &recordingPush{}, mediaRecorder, logger)
-	relay.flush(ctx)
+	relay.flushMediaDeletes(ctx)
+	if len(mediaRecorder.deleted) != 0 {
+		t.Fatalf("object deletion ran before in-flight upload grace elapsed: %v", mediaRecorder.deleted)
+	}
+	relay.now = func() time.Time { return created.ExpiresAt.UTC().Add(store.MediaDeleteGrace + time.Second) }
+	queued, err := persistence.LockOutboxBatch(ctx, 100)
+	if err != nil || len(queued) != 1 {
+		t.Fatalf("inspect queued deletion: events=%+v error=%v", queued, err)
+	}
+	if err := persistence.ReleaseOutboxEvent(ctx, queued[0].ID, time.Now().UTC().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	relay.flushMediaDeletes(ctx)
 	events, err := persistence.LockOutboxBatch(ctx, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +301,10 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	}
 
 	mediaRecorder.deleteErr = nil
-	relay.flush(ctx)
+	if err := persistence.ReleaseOutboxEvent(ctx, events[0].ID, time.Now().UTC().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	relay.flushMediaDeletes(ctx)
 	events, err = persistence.LockOutboxBatch(ctx, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -292,6 +312,277 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	if len(events) != 0 || len(mediaRecorder.deleted) != 2 {
 		t.Fatalf("successful deletion was not acknowledged: events=%+v calls=%+v", events, mediaRecorder.deleted)
 	}
+}
+
+func TestBlockedMediaDeleteDoesNotDelayRealtimePublishing(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	object := domain.MediaObject{
+		ID: uuid.New(), OwnerID: fixture.actor.ID, ConversationID: fixture.conversation.ID,
+		ObjectKey: "private/blocked-delete", ContentType: "application/octet-stream", ByteSize: 3,
+		CiphertextSHA256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+	}
+	created, err := fixture.store.CreateMedia(
+		fixture.ctx, object, store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DeleteMedia(fixture.ctx, created.ID, fixture.actor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := fixture.store.LockOutboxBatch(fixture.ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deleteID int64
+	for _, event := range queued {
+		if event.Topic == "media.delete" {
+			deleteID = event.ID
+		}
+	}
+	if deleteID == 0 {
+		t.Fatal("media deletion was not durably queued")
+	}
+	if err := fixture.store.ReleaseOutboxEvent(
+		fixture.ctx, deleteID, time.Now().UTC().Add(-time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &blockingDeleteMedia{
+		entered: make(chan struct{}, 1), release: make(chan struct{}),
+	}
+	bus := &countingBus{}
+	fixture.relay.media = blocked
+	fixture.relay.bus = bus
+	fixture.relay.mediaDeleteTimeout = 2 * time.Second
+	fixture.relay.now = func() time.Time {
+		return created.UploadValidUntil.Add(store.MediaDeleteGrace + time.Second)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fixture.relay.flushMediaDeletes(fixture.ctx)
+	}()
+	select {
+	case <-blocked.entered:
+	case <-time.After(time.Second):
+		t.Fatal("media deletion did not start")
+	}
+	fixture.relay.flush(fixture.ctx)
+	if got := bus.publishCount.Load(); got != 1 {
+		t.Fatalf("realtime publishes while object deletion blocked=%d, want 1", got)
+	}
+	close(blocked.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("media deletion did not finish after release")
+	}
+}
+
+func TestTopicSpecificOutboxClaimsIsolateMediaDeletion(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	object := domain.MediaObject{
+		ID: uuid.New(), OwnerID: fixture.actor.ID, ConversationID: fixture.conversation.ID,
+		ObjectKey: "private/topic-isolation", ContentType: "application/octet-stream", ByteSize: 3,
+		CiphertextSHA256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+	}
+	created, err := fixture.store.CreateMedia(
+		fixture.ctx, object, store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.DeleteMedia(fixture.ctx, created.ID, fixture.actor.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := fixture.store.LockOutboxBatch(fixture.ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mediaDeleteID int64
+	for _, event := range inspection {
+		if event.Topic == "media.delete" {
+			mediaDeleteID = event.ID
+		}
+	}
+	if mediaDeleteID == 0 {
+		t.Fatal("missing media.delete event")
+	}
+	if err := fixture.store.ReleaseOutboxEvent(
+		fixture.ctx, mediaDeleteID, time.Now().UTC().Add(-time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	realtime, err := fixture.store.LockRealtimeOutboxBatch(fixture.ctx, 100)
+	if err != nil || len(realtime) != 1 || realtime[0].Topic == "media.delete" {
+		t.Fatalf("realtime claim crossed topic boundary: events=%+v error=%v", realtime, err)
+	}
+	deletions, err := fixture.store.LockMediaDeleteOutboxBatch(fixture.ctx, 100)
+	if err != nil || len(deletions) != 1 || deletions[0].Topic != "media.delete" {
+		t.Fatalf("media-delete claim crossed topic boundary: events=%+v error=%v", deletions, err)
+	}
+}
+
+func TestMediaDeleteUsesBoundedConcurrencyAndPerObjectTimeout(t *testing.T) {
+	recorder := &concurrentDeleteMedia{delay: 25 * time.Millisecond}
+	relay := New(
+		memory.New(), nil, &recordingPush{}, recorder,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	relay.mediaDeleteTimeout = time.Second
+	keys := make([]string, 12)
+	for index := range keys {
+		keys[index] = "private/bounded-" + strconv.Itoa(index)
+	}
+	payload, _ := json.Marshal(store.NewMediaDeletePayloadAt(keys, time.Now().UTC().Add(-time.Second)))
+	if err := relay.deleteMedia(context.Background(), domain.OutboxEvent{Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if maximum := recorder.maximum.Load(); maximum < 2 || maximum > mediaDeleteConcurrency {
+		t.Fatalf("delete concurrency=%d, want 2..%d", maximum, mediaDeleteConcurrency)
+	}
+
+	blocked := &blockingDeleteMedia{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	relay.media = blocked
+	relay.mediaDeleteTimeout = 20 * time.Millisecond
+	payload, _ = json.Marshal(store.NewMediaDeletePayloadAt(
+		[]string{"private/timeout"}, time.Now().UTC().Add(-time.Second),
+	))
+	started := time.Now()
+	err := relay.deleteMedia(context.Background(), domain.OutboxEvent{Payload: payload})
+	if err == nil || time.Since(started) > time.Second {
+		t.Fatalf("blocked delete error=%v duration=%s", err, time.Since(started))
+	}
+}
+
+func TestRejectedUploadIsDeletedFromRealMinIOAfterURLExpiryGrace(t *testing.T) {
+	endpoint := os.Getenv("TEST_MINIO_ENDPOINT")
+	accessKey := os.Getenv("TEST_MINIO_ACCESS_KEY")
+	secretKey := os.Getenv("TEST_MINIO_SECRET_KEY")
+	if endpoint == "" || accessKey == "" || secretKey == "" {
+		t.Skip("TEST_MINIO_ENDPOINT, TEST_MINIO_ACCESS_KEY, and TEST_MINIO_SECRET_KEY are not configured")
+	}
+	useTLS, err := strconv.ParseBool(testEnvOr("TEST_MINIO_USE_TLS", "false"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	mediaService, err := media.NewS3(
+		ctx, endpoint, endpoint, accessKey, secretKey,
+		testEnvOr("TEST_MINIO_BUCKET", "clustr-media-integration"), useTLS, "",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mediaService.Close()
+
+	persistence := memory.New()
+	defer persistence.Close()
+	user := createUser(t, persistence, "minio-reject-"+uuid.NewString()+"@example.com", "MinIO Reject")
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: user.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := persistence.LockOutboxBatch(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialIDs := make([]int64, 0, len(initial))
+	for _, event := range initial {
+		initialIDs = append(initialIDs, event.ID)
+	}
+	if err := persistence.MarkOutboxPublished(ctx, initialIDs); err != nil {
+		t.Fatal(err)
+	}
+
+	const digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+	object := domain.MediaObject{
+		ID: uuid.New(), OwnerID: user.ID, ConversationID: conversation.ID,
+		ObjectKey: "rejection/" + uuid.NewString(), ContentType: "application/octet-stream",
+		ByteSize: 3, CiphertextSHA256: digest,
+	}
+	created, err := persistence.CreateMedia(ctx, object, store.DefaultMediaReservationLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, err := mediaService.PrepareUpload(
+		ctx, created.ObjectKey, created.ContentType, created.ByteSize,
+		created.CiphertextSHA256, 5*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, upload.Method, upload.URL.String(), bytes.NewReader([]byte("abc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range upload.Headers {
+		request.Header.Set(name, value)
+	}
+	request.ContentLength = 3
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		t.Fatalf("upload status=%d", response.StatusCode)
+	}
+	if _, err := persistence.RejectPendingMedia(ctx, created.ID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	relay := New(persistence, nil, &recordingPush{}, mediaService, logger)
+	deletePayload, err := json.Marshal(store.NewMediaDeletePayloadAt(
+		[]string{created.ObjectKey}, created.UploadValidUntil.Add(store.MediaDeleteGrace),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteEvent := domain.OutboxEvent{ID: 1, Topic: "media.delete", Payload: deletePayload}
+	relay.now = func() time.Time { return created.ExpiresAt.UTC().Add(store.MediaDeleteGrace - time.Second) }
+	if err := relay.deleteMedia(ctx, deleteEvent); !errors.Is(err, errMediaDeleteNotDue) {
+		t.Fatalf("pre-deadline delete error=%v", err)
+	}
+	if err := mediaService.Verify(ctx, created.ObjectKey, 3, digest, created.ContentType); err != nil {
+		t.Fatalf("object deleted before URL expiry grace: %v", err)
+	}
+	relay.now = func() time.Time { return created.ExpiresAt.UTC().Add(store.MediaDeleteGrace + time.Second) }
+	if err := relay.deleteMedia(ctx, deleteEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := mediaService.Verify(ctx, created.ObjectKey, 3, digest, created.ContentType); !media.IsDefinitiveVerificationFailure(err) {
+		t.Fatalf("rejected object survived deletion grace: %v", err)
+	}
+}
+
+func testEnvOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func TestTransientPushRetriesDurablyWithoutRepublishingRealtime(t *testing.T) {
@@ -412,6 +703,11 @@ func TestTransientConversationLookupRetainsOutboxForRetry(t *testing.T) {
 		t.Fatalf("transient lookup did not retain outbox: %+v", remaining)
 	}
 	lookup.err = nil
+	if err := fixture.store.ReleaseOutboxEvent(
+		fixture.ctx, remaining[0].ID, time.Now().UTC().Add(-time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
 	fixture.relay.flush(fixture.ctx)
 	if got := bus.publishCount.Load(); got != 1 {
 		t.Fatalf("recovered lookup publishes = %d, want 1", got)
@@ -486,6 +782,62 @@ func TestRetentionPrunesPushRowsBeforeOutboxUsingLongestWindow(t *testing.T) {
 	relay.pruneRetention(context.Background())
 	if len(recorder.calls) != 2 {
 		t.Fatalf("hourly retention guard made extra calls: %v", recorder.calls)
+	}
+}
+
+func TestRetentionDrainsMultipleBatchesAndSchedulesOneMinuteCatchUp(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 21, 0, 0, 0, time.UTC)
+	recorder := &retentionRecordingStore{
+		Store:         memory.New(),
+		pushResults:   []int64{1000, 1000, 37},
+		outboxResults: []int64{1000, 12},
+	}
+	relay := New(
+		recorder, nil, &recordingPush{}, media.Unavailable{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	relay.now = func() time.Time { return now }
+	relay.lastPrune = now.Add(-retentionInterval)
+	relay.pruneRetention(context.Background())
+	want := []string{"push", "push", "push", "outbox", "outbox"}
+	if len(recorder.calls) != len(want) {
+		t.Fatalf("multi-batch retention calls=%v want=%v", recorder.calls, want)
+	}
+	for index := range want {
+		if recorder.calls[index] != want[index] {
+			t.Fatalf("multi-batch retention calls=%v want=%v", recorder.calls, want)
+		}
+	}
+
+	recorder.calls = nil
+	recorder.pushResults = make([]int64, retentionMaxBatches)
+	for index := range recorder.pushResults {
+		recorder.pushResults[index] = store.MaxRetentionPruneBatchSize
+	}
+	recorder.outboxResults = []int64{0}
+	now = now.Add(retentionInterval)
+	relay.pruneRetention(context.Background())
+	if len(recorder.calls) != retentionMaxBatches {
+		t.Fatalf("bounded drain calls=%d want=%d", len(recorder.calls), retentionMaxBatches)
+	}
+	for _, call := range recorder.calls {
+		if call != "push" {
+			t.Fatalf("parent outbox pruned before child backlog drained: %v", recorder.calls)
+		}
+	}
+	callsAfterBudget := len(recorder.calls)
+	now = now.Add(retentionCatchUpInterval - time.Second)
+	relay.pruneRetention(context.Background())
+	if len(recorder.calls) != callsAfterBudget {
+		t.Fatalf("catch-up ran before one minute: %d -> %d", callsAfterBudget, len(recorder.calls))
+	}
+	now = now.Add(time.Second)
+	recorder.pushResults = []int64{0}
+	recorder.outboxResults = []int64{0}
+	relay.pruneRetention(context.Background())
+	if len(recorder.calls) != callsAfterBudget+2 ||
+		recorder.calls[len(recorder.calls)-2] != "push" || recorder.calls[len(recorder.calls)-1] != "outbox" {
+		t.Fatalf("one-minute catch-up did not resume child-first drain: %v", recorder.calls)
 	}
 }
 
@@ -807,6 +1159,7 @@ type retentionRecordingStore struct {
 	publishedBefore                   time.Time
 	pushLimit, outboxLimit            int
 	pushDeleted, outboxDeleted        int64
+	pushResults, outboxResults        []int64
 }
 
 func (s *retentionRecordingStore) PrunePushDeliveries(
@@ -818,6 +1171,11 @@ func (s *retentionRecordingStore) PrunePushDeliveries(
 	s.deliveredBefore = deliveredBefore
 	s.deadLetterBefore = deadLetterBefore
 	s.pushLimit = limit
+	if len(s.pushResults) > 0 {
+		deleted := s.pushResults[0]
+		s.pushResults = s.pushResults[1:]
+		return deleted, nil
+	}
 	return s.pushDeleted, nil
 }
 
@@ -829,6 +1187,11 @@ func (s *retentionRecordingStore) PrunePublishedOutbox(
 	s.calls = append(s.calls, "outbox")
 	s.publishedBefore = publishedBefore
 	s.outboxLimit = limit
+	if len(s.outboxResults) > 0 {
+		deleted := s.outboxResults[0]
+		s.outboxResults = s.outboxResults[1:]
+		return deleted, nil
+	}
 	return s.outboxDeleted, nil
 }
 
@@ -855,15 +1218,15 @@ type recordingMedia struct {
 	deleteErr error
 }
 
-func (*recordingMedia) UploadURL(context.Context, string, string, int64, time.Duration) (*url.URL, error) {
-	return nil, media.ErrUnavailable
+func (*recordingMedia) PrepareUpload(context.Context, string, string, int64, string, time.Duration) (media.UploadInstructions, error) {
+	return media.UploadInstructions{}, media.ErrUnavailable
 }
 
 func (*recordingMedia) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
 	return nil, media.ErrUnavailable
 }
 
-func (*recordingMedia) Verify(context.Context, string, int64, string) error {
+func (*recordingMedia) Verify(context.Context, string, int64, string, string) error {
 	return media.ErrUnavailable
 }
 
@@ -873,3 +1236,74 @@ func (r *recordingMedia) Delete(_ context.Context, objectKey string) error {
 }
 
 func (*recordingMedia) Close() {}
+
+type blockingDeleteMedia struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (*blockingDeleteMedia) PrepareUpload(context.Context, string, string, int64, string, time.Duration) (media.UploadInstructions, error) {
+	return media.UploadInstructions{}, media.ErrUnavailable
+}
+
+func (*blockingDeleteMedia) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
+	return nil, media.ErrUnavailable
+}
+
+func (*blockingDeleteMedia) Verify(context.Context, string, int64, string, string) error {
+	return media.ErrUnavailable
+}
+
+func (m *blockingDeleteMedia) Delete(ctx context.Context, _ string) error {
+	select {
+	case m.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-m.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*blockingDeleteMedia) Close() {}
+
+type concurrentDeleteMedia struct {
+	active  atomic.Int32
+	maximum atomic.Int32
+	delay   time.Duration
+}
+
+func (*concurrentDeleteMedia) PrepareUpload(context.Context, string, string, int64, string, time.Duration) (media.UploadInstructions, error) {
+	return media.UploadInstructions{}, media.ErrUnavailable
+}
+
+func (*concurrentDeleteMedia) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
+	return nil, media.ErrUnavailable
+}
+
+func (*concurrentDeleteMedia) Verify(context.Context, string, int64, string, string) error {
+	return media.ErrUnavailable
+}
+
+func (m *concurrentDeleteMedia) Delete(ctx context.Context, _ string) error {
+	current := m.active.Add(1)
+	defer m.active.Add(-1)
+	for {
+		maximum := m.maximum.Load()
+		if current <= maximum || m.maximum.CompareAndSwap(maximum, current) {
+			break
+		}
+	}
+	timer := time.NewTimer(m.delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*concurrentDeleteMedia) Close() {}

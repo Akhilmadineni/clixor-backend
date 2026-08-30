@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
@@ -128,11 +129,15 @@ func TestProduction05bStoredMediaReferenceReplaysAfterConversationAccessIsLost(t
 		ID: uuid.New(), OwnerID: user.ID, ConversationID: conversation.ID,
 		ObjectKey: "compat/lost-acl", ContentType: "application/octet-stream",
 		ByteSize: 3, CiphertextSHA256: production05bMediaDigest,
-	})
+	}, store.DefaultMediaReservationLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user.ID); err != nil {
+	claimed, err := persistence.ClaimMediaVerification(ctx, mediaObject.ID, user.ID, time.Minute)
+	if err != nil || claimed.VerificationLeaseToken == nil {
+		t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
+	}
+	if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user.ID, *claimed.VerificationLeaseToken); err != nil {
 		t.Fatal(err)
 	}
 	reference := "clustr-media://" + mediaObject.ID.String()
@@ -153,7 +158,7 @@ func TestProduction05bStoredMediaReferenceReplaysAfterConversationAccessIsLost(t
 	}
 }
 
-func TestProduction05bMediaRequestDefaultsContentTypeAndReturnsSignedHeaders(t *testing.T) {
+func TestProduction05bMediaRequestDefaultsContentTypeAndKeepsIntegrityVerification(t *testing.T) {
 	t.Parallel()
 	mediaService := &testMediaService{}
 	server := newTestHTTPServerWithMedia(t, mediaService)
@@ -175,8 +180,9 @@ func TestProduction05bMediaRequestDefaultsContentTypeAndReturnsSignedHeaders(t *
 	}
 	user.client.do(t, http.MethodPost, "/v1/media/"+upload.Media.ID.String()+"/complete",
 		nil, http.StatusOK, nil)
-	if mediaService.verifiedSize != 3 || mediaService.verifiedSHA256 != "" {
-		t.Fatalf("05b conversation completion did not preserve size-only verification: %+v", mediaService)
+	if mediaService.verifiedSize != 3 || mediaService.verifiedSHA256 != production05bMediaDigest ||
+		mediaService.verifiedType != "application/octet-stream" {
+		t.Fatalf("05b conversation completion lost its declared integrity metadata: %+v", mediaService)
 	}
 }
 
@@ -207,7 +213,7 @@ func TestProduction05bAfterSeqMessageCatchUp(t *testing.T) {
 
 func TestProduction05bDevicePushUpdatePreservesE2EEIdentity(t *testing.T) {
 	t.Parallel()
-	server, persistence := newTestHTTPServerWithMediaStore(t, &testMediaService{})
+	server, persistence := newTestHTTPServerWithMediaStore(t, &testMediaService{}, DefaultMediaPolicy())
 	user := registerTestUser(t, server.URL, "production-05b-device@example.com")
 	pushToken := strings.Repeat("a1", 32)
 	var updated domain.Device

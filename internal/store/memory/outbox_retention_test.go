@@ -116,6 +116,46 @@ func TestRetentionPruningUsesBoundedOldestFirstBatches(t *testing.T) {
 	}
 }
 
+func TestRetentionCanDrainMoreThanOneThousandMemoryRowsInBoundedBatches(t *testing.T) {
+	now := time.Now().UTC()
+	persistence := New()
+	const rows = 2501
+	for id := int64(1); id <= rows; id++ {
+		publishedAt := now.Add(-time.Hour)
+		persistence.outbox = append(persistence.outbox, domain.OutboxEvent{
+			ID: id, Topic: "published", CreatedAt: publishedAt,
+			PublishedAt: retentionTime(publishedAt),
+		})
+	}
+	var total int64
+	var batches []int64
+	for {
+		deleted, err := persistence.PrunePublishedOutbox(
+			context.Background(), now, store.MaxRetentionPruneBatchSize,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batches = append(batches, deleted)
+		total += deleted
+		if deleted < store.MaxRetentionPruneBatchSize {
+			break
+		}
+	}
+	if total != rows || len(persistence.outbox) != 0 {
+		t.Fatalf("drained=%d retained=%d batches=%v", total, len(persistence.outbox), batches)
+	}
+	want := []int64{1000, 1000, 501}
+	if len(batches) != len(want) {
+		t.Fatalf("batches=%v want=%v", batches, want)
+	}
+	for index := range want {
+		if batches[index] != want[index] {
+			t.Fatalf("batches=%v want=%v", batches, want)
+		}
+	}
+}
+
 func TestRetentionPruneRejectsUnboundedLimits(t *testing.T) {
 	persistence := New()
 	for _, limit := range []int{0, -1, store.MaxRetentionPruneBatchSize + 1} {

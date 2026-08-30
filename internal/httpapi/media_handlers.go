@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -32,7 +33,7 @@ func (s *Server) createMediaUpload(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ByteSize < 1 || request.ByteSize > 1<<30 || !validSHA256(request.CiphertextSHA256) {
+	if request.ByteSize < 1 || request.ByteSize > s.mediaPolicy.ConversationMaxBytes || !validSHA256(request.CiphertextSHA256) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
@@ -48,7 +49,7 @@ func (s *Server) createMediaUpload(w http.ResponseWriter, r *http.Request) {
 		ID: mediaID, OwnerID: id.UserID, ConversationID: conversationID,
 		ObjectKey: objectKey, ContentType: contentType,
 		ByteSize: request.ByteSize, CiphertextSHA256: request.CiphertextSHA256,
-	})
+	}, s.mediaPolicy.ReservationLimits)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -62,7 +63,7 @@ func (s *Server) createProfileMediaUpload(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	if request.ByteSize < 1 || request.ByteSize > 20<<20 || !validSHA256(request.CiphertextSHA256) {
+	if request.ByteSize < 1 || request.ByteSize > s.mediaPolicy.ProfileMaxBytes || !validSHA256(request.CiphertextSHA256) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
@@ -79,7 +80,7 @@ func (s *Server) createProfileMediaUpload(w http.ResponseWriter, r *http.Request
 		ObjectKey:   "users/" + id.UserID.String() + "/avatars/" + mediaID.String(),
 		ContentType: contentType, ByteSize: request.ByteSize,
 		CiphertextSHA256: request.CiphertextSHA256,
-	})
+	}, s.mediaPolicy.ReservationLimits)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -88,11 +89,23 @@ func (s *Server) createProfileMediaUpload(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) writeMediaUpload(w http.ResponseWriter, r *http.Request, record domain.MediaObject) {
-	uploadURL, err := s.media.UploadURL(
-		r.Context(), record.ObjectKey, record.ContentType, record.ByteSize, 15*time.Minute,
+	if record.ExpiresAt == nil {
+		_, _ = s.store.RejectPendingMedia(r.Context(), record.ID, record.OwnerID)
+		writeDomainError(w, errors.New("media reservation missing expiry"))
+		return
+	}
+	expiresIn := time.Until(record.ExpiresAt.UTC()).Truncate(time.Second)
+	if expiresIn < time.Second {
+		_, _ = s.store.RejectPendingMedia(r.Context(), record.ID, record.OwnerID)
+		writeError(w, http.StatusGone, "upload_expired", "The media upload reservation has expired.")
+		return
+	}
+	upload, err := s.media.PrepareUpload(
+		r.Context(), record.ObjectKey, record.ContentType, record.ByteSize,
+		record.CiphertextSHA256, expiresIn,
 	)
 	if err != nil {
-		_, _ = s.store.DeleteMedia(r.Context(), record.ID, record.OwnerID)
+		_, _ = s.store.RejectPendingMedia(r.Context(), record.ID, record.OwnerID)
 		if errors.Is(err, media.ErrUnavailable) {
 			writeError(w, http.StatusServiceUnavailable, "media_unavailable", "Media uploads are unavailable in this environment.")
 			return
@@ -100,12 +113,17 @@ func (s *Server) writeMediaUpload(w http.ResponseWriter, r *http.Request, record
 		writeDomainError(w, err)
 		return
 	}
+	if upload.URL == nil || upload.Method == "" || len(upload.Headers) == 0 {
+		_, _ = s.store.RejectPendingMedia(r.Context(), record.ID, record.OwnerID)
+		writeDomainError(w, errors.New("media provider returned incomplete upload instructions"))
+		return
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"media": record,
 		"upload": map[string]any{
-			"method": "PUT", "url": uploadURL.String(),
-			"headers":    map[string]string{"Content-Type": record.ContentType},
-			"expires_at": time.Now().UTC().Add(15 * time.Minute),
+			"method": upload.Method, "url": upload.URL.String(),
+			"headers":    upload.Headers,
+			"expires_at": record.ExpiresAt,
 		},
 	})
 }
@@ -126,25 +144,98 @@ func (s *Server) completeMediaUpload(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrForbidden)
 		return
 	}
-	expectedSHA256 := record.CiphertextSHA256
-	if record.Scope == domain.MediaScopeConversation {
-		// Production 05b allows 1 GiB conversation objects and gives completion
-		// requests the ordinary short client deadline. Preserve the ad9 size-only
-		// completion contract here; streaming a full object through the API would
-		// time out otherwise. Profile media is bounded to 20 MiB and keeps exact
-		// digest verification.
-		expectedSHA256 = ""
+	if record.Status == "ready" {
+		writeJSON(w, http.StatusOK, record)
+		return
 	}
-	if err := s.media.Verify(r.Context(), record.ObjectKey, record.ByteSize, expectedSHA256); err != nil {
+	select {
+	case s.mediaVerifySlots <- struct{}{}:
+		defer func() { <-s.mediaVerifySlots }()
+	case <-r.Context().Done():
+		writeError(w, http.StatusServiceUnavailable, "media_verification_unavailable",
+			"Media verification capacity is temporarily unavailable. Retry completion before the upload expires.")
+		return
+	}
+	leaseDuration := s.mediaPolicy.CompletionTimeout + 15*time.Second
+	record, err = s.store.ClaimMediaVerification(r.Context(), mediaID, id.UserID, leaseDuration)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrConflict):
+			w.Header().Set("Retry-After", "2")
+			writeError(w, http.StatusConflict, "media_verification_in_progress",
+				"This media upload is already being verified. Retry shortly.")
+		case errors.Is(err, domain.ErrMediaExpired):
+			_, _ = s.store.RejectPendingMedia(r.Context(), mediaID, id.UserID)
+			writeError(w, http.StatusGone, "upload_expired", "The media upload reservation has expired.")
+		default:
+			writeDomainError(w, err)
+		}
+		return
+	}
+	if record.Status == "ready" {
+		writeJSON(w, http.StatusOK, record)
+		return
+	}
+	if record.VerificationLeaseToken == nil {
+		s.logger.Error("media_verification_missing_fence", "media_id", mediaID)
+		writeError(w, http.StatusServiceUnavailable, "media_verification_unavailable",
+			"Media verification is temporarily unavailable. Retry completion before the upload expires.")
+		return
+	}
+	leaseToken := *record.VerificationLeaseToken
+	if err := s.media.Verify(
+		r.Context(), record.ObjectKey, record.ByteSize,
+		record.CiphertextSHA256, record.ContentType,
+	); err != nil {
+		if !media.IsDefinitiveVerificationFailure(err) {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
+			releaseErr := s.store.ReleaseMediaVerification(releaseCtx, mediaID, id.UserID, leaseToken)
+			cancel()
+			if releaseErr != nil && !errors.Is(releaseErr, domain.ErrConflict) {
+				s.logger.Warn("release_media_verification_failed", "error", releaseErr, "media_id", mediaID)
+			}
+			s.logger.Warn("media_verification_unavailable", "error", err, "media_id", mediaID)
+			writeError(w, http.StatusServiceUnavailable, "media_verification_unavailable",
+				"Media verification is temporarily unavailable. Retry completion before the upload expires.")
+			return
+		}
+		if _, cleanupErr := s.store.RejectMediaVerification(
+			r.Context(), mediaID, id.UserID, leaseToken,
+		); cleanupErr != nil {
+			if errors.Is(cleanupErr, domain.ErrConflict) {
+				if latest, lookupErr := s.store.Media(r.Context(), mediaID, id.UserID); lookupErr == nil && latest.Status == "ready" {
+					writeJSON(w, http.StatusOK, latest)
+					return
+				}
+				w.Header().Set("Retry-After", "2")
+				writeError(w, http.StatusConflict, "media_verification_in_progress",
+					"This media upload is already being verified. Retry shortly.")
+				return
+			}
+			if !errors.Is(cleanupErr, domain.ErrNotFound) {
+				s.logger.Error("reject_invalid_media_failed", "error", cleanupErr, "media_id", mediaID)
+				writeDomainError(w, cleanupErr)
+				return
+			}
+		}
 		writeError(w, http.StatusUnprocessableEntity, "upload_incomplete", "The uploaded object does not match its declaration.")
 		return
 	}
-	record, err = s.store.MarkMediaReady(r.Context(), mediaID, id.UserID)
+	ready, err := s.store.MarkMediaReady(r.Context(), mediaID, id.UserID, leaseToken)
 	if err != nil {
+		if latest, lookupErr := s.store.Media(r.Context(), mediaID, id.UserID); lookupErr == nil && latest.Status == "ready" {
+			writeJSON(w, http.StatusOK, latest)
+			return
+		}
+		if record.ExpiresAt != nil && !record.ExpiresAt.After(time.Now().UTC()) {
+			_, _ = s.store.RejectMediaVerification(r.Context(), mediaID, id.UserID, leaseToken)
+			writeDomainError(w, domain.ErrMediaExpired)
+			return
+		}
 		writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, record)
+	writeJSON(w, http.StatusOK, ready)
 }
 
 func (s *Server) deleteMedia(w http.ResponseWriter, r *http.Request) {

@@ -4,14 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
+	"mime"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +40,6 @@ type ociObjectStorageClient interface {
 	ListPreauthenticatedRequests(context.Context, objectstorage.ListPreauthenticatedRequestsRequest) (objectstorage.ListPreauthenticatedRequestsResponse, error)
 	DeletePreauthenticatedRequest(context.Context, objectstorage.DeletePreauthenticatedRequestRequest) (objectstorage.DeletePreauthenticatedRequestResponse, error)
 	HeadObject(context.Context, objectstorage.HeadObjectRequest) (objectstorage.HeadObjectResponse, error)
-	GetObject(context.Context, objectstorage.GetObjectRequest) (objectstorage.GetObjectResponse, error)
 	DeleteObject(context.Context, objectstorage.DeleteObjectRequest) (objectstorage.DeleteObjectResponse, error)
 }
 
@@ -126,17 +127,33 @@ func newOCIObjectStorage(
 	}, nil
 }
 
-func (s *OCIObjectStorage) UploadURL(
+func (s *OCIObjectStorage) PrepareUpload(
 	ctx context.Context,
 	objectKey string,
 	contentType string,
 	byteSize int64,
+	expectedSHA256 string,
 	expiry time.Duration,
-) (*url.URL, error) {
-	if strings.TrimSpace(contentType) == "" || byteSize < 1 {
-		return nil, errors.New("OCI media upload content type and positive byte size are required")
+) (UploadInstructions, error) {
+	digest, err := hex.DecodeString(expectedSHA256)
+	if err != nil || len(digest) != sha256.Size || strings.TrimSpace(contentType) == "" || byteSize < 1 {
+		return UploadInstructions{}, errors.New("invalid OCI media upload declaration")
 	}
-	return s.createPAR(ctx, objectKey, expiry, objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectwrite)
+	if parsed, _, err := mime.ParseMediaType(contentType); err != nil || !strings.EqualFold(parsed, contentType) {
+		return UploadInstructions{}, errors.New("invalid OCI media upload content type")
+	}
+	uploadURL, err := s.createPAR(
+		ctx, objectKey, expiry, objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectwrite,
+	)
+	if err != nil {
+		return UploadInstructions{}, err
+	}
+	return instructions(uploadURL, map[string]string{
+		"Content-Type":           contentType,
+		"Content-Length":         strconv.FormatInt(byteSize, 10),
+		"opc-checksum-algorithm": "SHA256",
+		"opc-content-sha256":     base64.StdEncoding.EncodeToString(digest),
+	}), nil
 }
 
 func (s *OCIObjectStorage) DownloadURL(ctx context.Context, objectKey string, expiry time.Duration) (*url.URL, error) {
@@ -184,7 +201,7 @@ func (s *OCIObjectStorage) Verify(
 	ctx context.Context,
 	objectKey string,
 	expectedSize int64,
-	expectedSHA256 string,
+	expectedSHA256, expectedContentType string,
 ) error {
 	if err := validateOCIObjectKey(objectKey); err != nil {
 		return err
@@ -192,104 +209,49 @@ func (s *OCIObjectStorage) Verify(
 	if expectedSize < 1 {
 		return errors.New("expected OCI media size must be positive")
 	}
-	var expectedDigest []byte
-	if expectedSHA256 != "" {
-		var err error
-		expectedDigest, err = hex.DecodeString(expectedSHA256)
-		if err != nil || len(expectedDigest) != sha256.Size {
-			return errors.New("expected OCI media SHA-256 must be 64 hexadecimal characters")
-		}
+	expectedDigest, err := hex.DecodeString(expectedSHA256)
+	if err != nil || len(expectedDigest) != sha256.Size {
+		return errors.New("expected OCI media SHA-256 must be 64 hexadecimal characters")
 	}
-	if len(expectedDigest) > 0 {
-		return s.verifyObjectDigest(ctx, objectKey, expectedSize, expectedDigest)
+	expectedType, _, err := mime.ParseMediaType(expectedContentType)
+	if err != nil || strings.TrimSpace(expectedType) == "" {
+		return errors.New("expected OCI media content type is invalid")
 	}
-	return s.verifyObjectSize(ctx, objectKey, expectedSize)
-}
-
-func (s *OCIObjectStorage) verifyObjectSize(
-	ctx context.Context,
-	objectKey string,
-	expectedSize int64,
-) error {
 	response, err := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
 		NamespaceName: common.String(s.namespace),
 		BucketName:    common.String(s.bucket),
 		ObjectName:    common.String(objectKey),
 	})
 	if err != nil {
-		return fmt.Errorf("inspect OCI media object: %w", err)
+		if ociStatus(err, 404) {
+			return fmt.Errorf("%w: inspect OCI media object", ErrUploadMissing)
+		}
+		return fmt.Errorf("%w: inspect OCI media object: %v", ErrUnavailable, err)
 	}
 	if response.ContentLength == nil {
-		return errors.New("OCI media object response omitted content length")
+		return fmt.Errorf("%w: OCI object omitted content length", ErrVerificationMismatch)
 	}
 	if *response.ContentLength != expectedSize {
-		return s.rejectMismatchedObject(
-			ctx,
-			objectKey,
-			fmt.Errorf("media size mismatch: expected %d, received %d", expectedSize, *response.ContentLength),
-		)
+		return fmt.Errorf("%w: size expected %d, received %d", ErrVerificationMismatch, expectedSize, *response.ContentLength)
 	}
-	return nil
-}
-
-func (s *OCIObjectStorage) verifyObjectDigest(
-	ctx context.Context,
-	objectKey string,
-	expectedSize int64,
-	expectedDigest []byte,
-) error {
-	response, err := s.client.GetObject(ctx, objectstorage.GetObjectRequest{
-		NamespaceName: common.String(s.namespace),
-		BucketName:    common.String(s.bucket),
-		ObjectName:    common.String(objectKey),
-	})
-	if err != nil {
-		return fmt.Errorf("read OCI media object for verification: %w", err)
+	if response.ContentType == nil {
+		return fmt.Errorf("%w: OCI object omitted content type", ErrVerificationMismatch)
 	}
-	if response.Content == nil {
-		return errors.New("OCI media object response omitted content")
+	actualType, _, err := mime.ParseMediaType(*response.ContentType)
+	if err != nil || !strings.EqualFold(actualType, expectedType) {
+		return fmt.Errorf("%w: content type", ErrVerificationMismatch)
 	}
-	defer response.Content.Close()
-	if response.ContentLength == nil {
-		return errors.New("OCI media object response omitted content length")
+	if response.OpcContentSha256 == nil || strings.TrimSpace(*response.OpcContentSha256) == "" {
+		return fmt.Errorf("%w: OCI object omitted SHA-256 metadata", ErrVerificationMismatch)
 	}
-	if *response.ContentLength != expectedSize {
-		return s.rejectMismatchedObject(
-			ctx,
-			objectKey,
-			fmt.Errorf("media size mismatch: expected %d, received %d", expectedSize, *response.ContentLength),
-		)
+	actualDigest, err := base64.StdEncoding.DecodeString(*response.OpcContentSha256)
+	if err != nil || len(actualDigest) != sha256.Size {
+		return fmt.Errorf("%w: OCI object returned invalid SHA-256 metadata", ErrVerificationMismatch)
 	}
-	hash := sha256.New()
-	read, err := io.Copy(hash, io.LimitReader(response.Content, expectedSize+1))
-	if err != nil {
-		return fmt.Errorf("hash OCI media object: %w", err)
-	}
-	if read != expectedSize {
-		return s.rejectMismatchedObject(
-			ctx,
-			objectKey,
-			fmt.Errorf("media size mismatch: expected %d, received %d", expectedSize, read),
-		)
-	}
-	actualDigest := hash.Sum(nil)
 	if subtle.ConstantTimeCompare(actualDigest, expectedDigest) != 1 {
-		return s.rejectMismatchedObject(ctx, objectKey, errors.New("media SHA-256 mismatch"))
+		return fmt.Errorf("%w: SHA-256", ErrVerificationMismatch)
 	}
 	return nil
-}
-
-func (s *OCIObjectStorage) rejectMismatchedObject(
-	ctx context.Context,
-	objectKey string,
-	mismatch error,
-) error {
-	deleteContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer cancel()
-	if err := s.Delete(deleteContext, objectKey); err != nil {
-		return errors.Join(mismatch, fmt.Errorf("remove mismatched OCI media object: %w", err))
-	}
-	return mismatch
 }
 
 func (s *OCIObjectStorage) Delete(ctx context.Context, objectKey string) error {

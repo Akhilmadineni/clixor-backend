@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -27,10 +28,6 @@ type fakeOCIObjectStorageClient struct {
 	headObjectError    error
 	headObjectRequests []objectstorage.HeadObjectRequest
 
-	getObjectResponse objectstorage.GetObjectResponse
-	getObjectError    error
-	getObjectRequests []objectstorage.GetObjectRequest
-
 	deleteObjectError    error
 	deleteObjectRequests []objectstorage.DeleteObjectRequest
 
@@ -41,6 +38,14 @@ type fakeOCIObjectStorageClient struct {
 	deletePARError    error
 	deletePARRequests []objectstorage.DeletePreauthenticatedRequestRequest
 }
+
+type fakeOCIServiceError struct{ status int }
+
+func (e fakeOCIServiceError) Error() string           { return "OCI service error" }
+func (e fakeOCIServiceError) GetHTTPStatusCode() int  { return e.status }
+func (e fakeOCIServiceError) GetMessage() string      { return e.Error() }
+func (e fakeOCIServiceError) GetCode() string         { return "test" }
+func (e fakeOCIServiceError) GetOpcRequestID() string { return "test-request" }
 
 func (*fakeOCIObjectStorageClient) HeadBucket(
 	context.Context,
@@ -89,14 +94,6 @@ func (f *fakeOCIObjectStorageClient) HeadObject(
 	return f.headObjectResponse, f.headObjectError
 }
 
-func (f *fakeOCIObjectStorageClient) GetObject(
-	_ context.Context,
-	request objectstorage.GetObjectRequest,
-) (objectstorage.GetObjectResponse, error) {
-	f.getObjectRequests = append(f.getObjectRequests, request)
-	return f.getObjectResponse, f.getObjectError
-}
-
 func (f *fakeOCIObjectStorageClient) DeleteObject(
 	_ context.Context,
 	request objectstorage.DeleteObjectRequest,
@@ -116,7 +113,15 @@ func newTestOCIStore(t *testing.T, client *fakeOCIObjectStorageClient) *OCIObjec
 	return store
 }
 
-func TestOCIUploadURLCreatesObjectSpecificWritePAR(t *testing.T) {
+func ociHeadResponse(size int64, contentType, digestHex string) objectstorage.HeadObjectResponse {
+	digest, _ := hex.DecodeString(digestHex)
+	checksum := base64.StdEncoding.EncodeToString(digest)
+	return objectstorage.HeadObjectResponse{
+		ContentLength: &size, ContentType: &contentType, OpcContentSha256: &checksum,
+	}
+}
+
+func TestOCIPrepareUploadCreatesObjectSpecificWritePARAndChecksumHeaders(t *testing.T) {
 	client := &fakeOCIObjectStorageClient{
 		createResponse: objectstorage.CreatePreauthenticatedRequestResponse{
 			PreauthenticatedRequest: objectstorage.PreauthenticatedRequest{
@@ -126,14 +131,20 @@ func TestOCIUploadURLCreatesObjectSpecificWritePAR(t *testing.T) {
 	}
 	store := newTestOCIStore(t, client)
 	before := time.Now().UTC()
-	uploadURL, err := store.UploadURL(
-		context.Background(), "conversations/id/media", "application/octet-stream", 42, 15*time.Minute,
+	upload, err := store.PrepareUpload(
+		context.Background(), "conversations/id/media", "application/octet-stream", 42,
+		testSHA256, 15*time.Minute,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := uploadURL.String(), testOCIEndpoint+"/p/opaque-token/n/testnamespace/b/clixor-media/o/conversations/id/media"; got != want {
+	if got, want := upload.URL.String(), testOCIEndpoint+"/p/opaque-token/n/testnamespace/b/clixor-media/o/conversations/id/media"; got != want {
 		t.Fatalf("upload URL = %q, want %q", got, want)
+	}
+	if upload.Method != "PUT" || upload.Headers["Content-Type"] != "application/octet-stream" ||
+		upload.Headers["Content-Length"] != "42" || upload.Headers["opc-checksum-algorithm"] != "SHA256" ||
+		upload.Headers["opc-content-sha256"] != "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=" {
+		t.Fatalf("OCI upload instructions = %+v", upload)
 	}
 	if len(client.createRequests) != 1 {
 		t.Fatalf("create request count = %d, want 1", len(client.createRequests))
@@ -192,91 +203,74 @@ func TestOCIRejectsAbsolutePARAccessURI(t *testing.T) {
 	}
 }
 
-func TestOCIVerifyDeletesMismatchedObject(t *testing.T) {
-	actualSize := int64(1 << 30)
+func TestOCIVerifyAcceptsMatchingHeadMetadataWithoutReadingObject(t *testing.T) {
 	client := &fakeOCIObjectStorageClient{
-		headObjectResponse: objectstorage.HeadObjectResponse{ContentLength: &actualSize},
-	}
-	store := newTestOCIStore(t, client)
-	err := store.Verify(context.Background(), "conversations/id/media", 42, "")
-	if err == nil || !strings.Contains(err.Error(), "media size mismatch") {
-		t.Fatalf("expected a size mismatch, received %v", err)
-	}
-	if len(client.deleteObjectRequests) != 1 || client.deleteObjectRequests[0].ObjectName == nil ||
-		*client.deleteObjectRequests[0].ObjectName != "conversations/id/media" {
-		t.Fatalf("mismatched object was not deleted: %#v", client.deleteObjectRequests)
-	}
-}
-
-func TestOCIVerifyAcceptsMatchingObjectWithoutDeletingIt(t *testing.T) {
-	actualSize := int64(42)
-	client := &fakeOCIObjectStorageClient{
-		headObjectResponse: objectstorage.HeadObjectResponse{ContentLength: &actualSize},
-	}
-	store := newTestOCIStore(t, client)
-	if err := store.Verify(context.Background(), "conversations/id/media", actualSize, ""); err != nil {
-		t.Fatal(err)
-	}
-	if len(client.deleteObjectRequests) != 0 {
-		t.Fatalf("matching object was unexpectedly deleted: %#v", client.deleteObjectRequests)
-	}
-}
-
-func TestOCIVerifyReportsMismatchedObjectCleanupFailure(t *testing.T) {
-	actualSize := int64(100)
-	client := &fakeOCIObjectStorageClient{
-		headObjectResponse: objectstorage.HeadObjectResponse{ContentLength: &actualSize},
-		deleteObjectError:  errors.New("delete failed"),
-	}
-	store := newTestOCIStore(t, client)
-	err := store.Verify(context.Background(), "conversations/id/media", 42, "")
-	if err == nil || !strings.Contains(err.Error(), "media size mismatch") || !strings.Contains(err.Error(), "delete failed") {
-		t.Fatalf("expected both mismatch and cleanup errors, received %v", err)
-	}
-}
-
-func TestOCIVerifyStreamsAndAcceptsMatchingSHA256(t *testing.T) {
-	content := []byte("encrypted-avatar")
-	contentLength := int64(len(content))
-	digest := sha256.Sum256(content)
-	client := &fakeOCIObjectStorageClient{
-		getObjectResponse: objectstorage.GetObjectResponse{
-			ContentLength: &contentLength,
-			Content:       io.NopCloser(strings.NewReader(string(content))),
-		},
+		headObjectResponse: ociHeadResponse(3, "application/octet-stream", testSHA256),
 	}
 	store := newTestOCIStore(t, client)
 	if err := store.Verify(
-		context.Background(), "users/id/avatars/media", contentLength,
-		hex.EncodeToString(digest[:]),
+		context.Background(), "conversations/id/media", 3, testSHA256, "application/octet-stream",
 	); err != nil {
 		t.Fatal(err)
 	}
-	if len(client.getObjectRequests) != 1 || len(client.deleteObjectRequests) != 0 {
-		t.Fatalf("unexpected verification calls: get=%d delete=%d", len(client.getObjectRequests), len(client.deleteObjectRequests))
+	if len(client.headObjectRequests) != 1 || len(client.deleteObjectRequests) != 0 {
+		t.Fatalf("verification calls: head=%d delete=%d", len(client.headObjectRequests), len(client.deleteObjectRequests))
 	}
 }
 
-func TestOCIVerifyDeletesObjectWithMismatchedSHA256(t *testing.T) {
-	content := []byte("tampered-avatar")
-	contentLength := int64(len(content))
-	expected := sha256.Sum256([]byte("expected-avatar"))
-	client := &fakeOCIObjectStorageClient{
-		getObjectResponse: objectstorage.GetObjectResponse{
-			ContentLength: &contentLength,
-			Content:       io.NopCloser(strings.NewReader(string(content))),
-		},
+func TestOCIVerifyTreatsMissingOrMismatchedMetadataAsDefinitive(t *testing.T) {
+	wrongDigest := sha256.Sum256([]byte("wrong"))
+	wrongChecksum := base64.StdEncoding.EncodeToString(wrongDigest[:])
+	wrongType := "image/jpeg"
+	missingChecksum := ociHeadResponse(3, "application/octet-stream", testSHA256)
+	missingChecksum.OpcContentSha256 = nil
+	wrongChecksumResponse := ociHeadResponse(3, "application/octet-stream", testSHA256)
+	wrongChecksumResponse.OpcContentSha256 = &wrongChecksum
+	wrongTypeResponse := ociHeadResponse(3, "application/octet-stream", testSHA256)
+	wrongTypeResponse.ContentType = &wrongType
+	wrongSizeResponse := ociHeadResponse(4, "application/octet-stream", testSHA256)
+
+	for name, response := range map[string]objectstorage.HeadObjectResponse{
+		"missing checksum": missingChecksum,
+		"wrong checksum":   wrongChecksumResponse,
+		"wrong type":       wrongTypeResponse,
+		"wrong size":       wrongSizeResponse,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &fakeOCIObjectStorageClient{headObjectResponse: response}
+			store := newTestOCIStore(t, client)
+			err := store.Verify(
+				context.Background(), "conversations/id/media", 3, testSHA256, "application/octet-stream",
+			)
+			if !errors.Is(err, ErrVerificationMismatch) || !IsDefinitiveVerificationFailure(err) {
+				t.Fatalf("verification error = %v, want definitive mismatch", err)
+			}
+			if len(client.deleteObjectRequests) != 0 {
+				t.Fatal("verification bypassed the durable deletion outbox")
+			}
+		})
 	}
-	store := newTestOCIStore(t, client)
-	err := store.Verify(
-		context.Background(), "users/id/avatars/media", contentLength,
-		hex.EncodeToString(expected[:]),
-	)
-	if err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") {
-		t.Fatalf("expected SHA-256 mismatch, received %v", err)
-	}
-	if len(client.deleteObjectRequests) != 1 {
-		t.Fatalf("mismatched object delete count = %d, want 1", len(client.deleteObjectRequests))
+}
+
+func TestOCIVerifyClassifiesMissingAndTransientStorageErrors(t *testing.T) {
+	for name, test := range map[string]struct {
+		status     int
+		definitive bool
+		want       error
+	}{
+		"missing":   {status: 404, definitive: true, want: ErrUploadMissing},
+		"transient": {status: 503, definitive: false, want: ErrUnavailable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &fakeOCIObjectStorageClient{headObjectError: fakeOCIServiceError{status: test.status}}
+			store := newTestOCIStore(t, client)
+			err := store.Verify(
+				context.Background(), "conversations/id/media", 3, testSHA256, "application/octet-stream",
+			)
+			if !errors.Is(err, test.want) || IsDefinitiveVerificationFailure(err) != test.definitive {
+				t.Fatalf("verification error = %v", err)
+			}
+		})
 	}
 }
 

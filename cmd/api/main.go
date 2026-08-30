@@ -254,6 +254,22 @@ func main() {
 			Enabled: cfg.Mail.Provider == "smtp", HMACSecret: cfg.Mail.PasswordResetSecret,
 			CodeLength: cfg.Mail.PasswordResetLength, TTL: cfg.Mail.PasswordResetTTL,
 			MaxAttempts: cfg.Mail.PasswordResetMaxAttempts,
+		}, httpapi.MediaPolicy{
+			ConversationMaxBytes:    cfg.Media.ConversationMaxBytes,
+			ProfileMaxBytes:         cfg.Media.ProfileMaxBytes,
+			CompletionTimeout:       cfg.Media.CompletionTimeout,
+			VerificationConcurrency: cfg.Media.VerificationConcurrency,
+			ReservationLimits: store.MediaReservationLimits{
+				PendingTTL:                  cfg.Media.PendingTTL,
+				MaxPendingCountPerUser:      cfg.Media.PendingUserMaxCount,
+				MaxPendingBytesPerUser:      cfg.Media.PendingUserMaxBytes,
+				MaxPendingCountConversation: cfg.Media.PendingConversationMaxCount,
+				MaxPendingBytesConversation: cfg.Media.PendingConversationMaxBytes,
+				MaxStoredCountPerUser:       cfg.Media.StoredUserMaxCount,
+				MaxStoredBytesPerUser:       cfg.Media.StoredUserMaxBytes,
+				MaxStoredCountConversation:  cfg.Media.StoredConversationMaxCount,
+				MaxStoredBytesConversation:  cfg.Media.StoredConversationMaxBytes,
+			},
 		}, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
 	if durableStore {
@@ -269,13 +285,16 @@ func main() {
 				DeadLetterRetention: cfg.PushDelivery.DeadLetterRetention,
 			},
 		).Run(ctx)
+		go media.RunPendingCleanup(
+			ctx, persistence, cfg.Media.CleanupInterval, cfg.Media.CleanupBatchSize, logger,
+		)
 	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.Router(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       35 * time.Second,
-		WriteTimeout:      35 * time.Second,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       75 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

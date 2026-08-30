@@ -80,6 +80,31 @@ func TestMediaProviderDefaultsToS3(t *testing.T) {
 	}
 }
 
+func TestMediaDefaultsPreserveProduction05bOneGiBContract(t *testing.T) {
+	t.Setenv("CLUSTER_ENV", "development")
+	t.Setenv("CLUSTER_STORE", "memory")
+	for _, key := range []string{
+		"CLUSTER_MEDIA_CONVERSATION_MAX_BYTES", "CLUSTER_MEDIA_PROFILE_MAX_BYTES",
+		"CLUSTER_MEDIA_PENDING_USER_MAX_BYTES", "CLUSTER_MEDIA_PENDING_CONVERSATION_MAX_BYTES",
+		"CLUSTER_MEDIA_STORED_USER_MAX_BYTES", "CLUSTER_MEDIA_STORED_CONVERSATION_MAX_BYTES",
+	} {
+		t.Setenv(key, "")
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Media.ConversationMaxBytes != 1<<30 || cfg.Media.ProfileMaxBytes != 20<<20 {
+		t.Fatalf("media object defaults = conversation %d profile %d", cfg.Media.ConversationMaxBytes, cfg.Media.ProfileMaxBytes)
+	}
+	if cfg.Media.PendingUserMaxBytes < cfg.Media.ConversationMaxBytes ||
+		cfg.Media.PendingConversationMaxBytes < cfg.Media.ConversationMaxBytes ||
+		cfg.Media.StoredUserMaxBytes < cfg.Media.PendingUserMaxBytes ||
+		cfg.Media.StoredConversationMaxBytes < cfg.Media.PendingConversationMaxBytes {
+		t.Fatalf("media quota defaults cannot reserve the public maximum: %+v", cfg.Media)
+	}
+}
+
 func TestOCIObjectStorageConfigurationIsValidated(t *testing.T) {
 	cfg := validProductionConfig()
 	cfg.MediaProvider = "oci"
@@ -202,9 +227,84 @@ func TestPushDeliveryPolicyIsBounded(t *testing.T) {
 	}
 }
 
+func TestMediaLimitsRejectUnsafeCapacityAndCleanupSettings(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name: "attachment above compatibility ceiling",
+			mutate: func(cfg *Config) {
+				cfg.Media.ConversationMaxBytes = (1 << 30) + 1
+			},
+			want: "CONVERSATION_MAX_BYTES",
+		},
+		{
+			name: "unbounded media verification concurrency",
+			mutate: func(cfg *Config) {
+				cfg.Media.VerificationConcurrency = 1000
+			},
+			want: "VERIFY_CONCURRENCY",
+		},
+		{
+			name: "reservation shorter than client upload",
+			mutate: func(cfg *Config) {
+				cfg.Media.PendingTTL = 10 * time.Second
+			},
+			want: "PENDING_TTL",
+		},
+		{
+			name: "outer write timeout cuts off completion",
+			mutate: func(cfg *Config) {
+				cfg.HTTPWriteTimeout = cfg.Media.CompletionTimeout
+			},
+			want: "HTTP_WRITE_TIMEOUT",
+		},
+		{
+			name: "user bytes below a single attachment",
+			mutate: func(cfg *Config) {
+				cfg.Media.PendingUserMaxBytes = 32 << 20
+			},
+			want: "PENDING_USER_MAX_BYTES",
+		},
+		{
+			name: "unbounded cleanup batch",
+			mutate: func(cfg *Config) {
+				cfg.Media.CleanupBatchSize = 10_000
+			},
+			want: "CLEANUP_BATCH_SIZE",
+		},
+		{
+			name: "stored bytes below pending reservations",
+			mutate: func(cfg *Config) {
+				cfg.Media.StoredUserMaxBytes = 64 << 20
+			},
+			want: "STORED_USER_MAX_BYTES",
+		},
+		{
+			name: "unbounded stored conversation count",
+			mutate: func(cfg *Config) {
+				cfg.Media.StoredConversationMaxCount = 2_000_000
+			},
+			want: "stored object counts",
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validProductionConfig()
+			test.mutate(&cfg)
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validation error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func validProductionConfig() Config {
 	return Config{
 		Environment:      "production",
+		HTTPWriteTimeout: 135 * time.Second,
 		PublicBaseURL:    "https://api.clustr.app",
 		Store:            "postgres",
 		DatabaseURL:      "postgres://user:pass@db.internal/clustr?sslmode=verify-full",
@@ -224,6 +324,16 @@ func validProductionConfig() Config {
 			Endpoint: "s3.internal", PublicEndpoint: "media.clustr.app",
 			Region: "us-east-1", AccessKey: "access", SecretKey: "secret",
 			Bucket: "clustr-media", UseTLS: true,
+		},
+		Media: MediaConfig{
+			ConversationMaxBytes: 1 << 30, ProfileMaxBytes: 20 << 20,
+			CompletionTimeout: 2 * time.Minute, VerificationConcurrency: 4,
+			PendingTTL: 5 * time.Minute, PendingUserMaxCount: 8,
+			PendingUserMaxBytes: 2 << 30, PendingConversationMaxCount: 32,
+			PendingConversationMaxBytes: 8 << 30,
+			StoredUserMaxCount:          2_000, StoredUserMaxBytes: 20 << 30,
+			StoredConversationMaxCount: 10_000, StoredConversationMaxBytes: 100 << 30,
+			CleanupInterval: 30 * time.Second, CleanupBatchSize: 500,
 		},
 		Verification: VerificationConfig{
 			Provider: "telnyx", OTPSecret: strings.Repeat("o", 48), OTPCodeLength: 6,

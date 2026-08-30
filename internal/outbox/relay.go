@@ -21,14 +21,15 @@ import (
 )
 
 type Relay struct {
-	store     store.Store
-	bus       events.Bus
-	logger    *slog.Logger
-	push      push.Service
-	media     media.Service
-	policy    PushRetryPolicy
-	now       func() time.Time
-	lastPrune time.Time
+	store              store.Store
+	bus                events.Bus
+	logger             *slog.Logger
+	push               push.Service
+	media              media.Service
+	policy             PushRetryPolicy
+	now                func() time.Time
+	lastPrune          time.Time
+	mediaDeleteTimeout time.Duration
 }
 
 type PushRetryPolicy struct {
@@ -42,9 +43,15 @@ type PushRetryPolicy struct {
 }
 
 const (
-	genericPushTitle = "Clixor"
-	genericPushBody  = "You have new activity. Open the app to view it."
-	genericPushKind  = "activity"
+	genericPushTitle         = "Clixor"
+	genericPushBody          = "You have new activity. Open the app to view it."
+	genericPushKind          = "activity"
+	mediaDeleteConcurrency   = 4
+	mediaDeleteObjectTimeout = 10 * time.Second
+	retentionInterval        = time.Hour
+	retentionCatchUpInterval = time.Minute
+	retentionRunBudget       = 5 * time.Second
+	retentionMaxBatches      = 100
 )
 
 func DefaultPushRetryPolicy() PushRetryPolicy {
@@ -54,6 +61,8 @@ func DefaultPushRetryPolicy() PushRetryPolicy {
 		DeadLetterRetention: 30 * 24 * time.Hour,
 	}
 }
+
+var errMediaDeleteNotDue = errors.New("media deletion is not due")
 
 func New(store store.Store, bus events.Bus, pushService push.Service, mediaService media.Service, logger *slog.Logger) *Relay {
 	return NewWithPushRetryPolicy(store, bus, pushService, mediaService, logger, DefaultPushRetryPolicy())
@@ -71,12 +80,13 @@ func NewWithPushRetryPolicy(
 	return &Relay{
 		store: persistence, bus: bus, push: pushService, media: mediaService,
 		logger: logger, policy: policy, now: now, lastPrune: now().UTC(),
+		mediaDeleteTimeout: mediaDeleteObjectTimeout,
 	}
 }
 
 func (r *Relay) Run(ctx context.Context) {
 	var workers sync.WaitGroup
-	workers.Add(2)
+	workers.Add(3)
 	go func() {
 		defer workers.Done()
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -104,11 +114,24 @@ func (r *Relay) Run(ctx context.Context) {
 			}
 		}
 	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.flushMediaDeletes(ctx)
+			}
+		}
+	}()
 	workers.Wait()
 }
 
 func (r *Relay) flush(ctx context.Context) {
-	batch, err := r.store.LockOutboxBatch(ctx, 100)
+	batch, err := r.store.LockRealtimeOutboxBatch(ctx, 100)
 	if err != nil {
 		observability.OutboxEvents.WithLabelValues("lock_failed").Inc()
 		r.logger.Error("outbox_lock_failed", "error", err)
@@ -116,30 +139,22 @@ func (r *Relay) flush(ctx context.Context) {
 	}
 	published := make([]int64, 0, len(batch))
 	for _, item := range batch {
-		if item.Topic == "media.delete" {
-			if err := r.deleteMedia(ctx, item); err != nil {
-				observability.OutboxEvents.WithLabelValues("media_delete_failed").Inc()
-				r.logger.Error("outbox_media_delete_failed", "error", err, "outbox_id", item.ID)
-				continue
-			}
-			observability.OutboxEvents.WithLabelValues("published").Inc()
-			observability.OutboxLag.Observe(time.Since(item.CreatedAt).Seconds())
-			published = append(published, item.ID)
-			continue
-		}
 		event, recipients, ok := r.translate(ctx, item)
 		if !ok {
 			observability.OutboxEvents.WithLabelValues("translate_failed").Inc()
+			r.releaseOutbox(ctx, item, time.Second)
 			continue
 		}
 		if err := r.enqueuePush(ctx, item, recipients); err != nil {
 			observability.PushDeliveries.WithLabelValues("queue_failed").Inc()
 			r.logger.Error("push_queue_failed", "error", err, "outbox_id", item.ID)
+			r.releaseOutbox(ctx, item, time.Second)
 			continue
 		}
 		if err := r.bus.Publish(ctx, recipients, event); err != nil {
 			observability.OutboxEvents.WithLabelValues("publish_failed").Inc()
 			r.logger.Error("outbox_publish_failed", "error", err, "outbox_id", item.ID)
+			r.releaseOutbox(ctx, item, time.Second)
 			continue
 		}
 		observability.OutboxEvents.WithLabelValues("published").Inc()
@@ -153,6 +168,62 @@ func (r *Relay) flush(ctx context.Context) {
 	}
 }
 
+func (r *Relay) flushMediaDeletes(ctx context.Context) {
+	// One durable event may contain up to 500 object keys. Claim one event at a
+	// time and bound the actual object-store calls below; this prevents a large
+	// account deletion from multiplying concurrency across events.
+	batch, err := r.store.LockMediaDeleteOutboxBatch(ctx, 1)
+	if err != nil {
+		observability.OutboxEvents.WithLabelValues("media_delete_lock_failed").Inc()
+		r.logger.Error("media_delete_outbox_lock_failed", "error", err)
+		return
+	}
+	for _, item := range batch {
+		if err := r.deleteMedia(ctx, item); err != nil {
+			observability.OutboxEvents.WithLabelValues("media_delete_failed").Inc()
+			r.logger.Error("outbox_media_delete_failed", "error", err, "outbox_id", item.ID)
+			delay := mediaDeleteRetryDelay(item)
+			if errors.Is(err, errMediaDeleteNotDue) {
+				delay = time.Second
+			}
+			r.releaseOutbox(ctx, item, delay)
+			continue
+		}
+		if err := r.store.MarkOutboxPublished(ctx, []int64{item.ID}); err != nil {
+			r.logger.Error("media_delete_outbox_ack_failed", "error", err, "outbox_id", item.ID)
+			r.releaseOutbox(ctx, item, time.Second)
+			continue
+		}
+		observability.OutboxEvents.WithLabelValues("published").Inc()
+		observability.OutboxLag.Observe(r.now().UTC().Sub(item.CreatedAt).Seconds())
+	}
+}
+
+func (r *Relay) releaseOutbox(ctx context.Context, item domain.OutboxEvent, delay time.Duration) {
+	releaseContext := ctx
+	cancel := func() {}
+	if ctx.Err() != nil {
+		releaseContext, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	}
+	defer cancel()
+	if err := r.store.ReleaseOutboxEvent(
+		releaseContext, item.ID, r.now().UTC().Add(max(delay, time.Second)),
+	); err != nil && !errors.Is(err, domain.ErrNotFound) {
+		r.logger.Error("outbox_release_failed", "error", err, "outbox_id", item.ID)
+	}
+}
+
+func mediaDeleteRetryDelay(item domain.OutboxEvent) time.Duration {
+	delay := time.Second
+	for attempt := 1; attempt < item.Attempts && delay < 15*time.Minute; attempt++ {
+		if delay >= 15*time.Minute/2 {
+			return 15 * time.Minute
+		}
+		delay *= 2
+	}
+	return min(delay, 15*time.Minute)
+}
+
 func (r *Relay) deleteMedia(ctx context.Context, item domain.OutboxEvent) error {
 	var payload store.MediaDeletePayload
 	if err := json.Unmarshal(item.Payload, &payload); err != nil {
@@ -161,13 +232,40 @@ func (r *Relay) deleteMedia(ctx context.Context, item domain.OutboxEvent) error 
 	if len(payload.ObjectKeys) == 0 || len(payload.ObjectKeys) > store.MediaDeleteBatchSize {
 		return fmt.Errorf("invalid media deletion object count: %d", len(payload.ObjectKeys))
 	}
+	if payload.NotBefore != nil && payload.NotBefore.After(r.now().UTC()) {
+		return errMediaDeleteNotDue
+	}
 	for _, objectKey := range payload.ObjectKeys {
 		if strings.TrimSpace(objectKey) == "" {
 			return fmt.Errorf("invalid empty media object key")
 		}
-		if err := r.media.Delete(ctx, objectKey); err != nil {
-			return fmt.Errorf("delete media object %q: %w", objectKey, err)
-		}
+	}
+	jobs := make(chan string)
+	errorsByObject := make(chan error, len(payload.ObjectKeys))
+	var workers sync.WaitGroup
+	workerCount := min(mediaDeleteConcurrency, len(payload.ObjectKeys))
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for objectKey := range jobs {
+				objectContext, cancel := context.WithTimeout(ctx, r.mediaDeleteTimeout)
+				err := r.media.Delete(objectContext, objectKey)
+				cancel()
+				if err != nil {
+					errorsByObject <- fmt.Errorf("delete media object %q: %w", objectKey, err)
+				}
+			}
+		}()
+	}
+	for _, objectKey := range payload.ObjectKeys {
+		jobs <- objectKey
+	}
+	close(jobs)
+	workers.Wait()
+	close(errorsByObject)
+	for err := range errorsByObject {
+		return err
 	}
 	return nil
 }
@@ -342,34 +440,89 @@ func (r *Relay) retryDelay(delivery domain.PushDelivery) time.Duration {
 
 func (r *Relay) pruneRetention(ctx context.Context) {
 	now := r.now().UTC()
-	if now.Sub(r.lastPrune) < time.Hour {
+	if now.Sub(r.lastPrune) < retentionInterval {
 		return
 	}
-	r.lastPrune = now
-	pushDeleted, err := r.store.PrunePushDeliveries(
-		ctx, now.Add(-r.policy.DeliveredRetention), now.Add(-r.policy.DeadLetterRetention),
-		store.MaxRetentionPruneBatchSize,
-	)
+	started := time.Now()
+	pushDeleted, pushBacklog, err := r.drainPushRetention(ctx, now, started)
 	if err != nil {
 		observability.PushDeliveries.WithLabelValues("prune_failed").Inc()
 		r.logger.Error("push_delivery_prune_failed", "error", err)
 	} else if pushDeleted > 0 {
 		observability.PushDeliveries.WithLabelValues("pruned").Add(float64(pushDeleted))
 	}
+	if err != nil || pushBacklog {
+		r.scheduleRetention(now, pushBacklog)
+		return
+	}
 
 	// Source rows outlive both terminal push retention windows. A source with a
 	// pending or retained terminal delivery is protected again by the store's
 	// no-child predicate and foreign key, including during concurrent pruning.
 	outboxRetention := max(r.policy.DeliveredRetention, r.policy.DeadLetterRetention)
-	outboxDeleted, err := r.store.PrunePublishedOutbox(
-		ctx, now.Add(-outboxRetention), store.MaxRetentionPruneBatchSize,
-	)
+	outboxDeleted, outboxBacklog, err := r.drainOutboxRetention(ctx, now.Add(-outboxRetention), started)
 	if err != nil {
 		observability.OutboxEvents.WithLabelValues("prune_failed").Inc()
 		r.logger.Error("outbox_prune_failed", "error", err)
 	} else if outboxDeleted > 0 {
 		observability.OutboxEvents.WithLabelValues("pruned").Add(float64(outboxDeleted))
 	}
+	r.scheduleRetention(now, outboxBacklog || err != nil)
+}
+
+func (r *Relay) drainPushRetention(
+	ctx context.Context,
+	now, started time.Time,
+) (int64, bool, error) {
+	var total int64
+	for batch := 0; batch < retentionMaxBatches; batch++ {
+		if ctx.Err() != nil || time.Since(started) >= retentionRunBudget {
+			return total, true, ctx.Err()
+		}
+		deleted, err := r.store.PrunePushDeliveries(
+			ctx, now.Add(-r.policy.DeliveredRetention), now.Add(-r.policy.DeadLetterRetention),
+			store.MaxRetentionPruneBatchSize,
+		)
+		if err != nil {
+			return total, true, err
+		}
+		total += deleted
+		if deleted < store.MaxRetentionPruneBatchSize {
+			return total, false, nil
+		}
+	}
+	return total, true, nil
+}
+
+func (r *Relay) drainOutboxRetention(
+	ctx context.Context,
+	before, started time.Time,
+) (int64, bool, error) {
+	var total int64
+	for batch := 0; batch < retentionMaxBatches; batch++ {
+		if ctx.Err() != nil || time.Since(started) >= retentionRunBudget {
+			return total, true, ctx.Err()
+		}
+		deleted, err := r.store.PrunePublishedOutbox(
+			ctx, before, store.MaxRetentionPruneBatchSize,
+		)
+		if err != nil {
+			return total, true, err
+		}
+		total += deleted
+		if deleted < store.MaxRetentionPruneBatchSize {
+			return total, false, nil
+		}
+	}
+	return total, true, nil
+}
+
+func (r *Relay) scheduleRetention(now time.Time, catchUp bool) {
+	interval := retentionInterval
+	if catchUp {
+		interval = retentionCatchUpInterval
+	}
+	r.lastPrune = now.Add(-(retentionInterval - interval))
 }
 
 type activityNotification struct {

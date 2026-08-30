@@ -106,6 +106,55 @@ func TestProfileMediaMigrationCleansExtensionsForLegacyAccountDeletion(t *testin
 	}
 }
 
+func TestMediaReservationMigrationAddsExpiryQuotaAndSchedulingSupport(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000010_media_reservations.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"media_objects_pending_expiry_check",
+		"profile_media_objects_pending_expiry_check",
+		"media_objects_pending_owner_idx",
+		"media_objects_pending_conversation_idx",
+		"media_objects_stored_owner_idx",
+		"media_objects_stored_conversation_idx",
+		"profile_media_objects_stored_owner_idx",
+		"upload_valid_until",
+		"verification_lease_token",
+		"verification_locked_until",
+		"media_objects_verification_lease_check",
+		"profile_media_objects_verification_lease_check",
+		"media_objects_verification_lease_idx",
+		"profile_media_objects_verification_lease_idx",
+		"ADD COLUMN available_at",
+		"ON outbox_events (available_at, id)",
+		"outbox_media_delete_unpublished_idx",
+		"topic = 'media.delete'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("media reservation migration is missing %q", required)
+		}
+	}
+}
+
+func TestOutboxRetentionMigrationHasPartialPublishedIndex(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000011_outbox_retention.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"outbox_published_retention_idx",
+		"ON outbox_events (published_at, id)",
+		"WHERE published_at IS NOT NULL",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("outbox retention migration is missing %q", required)
+		}
+	}
+}
+
 func TestPostgresRetentionPruneRejectsUnboundedLimitsBeforeQuery(t *testing.T) {
 	persistence := &Store{}
 	for _, limit := range []int{0, -1, store.MaxRetentionPruneBatchSize + 1} {

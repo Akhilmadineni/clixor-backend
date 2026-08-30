@@ -42,6 +42,11 @@ var (
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60},
 	})
 
+	MediaCleanup = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "media", Name: "pending_cleanup_total",
+		Help: "Expired media reservations and cleanup failures.",
+	}, []string{"result"})
+
 	PushFailures = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "clustr", Subsystem: "push", Name: "failures_total",
 		Help: "Push notification delivery failures.",

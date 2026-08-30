@@ -9,7 +9,37 @@ into independent services when traffic requires it.
 
 The API is stateless. Durable state lives in PostgreSQL, transient rate-limit and
 presence state lives in Redis, realtime fan-out uses NATS, and encrypted media
-lives in private S3-compatible object storage.
+lives in private OCI Object Storage. The media interface also retains a hardened
+S3-compatible implementation for portable deployments.
+
+Media upload slots return provider-neutral `PUT` instructions. OCI uses an
+object-specific pre-authenticated request plus `Content-Type`, exact
+`Content-Length`, `opc-checksum-algorithm: SHA256`, and the base64
+`opc-content-sha256` declaration. S3 signs the same type and length plus
+`X-Amz-Checksum-Sha256` into its SigV4 URL.
+PostgreSQL serializes per-user and per-conversation reservations with transaction
+advisory locks, so concurrent requests through separate API replicas cannot race
+past pending or total stored count/byte quotas. Total storage includes pending
+reservations and ready objects across profile and conversation scopes; deleted
+rows stop consuming quota. Conversation upload reservations also have a dedicated
+60-per-user/hour rate limit and retain the production-05b 1 GiB per-object ceiling.
+OCI completion checks length, content type, and the Object Storage-computed SHA-256
+with a `HEAD` request, so a 1 GiB object is never streamed through an API replica.
+A missing checksum header is a definitive mismatch, not permission to publish an
+unverified object. S3 completion independently streams the ciphertext through
+SHA-256 before marking it ready. Expired, rejected, deleted, and
+conversation-owned objects are removed through durable `media.delete`
+outbox events; database cascades never run before their object keys are captured.
+Deletion jobs wait three minutes after the upload capability expires so an upload accepted just
+before URL expiry cannot normally commit after an already-successful delete.
+Definitive missing-object or declaration mismatches reject the reservation and
+queue deletion; a provider timeout, network error, or storage 5xx leaves it pending
+and returns 503 so completion can be retried before expiry.
+
+Object Storage lifecycle rules should still abort incomplete multipart uploads
+and expire noncurrent versions. Completion has a two-minute application deadline;
+the API write timeout is 135 seconds, leaving an outer-layer margin while
+realtime/WebSocket requests remain exempt from the application request deadline.
 
 Phone verification is a Clustr-owned service: cryptographically random OTPs are
 HMACed with an independent secret and stored only in Redis with short TTLs. Atomic

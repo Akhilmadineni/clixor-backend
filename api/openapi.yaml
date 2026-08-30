@@ -233,7 +233,7 @@ paths:
   /me/avatar:
     post:
       operationId: createProfileMediaUpload
-      description: Creates a user-scoped profile image upload of at most 20 MiB. Completing the upload verifies both size and SHA-256, then atomically activates it as the current avatar.
+      description: Creates a user-scoped profile image upload of at most 20 MiB. Completing the upload verifies exact length, content type, and SHA-256, then atomically activates it as the current avatar.
       requestBody:
         required: true
         content:
@@ -245,6 +245,7 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/MediaUploadResponse"}
+        "429": {description: Pending or stored per-user media quota exceeded}
   /me/phone/start:
     post:
       operationId: startPhoneLink
@@ -607,7 +608,7 @@ paths:
   /conversations/{conversation_id}/media:
     post:
       operationId: createMediaUpload
-      description: Creates a production-05b-compatible conversation upload of at most 1 GiB. content_type is optional and defaults to application/octet-stream.
+      description: Reserves a production-05b-compatible conversation upload of at most 1 GiB. content_type is optional and defaults to application/octet-stream. Per-user and per-conversation pending and stored byte/count quotas are enforced atomically, with a dedicated 60 reservations per user per hour rate limit.
       parameters:
         - {$ref: "#/components/parameters/ConversationID"}
       requestBody:
@@ -621,10 +622,11 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/MediaUploadResponse"}
+        "429": {description: Media rate limit or pending/stored per-user/per-conversation quota exceeded}
   /media/{media_id}/complete:
     post:
       operationId: completeMediaUpload
-      description: Profile media (at most 20 MiB) is verified by size and SHA-256. During production-05b compatibility, conversation media is verified by size only; its declared SHA-256 is stored but not checked by the server. Newer clients authenticate and decrypt conversation ciphertext client-side rather than relying on server digest verification.
+      description: Revalidates exact length, content type, and SHA-256 before making the object downloadable. Definitive missing/mismatch failures reject the reservation and durably queue deletion; transient storage failures retain it for retry.
       parameters:
         - {name: media_id, in: path, required: true, schema: {type: string, format: uuid}}
       responses:
@@ -633,7 +635,11 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/MediaObject"}
-        "422": {description: Object size does not match, or profile-media SHA-256 does not match, the declaration}
+        "410": {description: Upload reservation expired and deletion was queued}
+        "409": {description: Another replica or request is already verifying this upload; retry after the Retry-After delay}
+        "422": {description: Object size, content type, or SHA-256 does not match the declaration}
+        "429": {description: Per-user completion rate limit exceeded}
+        "503": {description: Storage verification is temporarily unavailable; retry before reservation expiry}
   /media/{media_id}/download:
     get:
       operationId: mediaDownload
@@ -711,6 +717,7 @@ components:
         byte_size: {type: integer, format: int64}
         ciphertext_sha256: {type: string, pattern: "^[0-9a-fA-F]{64}$"}
         status: {type: string, enum: [pending, ready, deleted]}
+        expires_at: {type: string, format: date-time, description: Present only while the upload is pending}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
     MediaUploadResponse:
@@ -724,7 +731,10 @@ components:
           properties:
             method: {type: string, const: PUT}
             url: {type: string, format: uri}
-            headers: {type: object, additionalProperties: {type: string}}
+            headers:
+              type: object
+              description: Exact provider-supplied headers the client must send. S3 uses X-Amz-Checksum-Sha256; OCI uses opc-checksum-algorithm and opc-content-sha256.
+              additionalProperties: {type: string}
             expires_at: {type: string, format: date-time}
     Credentials:
       type: object

@@ -3,11 +3,17 @@ package media
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/tlsconfig"
@@ -43,13 +49,10 @@ func NewS3WithRegion(
 		return nil, err
 	}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: useTLS,
-		Region: region,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment, TLSClientConfig: tlsConfig,
-			ForceAttemptHTTP2: true, MaxIdleConns: 100, MaxIdleConnsPerHost: 100,
-		},
+		Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:    useTLS,
+		Region:    region,
+		Transport: boundedS3Transport(tlsConfig),
 	})
 	if err != nil {
 		return nil, err
@@ -58,9 +61,10 @@ func NewS3WithRegion(
 		publicEndpoint = endpoint
 	}
 	publicClient, err := minio.New(publicEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: useTLS,
-		Region: region,
+		Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:    useTLS,
+		Region:    region,
+		Transport: boundedS3Transport(tlsConfig),
 	})
 	if err != nil {
 		return nil, err
@@ -77,45 +81,114 @@ func NewS3WithRegion(
 	return &S3{client: client, publicClient: publicClient, bucket: bucket}, nil
 }
 
-func (s *S3) UploadURL(ctx context.Context, objectKey, contentType string, byteSize int64, expiry time.Duration) (*url.URL, error) {
-	_ = contentType
-	_ = byteSize
-	return s.publicClient.PresignedPutObject(ctx, s.bucket, objectKey, expiry)
+func boundedS3Transport(tlsConfig *tls.Config) *http.Transport {
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSClientConfig:       tlsConfig.Clone(),
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+	}
+}
+
+func (s *S3) PrepareUpload(
+	ctx context.Context,
+	objectKey, contentType string,
+	byteSize int64,
+	expectedSHA256 string,
+	expiry time.Duration,
+) (UploadInstructions, error) {
+	headers, err := RequiredUploadHeaders(contentType, byteSize, expectedSHA256)
+	if err != nil {
+		return UploadInstructions{}, err
+	}
+	uploadURL, err := s.publicClient.PresignHeader(
+		ctx, http.MethodPut, s.bucket, objectKey, expiry, nil, headers,
+	)
+	if err != nil {
+		return UploadInstructions{}, err
+	}
+	required := make(map[string]string, len(headers))
+	for name, values := range headers {
+		if len(values) != 1 {
+			return UploadInstructions{}, fmt.Errorf("invalid S3 upload header %q", name)
+		}
+		required[name] = values[0]
+	}
+	return instructions(uploadURL, required), nil
 }
 
 func (s *S3) DownloadURL(ctx context.Context, objectKey string, expiry time.Duration) (*url.URL, error) {
 	return s.publicClient.PresignedGetObject(ctx, s.bucket, objectKey, expiry, nil)
 }
 
-func (s *S3) Verify(ctx context.Context, objectKey string, expectedSize int64, expectedSHA256 string) error {
+func (s *S3) Verify(
+	ctx context.Context,
+	objectKey string,
+	expectedSize int64,
+	expectedSHA256, expectedContentType string,
+) error {
 	info, err := s.client.StatObject(ctx, s.bucket, objectKey, minio.StatObjectOptions{})
 	if err != nil {
-		return err
+		return verificationStorageError("stat media object", err)
 	}
 	if info.Size != expectedSize {
-		return fmt.Errorf("media size mismatch: expected %d, received %d", expectedSize, info.Size)
+		return fmt.Errorf("%w: size expected %d, received %d", ErrVerificationMismatch, expectedSize, info.Size)
 	}
-	if expectedSHA256 == "" {
-		return nil
+	actualContentType, _, err := mime.ParseMediaType(info.ContentType)
+	if err != nil || !strings.EqualFold(actualContentType, expectedContentType) {
+		return fmt.Errorf("%w: content type", ErrVerificationMismatch)
 	}
 	object, err := s.client.GetObject(ctx, s.bucket, objectKey, minio.GetObjectOptions{})
 	if err != nil {
-		return fmt.Errorf("open media object for verification: %w", err)
+		return verificationStorageError("open media object for verification", err)
 	}
 	defer object.Close()
 	hash := sha256.New()
 	read, err := io.Copy(hash, io.LimitReader(object, expectedSize+1))
 	if err != nil {
-		return fmt.Errorf("hash media object: %w", err)
+		return verificationStorageError("hash media object", err)
 	}
 	if read != expectedSize {
-		return fmt.Errorf("media size changed during verification: expected %d, received %d", expectedSize, read)
+		return fmt.Errorf("%w: size changed during verification: expected %d, received %d",
+			ErrVerificationMismatch, expectedSize, read)
 	}
 	actualSHA256 := hex.EncodeToString(hash.Sum(nil))
 	if actualSHA256 != expectedSHA256 {
-		return fmt.Errorf("media sha256 mismatch")
+		return fmt.Errorf("%w: sha256", ErrVerificationMismatch)
 	}
 	return nil
+}
+
+func verificationStorageError(operation string, err error) error {
+	response := minio.ToErrorResponse(err)
+	switch response.Code {
+	case "NoSuchKey", "NoSuchObject", "NotFound", "XMinioInvalidObjectName":
+		return fmt.Errorf("%w: %s", ErrUploadMissing, operation)
+	default:
+		return fmt.Errorf("%w: %s: %v", ErrUnavailable, operation, err)
+	}
+}
+
+// RequiredUploadHeaders returns every header covered by the SigV4 presigned
+// PUT signature. MinIO rejects a request if any signed value differs. The
+// checksum header also makes MinIO validate the uploaded payload while the
+// completion endpoint independently streams and hashes it before publication.
+func RequiredUploadHeaders(contentType string, byteSize int64, expectedSHA256 string) (http.Header, error) {
+	digest, err := hex.DecodeString(expectedSHA256)
+	if err != nil || len(digest) != sha256.Size || strings.TrimSpace(contentType) == "" || byteSize < 1 {
+		return nil, fmt.Errorf("invalid media upload declaration")
+	}
+	return http.Header{
+		"Content-Type":          []string{contentType},
+		"Content-Length":        []string{strconv.FormatInt(byteSize, 10)},
+		"X-Amz-Checksum-Sha256": []string{base64.StdEncoding.EncodeToString(digest)},
+	}, nil
 }
 
 func (s *S3) Delete(ctx context.Context, objectKey string) error {

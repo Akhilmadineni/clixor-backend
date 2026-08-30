@@ -77,6 +77,49 @@ type CreateConversationInviteParams struct {
 	MaxUses        int
 }
 
+// MediaReservationLimits are enforced atomically by the persistence layer.
+// User totals include profile and conversation media. Stored totals include
+// pending reservations as well as ready objects, so completing uploads cannot
+// bypass storage limits and different API replicas cannot race around them.
+type MediaReservationLimits struct {
+	PendingTTL                  time.Duration
+	MaxPendingCountPerUser      int
+	MaxPendingBytesPerUser      int64
+	MaxPendingCountConversation int
+	MaxPendingBytesConversation int64
+	MaxStoredCountPerUser       int
+	MaxStoredBytesPerUser       int64
+	MaxStoredCountConversation  int
+	MaxStoredBytesConversation  int64
+}
+
+func DefaultMediaReservationLimits() MediaReservationLimits {
+	return MediaReservationLimits{
+		PendingTTL:                  5 * time.Minute,
+		MaxPendingCountPerUser:      8,
+		MaxPendingBytesPerUser:      2 << 30,
+		MaxPendingCountConversation: 32,
+		MaxPendingBytesConversation: 8 << 30,
+		MaxStoredCountPerUser:       2_000,
+		MaxStoredBytesPerUser:       2 << 30,
+		MaxStoredCountConversation:  10_000,
+		MaxStoredBytesConversation:  10 << 30,
+	}
+}
+
+func (l MediaReservationLimits) Validate() error {
+	if l.PendingTTL < time.Minute || l.PendingTTL > 15*time.Minute ||
+		l.MaxPendingCountPerUser < 1 || l.MaxPendingBytesPerUser < 1 ||
+		l.MaxPendingCountConversation < 1 || l.MaxPendingBytesConversation < 1 ||
+		l.MaxStoredCountPerUser < l.MaxPendingCountPerUser ||
+		l.MaxStoredBytesPerUser < l.MaxPendingBytesPerUser ||
+		l.MaxStoredCountConversation < l.MaxPendingCountConversation ||
+		l.MaxStoredBytesConversation < l.MaxPendingBytesConversation {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -138,13 +181,21 @@ type Store interface {
 	ListEntities(context.Context, uuid.UUID, uuid.UUID, string, time.Time, int) ([]domain.Entity, error)
 	DeleteEntity(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, *int64) (domain.Entity, error)
 
-	CreateMedia(context.Context, domain.MediaObject) (domain.MediaObject, error)
-	CreateProfileMedia(context.Context, domain.MediaObject) (domain.MediaObject, error)
+	CreateMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
+	CreateProfileMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
 	Media(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
-	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	ClaimMediaVerification(context.Context, uuid.UUID, uuid.UUID, time.Duration) (domain.MediaObject, error)
+	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	ReleaseMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
+	RejectMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	RejectPendingMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
 	DeleteMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	ExpirePendingMedia(context.Context, time.Time, int) (int, error)
 
 	LockOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	LockRealtimeOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	LockMediaDeleteOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	ReleaseOutboxEvent(context.Context, int64, time.Time) error
 	MarkOutboxPublished(context.Context, []int64) error
 	EnqueuePushDeliveries(context.Context, domain.PushDelivery, []uuid.UUID) (int, error)
 	LockPushDeliveryBatch(context.Context, int) ([]domain.PushDelivery, error)

@@ -32,6 +32,9 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", userID); err != nil {
+		return err
+	}
 
 	var identity store.AccountIdentity
 	var profile json.RawMessage
@@ -87,18 +90,24 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	var deletedConversationIDs []uuid.UUID
 	var sharedConversationIDs []uuid.UUID
 	var objectKeys []string
+	deleteNotBefore := mediaDeleteNotBefore(time.Time{})
 	profileMediaRows, err := tx.Query(ctx, `
-		DELETE FROM profile_media_objects WHERE owner_id=$1 RETURNING object_key`, userID)
+		DELETE FROM profile_media_objects
+		WHERE owner_id=$1 RETURNING object_key,upload_valid_until`, userID)
 	if err != nil {
 		return err
 	}
 	for profileMediaRows.Next() {
 		var key string
-		if err := profileMediaRows.Scan(&key); err != nil {
+		var uploadValidUntil time.Time
+		if err := profileMediaRows.Scan(&key, &uploadValidUntil); err != nil {
 			profileMediaRows.Close()
 			return err
 		}
 		objectKeys = append(objectKeys, key)
+		if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+			deleteNotBefore = candidate
+		}
 	}
 	if err := profileMediaRows.Err(); err != nil {
 		profileMediaRows.Close()
@@ -108,18 +117,23 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	for _, conversation := range conversations {
 		if !conversation.successorID.Valid {
 			mediaRows, err := tx.Query(ctx, `
-				SELECT object_key FROM media_objects WHERE conversation_id=$1 ORDER BY object_key`,
+				SELECT object_key,upload_valid_until FROM media_objects
+				WHERE conversation_id=$1 ORDER BY object_key`,
 				conversation.id)
 			if err != nil {
 				return err
 			}
 			for mediaRows.Next() {
 				var key string
-				if err := mediaRows.Scan(&key); err != nil {
+				var uploadValidUntil time.Time
+				if err := mediaRows.Scan(&key, &uploadValidUntil); err != nil {
 					mediaRows.Close()
 					return err
 				}
 				objectKeys = append(objectKeys, key)
+				if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+					deleteNotBefore = candidate
+				}
 			}
 			if err := mediaRows.Err(); err != nil {
 				mediaRows.Close()
@@ -274,13 +288,9 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	if len(objectKeys) > 0 {
 		for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
 			end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
-			payload, err := json.Marshal(store.MediaDeletePayload{ObjectKeys: objectKeys[start:end]})
-			if err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO outbox_events(topic,aggregate_id,payload)
-				VALUES('media.delete',$1,$2)`, userID, payload); err != nil {
+			if err := enqueueMediaDeletesAt(
+				ctx, tx, userID, objectKeys[start:end], deleteNotBefore,
+			); err != nil {
 				return err
 			}
 		}

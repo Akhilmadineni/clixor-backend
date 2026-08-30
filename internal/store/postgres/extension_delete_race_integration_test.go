@@ -31,7 +31,7 @@ func TestPostgresLegacyDeleteSerializesNewExtensionWrites(t *testing.T) {
 		user := createExtensionRaceUser(t, ctx, persistence, "profile-create")
 		mediaObject := extensionRaceProfileMedia(user)
 		err := legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
-			_, err := persistence.CreateProfileMedia(ctx, mediaObject)
+			_, err := persistence.CreateProfileMedia(ctx, mediaObject, store.DefaultMediaReservationLimits())
 			return err
 		})
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -43,11 +43,15 @@ func TestPostgresLegacyDeleteSerializesNewExtensionWrites(t *testing.T) {
 	t.Run("profile completion cannot reactivate after tombstone", func(t *testing.T) {
 		user := createExtensionRaceUser(t, ctx, persistence, "profile-complete")
 		mediaObject := extensionRaceProfileMedia(user)
-		if _, err := persistence.CreateProfileMedia(ctx, mediaObject); err != nil {
+		if _, err := persistence.CreateProfileMedia(ctx, mediaObject, store.DefaultMediaReservationLimits()); err != nil {
 			t.Fatal(err)
 		}
-		err := legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
-			_, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user)
+		claimed, err := persistence.ClaimMediaVerification(ctx, mediaObject.ID, user, time.Minute)
+		if err != nil || claimed.VerificationLeaseToken == nil {
+			t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
+		}
+		err = legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
+			_, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken)
 			return err
 		})
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -60,13 +64,17 @@ func TestPostgresLegacyDeleteSerializesNewExtensionWrites(t *testing.T) {
 	t.Run("profile deletion and tombstone do not orphan an object", func(t *testing.T) {
 		user := createExtensionRaceUser(t, ctx, persistence, "profile-delete")
 		mediaObject := extensionRaceProfileMedia(user)
-		if _, err := persistence.CreateProfileMedia(ctx, mediaObject); err != nil {
+		if _, err := persistence.CreateProfileMedia(ctx, mediaObject, store.DefaultMediaReservationLimits()); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user); err != nil {
+		claimed, err := persistence.ClaimMediaVerification(ctx, mediaObject.ID, user, time.Minute)
+		if err != nil || claimed.VerificationLeaseToken == nil {
+			t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
+		}
+		if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken); err != nil {
 			t.Fatal(err)
 		}
-		err := legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
+		err = legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
 			_, err := persistence.DeleteMedia(ctx, mediaObject.ID, user)
 			return err
 		})

@@ -358,7 +358,7 @@ func newPasswordResetHTTPServerForStore(
 		appleauth.Unavailable{}, presenceService, recorder, PasswordResetPolicy{
 			Enabled: true, HMACSecret: strings.Repeat("r", 48), CodeLength: 8,
 			TTL: 10 * time.Minute, MaxAttempts: 5,
-		}, nil, "", logger,
+		}, MediaPolicy{}, nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)
 	return server, recorder

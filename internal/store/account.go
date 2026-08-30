@@ -3,12 +3,14 @@ package store
 import (
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 const DeletedUserDisplayName = "Deleted user"
 const MediaDeleteBatchSize = 500
+const MediaDeleteGrace = 3 * time.Minute
 
 // AccountIdentity contains the identifiers which must no longer be exposed after
 // an account is deleted. UserID remains as an opaque tombstone identifier so
@@ -22,7 +24,17 @@ type AccountIdentity struct {
 }
 
 type MediaDeletePayload struct {
-	ObjectKeys []string `json:"object_keys"`
+	ObjectKeys []string   `json:"object_keys"`
+	NotBefore  *time.Time `json:"not_before,omitempty"`
+}
+
+func NewMediaDeletePayload(objectKeys []string, queuedAt time.Time) MediaDeletePayload {
+	return NewMediaDeletePayloadAt(objectKeys, queuedAt.UTC().Add(MediaDeleteGrace))
+}
+
+func NewMediaDeletePayloadAt(objectKeys []string, notBefore time.Time) MediaDeletePayload {
+	notBefore = notBefore.UTC()
+	return MediaDeletePayload{ObjectKeys: objectKeys, NotBefore: &notBefore}
 }
 
 // AnonymizeAccountJSON removes identity fields from JSON owned by the deleted

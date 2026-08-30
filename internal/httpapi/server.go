@@ -43,6 +43,8 @@ type Server struct {
 	metricsToken      string
 	trustedProxyCIDRs []netip.Prefix
 	passwordReset     PasswordResetPolicy
+	mediaPolicy       MediaPolicy
+	mediaVerifySlots  chan struct{}
 }
 
 type PasswordResetPolicy struct {
@@ -53,13 +55,40 @@ type PasswordResetPolicy struct {
 	MaxAttempts int
 }
 
-func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailer clustrmail.Service, passwordReset PasswordResetPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
+type MediaPolicy struct {
+	ConversationMaxBytes    int64
+	ProfileMaxBytes         int64
+	CompletionTimeout       time.Duration
+	VerificationConcurrency int
+	ReservationLimits       store.MediaReservationLimits
+}
+
+func DefaultMediaPolicy() MediaPolicy {
+	return MediaPolicy{
+		ConversationMaxBytes:    1 << 30,
+		ProfileMaxBytes:         20 << 20,
+		CompletionTimeout:       2 * time.Minute,
+		VerificationConcurrency: 4,
+		ReservationLimits:       store.DefaultMediaReservationLimits(),
+	}
+}
+
+func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailer clustrmail.Service, passwordReset PasswordResetPolicy, mediaPolicy MediaPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
+	if mediaPolicy.ConversationMaxBytes == 0 {
+		mediaPolicy = DefaultMediaPolicy()
+	} else if mediaPolicy.CompletionTimeout == 0 {
+		mediaPolicy.CompletionTimeout = DefaultMediaPolicy().CompletionTimeout
+	}
+	if mediaPolicy.VerificationConcurrency < 1 {
+		mediaPolicy.VerificationConcurrency = DefaultMediaPolicy().VerificationConcurrency
+	}
 	return &Server{
 		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService, mailer: mailer,
 		verifier: verifier, apple: apple, presence: presenceService, metricsToken: metricsToken,
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
-		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset,
+		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset, mediaPolicy: mediaPolicy,
+		mediaVerifySlots: make(chan struct{}, mediaPolicy.VerificationConcurrency),
 	}
 }
 
@@ -68,7 +97,7 @@ func (s *Server) Router() http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(s.requestIDHeader)
 	router.Use(middleware.Recoverer)
-	router.Use(requestTimeoutByRoute(30*time.Second, 2*time.Minute))
+	router.Use(requestTimeoutByRoute(30*time.Second, s.mediaPolicy.CompletionTimeout))
 	router.Use(s.securityHeaders)
 	router.Use(s.requestLogger)
 	router.Use(s.rateLimit("api", 600, time.Minute, false))
@@ -145,7 +174,8 @@ func (s *Server) Router() http.Handler {
 					router.Post("/messages", s.createMessage)
 					router.Get("/receipts", s.listReceipts)
 					router.Put("/receipt", s.putReceipt)
-					router.Post("/media", s.createMediaUpload)
+					router.With(s.rateLimitUser("conversation-media-upload", 60, time.Hour)).
+						Post("/media", s.createMediaUpload)
 					router.Get("/entities/{kind}", s.listEntities)
 					router.Put("/entities/{kind}/{entityID}", s.putEntity)
 					router.Delete("/entities/{kind}/{entityID}", s.deleteEntity)
@@ -155,7 +185,8 @@ func (s *Server) Router() http.Handler {
 				Post("/invites/preview", s.getConversationInvite)
 			router.With(s.rateLimitIdentity("conversation-invite-accept", 30, time.Minute)).
 				Post("/invites/accept", s.acceptConversationInvite)
-			router.Post("/media/{mediaID}/complete", s.completeMediaUpload)
+			router.With(s.rateLimitUser("media-complete", 120, time.Hour)).
+				Post("/media/{mediaID}/complete", s.completeMediaUpload)
 			router.Get("/media/{mediaID}/download", s.mediaDownload)
 			router.Delete("/media/{mediaID}", s.deleteMedia)
 			router.Get("/realtime", s.realtime)
@@ -245,6 +276,35 @@ func (s *Server) rateLimitIdentity(namespace string, limit int, window time.Dura
 			if !allowed {
 				observability.RateLimited.WithLabelValues(namespace).Inc()
 				w.Header().Set("Retry-After", "60")
+				writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests.")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// rateLimitUser is deliberately independent of device/session identity. It is
+// used for storage-cost controls that must not be multiplied by registering
+// additional devices on the same account.
+func (s *Server) rateLimitUser(namespace string, limit int, window time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, ok := identityFrom(r.Context())
+			if !ok {
+				writeDomainError(w, domain.ErrUnauthenticated)
+				return
+			}
+			key := namespace + ":" + id.UserID.String()
+			allowed, err := s.limiter.Allow(r.Context(), key, limit, window)
+			if err != nil {
+				s.logger.Error("rate_limiter_unavailable", "error", err, "namespace", namespace)
+				writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+				return
+			}
+			if !allowed {
+				observability.RateLimited.WithLabelValues(namespace).Inc()
+				w.Header().Set("Retry-After", strconv.FormatInt(max(1, int64(window/time.Second)), 10))
 				writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests.")
 				return
 			}

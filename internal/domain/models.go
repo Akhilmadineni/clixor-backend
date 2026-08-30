@@ -17,6 +17,8 @@ var (
 	ErrInviteRevoked   = errors.New("invite revoked")
 	ErrInviteExpired   = errors.New("invite expired")
 	ErrInviteExhausted = errors.New("invite exhausted")
+	ErrQuotaExceeded   = errors.New("quota exceeded")
+	ErrMediaExpired    = errors.New("media upload expired")
 )
 
 type User struct {
@@ -187,17 +189,24 @@ type Entity struct {
 }
 
 type MediaObject struct {
-	ID               uuid.UUID `json:"id"`
-	OwnerID          uuid.UUID `json:"owner_id"`
-	ConversationID   uuid.UUID `json:"conversation_id"`
-	Scope            string    `json:"scope"`
-	ObjectKey        string    `json:"-"`
-	ContentType      string    `json:"content_type"`
-	ByteSize         int64     `json:"byte_size"`
-	CiphertextSHA256 string    `json:"ciphertext_sha256"`
-	Status           string    `json:"status"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               uuid.UUID  `json:"id"`
+	OwnerID          uuid.UUID  `json:"owner_id"`
+	ConversationID   uuid.UUID  `json:"conversation_id"`
+	Scope            string     `json:"scope"`
+	ObjectKey        string     `json:"-"`
+	ContentType      string     `json:"content_type"`
+	ByteSize         int64      `json:"byte_size"`
+	CiphertextSHA256 string     `json:"ciphertext_sha256"`
+	Status           string     `json:"status"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	// UploadValidUntil is the immutable expiry of the presigned PUT. It remains
+	// available internally after the pending reservation becomes ready so every
+	// later deletion can wait until the upload capability is no longer usable.
+	UploadValidUntil        time.Time  `json:"-"`
+	VerificationLeaseToken  *uuid.UUID `json:"-"`
+	VerificationLockedUntil *time.Time `json:"-"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
 }
 
 const (
@@ -212,6 +221,9 @@ type OutboxEvent struct {
 	Payload     json.RawMessage
 	CreatedAt   time.Time
 	PublishedAt *time.Time
+	AvailableAt time.Time
+	LockedUntil *time.Time
+	Attempts    int
 }
 
 const (

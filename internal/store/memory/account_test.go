@@ -112,7 +112,7 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 		ID: uuid.New(), OwnerID: user.ID, ConversationID: personal.ID,
 		ObjectKey: "users/erase/private-object", ContentType: "image/jpeg", ByteSize: 42,
 	}
-	if _, err := persistence.CreateMedia(ctx, mediaObject); err != nil {
+	if _, err := persistence.CreateMedia(ctx, mediaObject, store.DefaultMediaReservationLimits()); err != nil {
 		t.Fatal(err)
 	}
 

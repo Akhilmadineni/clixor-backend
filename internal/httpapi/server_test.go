@@ -807,7 +807,7 @@ func newTestHTTPServerWithVerifierAndMail(
 	server := httptest.NewServer(New(
 		persistence, tokens, bus, limiter, media.Unavailable{},
 		verifier, appleauth.Unavailable{}, presenceService, mailer,
-		PasswordResetPolicy{}, nil, "", logger,
+		PasswordResetPolicy{}, MediaPolicy{}, nil, "", logger,
 	).Router())
 	t.Cleanup(server.Close)
 	return server

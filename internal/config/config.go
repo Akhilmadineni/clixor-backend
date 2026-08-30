@@ -20,6 +20,7 @@ var ociRegionPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)+$`)
 type Config struct {
 	Environment       string
 	HTTPAddr          string
+	HTTPWriteTimeout  time.Duration
 	PublicBaseURL     string
 	TLSCAFile         string
 	Store             string
@@ -39,6 +40,7 @@ type Config struct {
 	MediaProvider     string
 	S3                S3Config
 	OCIObjectStorage  OCIObjectStorageConfig
+	Media             MediaConfig
 	Verification      VerificationConfig
 	Mail              MailConfig
 	APNS              APNSConfig
@@ -60,6 +62,24 @@ type OCIObjectStorageConfig struct {
 	Region    string
 	Namespace string
 	Bucket    string
+}
+
+type MediaConfig struct {
+	ConversationMaxBytes        int64
+	ProfileMaxBytes             int64
+	CompletionTimeout           time.Duration
+	VerificationConcurrency     int
+	PendingTTL                  time.Duration
+	PendingUserMaxCount         int
+	PendingUserMaxBytes         int64
+	PendingConversationMaxCount int
+	PendingConversationMaxBytes int64
+	StoredUserMaxCount          int
+	StoredUserMaxBytes          int64
+	StoredConversationMaxCount  int
+	StoredConversationMaxBytes  int64
+	CleanupInterval             time.Duration
+	CleanupBatchSize            int
 }
 
 type VerificationConfig struct {
@@ -213,9 +233,74 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	mediaConversationMaxBytes, err := envInt64("CLUSTER_MEDIA_CONVERSATION_MAX_BYTES", 1<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaProfileMaxBytes, err := envInt64("CLUSTER_MEDIA_PROFILE_MAX_BYTES", 20<<20)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaCompletionTimeout, err := envDuration("CLUSTER_MEDIA_COMPLETION_TIMEOUT", "2m")
+	if err != nil {
+		return Config{}, err
+	}
+	mediaVerificationConcurrency, err := envInt("CLUSTER_MEDIA_VERIFY_CONCURRENCY", 4)
+	if err != nil {
+		return Config{}, err
+	}
+	httpWriteTimeout, err := envDuration("CLUSTER_HTTP_WRITE_TIMEOUT", "135s")
+	if err != nil {
+		return Config{}, err
+	}
+	mediaPendingTTL, err := envDuration("CLUSTER_MEDIA_PENDING_TTL", "5m")
+	if err != nil {
+		return Config{}, err
+	}
+	mediaPendingUserMaxCount, err := envInt("CLUSTER_MEDIA_PENDING_USER_MAX_COUNT", 8)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaPendingUserMaxBytes, err := envInt64("CLUSTER_MEDIA_PENDING_USER_MAX_BYTES", 2<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaPendingConversationMaxCount, err := envInt("CLUSTER_MEDIA_PENDING_CONVERSATION_MAX_COUNT", 32)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaPendingConversationMaxBytes, err := envInt64("CLUSTER_MEDIA_PENDING_CONVERSATION_MAX_BYTES", 8<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaStoredUserMaxCount, err := envInt("CLUSTER_MEDIA_STORED_USER_MAX_COUNT", 2_000)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaStoredUserMaxBytes, err := envInt64("CLUSTER_MEDIA_STORED_USER_MAX_BYTES", 2<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaStoredConversationMaxCount, err := envInt("CLUSTER_MEDIA_STORED_CONVERSATION_MAX_COUNT", 10_000)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaStoredConversationMaxBytes, err := envInt64("CLUSTER_MEDIA_STORED_CONVERSATION_MAX_BYTES", 10<<30)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaCleanupInterval, err := envDuration("CLUSTER_MEDIA_CLEANUP_INTERVAL", "30s")
+	if err != nil {
+		return Config{}, err
+	}
+	mediaCleanupBatchSize, err := envInt("CLUSTER_MEDIA_CLEANUP_BATCH_SIZE", 500)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		Environment:       env("CLUSTER_ENV", "development"),
 		HTTPAddr:          env("CLUSTER_HTTP_ADDR", ":8080"),
+		HTTPWriteTimeout:  httpWriteTimeout,
 		PublicBaseURL:     env("CLUSTER_PUBLIC_BASE_URL", "http://127.0.0.1:8080"),
 		TLSCAFile:         os.Getenv("CLUSTER_TLS_CA_FILE"),
 		Store:             env("CLUSTER_STORE", "postgres"),
@@ -246,6 +331,23 @@ func Load() (Config, error) {
 			Region:    os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_REGION"),
 			Namespace: os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_NAMESPACE"),
 			Bucket:    os.Getenv("CLUSTER_OCI_OBJECT_STORAGE_BUCKET"),
+		},
+		Media: MediaConfig{
+			ConversationMaxBytes:        mediaConversationMaxBytes,
+			ProfileMaxBytes:             mediaProfileMaxBytes,
+			CompletionTimeout:           mediaCompletionTimeout,
+			VerificationConcurrency:     mediaVerificationConcurrency,
+			PendingTTL:                  mediaPendingTTL,
+			PendingUserMaxCount:         mediaPendingUserMaxCount,
+			PendingUserMaxBytes:         mediaPendingUserMaxBytes,
+			PendingConversationMaxCount: mediaPendingConversationMaxCount,
+			PendingConversationMaxBytes: mediaPendingConversationMaxBytes,
+			StoredUserMaxCount:          mediaStoredUserMaxCount,
+			StoredUserMaxBytes:          mediaStoredUserMaxBytes,
+			StoredConversationMaxCount:  mediaStoredConversationMaxCount,
+			StoredConversationMaxBytes:  mediaStoredConversationMaxBytes,
+			CleanupInterval:             mediaCleanupInterval,
+			CleanupBatchSize:            mediaCleanupBatchSize,
 		},
 		Verification: VerificationConfig{
 			Provider:      env("CLUSTER_VERIFICATION_PROVIDER", "disabled"),
@@ -364,6 +466,9 @@ func (cfg Config) Validate() error {
 	if err := cfg.validateMail(); err != nil {
 		return err
 	}
+	if err := cfg.validateMedia(); err != nil {
+		return err
+	}
 	if cfg.Environment == "production" && strings.TrimSpace(cfg.AppleClientID) == "" {
 		return errors.New("production CLUSTER_APPLE_CLIENT_ID is required")
 	}
@@ -450,6 +555,64 @@ func (cfg Config) validatePushDelivery() error {
 	}
 	if pushDelivery.DeadLetterRetention < 24*time.Hour || pushDelivery.DeadLetterRetention > 365*24*time.Hour {
 		return errors.New("CLUSTER_PUSH_DEAD_LETTER_RETENTION must be between 24h and 8760h")
+	}
+	return nil
+}
+
+func (cfg Config) validateMedia() error {
+	media := cfg.Media
+	// Directly constructed Config values in tests and small tools inherit the
+	// same bounded process default as Load.
+	if media.VerificationConcurrency == 0 {
+		media.VerificationConcurrency = 4
+	}
+	if media.ConversationMaxBytes < 1<<20 || media.ConversationMaxBytes > 1<<30 {
+		return errors.New("CLUSTER_MEDIA_CONVERSATION_MAX_BYTES must be between 1 MiB and 1 GiB")
+	}
+	if media.ProfileMaxBytes < 1<<20 || media.ProfileMaxBytes > 20<<20 {
+		return errors.New("CLUSTER_MEDIA_PROFILE_MAX_BYTES must be between 1 MiB and 20 MiB")
+	}
+	if media.CompletionTimeout < 30*time.Second || media.CompletionTimeout > 2*time.Minute {
+		return errors.New("CLUSTER_MEDIA_COMPLETION_TIMEOUT must be between 30s and 2m")
+	}
+	if media.VerificationConcurrency < 1 || media.VerificationConcurrency > 32 {
+		return errors.New("CLUSTER_MEDIA_VERIFY_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.HTTPWriteTimeout < media.CompletionTimeout+10*time.Second || cfg.HTTPWriteTimeout > 5*time.Minute {
+		return errors.New("CLUSTER_HTTP_WRITE_TIMEOUT must exceed media completion timeout by at least 10s and be at most 5m")
+	}
+	if media.PendingTTL < time.Minute || media.PendingTTL > 15*time.Minute {
+		return errors.New("CLUSTER_MEDIA_PENDING_TTL must be between 1m and 15m")
+	}
+	if media.PendingUserMaxCount < 1 || media.PendingUserMaxCount > 100 ||
+		media.PendingConversationMaxCount < 1 || media.PendingConversationMaxCount > 500 {
+		return errors.New("media pending reservation counts are outside safe bounds")
+	}
+	if media.PendingUserMaxBytes < max(media.ConversationMaxBytes, media.ProfileMaxBytes) ||
+		media.PendingUserMaxBytes > 8<<30 {
+		return errors.New("CLUSTER_MEDIA_PENDING_USER_MAX_BYTES is outside safe bounds")
+	}
+	if media.PendingConversationMaxBytes < media.ConversationMaxBytes ||
+		media.PendingConversationMaxBytes > 32<<30 {
+		return errors.New("CLUSTER_MEDIA_PENDING_CONVERSATION_MAX_BYTES is outside safe bounds")
+	}
+	if media.StoredUserMaxCount < media.PendingUserMaxCount || media.StoredUserMaxCount > 100_000 ||
+		media.StoredConversationMaxCount < media.PendingConversationMaxCount ||
+		media.StoredConversationMaxCount > 1_000_000 {
+		return errors.New("media stored object counts are outside safe bounds")
+	}
+	if media.StoredUserMaxBytes < media.PendingUserMaxBytes || media.StoredUserMaxBytes > 100<<30 {
+		return errors.New("CLUSTER_MEDIA_STORED_USER_MAX_BYTES is outside safe bounds")
+	}
+	if media.StoredConversationMaxBytes < media.PendingConversationMaxBytes ||
+		media.StoredConversationMaxBytes > 1<<40 {
+		return errors.New("CLUSTER_MEDIA_STORED_CONVERSATION_MAX_BYTES is outside safe bounds")
+	}
+	if media.CleanupInterval < 5*time.Second || media.CleanupInterval > 5*time.Minute {
+		return errors.New("CLUSTER_MEDIA_CLEANUP_INTERVAL must be between 5s and 5m")
+	}
+	if media.CleanupBatchSize < 1 || media.CleanupBatchSize > 500 {
+		return errors.New("CLUSTER_MEDIA_CLEANUP_BATCH_SIZE must be between 1 and 500")
 	}
 	return nil
 }
@@ -598,6 +761,18 @@ func envInt(key string, fallback int) (int, error) {
 		return fallback, nil
 	}
 	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", key, err)
+	}
+	return value, nil
+}
+
+func envInt64(key string, fallback int64) (int64, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", key, err)
 	}

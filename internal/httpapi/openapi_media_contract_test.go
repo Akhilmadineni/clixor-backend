@@ -30,10 +30,9 @@ func TestOpenAPISplitsConversationAndProfileMediaIntegrityContracts(t *testing.T
 		t.Fatal("conversation route does not use the production-05b media schema")
 	}
 	for _, required := range []string{
-		"conversation media is verified by size only",
-		"declared SHA-256 is stored but not checked by the server",
-		"authenticate and decrypt conversation ciphertext client-side",
-		"profile-media SHA-256 does not match",
+		"exact length, content type, and SHA-256",
+		"Definitive missing/mismatch failures reject the reservation",
+		"transient storage failures retain it for retry",
 	} {
 		if !strings.Contains(completion, required) {
 			t.Fatalf("media completion contract is missing %q", required)
@@ -60,6 +59,16 @@ func TestOpenAPISplitsConversationAndProfileMediaIntegrityContracts(t *testing.T
 	)
 	if !strings.Contains(conversationSchema, "maximum: 1073741824") {
 		t.Fatal("conversation media schema lost the production-05b 1 GiB bound")
+	}
+	uploadSchema := openAPISection(
+		t, document,
+		"    MediaUploadResponse:",
+		"    Credentials:",
+	)
+	for _, required := range []string{"X-Amz-Checksum-Sha256", "opc-checksum-algorithm", "opc-content-sha256"} {
+		if !strings.Contains(uploadSchema, required) {
+			t.Fatalf("provider-neutral upload response is missing %q", required)
+		}
 	}
 }
 

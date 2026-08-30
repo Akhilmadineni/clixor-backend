@@ -40,12 +40,12 @@ token transfers with an advisory lock. Deduplication and a database uniqueness
 constraint require coordinated migration 12 after all 05b replicas are drained;
 do not rewrite already-applied migration 9.
 
-The bounded retention workers are safe without a new schema dependency, but the
-published-outbox scan is intentionally unindexed in this compatibility release.
-Reserve migration 10 for media reservations. Add the final outbox retention index
-as migration 11 in the coordinated release; never publish a different migration
-body under an already-applied version. Migration 12 is reserved for the push-token
-database constraint after migrations 10 and 11 have landed.
+Migration 10 adds bounded media reservations, stored-media quota indexes, pending
+expiry, verification leases, and delayed object-deletion scheduling. Migration 11
+adds the published-outbox retention index. Apply both in numeric order before
+rolling out this binary. Never publish a different migration body under an
+already-applied version. Migration 12 remains reserved for the push-token database
+constraint after migrations 10 and 11 have landed.
 
 `clustr_messaging_transition_messages_total` counts accepted messages from the
 installed production-05b codec. Those payloads are base64-encoded JSON,
@@ -106,9 +106,15 @@ causes the just-created challenge to be canceled.
 
 - PostgreSQL: encrypted daily base backup plus continuous WAL archiving to a
   separate account/region. Retain 35 days and test point-in-time recovery monthly.
-- S3 media: encryption at rest, versioning, lifecycle policy, and cross-region
-  replication. Treat payloads as plaintext-sensitive until audited client-side
-  encryption is deployed; storage credentials and metadata are always sensitive.
+- OCI Object Storage media: encryption at rest, versioning, lifecycle policy,
+  and a tested cross-region recovery plan. Treat payloads as plaintext-sensitive
+  until audited client-side encryption is deployed; PARs and metadata are always
+  sensitive.
+- Alert on `clustr_media_pending_cleanup_total{result="failed"}` and sustained
+  media quota/rate-limit rejections. Confirm OCI lifecycle rules abort incomplete
+  multipart uploads, stored-object limits match the product plan, the configured
+  conversation ceiling remains 1 GiB while production-05b is supported, and a
+  missing `opc-content-sha256` can never transition an object to ready.
 - Redis presence/rate limits and NATS realtime fan-out are rebuildable. PostgreSQL
   messages plus the transactional outbox are the recovery source of truth.
 - Export backup success and restore-point age as monitored metrics.
@@ -151,5 +157,8 @@ sample of stored-payload hashes match the source environment.
   destination spray, and daily SMS cost-cap handling.
 - Reconnect storm, hot 1024-member group, media quota, and one-time-prekey
   depletion load tests.
+- Concurrent pending-media quota races across both API replicas, expired upload
+  cleanup, invalid checksum/content-type rejection, and conversation deletion
+  while MinIO is unavailable (the outbox must retry without losing object keys).
 - External penetration test, abuse review, privacy review, and client cryptography
   audit.

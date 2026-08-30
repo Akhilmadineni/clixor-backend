@@ -533,7 +533,7 @@ func TestPostgresLegacyAccountTombstoneCleansNewExtensionState(t *testing.T) {
 		},
 	}
 	for _, mediaObject := range profileMedia {
-		if _, err := persistence.CreateProfileMedia(ctx, mediaObject); err != nil {
+		if _, err := persistence.CreateProfileMedia(ctx, mediaObject, store.DefaultMediaReservationLimits()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -693,7 +693,7 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 		ID: uuid.New(), OwnerID: deletedUser.ID, ConversationID: personal.ID,
 		ObjectKey: "pg/private/" + uuid.NewString(), ContentType: "image/jpeg", ByteSize: 7,
 	}
-	if _, err := persistence.CreateMedia(ctx, mediaObject); err != nil {
+	if _, err := persistence.CreateMedia(ctx, mediaObject, store.DefaultMediaReservationLimits()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -744,23 +744,30 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	if _, err := persistence.Conversation(ctx, personal.ID, remainingUser.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("personal conversation returned %v, want not found", err)
 	}
-	events, err := persistence.LockOutboxBatch(ctx, 100)
+	rows, err := persistence.pool.Query(ctx, `
+		SELECT payload FROM outbox_events WHERE topic='media.delete' AND aggregate_id=$1`,
+		deletedUser.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rows.Close()
 	foundMediaDelete := false
-	for _, event := range events {
-		if event.Topic != "media.delete" {
-			continue
+	for rows.Next() {
+		var raw json.RawMessage
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatal(err)
 		}
 		var payload store.MediaDeletePayload
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		if err := json.Unmarshal(raw, &payload); err != nil {
 			t.Fatal(err)
 		}
 		foundMediaDelete = len(payload.ObjectKeys) == 1 && payload.ObjectKeys[0] == mediaObject.ObjectKey
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	if !foundMediaDelete {
-		t.Fatalf("personal MinIO deletion was not queued: %+v", events)
+		t.Fatal("personal MinIO deletion was not queued")
 	}
 	if _, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: email}); err != nil {
 		t.Fatalf("deleted email was not reusable: %v", err)
