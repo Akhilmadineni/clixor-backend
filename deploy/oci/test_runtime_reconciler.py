@@ -80,6 +80,24 @@ class GitArchiveRunner(FakeRunner):
         )
 
 
+class NftTransactionRunner(FakeRunner):
+    def __init__(self, outputs=None, transaction_results=()):
+        super().__init__(outputs)
+        self.transaction_results = list(transaction_results)
+        self.transactions: list[str] = []
+
+    def run(self, arguments, *, check=True, capture=False, environment=None):
+        if tuple(arguments[:2]) == (RECONCILER.NFT_BINARY, "-f"):
+            self.calls.append(tuple(arguments))
+            self.transactions.append(Path(arguments[2]).read_text(encoding="ascii"))
+            returncode = self.transaction_results.pop(0)
+            result = subprocess.CompletedProcess(list(arguments), returncode, b"", b"")
+            if check and returncode:
+                raise RECONCILER.ReconcileError("fake nft transaction failed")
+            return result
+        return super().run(arguments, check=check, capture=capture, environment=environment)
+
+
 class RuntimeFixture:
     def __init__(self, root: Path):
         self.root = root
@@ -596,12 +614,29 @@ class LegacyBaselineTests(unittest.TestCase):
                 ): (0, (source_sha + "\n").encode()),
             }
             runner = GitArchiveRunner(outputs)
+            controller_source = fixture.root / "controller-source"
+            shutil.copytree(SCRIPT_ROOT, controller_source / "deploy" / "oci")
+            approved_compose = (SCRIPT_ROOT / "compose.yaml").read_bytes()
+            original_verify = RECONCILER._verified_legacy_controller
+
+            def verify_then_drift(source):
+                verified = original_verify(source)
+                (source / "deploy" / "oci" / "compose.yaml").write_text(
+                    "services: { attacker: { image: attacker.invalid/latest } }\n",
+                    encoding="ascii",
+                )
+                return verified
+
             with mock.patch.object(
                 RECONCILER, "STAGING_SECRET_ROOT", staging_secrets
+            ), mock.patch.object(
+                RECONCILER,
+                "_verified_legacy_controller",
+                side_effect=verify_then_drift,
             ):
                 selected = RECONCILER.establish_legacy_baseline(
                     fixture.root,
-                    SCRIPT_ROOT.parent.parent,
+                    controller_source,
                     runner,
                     fixture.cloudflared,
                     git_directory,
@@ -610,6 +645,10 @@ class LegacyBaselineTests(unittest.TestCase):
             self.assertEqual(os.readlink(current), str(legacy))
             manifest = RECONCILER._validate_bundle(legacy, fixture.root)
             self.assertEqual(manifest["source_sha"], source_sha)
+            self.assertEqual(
+                (legacy / runtime_bundle.BUNDLE_DIRECTORY / "compose.yaml").read_bytes(),
+                approved_compose,
+            )
             self.assertEqual(
                 (
                     legacy
@@ -641,7 +680,7 @@ class LegacyBaselineTests(unittest.TestCase):
                 self.assertEqual(
                     RECONCILER.establish_legacy_baseline(
                         fixture.root,
-                        SCRIPT_ROOT.parent.parent,
+                        controller_source,
                         runner,
                         fixture.cloudflared,
                         git_directory,
@@ -653,10 +692,18 @@ class LegacyBaselineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="clixor-controller-", dir=TEMP_ROOT) as temporary:
             source = Path(temporary) / "source"
             shutil.copytree(SCRIPT_ROOT, source / "deploy" / "oci")
-            target = source / "deploy" / "oci" / "prepare-runtime-secrets.sh"
-            target.write_bytes(target.read_bytes() + b"\n# injected drift\n")
-            with self.assertRaisesRegex(RECONCILER.ReconcileError, "cohort digest"):
-                RECONCILER._verified_legacy_controller(source)
+            self.assertEqual(
+                set(RECONCILER._verified_legacy_controller(source)),
+                set(RECONCILER.LEGACY_CONTROLLER_FILES),
+            )
+            for relative in RECONCILER.LEGACY_CONTROLLER_FILES:
+                with self.subTest(relative=relative):
+                    target = source / relative
+                    original = target.read_bytes()
+                    target.write_bytes(original + b"\n# injected drift\n")
+                    with self.assertRaisesRegex(RECONCILER.ReconcileError, "cohort digest"):
+                        RECONCILER._verified_legacy_controller(source)
+                    target.write_bytes(original)
 
     def test_legacy_transition_fails_closed_on_live_image_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -697,6 +744,58 @@ class LegacyBaselineTests(unittest.TestCase):
 
 
 class BootSelectionContractTests(unittest.TestCase):
+    def test_network_cut_clears_between_two_readiness_checks_before_ingress(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="clixor-cut-order-", dir=TEMP_ROOT) as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            release = root / "releases" / "oci-aaaaaaaaaaaa-old"
+            release.mkdir(parents=True, mode=0o700)
+            (release.parent / "current").symlink_to(release)
+            manifest = {
+                "source_sha": "a" * 40,
+                "state": {
+                    "cloudflared": {"enabled": True, "active": True},
+                    "observability": {"prometheus": False, "grafana": False},
+                    "timers": {
+                        "clixor-offsite-backup.timer": False,
+                        "clixor-restore-drill.timer": False,
+                        "clixor-backup-health.timer": False,
+                    },
+                },
+            }
+            events: list[str] = []
+            runner = FakeRunner({
+                ("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}"): (0, b"")
+            })
+            common = (
+                mock.patch.object(RECONCILER, "_stop_ingress_and_containers"),
+                mock.patch.object(RECONCILER, "_validate_bundle", return_value=manifest),
+                mock.patch.object(RECONCILER, "_boot_bundle_validate"),
+                mock.patch.object(RECONCILER, "_validate_image", return_value=(f"clixor-api:{release.name}", IMAGE_ID)),
+                mock.patch.object(RECONCILER, "_prepare_current_secrets"),
+                mock.patch.object(RECONCILER, "_restore_source"),
+                mock.patch.object(RECONCILER, "_restore_runtime"),
+                mock.patch.object(RECONCILER, "_restore_host_tools"),
+                mock.patch.object(RECONCILER, "_set_service_selection"),
+                mock.patch.object(RECONCILER, "_compose_up"),
+                mock.patch.object(RECONCILER, "_wait_ready", side_effect=lambda *args, **kwargs: events.append("ready")),
+                mock.patch.object(RECONCILER, "_clear_emergency_network_cut", side_effect=lambda *args: events.append("clear")),
+                mock.patch.object(RECONCILER, "_publish_ready_marker", side_effect=lambda *args: events.append("publish")),
+            )
+            with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8], common[9], common[10], common[11], common[12]:
+                RECONCILER.reconcile_current(root, runner, boot=True)
+            self.assertEqual(events, ["ready", "clear", "ready", "publish"])
+            self.assertIn(("/usr/bin/systemctl", "start", "--no-block", "cloudflared.service"), runner.calls)
+
+            runner = FakeRunner()
+            with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7], common[8], common[9], mock.patch.object(RECONCILER, "_wait_ready"), mock.patch.object(
+                RECONCILER, "_clear_emergency_network_cut", side_effect=RECONCILER.ReconcileError("cut removal failed")
+            ), mock.patch.object(RECONCILER, "_publish_ready_marker") as publish:
+                with self.assertRaisesRegex(RECONCILER.ReconcileError, "cut removal"):
+                    RECONCILER.reconcile_current(root, runner, boot=True)
+            publish.assert_not_called()
+            self.assertNotIn(("/usr/bin/systemctl", "start", "--no-block", "cloudflared.service"), runner.calls)
+
     def test_reconcile_removes_inactive_observability_container_metadata(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="clixor-observability-", dir=TEMP_ROOT
@@ -705,7 +804,10 @@ class BootSelectionContractTests(unittest.TestCase):
             compose = release / runtime_bundle.BUNDLE_DIRECTORY / "compose.yaml"
             compose.parent.mkdir(parents=True)
             compose.write_text(_compose(), encoding="ascii")
-            runner = FakeRunner()
+            inventory = ("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")
+            prometheus = json.dumps({"ID": "a" * 64, "Names": "clixor-oci-prometheus", "State": "exited"})
+            grafana = json.dumps({"ID": "b" * 64, "Names": "clixor-oci-grafana", "State": "exited"})
+            runner = FakeRunner({inventory: (0, (prometheus + "\n" + grafana + "\n").encode())})
             manifest = {
                 "state": {
                     "observability": {"prometheus": False, "grafana": False}
@@ -772,10 +874,11 @@ class BootSelectionContractTests(unittest.TestCase):
                 mock.patch.object(RECONCILER, "_set_service_selection"),
                 mock.patch.object(RECONCILER, "_compose_up"),
                 mock.patch.object(RECONCILER, "_wait_ready"),
+                mock.patch.object(RECONCILER, "_clear_emergency_network_cut"),
                 mock.patch.object(RECONCILER, "_publish_ready_marker"),
                 mock.patch.object(RECONCILER, "_prepare_current_secrets"),
             )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11], patches[12]:
                 self.assertEqual(
                     RECONCILER.reconcile_current(root, FakeRunner(), boot=True), old
                 )
@@ -916,6 +1019,8 @@ class SecretRecoveryTests(unittest.TestCase):
                     RECONCILER, "_compose_up"
                 ), mock.patch.object(
                     RECONCILER, "_wait_ready"
+                ), mock.patch.object(
+                    RECONCILER, "_clear_emergency_network_cut"
                 ), mock.patch.object(
                     RECONCILER, "_publish_ready_marker"
                 ):
@@ -1231,9 +1336,13 @@ class FailClosedStopTests(unittest.TestCase):
                 "--property=ActiveState",
                 "--value",
             ): (0, b"inactive\n"),
+            (
+                "/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}"
+            ): (0, b""),
+            (
+                "/usr/bin/docker", "info", "--format", "{{json .LiveRestoreEnabled}}"
+            ): (0, b"false\n"),
         }
-        for container in RECONCILER.KNOWN_CONTAINERS:
-            outputs[("/usr/bin/docker", "inspect", container)] = (1, b"")
         return outputs
 
     def test_first_boot_absent_cloudflared_unit_is_idempotently_safe(self) -> None:
@@ -1346,8 +1455,10 @@ class FailClosedStopTests(unittest.TestCase):
         runner = FakeRunner(outputs)
         with self.assertRaisesRegex(RECONCILER.ReconcileError, "cannot be verified"):
             RECONCILER._stop_ingress_and_containers(runner)
-        for container in RECONCILER.KNOWN_CONTAINERS:
-            self.assertIn(("/usr/bin/docker", "inspect", container), runner.calls)
+        self.assertIn(
+            ("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}"),
+            runner.calls,
+        )
 
     def test_connector_stop_error_is_aggregated_only_after_docker_shutdown(self) -> None:
         outputs = self._absent_outputs()
@@ -1373,7 +1484,9 @@ class FailClosedStopTests(unittest.TestCase):
             )
         ] = (0, b"inactive\n")
         container = RECONCILER.KNOWN_CONTAINERS[0]
-        outputs[("/usr/bin/docker", "inspect", container)] = (0, b"")
+        outputs[("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")] = (
+            0, (json.dumps({"ID": "a" * 64, "Names": container, "State": "running"}) + "\n").encode()
+        )
         outputs[
             (
                 "/usr/bin/docker",
@@ -1407,25 +1520,116 @@ class FailClosedStopTests(unittest.TestCase):
         ]
         for call in systemd_calls:
             outputs[call] = failure
-        for container in RECONCILER.KNOWN_CONTAINERS:
-            outputs[("/usr/bin/docker", "inspect", container)] = failure
-        nft_list = (RECONCILER.NFT_BINARY, "list", "table", "inet", "clixor_fail_closed")
-        outputs[nft_list] = (
-            0,
-            b"chain input { type filter hook input priority -300; policy drop; }\n"
-            b"chain output { type filter hook output priority -300; policy drop; }\n",
-        )
+        outputs[("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")] = failure
+        outputs[("/usr/bin/docker", "info", "--format", "{{json .LiveRestoreEnabled}}")] = failure
+
+        def cut(table: str) -> bytes:
+            return json.dumps({"nftables": [
+                {"table": {"family": "inet", "name": table}},
+                {"chain": {"family": "inet", "table": table, "name": "input", "type": "filter", "hook": "input", "prio": -300, "policy": "drop"}},
+                {"chain": {"family": "inet", "table": table, "name": "output", "type": "filter", "hook": "output", "prio": -300, "policy": "drop"}},
+            ]}).encode()
+
+        current_list = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", RECONCILER.EMERGENCY_NFT_TABLE)
+        candidate_list = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", RECONCILER.EMERGENCY_NFT_CANDIDATE)
+        outputs[current_list] = [(1, b""), (0, cut(RECONCILER.EMERGENCY_NFT_TABLE))]
+        outputs[candidate_list] = (0, cut(RECONCILER.EMERGENCY_NFT_CANDIDATE))
+        outputs[(RECONCILER.NFT_BINARY, "-j", "list", "ruleset")] = (0, b'{"nftables": []}')
         runner = FakeRunner(outputs)
         with tempfile.TemporaryDirectory(prefix="no-cgroups-", dir=TEMP_ROOT) as temporary, mock.patch.object(
             RECONCILER, "CGROUP_SYSTEM_SLICE", Path(temporary)
         ):
             with self.assertRaisesRegex(RECONCILER.ReconcileError, "shutdown"):
                 RECONCILER._stop_ingress_and_containers(runner)
-        self.assertIn(
-            (RECONCILER.NFT_BINARY, "add", "table", "inet", "clixor_fail_closed"),
-            runner.calls,
+        self.assertGreaterEqual(len([call for call in runner.calls if call[:2] == (RECONCILER.NFT_BINARY, "-f")]), 2)
+        self.assertIn(candidate_list, runner.calls)
+        self.assertIn(current_list, runner.calls)
+
+    def test_unauthoritative_docker_inventory_and_live_restore_force_isolation(self) -> None:
+        inventory_call = ("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")
+        info_call = ("/usr/bin/docker", "info", "--format", "{{json .LiveRestoreEnabled}}")
+        cases = (
+            ("rc1", (1, b""), (0, b"false\n")),
+            ("rc125", (125, b""), (0, b"false\n")),
+            ("exception", RECONCILER.ReconcileError("daemon lost"), (0, b"false\n")),
+            ("partial", (0, b"clixor-oci-api-a"), (0, b"false\n")),
+            ("live-restore", (0, b""), (0, b"true\n")),
         )
-        self.assertIn(nft_list, runner.calls)
+        for label, inventory, live_restore in cases:
+            with self.subTest(label=label):
+                outputs: dict[tuple[str, ...], object] = self._absent_outputs()
+                outputs[inventory_call] = inventory
+                outputs[info_call] = live_restore
+                with mock.patch.object(RECONCILER, "_kernel_fail_closed", return_value=True) as isolate:
+                    with self.assertRaises(RECONCILER.ReconcileError):
+                        RECONCILER._stop_ingress_and_containers(FakeRunner(outputs))
+                isolate.assert_called_once()
+
+
+class EmergencyNetworkCutTests(unittest.TestCase):
+    @staticmethod
+    def _cut(table_name: str, **overrides) -> bytes:
+        chains = []
+        for name in ("input", "output"):
+            chain = {
+                "family": "inet", "table": table_name, "name": name,
+                "type": "filter", "hook": name, "prio": -300, "policy": "drop",
+            }
+            chain.update(overrides)
+            chains.append({"chain": chain})
+        return json.dumps({"nftables": [{"table": {"family": "inet", "name": table_name}}, *chains]}).encode()
+
+    def test_structured_verifier_rejects_near_match_cuts(self) -> None:
+        table = RECONCILER.EMERGENCY_NFT_TABLE
+        self.assertTrue(RECONCILER._nft_exact_cut(json.loads(self._cut(table)), table))
+        for field, value in (
+            ("family", "ip"), ("table", "lookalike"), ("type", "nat"),
+            ("hook", "forward"), ("prio", -299), ("policy", "accept"),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    RECONCILER._nft_exact_cut(json.loads(self._cut(table, **{field: value})), table)
+                )
+        extra = json.loads(self._cut(table))
+        extra["nftables"].append({"rule": {"family": "inet", "table": table}})
+        self.assertFalse(RECONCILER._nft_exact_cut(extra, table))
+
+    def test_existing_exact_cut_is_idempotent(self) -> None:
+        table = RECONCILER.EMERGENCY_NFT_TABLE
+        call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
+        runner = NftTransactionRunner({call: (0, self._cut(table))})
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
+        self.assertEqual(runner.transactions, [])
+
+    def test_failed_replacement_keeps_verified_candidate_and_old_cut(self) -> None:
+        table = RECONCILER.EMERGENCY_NFT_TABLE
+        candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        current_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
+        candidate_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", candidate)
+        ruleset_call = (RECONCILER.NFT_BINARY, "-j", "list", "ruleset")
+        malformed = self._cut(table, policy="accept")
+        ruleset = json.dumps({"nftables": [{"table": {"family": "inet", "name": table}}]}).encode()
+        runner = NftTransactionRunner(
+            {current_call: (0, malformed), candidate_call: (0, self._cut(candidate)), ruleset_call: (0, ruleset)},
+            transaction_results=(0, 1),
+        )
+        self.assertFalse(RECONCILER._activate_emergency_network_cut(runner))
+        self.assertEqual(len(runner.transactions), 2)
+        self.assertNotIn(f"delete table inet {table}", runner.transactions[0])
+        self.assertIn(f"delete table inet {table}\nrename table", runner.transactions[1])
+
+    def test_clear_refuses_unknown_cut_and_is_retry_idempotent(self) -> None:
+        table = RECONCILER.EMERGENCY_NFT_TABLE
+        ruleset_call = (RECONCILER.NFT_BINARY, "-j", "list", "ruleset")
+        list_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
+        present = json.dumps({"nftables": [{"table": {"family": "inet", "name": table}}]}).encode()
+        runner = FakeRunner({ruleset_call: (0, present), list_call: (0, self._cut(table, prio=0))})
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "unrecognized"):
+            RECONCILER._clear_emergency_network_cut(runner)
+        self.assertNotIn((RECONCILER.NFT_BINARY, "delete", "table", "inet", table), runner.calls)
+        absent = FakeRunner({ruleset_call: (0, b'{"nftables": []}')})
+        RECONCILER._clear_emergency_network_cut(absent)
+        RECONCILER._clear_emergency_network_cut(absent)
 
 
 class PreMigrationDurabilityTests(unittest.TestCase):

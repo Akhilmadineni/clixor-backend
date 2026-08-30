@@ -59,6 +59,8 @@ KNOWN_CONTAINERS = (
 )
 CGROUP_SYSTEM_SLICE = Path("/sys/fs/cgroup/system.slice")
 NFT_BINARY = "/usr/sbin/nft"
+EMERGENCY_NFT_TABLE = "clixor_fail_closed"
+EMERGENCY_NFT_CANDIDATE = "clixor_fail_closed_candidate"
 PHASES = (
     "prepared",
     "secrets-hydrating",
@@ -86,7 +88,7 @@ LEGACY_CONTROLLER_REVISION = "cd94bac4a47e786670aa0f87972203938dace7c9"
 LEGACY_CONTROLLER_FILES = {
     "deploy/oci/backup-health.sh": "0f0faf1a077b78bec4d0305aaba3f606cd76906a205155c3ba2373f028c23d02",
     "deploy/oci/backup_manifest.py": "e569004d5c6357e5a8e78bd85cd1091fce7fb768f05f743c8f9f5936dfbebecc",
-    "deploy/oci/backup.sh": "75d13409deca9d64c7a2c9486f2a8922482217a42d0571dcb925214ebf3ad83c",
+    "deploy/oci/offsite-backup.sh": "a53fe752142f4011b5a1949e093fd62a716d627265760e1f64a87256c6b35137",
     "deploy/oci/clixor-backup-health.service": "132c69f6f7a03601302ba312ea1932d2ac5649e288c696c9855200f82639776c",
     "deploy/oci/clixor-backup-health.timer": "07bd84da1e6d4e3476bce0b00c8d0e61de543f3b3c7672ca8c1ed988fc7817db",
     "deploy/oci/clixor-offsite-backup.service": "209472ac8b08ccb8b3403e6f6ca505c798b5df664fed1ec9637ee6581618ff6e",
@@ -829,39 +831,125 @@ def _kill_cgroup(path: Path) -> bool:
         return False
 
 
-def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
-    """Install and verify a kernel firewall cut on all host ingress/egress."""
-
-    table = "clixor_fail_closed"
-    runner.run([NFT_BINARY, "delete", "table", "inet", table], check=False)
-    created = runner.run([NFT_BINARY, "add", "table", "inet", table], check=False)
-    inbound = runner.run(
-        [NFT_BINARY, "add", "chain", "inet", table, "input",
-         "{ type filter hook input priority -300; policy drop; }"],
-        check=False,
-    )
-    outbound = runner.run(
-        [NFT_BINARY, "add", "chain", "inet", table, "output",
-         "{ type filter hook output priority -300; policy drop; }"],
-        check=False,
-    )
-    if any(result.returncode != 0 for result in (created, inbound, outbound)):
-        return False
-    verified = runner.run(
-        [NFT_BINARY, "list", "table", "inet", table],
-        check=False,
-        capture=True,
-    )
-    if verified.returncode != 0:
-        return False
+def _nft_json(runner: CommandRunner, *arguments: str) -> Mapping[str, Any] | None:
+    result = runner.run([NFT_BINARY, "-j", *arguments], check=False, capture=True)
+    if result.returncode != 0:
+        return None
     try:
-        content = verified.stdout.decode("ascii", errors="strict")
-    except UnicodeError:
+        value = json.loads(result.stdout.decode("utf-8", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _nft_exact_cut(document: Mapping[str, Any] | None, table: str) -> bool:
+    if document is None or set(document) != {"nftables"}:
         return False
-    return (
-        "hook input" in content
-        and "hook output" in content
-        and content.count("policy drop") >= 2
+    objects = document["nftables"]
+    if not isinstance(objects, list):
+        return False
+    table_seen = False
+    chains: dict[str, Mapping[str, Any]] = {}
+    for item in objects:
+        if not isinstance(item, dict) or len(item) != 1:
+            return False
+        if "metainfo" in item:
+            continue
+        if "table" in item:
+            value = item["table"]
+            if not isinstance(value, dict) or value.get("family") != "inet" or value.get("name") != table:
+                return False
+            table_seen = not table_seen
+            if not table_seen:
+                return False
+            continue
+        if "chain" not in item or not isinstance(item["chain"], dict):
+            return False
+        chain = item["chain"]
+        name = chain.get("name")
+        if name not in {"input", "output"} or name in chains:
+            return False
+        if (
+            chain.get("family") != "inet"
+            or chain.get("table") != table
+            or chain.get("type") != "filter"
+            or chain.get("hook") != name
+            or chain.get("prio") != -300
+            or chain.get("policy") != "drop"
+        ):
+            return False
+        chains[str(name)] = chain
+    return table_seen and set(chains) == {"input", "output"}
+
+
+def _nft_table_exists(runner: CommandRunner, table: str) -> bool | None:
+    ruleset = _nft_json(runner, "list", "ruleset")
+    if ruleset is None or not isinstance(ruleset.get("nftables"), list):
+        return None
+    found = False
+    for item in ruleset["nftables"]:
+        if not isinstance(item, dict):
+            return None
+        value = item.get("table")
+        if isinstance(value, dict) and value.get("family") == "inet" and value.get("name") == table:
+            found = True
+    return found
+
+
+def _run_nft_transaction(runner: CommandRunner, content: bytes) -> bool:
+    descriptor, name = tempfile.mkstemp(prefix="clixor-nft-", suffix=".conf")
+    path = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            descriptor = -1
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        return runner.run([NFT_BINARY, "-f", str(path)], check=False).returncode == 0
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
+    """Transactionally replace only after a candidate kernel cut is proven."""
+
+    current = _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE)
+    if _nft_exact_cut(current, EMERGENCY_NFT_TABLE):
+        return True
+    runner.run(
+        [NFT_BINARY, "delete", "table", "inet", EMERGENCY_NFT_CANDIDATE],
+        check=False,
+    )
+    candidate = (
+        f"add table inet {EMERGENCY_NFT_CANDIDATE}\n"
+        f"add chain inet {EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
+        f"add chain inet {EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n"
+    ).encode("ascii")
+    if not _run_nft_transaction(runner, candidate):
+        return False
+    if not _nft_exact_cut(
+        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_CANDIDATE),
+        EMERGENCY_NFT_CANDIDATE,
+    ):
+        return False
+    exists = _nft_table_exists(runner, EMERGENCY_NFT_TABLE)
+    if exists is None:
+        return False
+    replacement = ""
+    if exists:
+        replacement += f"delete table inet {EMERGENCY_NFT_TABLE}\n"
+    replacement += f"rename table inet {EMERGENCY_NFT_CANDIDATE} {EMERGENCY_NFT_TABLE}\n"
+    if not _run_nft_transaction(runner, replacement.encode("ascii")):
+        return False
+    return _nft_exact_cut(
+        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE),
+        EMERGENCY_NFT_TABLE,
     )
 
 
@@ -879,6 +967,63 @@ def _kernel_fail_closed(runner: CommandRunner) -> bool:
     if connector_empty and runtime_empty:
         return True
     return _activate_emergency_network_cut(runner)
+
+
+def _clear_emergency_network_cut(runner: CommandRunner) -> None:
+    """Remove only an exact known cut and prove it absent from the ruleset."""
+
+    exists = _nft_table_exists(runner, EMERGENCY_NFT_TABLE)
+    if exists is None:
+        raise ReconcileError("emergency network-cut state is unavailable")
+    if not exists:
+        return
+    if not _nft_exact_cut(
+        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE),
+        EMERGENCY_NFT_TABLE,
+    ):
+        raise ReconcileError("refusing to clear an unrecognized emergency network cut")
+    removed = runner.run(
+        [NFT_BINARY, "delete", "table", "inet", EMERGENCY_NFT_TABLE],
+        check=False,
+    )
+    if removed.returncode != 0 or _nft_table_exists(runner, EMERGENCY_NFT_TABLE) is not False:
+        raise ReconcileError("emergency network cut was not removed")
+
+
+def _authoritative_docker_inventory(runner: CommandRunner) -> set[str]:
+    result = runner.run(
+        ["/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}"],
+        capture=True,
+    )
+    try:
+        raw = result.stdout.decode("utf-8", errors="strict")
+        lines = raw.splitlines()
+        records = [json.loads(line) for line in lines]
+    except (UnicodeError, json.JSONDecodeError):
+        raise ReconcileError("Docker inventory is invalid") from None
+    if result.stdout and not result.stdout.endswith(b"\n"):
+        raise ReconcileError("Docker inventory is truncated")
+    names: list[str] = []
+    identifiers: list[str] = []
+    states = {"created", "restarting", "running", "removing", "paused", "exited", "dead"}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ReconcileError("Docker inventory is invalid")
+        name = record.get("Names")
+        identifier = record.get("ID")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None
+            or not isinstance(identifier, str)
+            or re.fullmatch(r"[0-9a-f]{64}", identifier) is None
+            or record.get("State") not in states
+        ):
+            raise ReconcileError("Docker inventory is invalid")
+        names.append(name)
+        identifiers.append(identifier)
+    if len(names) != len(set(names)) or len(identifiers) != len(set(identifiers)):
+        raise ReconcileError("Docker inventory is inconsistent")
+    return set(names)
 
 
 def _stop_ingress_and_containers(runner: CommandRunner) -> None:
@@ -1002,14 +1147,63 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
         requires_kernel_fallback = True
 
     existing: list[str] = []
-    for name in KNOWN_CONTAINERS:
-        result, inspect_error = attempt(["/usr/bin/docker", "inspect", name])
-        if inspect_error:
-            errors.append(f"runtime container state is unavailable: {name}")
+    inventory, inventory_error = attempt(
+        ["/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}"],
+        capture=True,
+    )
+    live_restore, live_restore_error = attempt(
+        ["/usr/bin/docker", "info", "--format", "{{json .LiveRestoreEnabled}}"],
+        capture=True,
+    )
+    inventory_names: set[str] | None = None
+    if not inventory_error and inventory.returncode == 0:
+        try:
+            lines = inventory.stdout.decode("utf-8", errors="strict").splitlines()
+            records = [json.loads(line) for line in lines]
+        except (UnicodeError, json.JSONDecodeError):
+            lines = []
+            records = []
+            errors.append("Docker inventory is invalid")
             requires_kernel_fallback = True
-            continue
-        if result.returncode == 0:
-            existing.append(name)
+        names: list[str] = []
+        ids: list[str] = []
+        valid_states = {"created", "restarting", "running", "removing", "paused", "exited", "dead"}
+        for record in records:
+            if not isinstance(record, dict):
+                names.append("")
+                ids.append("")
+                continue
+            names.append(str(record.get("Names", "")))
+            ids.append(str(record.get("ID", "")))
+        if (
+            (inventory.stdout and not inventory.stdout.endswith(b"\n"))
+            or len(lines) != len(records)
+            or len(names) != len(set(names))
+            or len(ids) != len(set(ids))
+            or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name) is None for name in names)
+            or any(re.fullmatch(r"[0-9a-f]{64}", identifier) is None for identifier in ids)
+            or any(not isinstance(record, dict) or record.get("State") not in valid_states for record in records)
+        ):
+            errors.append("Docker inventory is invalid")
+            requires_kernel_fallback = True
+        else:
+            inventory_names = set(names)
+    else:
+        errors.append("Docker inventory is unavailable")
+        requires_kernel_fallback = True
+    if live_restore_error or live_restore.returncode != 0:
+        errors.append("Docker live-restore state is unavailable")
+        requires_kernel_fallback = True
+    else:
+        value = live_restore.stdout.decode("ascii", errors="ignore").strip()
+        if value not in {"true", "false"}:
+            errors.append("Docker live-restore state is invalid")
+            requires_kernel_fallback = True
+        elif value == "true":
+            errors.append("Docker live-restore requires kernel isolation")
+            requires_kernel_fallback = True
+    if inventory_names is not None:
+        existing = [name for name in KNOWN_CONTAINERS if name in inventory_names]
     if existing:
         stopped, stop_containers_error = attempt(
             ["/usr/bin/docker", "stop", "--time", "30", *existing]
@@ -1767,17 +1961,20 @@ def _compose_up(
         if active:
             continue
         container = f"clixor-oci-{name}"
-        exists = runner.run(
-            ["/usr/bin/docker", "inspect", container], check=False
-        ).returncode == 0
-        if exists:
+        if container in _authoritative_docker_inventory(runner):
             # The data bind mount is retained. Removing only the stopped
             # immutable container prevents a retired restart policy or config
             # from becoming an alternate boot authority.
             runner.run(["/usr/bin/docker", "rm", container])
 
 
-def _wait_ready(source_sha: str, expected_image_id: str, runner: CommandRunner) -> None:
+def _wait_ready(
+    source_sha: str,
+    expected_image_id: str,
+    runner: CommandRunner,
+    *,
+    host_probe: bool = True,
+) -> None:
     for container in ("clixor-oci-api-a", "clixor-oci-api-b"):
         result = runner.run(
             ["/usr/bin/docker", "inspect", container, "--format", "{{.Image}}"],
@@ -1787,22 +1984,32 @@ def _wait_ready(source_sha: str, expected_image_id: str, runner: CommandRunner) 
             raise ReconcileError("API container does not use the selected image ID")
     deadline = time.monotonic() + 180
     while True:
-        replicas_ready = all(
-            runner.run(
+        replicas_ready = True
+        for replica in ("api-a", "api-b"):
+            probe = runner.run(
                 [
                     "/usr/bin/docker",
                     "exec",
                     "clixor-oci-api-gateway",
                     "wget",
                     "--quiet",
-                    "--output-document=/dev/null",
+                    "--output-document=-",
                     f"http://{replica}:8080/health/ready",
                 ],
                 check=False,
-            ).returncode
-            == 0
-            for replica in ("api-a", "api-b")
-        )
+                capture=True,
+            )
+            try:
+                document = json.loads(probe.stdout)
+            except (UnicodeError, json.JSONDecodeError):
+                document = None
+            if probe.returncode != 0 or document != {
+                "status": "ready",
+                "revision": source_sha,
+            }:
+                replicas_ready = False
+        if replicas_ready and not host_probe:
+            return
         try:
             request = urllib.request.Request(
                 "http://172.30.254.2:8080/health/ready",
@@ -1872,6 +2079,10 @@ def reconcile_current(
     _restore_host_tools(release, runner)
     _set_service_selection(manifest, runner)
     _compose_up(release, manifest, image_ref, runner)
+    _wait_ready(str(manifest["source_sha"]), image_id, runner, host_probe=False)
+    _clear_emergency_network_cut(runner)
+    # The cut may have hidden a host-routing defect. Recheck the exact local
+    # release immediately after reopening networking and before ingress starts.
     _wait_ready(str(manifest["source_sha"]), image_id, runner)
     _publish_ready_marker(release)
     state = manifest["state"]
@@ -2030,6 +2241,7 @@ def _runtime_matches_current(project_root: Path, runner: CommandRunner) -> bool:
         assert isinstance(cloudflared, dict)
         assert isinstance(timers, dict)
         assert isinstance(observability, dict)
+        docker_inventory = _authoritative_docker_inventory(runner)
         cloud_enabled = runner.run(
             ["/usr/bin/systemctl", "is-enabled", "--quiet", "cloudflared.service"],
             check=False,
@@ -2065,7 +2277,7 @@ def _runtime_matches_current(project_root: Path, runner: CommandRunner) -> bool:
                 capture=True,
             )
             if result.returncode != 0:
-                if expected_active:
+                if expected_active or container in docker_inventory:
                     return False
                 continue
             expected_state = f"{'true' if expected_active else 'false'}|no"
@@ -2237,6 +2449,17 @@ def _legacy_git_tree(
 def _verified_legacy_controller(controller_source: Path) -> Mapping[str, bytes]:
     """Authenticate every controller file consumed by the legacy transition."""
 
+    consumed = {
+        "deploy/oci/compose.yaml",
+        "deploy/oci/hydrate-vault-secrets.py",
+        "deploy/oci/prepare-runtime-secrets.sh",
+        *(
+            f"deploy/oci/{relative.split('/', 1)[1]}"
+            for relative in runtime_bundle.HOST_TOOL_SOURCE_MODES
+        ),
+    }
+    if set(LEGACY_CONTROLLER_FILES) != consumed:
+        raise ReconcileError("legacy controller inventory is incomplete")
     result: dict[str, bytes] = {}
     for relative, expected_digest in LEGACY_CONTROLLER_FILES.items():
         content = _regular_file_bytes(
@@ -2250,6 +2473,22 @@ def _verified_legacy_controller(controller_source: Path) -> Mapping[str, bytes]:
             raise ReconcileError("legacy controller cohort digest is invalid")
         result[relative] = content
     return result
+
+
+def _materialize_legacy_controller(
+    project_root: Path, files: Mapping[str, bytes]
+) -> Path:
+    """Create a private immutable view; staging never rereads verified input."""
+
+    root = Path(tempfile.mkdtemp(prefix=".legacy-controller.", dir=project_root / "runtime"))
+    os.chmod(root, 0o700)
+    for relative, content in files.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(target.parent, 0o700)
+        _atomic_write(target, content, 0o500 if relative.endswith((".sh", ".py")) else 0o400)
+    _fsync(root)
+    return root
 
 
 def _legacy_provenance_content(source_sha: str, tree_sha: str) -> bytes:
@@ -2504,18 +2743,24 @@ def establish_legacy_baseline(
             _validate_bundle(release, project_root)
             return release
     if not (staged_release / runtime_bundle.BUNDLE_DIRECTORY).exists():
-        _stage_legacy_source_from_git(
-            staged_release,
-            project_root,
-            controller_source,
-            legacy_git_directory,
-            source_sha,
-            tree_sha,
-            runner,
+        immutable_controller = _materialize_legacy_controller(
+            project_root, controller_files
         )
-        runtime_bundle.stage_host_tools(
-            staged_release, controller_source, cloudflared_binary
-        )
+        try:
+            _stage_legacy_source_from_git(
+                staged_release,
+                project_root,
+                immutable_controller,
+                legacy_git_directory,
+                source_sha,
+                tree_sha,
+                runner,
+            )
+            runtime_bundle.stage_host_tools(
+                staged_release, immutable_controller, cloudflared_binary
+            )
+        finally:
+            shutil.rmtree(immutable_controller, ignore_errors=True)
     state_path = staged_release / ".baseline-runtime-state"
 
     def service_state(arguments: Sequence[str]) -> bool:
