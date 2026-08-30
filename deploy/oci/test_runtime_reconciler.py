@@ -541,7 +541,7 @@ class HostToolSelectionTests(unittest.TestCase):
 
 class LegacyBaselineTests(unittest.TestCase):
     def _git_object_store(self, fixture: RuntimeFixture) -> tuple[Path, str, bytes]:
-        repository = SCRIPT_ROOT.parent.parent
+        repository = Path(os.environ.get("CLIXOR_TEST_REPOSITORY", SCRIPT_ROOT.parent.parent)).resolve()
         # Exercise the actual live legacy application object, not a newly
         # synthesized tree that happens to omit modern boot helpers.
         source_sha = subprocess.run(
@@ -1702,7 +1702,7 @@ class EmergencyNetworkCutTests(unittest.TestCase):
         self.assertEqual(runner.tables, {})
         self.assertEqual(runner.transactions, [f"delete table inet {candidate}\n"])
 
-    def test_target_ubuntu_nft_accepts_every_transaction_grammar(self) -> None:
+    def test_target_ubuntu_nft_executes_exact_replacement_and_rolls_back_failure(self) -> None:
         nft = Path(RECONCILER.NFT_BINARY)
         if not nft.is_file() or shutil.which("unshare") is None or shutil.which("sudo") is None:
             self.skipTest("target nft/unshare/sudo integration tools are unavailable")
@@ -1710,31 +1710,50 @@ class EmergencyNetworkCutTests(unittest.TestCase):
         match = re.search(r"v(\d+)\.(\d+)\.(\d+)", version)
         self.assertIsNotNone(match)
         self.assertGreaterEqual(tuple(map(int, match.groups())), (1, 0, 9))
-        transactions = (
-            f"add table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n",
-            f"add table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} input {{ type filter hook input priority -300; policy drop; }}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} output {{ type filter hook output priority -300; policy drop; }}\n"
-            f"delete table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n",
-            f"add table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} input {{ type filter hook input priority -300; policy drop; }}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} output {{ type filter hook output priority -300; policy drop; }}\n"
-            f"add table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
-            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n"
-            f"delete table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
-            f"delete table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n",
-        )
-        for content in transactions:
-            with tempfile.NamedTemporaryFile("w", encoding="ascii") as source:
-                source.write(content)
-                source.flush()
-                subprocess.run(
-                    ["sudo", "-n", "unshare", "--net", str(nft), "--check", "--file", source.name],
-                    check=True,
+        table = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        malformed = (
+            f"add table inet {table}\n"
+            f"add chain inet {table} input {{ type filter hook input priority 0; policy accept; }}\n"
+        ).encode("ascii")
+        production = RECONCILER._nft_install_batch(table, replace=True)
+        shell = """
+set -u
+\"$1\" -f \"$2\"
+\"$1\" -f \"$3\" 2>/dev/null
+status=$?
+printf '%s\\n' \"${status}\"
+\"$1\" -j list table inet \"$4\"
+"""
+
+        def execute(batch: bytes) -> tuple[int, dict]:
+            with tempfile.NamedTemporaryFile("wb") as setup, tempfile.NamedTemporaryFile("wb") as transaction:
+                setup.write(malformed)
+                setup.flush()
+                transaction.write(batch)
+                transaction.flush()
+                result = subprocess.run(
+                    ["sudo", "-n", "unshare", "--net", "sh", "-c", shell, "sh", str(nft), setup.name, transaction.name, table],
+                    check=True, stdout=subprocess.PIPE,
                 )
+            status, document = result.stdout.split(b"\n", 1)
+            return int(status), json.loads(document)
+
+        status, replaced = execute(production)
+        self.assertEqual(status, 0)
+        self.assertTrue(RECONCILER._nft_exact_cut(replaced, table))
+
+        # A later command failure aborts the whole nft transaction. The exact
+        # production replacement prefix must not partially delete the old table.
+        status, preserved = execute(
+            production + b"delete table inet clixor_intentionally_absent\n"
+        )
+        self.assertNotEqual(status, 0)
+        self.assertFalse(RECONCILER._nft_exact_cut(preserved, table))
+        chains = [item["chain"] for item in preserved["nftables"] if "chain" in item]
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(chains[0]["name"], "input")
+        self.assertEqual(chains[0]["prio"], 0)
+        self.assertEqual(chains[0]["policy"], "accept")
 
 
 class PreMigrationDurabilityTests(unittest.TestCase):

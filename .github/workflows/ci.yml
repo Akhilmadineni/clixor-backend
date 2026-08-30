@@ -89,6 +89,10 @@ jobs:
         working-directory: deploy/oci/terraform
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The one-time 9e41/d2f5 bootstrap proof authenticates the historical
+          # application object itself; a synthetic or shallow-only tree is not authority.
+          fetch-depth: 0
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: 1.5.7
@@ -123,6 +127,8 @@ jobs:
         run: sh ../test-backup.sh
       - name: Test crash-consistent OCI runtime selection
         run: python3 ../test_runtime_reconciler.py -v
+      - name: Reproduce the legacy proof from a shallow checkout
+        run: sh ../test_legacy_shallow_checkout.sh
       - name: Test OCI deployment helpers offline
         run: python3 -m unittest discover -v -s .. -p 'test_*.py'
       - name: Check the data-volume mount helper

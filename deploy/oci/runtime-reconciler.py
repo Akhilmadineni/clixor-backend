@@ -933,6 +933,18 @@ def _run_nft_transaction(runner: CommandRunner, content: bytes) -> bool:
             pass
 
 
+def _nft_install_batch(table: str, *, replace: bool) -> bytes:
+    if table not in {EMERGENCY_NFT_TABLE, EMERGENCY_NFT_CANDIDATE}:
+        raise ReconcileError("invalid emergency network-cut identity")
+    commands = f"delete table inet {table}\n" if replace else ""
+    commands += (
+        f"add table inet {table}\n"
+        f"add chain inet {table} input {{ type filter hook input priority -300; policy drop; }}\n"
+        f"add chain inet {table} output {{ type filter hook output priority -300; policy drop; }}\n"
+    )
+    return commands.encode("ascii")
+
+
 def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
     """Install or recover either exact controller-owned fail-closed identity."""
 
@@ -951,15 +963,9 @@ def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
         (table for table in (EMERGENCY_NFT_CANDIDATE, EMERGENCY_NFT_TABLE) if states[table] == "absent"),
         EMERGENCY_NFT_CANDIDATE,
     )
-    commands = ""
-    if states[target] == "unknown":
-        commands += f"delete table inet {target}\n"
-    commands += (
-        f"add table inet {target}\n"
-        f"add chain inet {target} input {{ type filter hook input priority -300; policy drop; }}\n"
-        f"add chain inet {target} output {{ type filter hook output priority -300; policy drop; }}\n"
-    )
-    if not _run_nft_transaction(runner, commands.encode("ascii")):
+    if not _run_nft_transaction(
+        runner, _nft_install_batch(target, replace=states[target] == "unknown")
+    ):
         return False
     return _nft_exact_cut(
         _nft_json(runner, "list", "table", "inet", target), target
