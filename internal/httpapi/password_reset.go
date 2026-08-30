@@ -13,6 +13,7 @@ import (
 
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	"github.com/google/uuid"
 )
 
@@ -152,10 +153,16 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 	codeHash := passwordResetCodeHash(
 		s.passwordReset.HMACSecret, challengeID, strings.TrimSpace(request.Code),
 	)
-	completion, err := s.store.ConsumePasswordResetChallengeWithMail(
+	var fenceTicket events.SessionFenceTicket
+	_, err = s.store.ConsumePasswordResetChallengeWithMailAndFence(
 		r.Context(), challengeID, codeHash, newPasswordHash, s.passwordReset.MaxAttempts,
 		func(recipient string) (domain.MailDelivery, error) {
 			return s.mailQueue.SealPasswordChanged(challengeID, recipient)
+		},
+		func(userID uuid.UUID) error {
+			var fenceErr error
+			fenceTicket, fenceErr = s.publishSessionRevocation(r.Context(), userID, nil)
+			return fenceErr
 		},
 	)
 	if errors.Is(err, domain.ErrUnauthenticated) || errors.Is(err, domain.ErrNotFound) {
@@ -163,11 +170,12 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		releaseSessionFence(fenceTicket)
 		s.logger.Error("password_reset_consume_failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
 		return
 	}
-	s.publishSessionRevocation(r.Context(), completion.UserID, nil)
+	releaseSessionFence(fenceTicket)
 	w.WriteHeader(http.StatusNoContent)
 }
 

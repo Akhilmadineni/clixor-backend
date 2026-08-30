@@ -130,12 +130,6 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		return domain.ConversationInviteAcceptance{}, mapError(err)
 	}
 	now := time.Now().UTC()
-	if invite.RevokedAt != nil {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
-	}
-	if !invite.ExpiresAt.After(now) {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
-	}
 	var alreadyMember bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2)`,
@@ -164,6 +158,12 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		}
 		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
 	}
+	if invite.RevokedAt != nil {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
+	}
 	if invite.Uses >= invite.MaxUses {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExhausted
 	}
@@ -183,6 +183,9 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
 		VALUES($1,$2,'member',$3)`, invite.ConversationID, userID, now); err != nil {
 		return domain.ConversationInviteAcceptance{}, mapError(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_member_tombstones WHERE conversation_id=$1 AND user_id=$2`, invite.ConversationID, userID); err != nil {
+		return domain.ConversationInviteAcceptance{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversation_invite_links SET uses=uses+1 WHERE id=$1`, invite.ID); err != nil {

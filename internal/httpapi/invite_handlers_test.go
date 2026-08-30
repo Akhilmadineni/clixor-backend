@@ -133,8 +133,12 @@ func TestSecureConversationInviteHTTPContract(t *testing.T) {
 		map[string]any{"token": active.Token}, http.StatusGone, nil)
 	admin.do(t, http.MethodDelete, invitePath+"/"+active.Invite.ID.String(),
 		nil, http.StatusNoContent, nil)
+	var revokedRetry domain.ConversationInviteAcceptance
 	firstJoiner.do(t, http.MethodPost, "/v1/invites/accept",
-		map[string]any{"token": active.Token}, http.StatusGone, nil)
+		map[string]any{"token": active.Token}, http.StatusOK, &revokedRetry)
+	if revokedRetry.Joined || revokedRetry.Conversation.ID != group.ID {
+		t.Fatalf("authorized revoked-token retry was not idempotent: %+v", revokedRetry)
+	}
 
 	for _, fixedPath := range []string{"/v1/invites/preview", "/v1/invites/accept"} {
 		if strings.Contains(fixedPath, active.Token) {

@@ -124,12 +124,20 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFrom(r.Context())
+	// Fence first. Closing a socket when a later database mutation fails is a
+	// safe false positive; returning success while another replica can still send
+	// is not.
+	ticket, err := s.publishSessionRevocation(r.Context(), id.UserID, &id.SessionID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+		return
+	}
+	defer releaseSessionFence(ticket)
 	if err := s.store.RevokeSession(r.Context(), id.SessionID, id.UserID); err != nil &&
 		!errors.Is(err, domain.ErrNotFound) {
 		writeDomainError(w, err)
 		return
 	}
-	s.publishSessionRevocation(r.Context(), id.UserID, &id.SessionID)
 	if err := s.store.ClearDevicePushToken(r.Context(), id.UserID, id.DeviceID); err != nil &&
 		!errors.Is(err, domain.ErrNotFound) {
 		writeDomainError(w, err)
@@ -150,11 +158,16 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFrom(r.Context())
+	ticket, err := s.publishSessionRevocation(r.Context(), id.UserID, nil)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+		return
+	}
+	defer releaseSessionFence(ticket)
 	if err := s.store.DeleteAccount(r.Context(), id.UserID); err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	s.publishSessionRevocation(r.Context(), id.UserID, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 

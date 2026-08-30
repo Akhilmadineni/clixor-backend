@@ -105,6 +105,16 @@ func TestPostgresSecureConversationInviteLifecycle(t *testing.T) {
 	if _, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], secondJoiner); !errors.Is(err, domain.ErrInviteExhausted) {
 		t.Fatalf("max-use acceptance returned %v, want exhausted", err)
 	}
+	if err := persistence.RevokeConversationInvite(ctx, conversation.ID, owner, invite.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.pool.Exec(ctx, `UPDATE conversations SET metadata='{"members":[]}'::jsonb WHERE id=$1`, conversation.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err = persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
+	if err != nil || retried.Joined || !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("revoked idempotent retry did not heal: accepted=%+v err=%v", retried, err)
+	}
 
 	expiredHash := sha256.Sum256([]byte("expired-postgres-token"))
 	expired, err := persistence.CreateConversationInvite(ctx, store.CreateConversationInviteParams{

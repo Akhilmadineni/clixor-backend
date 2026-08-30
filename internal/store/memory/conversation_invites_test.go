@@ -119,6 +119,15 @@ func TestConversationInviteLifecycleAndAuthorization(t *testing.T) {
 	if _, err := persistence.ConversationInvitePreview(ctx, tokenHash[:], firstJoiner); !errors.Is(err, domain.ErrInviteRevoked) {
 		t.Fatalf("revoked preview returned %v, want revoked", err)
 	}
+	persistence.mu.Lock()
+	stale = persistence.conversations[conversation.ID]
+	stale.Metadata = []byte(`{"members":[]}`)
+	persistence.conversations[conversation.ID] = stale
+	persistence.mu.Unlock()
+	retried, err = persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
+	if err != nil || retried.Joined || !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("revoked idempotent retry did not heal: accepted=%+v err=%v", retried, err)
+	}
 }
 
 func TestConversationInviteExpiryAndAtomicMaxUse(t *testing.T) {

@@ -93,7 +93,7 @@ func (s *Store) ConsumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 ) (string, error) {
-	completion, err := s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, nil)
+	completion, err := s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, nil, nil)
 	return completion.Email, err
 }
 
@@ -108,7 +108,17 @@ func (s *Store) ConsumePasswordResetChallengeWithMail(
 	if buildMail == nil {
 		return store.PasswordResetCompletion{}, domain.ErrInvalid
 	}
-	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail)
+	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail, nil)
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMailAndFence(
+	_ context.Context, id uuid.UUID, codeHash []byte, newPasswordHash string,
+	maxAttempts int, buildMail store.MailDeliveryBuilder, fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
+	if buildMail == nil || fence == nil {
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail, fence)
 }
 
 func (s *Store) consumePasswordResetChallenge(
@@ -117,6 +127,7 @@ func (s *Store) consumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
+	fence store.PasswordResetFence,
 ) (store.PasswordResetCompletion, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,6 +158,11 @@ func (s *Store) consumePasswordResetChallenge(
 			return store.PasswordResetCompletion{}, domain.ErrInvalid
 		}
 		delivery = &built
+	}
+	if fence != nil {
+		if err := fence(user.ID); err != nil {
+			return store.PasswordResetCompletion{}, err
+		}
 	}
 	for deliveryID, queued := range s.mailDeliveries {
 		if queued.ChallengeID == id && queued.Purpose == domain.MailDeliveryPasswordReset &&

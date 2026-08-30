@@ -74,9 +74,8 @@ func PublicUserFromUser(user domain.User, includePhone bool) domain.PublicUser {
 }
 
 // ProjectConversationMembers makes the relational ACL the source of truth for
-// registered group members while preserving legacy local Member UUIDs and
-// unknown/contact-only member objects. A deleted-account tombstone is also
-// retained because shared financial history can still reference its local ID.
+// registered group members while preserving legacy local Member UUIDs. Only
+// tombstones supplied by the store's trusted history table are retained.
 //
 // Objects with a valid backendUserId that is absent from the ACL are removed.
 // Consequently replaying stale metadata can neither grant access nor restore a
@@ -84,6 +83,7 @@ func PublicUserFromUser(user domain.User, includePhone bool) domain.PublicUser {
 func ProjectConversationMembers(
 	metadata json.RawMessage,
 	members []domain.ConversationMember,
+	tombstones ...ConversationMemberTombstone,
 ) (json.RawMessage, error) {
 	root := make(map[string]json.RawMessage)
 	trimmed := bytes.TrimSpace(metadata)
@@ -112,7 +112,7 @@ func ProjectConversationMembers(
 	if raw, ok := root["members"]; ok {
 		_ = json.Unmarshal(raw, &existing)
 	}
-	projected := make([]json.RawMessage, 0, len(existing)+len(ordered))
+	projected := make([]json.RawMessage, 0, len(ordered)+len(tombstones))
 	seen := make(map[uuid.UUID]struct{}, len(ordered))
 	for _, raw := range existing {
 		var object map[string]json.RawMessage
@@ -121,12 +121,8 @@ func ProjectConversationMembers(
 		}
 		backendID, backendIDPresent, backendIDValid := memberBackendUserID(object)
 		if !backendIDPresent {
-			// Contact-only and historical local members cannot authenticate. Keep
-			// only the narrow display projection needed by legacy expense history;
-			// never replay phone, email, image blobs, or arbitrary private fields.
-			if contact, ok := marshalContactOnlyMember(object); ok {
-				projected = append(projected, contact)
-			}
+			// Pending address-book contacts and arbitrary local objects are private
+			// client state and never belong in shared group metadata.
 			continue
 		}
 		// A present backend identity must be one unambiguous UUID. Treating a
@@ -137,12 +133,6 @@ func ProjectConversationMembers(
 		}
 		member, authorized := authoritative[backendID]
 		if !authorized {
-			if memberIsDeletedTombstone(object) {
-				// Historical financial records need the stable local identifier, not
-				// the deleted person's former PII. Rebuild a minimal server-owned
-				// tombstone instead of trusting the client-supplied object.
-				projected = append(projected, marshalDeletedMember(object, backendID))
-			}
 			continue
 		}
 		if _, duplicate := seen[backendID]; duplicate {
@@ -158,12 +148,64 @@ func ProjectConversationMembers(
 		projected = append(projected, marshalProjectedMember(nil, member))
 		seen[member.UserID] = struct{}{}
 	}
+	for _, tombstone := range tombstones {
+		if tombstone.UserID == uuid.Nil {
+			continue
+		}
+		if _, active := authoritative[tombstone.UserID]; active {
+			continue
+		}
+		projected = append(projected, marshalTrustedDeletedMember(tombstone))
+	}
 	membersJSON, err := json.Marshal(projected)
 	if err != nil {
 		return nil, err
 	}
 	root["members"] = membersJSON
 	return json.Marshal(root)
+}
+
+// ConversationMemberTombstone is store-owned history. HTTP metadata cannot
+// create one; it is persisted before the relational ACL row is removed.
+type ConversationMemberTombstone struct {
+	UserID  uuid.UUID
+	LocalID uuid.UUID
+}
+
+// NewConversationMemberTombstone preserves a valid, unambiguous legacy local
+// UUID for an authoritative member. Malformed or duplicate identities fall
+// back to the backend user UUID and can never smuggle raw metadata into history.
+func NewConversationMemberTombstone(metadata json.RawMessage, userID uuid.UUID) ConversationMemberTombstone {
+	result := ConversationMemberTombstone{UserID: userID, LocalID: userID}
+	var root map[string]json.RawMessage
+	if json.Unmarshal(metadata, &root) != nil {
+		return result
+	}
+	var members []json.RawMessage
+	if json.Unmarshal(root["members"], &members) != nil {
+		return result
+	}
+	matched := false
+	for _, raw := range members {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(raw, &object) != nil {
+			continue
+		}
+		backendID, present, valid := memberBackendUserID(object)
+		if !present || !valid || backendID != userID {
+			continue
+		}
+		if matched {
+			return ConversationMemberTombstone{UserID: userID, LocalID: userID}
+		}
+		matched = true
+		if local, present, valid := uniqueStringField(object, "id"); present && valid {
+			if parsed, err := uuid.Parse(local); err == nil && parsed != uuid.Nil {
+				result.LocalID = parsed
+			}
+		}
+	}
+	return result
 }
 
 type publicProfile struct {
@@ -262,9 +304,6 @@ func marshalProjectedMember(
 	if username := boundedString(member.Username, 31); username != "" {
 		setJSON(object, "username", username)
 	}
-	if bio := boundedString(member.Bio, 500); bio != "" {
-		setJSON(object, "bio", bio)
-	}
 	if avatarURL := boundedString(member.AvatarURL, 2048); avatarURL != "" {
 		setJSON(object, "profileImageURL", avatarURL)
 	}
@@ -272,44 +311,14 @@ func marshalProjectedMember(
 	return result
 }
 
-func marshalContactOnlyMember(existing map[string]json.RawMessage) (json.RawMessage, bool) {
-	localID, present, valid := uniqueStringField(existing, "id")
-	localID, localIDValid := safeLocalMemberID(localID)
-	if !present || !valid || !localIDValid {
-		return nil, false
-	}
+func marshalTrustedDeletedMember(tombstone ConversationMemberTombstone) json.RawMessage {
 	object := make(map[string]json.RawMessage, 6)
-	setJSON(object, "id", localID)
-	name, _, nameValid := uniqueStringField(existing, "name")
-	name = boundedString(name, 100)
-	if !nameValid || name == "" {
-		name = "Member"
+	localID := tombstone.LocalID
+	if localID == uuid.Nil {
+		localID = tombstone.UserID
 	}
-	setJSON(object, "name", name)
-	color, _, colorValid := uniqueStringField(existing, "avatarColor")
-	if !colorValid {
-		color = ""
-	}
-	setJSON(object, "avatarColor", normalizedAvatarColor(color))
-	setJSON(object, "rosterState", "pendingContact")
-	if username, present, valid := uniqueStringField(existing, "username"); present && valid {
-		if username = boundedString(username, 31); username != "" {
-			setJSON(object, "username", username)
-		}
-	}
-	if bio, present, valid := uniqueStringField(existing, "bio"); present && valid {
-		if bio = boundedString(bio, 500); bio != "" {
-			setJSON(object, "bio", bio)
-		}
-	}
-	encoded, _ := json.Marshal(object)
-	return encoded, true
-}
-
-func marshalDeletedMember(existing map[string]json.RawMessage, backendID uuid.UUID) json.RawMessage {
-	object := make(map[string]json.RawMessage, 6)
-	setJSON(object, "id", stableLocalMemberID(existing, backendID))
-	setJSON(object, "backendUserId", backendID.String())
+	setJSON(object, "id", localID.String())
+	setJSON(object, "backendUserId", tombstone.UserID.String())
 	setJSON(object, "name", DeletedUserDisplayName)
 	setJSON(object, "avatarColor", defaultMemberAvatarColor)
 	setJSON(object, "isDeleted", true)

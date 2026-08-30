@@ -33,6 +33,7 @@ type Store struct {
 	sessions                  map[uuid.UUID]domain.Session
 	conversations             map[uuid.UUID]domain.Conversation
 	members                   map[uuid.UUID]map[uuid.UUID]domain.ConversationMember
+	memberTombstones          map[uuid.UUID]map[uuid.UUID]store.ConversationMemberTombstone
 	invites                   map[uuid.UUID]map[string]uuid.UUID
 	inviteLinks               map[string]domain.ConversationInvite
 	inviteLinkKeys            map[uuid.UUID]string
@@ -64,6 +65,7 @@ func New() *Store {
 		sessions:                  make(map[uuid.UUID]domain.Session),
 		conversations:             make(map[uuid.UUID]domain.Conversation),
 		members:                   make(map[uuid.UUID]map[uuid.UUID]domain.ConversationMember),
+		memberTombstones:          make(map[uuid.UUID]map[uuid.UUID]store.ConversationMemberTombstone),
 		invites:                   make(map[uuid.UUID]map[string]uuid.UUID),
 		inviteLinks:               make(map[string]domain.ConversationInvite),
 		inviteLinkKeys:            make(map[uuid.UUID]string),
@@ -379,6 +381,7 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			deletedConversations[conversationID] = struct{}{}
 			delete(s.conversations, conversationID)
 			delete(s.members, conversationID)
+			delete(s.memberTombstones, conversationID)
 			delete(s.invites, conversationID)
 			delete(s.messages, conversationID)
 			continue
@@ -398,6 +401,10 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			successor.Role = "owner"
 			members[successor.UserID] = successor
 		}
+		if s.memberTombstones[conversationID] == nil {
+			s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+		}
+		s.memberTombstones[conversationID][userID] = store.NewConversationMemberTombstone(conversation.Metadata, userID)
 		delete(members, userID)
 		s.projectConversationMembersLocked(conversationID)
 		delete(s.receipts, conversationID.String()+":"+userID.String())
@@ -800,6 +807,7 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 	}
 	s.conversations[conversation.ID] = conversation
 	s.members[conversation.ID] = make(map[uuid.UUID]domain.ConversationMember)
+	s.memberTombstones[conversation.ID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
 	s.invites[conversation.ID] = make(map[string]uuid.UUID)
 	for _, id := range uniqueUUIDs(memberIDs) {
 		role := "member"
@@ -813,6 +821,7 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 	if conversation.Kind == "group" {
 		conversation.Metadata, _ = store.ProjectConversationMembers(
 			conversation.Metadata, s.conversationMembersLocked(conversation.ID),
+			s.conversationMemberTombstonesLocked(conversation.ID)...,
 		)
 		s.conversations[conversation.ID] = conversation
 	}
@@ -847,6 +856,7 @@ func (s *Store) UpdateConversation(_ context.Context, conversationID, actorID uu
 	if conversation.Kind == "group" {
 		conversation.Metadata, _ = store.ProjectConversationMembers(
 			conversation.Metadata, s.conversationMembersLocked(conversationID),
+			s.conversationMemberTombstonesLocked(conversationID)...,
 		)
 	}
 	conversation.UpdatedAt = time.Now().UTC()
@@ -885,6 +895,7 @@ func (s *Store) DeleteConversation(_ context.Context, conversationID, actorID uu
 	s.outbox = filtered
 	delete(s.conversations, conversationID)
 	delete(s.members, conversationID)
+	delete(s.memberTombstones, conversationID)
 	delete(s.invites, conversationID)
 	for tokenKey, invite := range s.inviteLinks {
 		if invite.ConversationID == conversationID {
@@ -971,8 +982,19 @@ func (s *Store) projectConversationMembersLocked(conversationID uuid.UUID) {
 	}
 	conversation.Metadata, _ = store.ProjectConversationMembers(
 		conversation.Metadata, s.conversationMembersLocked(conversationID),
+		s.conversationMemberTombstonesLocked(conversationID)...,
 	)
 	s.conversations[conversationID] = conversation
+}
+
+func (s *Store) conversationMemberTombstonesLocked(conversationID uuid.UUID) []store.ConversationMemberTombstone {
+	byUser := s.memberTombstones[conversationID]
+	result := make([]store.ConversationMemberTombstone, 0, len(byUser))
+	for _, tombstone := range byUser {
+		result = append(result, tombstone)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].UserID.String() < result[j].UserID.String() })
+	return result
 }
 
 func (s *Store) ConversationMemberIDs(_ context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -1032,6 +1054,7 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	members[userID] = domain.ConversationMember{
 		ConversationID: conversationID, UserID: userID, Role: role, JoinedAt: joinedAt,
 	}
+	delete(s.memberTombstones[conversationID], userID)
 	conversation := s.conversations[conversationID]
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
@@ -1079,6 +1102,7 @@ func (s *Store) ClaimConversationInvites(_ context.Context, userID uuid.UUID, ph
 			})
 			s.appendOutbox("conversation.member_added", conversationID, payload)
 		}
+		delete(s.memberTombstones[conversationID], userID)
 		conversation := s.conversations[conversationID]
 		conversation.UpdatedAt = time.Now().UTC()
 		s.conversations[conversationID] = conversation
@@ -1153,12 +1177,6 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
 	}
 	now := time.Now().UTC()
-	if invite.RevokedAt != nil {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
-	}
-	if !invite.ExpiresAt.After(now) {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
-	}
 	conversation, ok := s.conversations[invite.ConversationID]
 	if !ok {
 		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
@@ -1167,6 +1185,7 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 	if _, alreadyMember := members[userID]; alreadyMember {
 		projected, err := store.ProjectConversationMembers(
 			conversation.Metadata, s.conversationMembersLocked(conversation.ID),
+			s.conversationMemberTombstonesLocked(conversation.ID)...,
 		)
 		if err != nil {
 			return domain.ConversationInviteAcceptance{}, err
@@ -1178,6 +1197,12 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 		}
 		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
 	}
+	if invite.RevokedAt != nil {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
+	}
 	if invite.Uses >= invite.MaxUses {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExhausted
 	}
@@ -1187,6 +1212,7 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 	members[userID] = domain.ConversationMember{
 		ConversationID: conversation.ID, UserID: userID, Role: "member", JoinedAt: now,
 	}
+	delete(s.memberTombstones[conversation.ID], userID)
 	invite.Uses++
 	s.inviteLinks[tokenKey] = invite
 	conversation.UpdatedAt = now
@@ -1259,6 +1285,10 @@ func (s *Store) RemoveConversationMember(_ context.Context, conversationID, acto
 	}
 	delete(members, userID)
 	conversation := s.conversations[conversationID]
+	if s.memberTombstones[conversationID] == nil {
+		s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+	}
+	s.memberTombstones[conversationID][userID] = store.NewConversationMemberTombstone(conversation.Metadata, userID)
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
 	s.projectConversationMembersLocked(conversationID)
@@ -1403,6 +1433,15 @@ func (s *Store) PutEntity(_ context.Context, entity domain.Entity, expectedVersi
 	defer s.mu.Unlock()
 	if _, ok := s.members[entity.ConversationID][entity.CreatedBy]; !ok {
 		return domain.Entity{}, domain.ErrForbidden
+	}
+	conversation, ok := s.conversations[entity.ConversationID]
+	if !ok {
+		return domain.Entity{}, domain.ErrNotFound
+	}
+	if err := store.ValidateEntityParticipants(
+		entity.Kind, entity.Payload, conversation.Metadata, s.conversationMembersLocked(entity.ConversationID),
+	); err != nil {
+		return domain.Entity{}, err
 	}
 	key := entityKey(entity.ConversationID, entity.Kind, entity.ID)
 	now := time.Now().UTC()

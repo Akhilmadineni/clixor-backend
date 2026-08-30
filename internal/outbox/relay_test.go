@@ -1211,6 +1211,14 @@ func (*countingBus) Subscribe(context.Context, uuid.UUID) (events.Subscription, 
 	return nil, errors.New("not implemented")
 }
 
+func (*countingBus) RegisterSessionOwner(context.Context, uuid.UUID, uuid.UUID, events.SessionFence) (events.SessionOwner, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (*countingBus) FenceSessions(context.Context, uuid.UUID, *uuid.UUID) (events.SessionFenceTicket, error) {
+	return nil, nil
+}
+
 func (*countingBus) Close() {}
 
 type recordingMedia struct {

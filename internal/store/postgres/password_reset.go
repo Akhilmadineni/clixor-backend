@@ -101,7 +101,7 @@ func (s *Store) ConsumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 ) (string, error) {
-	completion, err := s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, nil)
+	completion, err := s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, nil, nil)
 	return completion.Email, err
 }
 
@@ -117,8 +117,18 @@ func (s *Store) ConsumePasswordResetChallengeWithMail(
 		return store.PasswordResetCompletion{}, domain.ErrInvalid
 	}
 	return s.consumePasswordResetChallenge(
-		ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail,
+		ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail, nil,
 	)
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMailAndFence(
+	ctx context.Context, id uuid.UUID, codeHash []byte, newPasswordHash string,
+	maxAttempts int, buildMail store.MailDeliveryBuilder, fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
+	if buildMail == nil || fence == nil {
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail, fence)
 }
 
 func (s *Store) consumePasswordResetChallenge(
@@ -128,6 +138,7 @@ func (s *Store) consumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
+	fence store.PasswordResetFence,
 ) (store.PasswordResetCompletion, error) {
 	// Read only the owner needed to choose the per-user lock. Do not lock the
 	// challenge first: account deletion locks users before its cleanup trigger
@@ -194,6 +205,11 @@ func (s *Store) consumePasswordResetChallenge(
 			return store.PasswordResetCompletion{}, err
 		}
 		delivery = &built
+	}
+	if fence != nil {
+		if err := fence(userID); err != nil {
+			return store.PasswordResetCompletion{}, err
+		}
 	}
 	// Once a reset code is consumed, any still-pending copy of that code must
 	// never leave the queue. A concurrently leased worker will lose its lease

@@ -135,6 +135,8 @@ type PasswordResetCompletion struct {
 	Email  string
 }
 
+type PasswordResetFence func(uuid.UUID) error
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -158,6 +160,7 @@ type Store interface {
 	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
 	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
 	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (PasswordResetCompletion, error)
+	ConsumePasswordResetChallengeWithMailAndFence(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder, PasswordResetFence) (PasswordResetCompletion, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)

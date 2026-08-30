@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	"github.com/google/uuid"
 )
 
@@ -34,9 +34,10 @@ type sessionRevocationKey struct {
 type realtimeSessionGuard struct {
 	identity identity
 
-	mu        sync.Mutex
-	revoked   bool
-	revokedCh chan struct{}
+	mu         sync.Mutex
+	revoked    bool
+	revokedCh  chan struct{}
+	leaseValid func() bool
 }
 
 func newRealtimeSessionGuard(id identity) *realtimeSessionGuard {
@@ -66,10 +67,20 @@ func (g *realtimeSessionGuard) IsRevoked() bool {
 func (g *realtimeSessionGuard) WhileActive(action func() error) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.revoked {
+	if g.revoked || (g.leaseValid != nil && !g.leaseValid()) {
+		if !g.revoked {
+			g.revoked = true
+			close(g.revokedCh)
+		}
 		return false, nil
 	}
 	return true, action()
+}
+
+func (g *realtimeSessionGuard) SetLeaseValidator(valid func() bool) {
+	g.mu.Lock()
+	g.leaseValid = valid
+	g.mu.Unlock()
 }
 
 // sessionRevocationCache keeps only short-lived acceleration records plus the
@@ -242,18 +253,26 @@ func (s *Server) publishSessionRevocation(
 	ctx context.Context,
 	userID uuid.UUID,
 	sessionID *uuid.UUID,
-) {
+) (events.SessionFenceTicket, error) {
 	s.realtimeRevocations().Revoke(userID, sessionID)
-	payload := sessionRevocationPayload{SessionID: sessionID, All: sessionID == nil}
-	encoded, _ := json.Marshal(payload)
 	publishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionRevocationPublishTimeout)
 	defer cancel()
-	if err := s.bus.Publish(publishContext, []uuid.UUID{userID}, domain.RealtimeEvent{
-		ID:         uuid.NewString(),
-		Type:       sessionRevokedEventType,
-		Payload:    encoded,
-		OccurredAt: time.Now().UTC(),
-	}); err != nil {
+	ticket, err := s.bus.FenceSessions(publishContext, userID, sessionID)
+	if err != nil {
 		s.logger.Warn("session_revocation_signal_failed", "user_id", userID, "error", err)
+		if ticket != nil {
+			_ = ticket.Release(context.Background())
+		}
+		return nil, err
 	}
+	return ticket, nil
+}
+
+func releaseSessionFence(ticket events.SessionFenceTicket) {
+	if ticket == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sessionRevocationPublishTimeout)
+	defer cancel()
+	_ = ticket.Release(ctx)
 }

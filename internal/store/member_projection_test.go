@@ -43,7 +43,7 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 			ConversationID: uuid.New(), UserID: memberID, Role: "member", JoinedAt: joined.Add(time.Second),
 			DisplayName: "New member", Username: "@member", AvatarColor: "#BBBBBB",
 		},
-	})
+	}, ConversationMemberTombstone{UserID: deletedID, LocalID: uuid.MustParse(deletedLocalID)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	if err := json.Unmarshal(projected, &root); err != nil {
 		t.Fatal(err)
 	}
-	if root.Theme != "trip" || len(root.Members) != 4 {
+	if root.Theme != "trip" || len(root.Members) != 3 {
 		t.Fatalf("unexpected projection: %s", projected)
 	}
 	byID := make(map[string]map[string]interface{}, len(root.Members))
@@ -64,7 +64,7 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	owner := byID[ownerLocalID]
 	if owner == nil || owner["name"] != "Server owner" || owner["username"] != "@owner" ||
 		owner["avatarColor"] != "#AAAAAA" || owner["profileImageURL"] != "clustr-media://owner" ||
-		owner["bio"] != "public bio" || owner["rosterState"] != "active" {
+		owner["bio"] != nil || owner["rosterState"] != "active" {
 		t.Fatalf("owner was not rebuilt from authoritative identity: %+v", owner)
 	}
 	if _, duplicate := byID["duplicate-owner"]; duplicate {
@@ -75,18 +75,13 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	}
 	deleted := byID[deletedLocalID]
 	if deleted == nil || deleted["name"] != DeletedUserDisplayName || deleted["isDeleted"] != true ||
-		byID[pendingLocalID] == nil {
-		t.Fatalf("historical/contact-only members were lost: %+v", root.Members)
+		byID[pendingLocalID] != nil {
+		t.Fatalf("trusted history or private contact handling failed: %+v", root.Members)
 	}
 	if len(deleted) != 6 || deleted["backendUserId"] != deletedID.String() ||
 		deleted["avatarColor"] != defaultMemberAvatarColor ||
 		deleted["rosterState"] != "inactiveTombstone" {
 		t.Fatalf("deleted member was not reduced to a minimal server tombstone: %+v", deleted)
-	}
-	contact := byID[pendingLocalID]
-	if len(contact) != 4 || contact["name"] != "Pending contact" || contact["avatarColor"] != "#222222" ||
-		contact["rosterState"] != "pendingContact" {
-		t.Fatalf("contact-only member was not reduced to the safe display projection: %+v", contact)
 	}
 	synthesized := byID[memberID.String()]
 	if synthesized == nil || synthesized["backendUserId"] != memberID.String() ||
@@ -98,6 +93,7 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 		"private@example.com", "+13125550199", "@spoof", "private-blob", "custom",
 		"deleted@example.com", "+13125550198", "+13125550123", "Malformed", "Ambiguous",
 		"contact@example.com", "Unsafe local ID",
+		"public bio", "Pending contact",
 	} {
 		if strings.Contains(encoded, forbidden) {
 			t.Fatalf("member projection retained forbidden value %q: %s", forbidden, projected)
@@ -114,7 +110,7 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 				ConversationID: uuid.New(), UserID: memberID, Role: "member", JoinedAt: joined.Add(time.Second),
 				DisplayName: "New member", Username: "@member", AvatarColor: "#BBBBBB",
 			},
-		})
+		}, ConversationMemberTombstone{UserID: deletedID, LocalID: uuid.MustParse(deletedLocalID)})
 		if repeatErr != nil {
 			t.Fatal(repeatErr)
 		}

@@ -42,6 +42,7 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://clustr:clustr-test-password@127.0.0.1:5432/clustr_test?sslmode=disable
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      TEST_NATS_URL: nats://127.0.0.1:4222
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -56,6 +57,20 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Start pinned JetStream test service
+        run: |
+          docker run --detach --rm --name clixor-ci-nats \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.11.6-alpine@sha256:7dec3f8f1ff181975dbdfc0d903d2a9724659648294dbc2ebb2fa3a294d573a6 \
+            --jetstream --store_dir=/data --http_port=8222
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8222/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs clixor-ci-nats
+          exit 1
       - name: Race-enabled tests
         run: go test -race -coverprofile=coverage.out ./...
       - name: Vulnerability scan

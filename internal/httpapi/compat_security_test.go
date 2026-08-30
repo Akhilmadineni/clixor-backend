@@ -51,8 +51,8 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 	assertProjectedMember(t, group.Metadata, owner.user.ID, ownerLocalID, true)
 	assertProjectedMember(t, group.Metadata, member.user.ID, memberLocalID, true)
 	assertProjectedMember(t, group.Metadata, added.user.ID, "", false)
-	if !bytes.Contains(group.Metadata, []byte(pendingLocalID)) {
-		t.Fatalf("contact-only legacy member was removed: %s", group.Metadata)
+	if bytes.Contains(group.Metadata, []byte(pendingLocalID)) {
+		t.Fatalf("private contact-only member was shared: %s", group.Metadata)
 	}
 	for _, forbidden := range []string{
 		"Spoofed Member", "@spoofed", "metadata-secret@example.com", "+13125550111",
@@ -103,7 +103,10 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 			"name": "Stale replay", "role": "owner", "avatarColor": "#FFFFFF",
 		}}},
 	}, http.StatusOK, &group)
-	assertProjectedMember(t, group.Metadata, added.user.ID, "", false)
+	assertProjectedMember(t, group.Metadata, added.user.ID, added.user.ID.String(), true)
+	if bytes.Contains(group.Metadata, []byte("Stale replay")) || bytes.Contains(group.Metadata, []byte(`"role"`)) {
+		t.Fatalf("client fabricated tombstone fields survived: %s", group.Metadata)
+	}
 	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusNotFound, nil)
 
 	var created conversationInviteCreationResponse

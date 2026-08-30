@@ -167,11 +167,14 @@ func (s *Store) SearchUsersByUsername(ctx context.Context, query string, limit i
 	if limit <= 0 || limit > 50 {
 		limit = 20
 	}
+	// LIKE metacharacters are valid persisted legacy username characters. Escape
+	// them so PostgreSQL has the same literal-prefix semantics as memory.
+	q = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
 	rows, err := s.pool.Query(ctx, `
 		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at
 		FROM users
 		WHERE deleted_at IS NULL
-		  AND lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) LIKE $1 || '%'
+		  AND lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', '')) LIKE $1 || '%' ESCAPE '\'
 		ORDER BY lower(regexp_replace(COALESCE(profile->>'username', ''), '^@+', ''))
 		LIMIT $2`, q, limit)
 	if err != nil {
@@ -818,7 +821,25 @@ func projectConversationMetadata(
 	if err != nil {
 		return nil, err
 	}
-	return store.ProjectConversationMembers(metadata, members)
+	rows, err := query.Query(ctx, `
+		SELECT user_id,local_id FROM conversation_member_tombstones
+		WHERE conversation_id=$1 ORDER BY user_id`, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tombstones []store.ConversationMemberTombstone
+	for rows.Next() {
+		var tombstone store.ConversationMemberTombstone
+		if err := rows.Scan(&tombstone.UserID, &tombstone.LocalID); err != nil {
+			return nil, err
+		}
+		tombstones = append(tombstones, tombstone)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return store.ProjectConversationMembers(metadata, members, tombstones...)
 }
 
 func (s *Store) ConversationMemberIDs(ctx context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -889,6 +910,9 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 		VALUES($1,$2,$3,now()) ON CONFLICT(conversation_id,user_id) DO UPDATE SET role=EXCLUDED.role`,
 		conversationID, userID, role); err != nil {
 		return mapError(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_member_tombstones WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID); err != nil {
+		return err
 	}
 	metadata, err = projectConversationMetadata(ctx, tx, conversationID, metadata)
 	if err != nil {
@@ -1001,6 +1025,9 @@ func (s *Store) ClaimConversationInvites(ctx context.Context, userID uuid.UUID, 
 		if err != nil {
 			return nil, mapError(err)
 		}
+		if _, err := tx.Exec(ctx, `DELETE FROM conversation_member_tombstones WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID); err != nil {
+			return nil, err
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE conversation_invites SET claimed_by=$2,claimed_at=now()
 			WHERE conversation_id=$1 AND phone=$3`, conversationID, userID, phone); err != nil {
@@ -1066,6 +1093,13 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 	}
 	if actorID != userID && actorRole != "owner" && actorRole != "admin" {
 		return domain.ErrForbidden
+	}
+	tombstone := store.NewConversationMemberTombstone(metadata, userID)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
+		VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO UPDATE
+		SET local_id=EXCLUDED.local_id,removed_at=now()`, conversationID, userID, tombstone.LocalID); err != nil {
+		return err
 	}
 	tag, err := tx.Exec(ctx, `
 		DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID)
@@ -1311,7 +1345,18 @@ func (s *Store) PutEntity(ctx context.Context, entity domain.Entity, expectedVer
 		return domain.Entity{}, err
 	}
 	defer tx.Rollback(ctx)
+	var conversationMetadata json.RawMessage
+	if err := tx.QueryRow(ctx, `SELECT metadata FROM conversations WHERE id=$1 FOR SHARE`, entity.ConversationID).Scan(&conversationMetadata); err != nil {
+		return domain.Entity{}, mapError(err)
+	}
 	if err := s.requireMember(ctx, tx, entity.ConversationID, entity.CreatedBy); err != nil {
+		return domain.Entity{}, err
+	}
+	activeMembers, err := listConversationMembers(ctx, tx, entity.ConversationID)
+	if err != nil {
+		return domain.Entity{}, err
+	}
+	if err := store.ValidateEntityParticipants(entity.Kind, entity.Payload, conversationMetadata, activeMembers); err != nil {
 		return domain.Entity{}, err
 	}
 	var expected any

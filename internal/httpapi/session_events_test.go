@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -197,6 +199,16 @@ func (*failingPublishBus) Subscribe(context.Context, uuid.UUID) (events.Subscrip
 	return nil, errors.New("not implemented")
 }
 
+func (*failingPublishBus) RegisterSessionOwner(context.Context, uuid.UUID, uuid.UUID, events.SessionFence) (events.SessionOwner, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (bus *failingPublishBus) FenceSessions(ctx context.Context, _ uuid.UUID, _ *uuid.UUID) (events.SessionFenceTicket, error) {
+	bus.called.Store(true)
+	bus.contextCanceled.Store(ctx.Err() != nil)
+	return nil, errors.New("revocation transport unavailable")
+}
+
 func (*failingPublishBus) Close() {}
 
 func TestRevocationPublishFailureStillFencesLocalSocket(t *testing.T) {
@@ -211,7 +223,7 @@ func TestRevocationPublishFailureStillFencesLocalSocket(t *testing.T) {
 	guard := cache.Register(id)
 	requestContext, cancel := context.WithCancel(context.Background())
 	cancel()
-	server.publishSessionRevocation(requestContext, id.UserID, &id.SessionID)
+	_, _ = server.publishSessionRevocation(requestContext, id.UserID, &id.SessionID)
 	if !guard.IsRevoked() {
 		t.Fatal("local socket remained active after revocation transport failed")
 	}
@@ -220,6 +232,54 @@ func TestRevocationPublishFailureStillFencesLocalSocket(t *testing.T) {
 	}
 	if bus.contextCanceled.Load() {
 		t.Fatal("canceled request context suppressed the detached revocation attempt")
+	}
+}
+
+func TestRealtimeGuardFailsClosedWhenOwnerLeaseExpires(t *testing.T) {
+	guard := newRealtimeSessionGuard(identity{UserID: uuid.New(), SessionID: uuid.New()})
+	valid := atomic.Bool{}
+	valid.Store(true)
+	guard.SetLeaseValidator(valid.Load)
+	writes := 0
+	if wrote, err := guard.WhileActive(func() error { writes++; return nil }); err != nil || !wrote {
+		t.Fatal("valid lease blocked write")
+	}
+	valid.Store(false)
+	if wrote, err := guard.WhileActive(func() error { writes++; return nil }); err != nil || wrote {
+		t.Fatal("expired lease allowed write")
+	}
+	if writes != 1 || !guard.IsRevoked() {
+		t.Fatalf("writes=%d revoked=%t", writes, guard.IsRevoked())
+	}
+}
+
+type revocationBarrierStore struct {
+	store.Store
+	revoked atomic.Bool
+}
+
+func (s *revocationBarrierStore) RevokeSession(context.Context, uuid.UUID, uuid.UUID) error {
+	s.revoked.Store(true)
+	return nil
+}
+
+func TestLogoutReturnsUnavailableAndDoesNotMutateWhenFenceFails(t *testing.T) {
+	persistence := &revocationBarrierStore{}
+	server := &Server{
+		store: persistence, bus: &failingPublishBus{},
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		sessionRevocations: newSessionRevocationCache(8, time.Minute, time.Now),
+	}
+	id := identity{UserID: uuid.New(), DeviceID: uuid.New(), SessionID: uuid.New()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/logout", nil)
+	request = request.WithContext(withIdentity(request.Context(), id))
+	response := httptest.NewRecorder()
+	server.logout(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if persistence.revoked.Load() {
+		t.Fatal("session mutation ran despite failed barrier")
 	}
 }
 

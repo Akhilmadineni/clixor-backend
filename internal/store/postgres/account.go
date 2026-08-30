@@ -175,6 +175,13 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 			conversation.id, userID); err != nil {
 			return err
 		}
+		tombstone := store.NewConversationMemberTombstone(metadata, userID)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
+			VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO UPDATE
+			SET local_id=EXCLUDED.local_id,removed_at=now()`, conversation.id, userID, tombstone.LocalID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
 			conversation.id, userID); err != nil {

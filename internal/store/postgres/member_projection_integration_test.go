@@ -108,7 +108,10 @@ func TestPostgresACLAndLegacyMemberProjectionRemainAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPostgresProjectedMember(t, updated.Metadata, added.ID, "", false)
+	assertPostgresProjectedMember(t, updated.Metadata, added.ID, added.ID.String(), true)
+	if strings.Contains(string(updated.Metadata), "Stale replay") || strings.Contains(string(updated.Metadata), `"role"`) {
+		t.Fatalf("client fabricated tombstone fields survived: %s", updated.Metadata)
+	}
 	if _, err := persistence.Conversation(ctx, conversation.ID, added.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("stale metadata restored ACL access: %v", err)
 	}

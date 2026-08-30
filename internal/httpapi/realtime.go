@@ -27,6 +27,25 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrUnauthenticated)
 		return
 	}
+	guard := s.realtimeRevocations().Register(id)
+	defer s.realtimeRevocations().Unregister(guard)
+	owner, err := s.bus.RegisterSessionOwner(r.Context(), id.UserID, id.SessionID, func(sessionID *uuid.UUID) {
+		s.realtimeRevocations().Revoke(id.UserID, sessionID)
+	})
+	if err != nil {
+		guard.Revoke()
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Realtime delivery is unavailable.")
+		return
+	}
+	defer owner.Close()
+	guard.SetLeaseValidator(owner.Valid)
+	// This durable check occurs after owner registration. A revocation racing
+	// registration therefore either fences us through the barrier or is observed
+	// here before the socket can send any application data.
+	if !s.realtimeSessionActive(r.Context(), id, guard) {
+		writeDomainError(w, domain.ErrUnauthenticated)
+		return
+	}
 	connection, err := websocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -34,8 +53,6 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 	defer connection.Close()
 	observability.WebsocketConnections.Inc()
 	defer observability.WebsocketConnections.Dec()
-	guard := s.realtimeRevocations().Register(id)
-	defer s.realtimeRevocations().Unregister(guard)
 	_ = s.presence.Online(r.Context(), id.UserID, id.DeviceID)
 	defer s.presence.Offline(context.Background(), id.UserID, id.DeviceID)
 
@@ -52,10 +69,6 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		return connection.SetReadDeadline(time.Now().Add(70 * time.Second))
 	})
 
-	if !s.realtimeSessionActive(r.Context(), id, guard) {
-		s.closeRealtimeSession(connection)
-		return
-	}
 	hello, _ := json.Marshal(map[string]any{
 		"user_id": id.UserID, "device_id": id.DeviceID, "heartbeat_seconds": 25,
 	})

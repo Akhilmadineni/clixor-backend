@@ -213,6 +213,19 @@ func TestMailMigrationStoresOnlyEncryptedPayloadAndCascadesPrivacyState(t *testi
 	}
 }
 
+func TestConversationMemberTombstoneMigrationIsStoreOwnedAndCascades(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000015_conversation_member_tombstones.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{"CREATE TABLE conversation_member_tombstones", "local_id uuid NOT NULL", "ON DELETE CASCADE", "PRIMARY KEY (conversation_id, user_id)"} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("tombstone migration is missing %q", required)
+		}
+	}
+}
+
 func TestPostgresRetentionPruneRejectsUnboundedLimitsBeforeQuery(t *testing.T) {
 	persistence := &Store{}
 	for _, limit := range []int{0, -1, store.MaxRetentionPruneBatchSize + 1} {
