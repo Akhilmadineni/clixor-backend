@@ -4,10 +4,16 @@
 -- existing expenses and settlements.
 --
 -- Deployments run migrations while the previous API replicas are still
--- serving. Take both writer-conflicting locks before the first validation and
--- retain them until this migration transaction commits. An old replica must
+-- serving. Membership transactions lock a user row and then a conversation row
+-- before mutating either identity table. Fence those relation authorities in
+-- the same order before taking the identity-table locks. EXCLUSIVE conflicts
+-- with SELECT FOR UPDATE's ROW SHARE relation lock, so we never wait on an old
+-- transaction's user/conversation row while already blocking its table write.
+-- Retain all locks until this migration transaction commits. An old replica must
 -- therefore either commit before validation or resume only after the triggers
 -- below are visible; no write can slip between validation and enforcement.
+LOCK TABLE users IN EXCLUSIVE MODE;
+LOCK TABLE conversations IN EXCLUSIVE MODE;
 LOCK TABLE conversation_members, conversation_member_local_ids
     IN SHARE ROW EXCLUSIVE MODE;
 

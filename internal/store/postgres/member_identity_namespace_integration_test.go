@@ -1,19 +1,23 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestPostgresMembershipPathsRejectBackendUUIDReservedAsAnotherLocalID(t *testing.T) {
@@ -235,7 +239,7 @@ func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHisto
 	}
 	historyBefore := snapshot(t)
 
-	// This is the lock acquired by migration 000018 before its first validation.
+	// These are the locks acquired by migration 000018 before its first validation.
 	// A write from a previous binary uses ROW EXCLUSIVE and must remain blocked.
 	migrationTx, err := persistence.pool.Begin(ctx)
 	if err != nil {
@@ -243,6 +247,8 @@ func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHisto
 	}
 	defer migrationTx.Rollback(ctx)
 	if _, err := migrationTx.Exec(ctx, `
+		LOCK TABLE users IN EXCLUSIVE MODE;
+		LOCK TABLE conversations IN EXCLUSIVE MODE;
 		LOCK TABLE conversation_members, conversation_member_local_ids
 		IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
@@ -305,4 +311,263 @@ func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHisto
 	if got := snapshot(t); got != historyBefore {
 		t.Fatalf("migration rerun changed history:\nbefore %s\nafter  %s", historyBefore, got)
 	}
+}
+
+func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	migrationSQL, err := migrationFiles.ReadFile("migrations/000018_conversation_member_identity_namespace.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type fixture struct {
+		schema                        string
+		migration, writer             *pgxpool.Conn
+		owner, joining, historical    uuid.UUID
+		conversation, historicalLocal uuid.UUID
+	}
+	newFixture := func(t *testing.T, collision bool) fixture {
+		t.Helper()
+		schema := "identity_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		identifier := pgx.Identifier{schema}.Sanitize()
+		if _, err := persistence.pool.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = persistence.pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+identifier+" CASCADE")
+		})
+		migration, err := persistence.pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(migration.Release)
+		writer, err := persistence.pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(writer.Release)
+		for _, conn := range []*pgxpool.Conn{migration, writer} {
+			if _, err := conn.Exec(ctx, "SET search_path TO "+identifier+", public"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ddl := `
+			CREATE TABLE users(id uuid PRIMARY KEY);
+			CREATE TABLE conversations(id uuid PRIMARY KEY);
+			CREATE TABLE conversation_members(
+				conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+				user_id uuid NOT NULL REFERENCES users(id), role text NOT NULL, joined_at timestamptz NOT NULL,
+				PRIMARY KEY(conversation_id,user_id));
+			CREATE TABLE conversation_member_local_ids(
+				conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+				user_id uuid NOT NULL REFERENCES users(id), local_id uuid NOT NULL,
+				created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(conversation_id,user_id),
+				UNIQUE(conversation_id,local_id));
+			CREATE TABLE conversation_member_tombstones(
+				conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+				user_id uuid NOT NULL, local_id uuid NOT NULL,
+				removed_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(conversation_id,user_id));`
+		if _, err := migration.Exec(ctx, ddl); err != nil {
+			t.Fatal(err)
+		}
+		f := fixture{schema: schema, migration: migration, writer: writer, owner: uuid.New(), joining: uuid.New(), historical: uuid.New(), conversation: uuid.New(), historicalLocal: uuid.New()}
+		reserved := f.owner
+		if collision {
+			reserved = f.joining
+		}
+		if _, err := migration.Exec(ctx, `
+			INSERT INTO users(id) VALUES($1),($2),($3);
+			INSERT INTO conversations(id) VALUES($4);
+			INSERT INTO conversation_members VALUES($4,$1,'owner',now());
+			INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id) VALUES($4,$1,$5);
+			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id) VALUES($4,$3,$6)`,
+			f.owner, f.joining, f.historical, f.conversation, reserved, f.historicalLocal); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	t.Run("old user-conversation-first writer commits before validation", func(t *testing.T) {
+		f := newFixture(t, false)
+		old, err := f.writer.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer old.Rollback(ctx)
+		if _, err := old.Exec(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, f.joining); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := old.Exec(ctx, `SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, f.conversation); err != nil {
+			t.Fatal(err)
+		}
+		migrationResult := make(chan error, 1)
+		go func() {
+			tx, beginErr := f.migration.Begin(ctx)
+			if beginErr != nil {
+				migrationResult <- beginErr
+				return
+			}
+			if _, execErr := tx.Exec(ctx, string(migrationSQL)); execErr != nil {
+				_ = tx.Rollback(ctx)
+				migrationResult <- execErr
+				return
+			}
+			migrationResult <- tx.Commit(ctx)
+		}()
+		select {
+		case err := <-migrationResult:
+			t.Fatalf("migration did not wait for old authority locks: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		if _, err := old.Exec(ctx, `INSERT INTO conversation_members VALUES($1,$2,'member',now())`, f.conversation, f.joining); err != nil {
+			t.Fatal(err)
+		}
+		if err := old.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-migrationResult; err != nil {
+			t.Fatalf("migration deadlocked behind old writer: %v", err)
+		}
+	})
+
+	t.Run("post-fence writer blocks then committed trigger rejects", func(t *testing.T) {
+		f := newFixture(t, true)
+		marker := "DO $$"
+		at := bytes.Index(migrationSQL, []byte(marker))
+		if at < 0 {
+			t.Fatal("migration validation marker missing")
+		}
+		migrationTx, err := f.migration.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer migrationTx.Rollback(ctx)
+		if _, err := migrationTx.Exec(ctx, string(migrationSQL[:at])); err != nil {
+			t.Fatal(err)
+		}
+		writerResult := make(chan error, 1)
+		go func() {
+			tx, beginErr := f.writer.Begin(ctx)
+			if beginErr != nil {
+				writerResult <- beginErr
+				return
+			}
+			defer tx.Rollback(ctx)
+			_, writeErr := tx.Exec(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, f.joining)
+			if writeErr == nil {
+				_, writeErr = tx.Exec(ctx, `SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, f.conversation)
+				if writeErr == nil {
+					_, writeErr = tx.Exec(ctx, `INSERT INTO conversation_members VALUES($1,$2,'member',now())`, f.conversation, f.joining)
+				}
+			}
+			writerResult <- writeErr
+		}()
+		select {
+		case err := <-writerResult:
+			t.Fatalf("post-fence writer did not block: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		if _, err := migrationTx.Exec(ctx, string(migrationSQL[at:])); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrationTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var pgErr *pgconn.PgError
+		if err := <-writerResult; !errors.As(err, &pgErr) || pgErr.ConstraintName != "conversation_member_backend_local_disjoint" {
+			t.Fatalf("resumed writer was not rejected by committed trigger: %v", err)
+		}
+	})
+
+	t.Run("fence blocks every old identity table write mode", func(t *testing.T) {
+		at := bytes.Index(migrationSQL, []byte("DO $$"))
+		if at < 0 {
+			t.Fatal("migration validation marker missing")
+		}
+		operations := []struct {
+			name, sql string
+			args      func(fixture) []any
+		}{
+			{"members insert", `INSERT INTO conversation_members VALUES($1,$2,'member',now())`, func(f fixture) []any { return []any{f.conversation, f.joining} }},
+			{"members update", `UPDATE conversation_members SET role='admin' WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
+			{"members delete", `DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
+			{"members truncate", `TRUNCATE conversation_members`, func(f fixture) []any { return nil }},
+			{"local ids insert", `INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id) VALUES($1,$2,$3)`, func(f fixture) []any { return []any{f.conversation, f.historical, f.historicalLocal} }},
+			{"local ids update", `UPDATE conversation_member_local_ids SET created_at=created_at WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
+			{"local ids delete", `DELETE FROM conversation_member_local_ids WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
+			{"local ids truncate", `TRUNCATE conversation_member_local_ids`, func(f fixture) []any { return nil }},
+		}
+		for _, operation := range operations {
+			t.Run(operation.name, func(t *testing.T) {
+				f := newFixture(t, false)
+				migrationTx, err := f.migration.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := migrationTx.Exec(ctx, string(migrationSQL[:at])); err != nil {
+					t.Fatal(err)
+				}
+				result := make(chan error, 1)
+				go func() { _, err := f.writer.Exec(ctx, operation.sql, operation.args(f)...); result <- err }()
+				select {
+				case err := <-result:
+					t.Fatalf("%s bypassed migration fence: %v", operation.name, err)
+				case <-time.After(100 * time.Millisecond):
+				}
+				if err := migrationTx.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-result; err != nil {
+					t.Fatalf("%s failed after fence rollback: %v", operation.name, err)
+				}
+			})
+		}
+	})
+
+	t.Run("failure rolls back backfill and DDL then exact rerun succeeds", func(t *testing.T) {
+		f := newFixture(t, false)
+		var before string
+		if err := f.migration.QueryRow(ctx, `SELECT jsonb_build_object(
+			'mappings',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM conversation_member_local_ids x),
+			'tombstones',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM conversation_member_tombstones x))::text`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := f.migration.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, failure := tx.Exec(ctx, string(migrationSQL)+"\nSELECT 1/0;")
+		if failure == nil {
+			t.Fatal("injected migration failure succeeded")
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var after string
+		if err := f.migration.QueryRow(ctx, `SELECT jsonb_build_object(
+			'mappings',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM conversation_member_local_ids x),
+			'tombstones',(SELECT jsonb_agg(to_jsonb(x) ORDER BY user_id) FROM conversation_member_tombstones x))::text`).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if after != before {
+			t.Fatalf("failed migration changed all-column history:\nbefore %s\nafter  %s", before, after)
+		}
+		var triggerCount int
+		if err := f.migration.QueryRow(ctx, `SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'conversation%identity_namespace%' AND tgrelid IN ('conversation_members'::regclass,'conversation_member_local_ids'::regclass)`).Scan(&triggerCount); err != nil || triggerCount != 0 {
+			t.Fatalf("failed migration left triggers=%d err=%v", triggerCount, err)
+		}
+		if _, err := f.migration.Exec(ctx, string(migrationSQL)); err != nil {
+			t.Fatalf("exact migration rerun failed: %v", err)
+		}
+	})
 }

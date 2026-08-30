@@ -50,6 +50,8 @@ func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T)
 	}
 	sql := string(raw)
 	for _, required := range []string{
+		"LOCK TABLE users IN EXCLUSIVE MODE",
+		"LOCK TABLE conversations IN EXCLUSIVE MODE",
 		"LOCK TABLE conversation_members, conversation_member_local_ids",
 		"IN SHARE ROW EXCLUSIVE MODE",
 		"INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)",
@@ -66,10 +68,13 @@ func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T)
 			t.Fatalf("identity-namespace migration is missing %q", required)
 		}
 	}
+	userLockAt := strings.Index(sql, "LOCK TABLE users IN EXCLUSIVE MODE")
+	conversationLockAt := strings.Index(sql, "LOCK TABLE conversations IN EXCLUSIVE MODE")
 	lockAt := strings.Index(sql, "LOCK TABLE conversation_members, conversation_member_local_ids")
 	validationAt := strings.Index(sql, "DO $$")
 	triggerAt := strings.Index(sql, "CREATE TRIGGER conversation_members_identity_namespace_insert")
-	if lockAt < 0 || validationAt < 0 || triggerAt < 0 || lockAt > validationAt || lockAt > triggerAt {
+	if userLockAt < 0 || conversationLockAt < 0 || lockAt < 0 || validationAt < 0 || triggerAt < 0 ||
+		userLockAt > conversationLockAt || conversationLockAt > lockAt || lockAt > validationAt || lockAt > triggerAt {
 		t.Fatal("identity namespace tables must be write-locked before validation and trigger creation")
 	}
 	for _, forbidden := range []string{"UPDATE conversation_member_local_ids SET", "ON CONFLICT DO UPDATE"} {
