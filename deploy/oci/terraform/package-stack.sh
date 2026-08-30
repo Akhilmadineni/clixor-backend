@@ -13,6 +13,8 @@ rm -f -- "$output_file"
   cd "$script_dir"
   zip -q "$output_file" \
     .terraform.lock.hcl \
+    clixor-data-volume.service \
+    clixor-mount-data.sh \
     cloud-init.yaml.tftpl \
     compute.tf \
     identity.tf \

@@ -1,0 +1,13 @@
+[Unit]
+Description=Validate and mount the Clixor data volume
+Before=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/clixor-data-volume
+ExecStart=/usr/local/sbin/clixor-mount-data
+RemainAfterExit=yes
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=multi-user.target

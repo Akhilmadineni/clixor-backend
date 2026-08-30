@@ -29,57 +29,20 @@ write_files:
     owner: root:root
     permissions: "0750"
     content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
+      ${indent(6, chomp(mount_data_script))}
 
-      device="${data_device}"
-      mount_point="/srv/clixor"
-
-      if [[ ! -b "$device" ]]; then
-        echo "waiting for Terraform to attach $device" >&2
-        exit 1
-      fi
-
-      root_device="$(findmnt -n -o SOURCE /)"
-      if [[ "$(readlink -f "$device")" == "$(readlink -f "$root_device")" ]]; then
-        echo "refusing to format the root filesystem device" >&2
-        exit 2
-      fi
-
-      filesystem="$(blkid -o value -s TYPE "$device" || true)"
-      if [[ -z "$filesystem" ]]; then
-        mkfs.xfs -f -L CLIXOR_DATA "$device"
-      elif [[ "$filesystem" != "xfs" ]]; then
-        echo "refusing unexpected filesystem type: $filesystem" >&2
-        exit 3
-      fi
-
-      mkdir -p "$mount_point"
-      uuid="$(blkid -o value -s UUID "$device")"
-      if ! grep -q "UUID=$uuid " /etc/fstab; then
-        printf 'UUID=%s %s xfs defaults,nofail,x-systemd.device-timeout=5min 0 2\n' "$uuid" "$mount_point" >> /etc/fstab
-      fi
-      mount "$mount_point"
-      install -d -m 0750 -o root -g docker "$mount_point/app" "$mount_point/data" "$mount_point/backups" "$mount_point/releases"
+  - path: /etc/default/clixor-data-volume
+    owner: root:root
+    permissions: "0644"
+    content: |
+      CLIXOR_DATA_DEVICE=${data_device}
+      CLIXOR_DATA_VOLUME_SIZE_GBS=${data_volume_size_gbs}
 
   - path: /etc/systemd/system/clixor-data-volume.service
     owner: root:root
     permissions: "0644"
     content: |
-      [Unit]
-      Description=Validate and mount the Clixor data volume
-      Before=docker.service
-      StartLimitIntervalSec=0
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/clixor-mount-data
-      RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=15
-
-      [Install]
-      WantedBy=multi-user.target
+      ${indent(6, chomp(mount_data_unit))}
 
   - path: /etc/systemd/system/docker.service.d/10-clixor-data.conf
     owner: root:root

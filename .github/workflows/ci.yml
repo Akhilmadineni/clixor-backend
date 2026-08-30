@@ -94,6 +94,8 @@ jobs:
         run: terraform init -backend=false -input=false
       - name: Validate the OCI Resource Manager stack
         run: terraform validate -no-color
+      - name: Check the data-volume mount helper
+        run: bash -n clixor-mount-data.sh
       - name: Verify the break-glass upload bundle
         run: |
           ./package-stack.sh /tmp/clixor-oci-resource-manager.zip

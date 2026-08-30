@@ -101,3 +101,7 @@ bucket stays private; clients receive only expiring, object-specific PAR URLs.
 The cloud-init template only hardens the host, installs packages, validates and
 mounts the attached data volume at `/srv/clixor`, restricts SSH, and prevents
 Docker from starting without the data mount. It contains no runtime credentials.
+Cloud-init user data is treated as a first-boot contract and ignored for
+in-place drift so a template edit cannot unexpectedly replace an existing A1
+instance. Reconcile later host-script or unit updates through a reviewed Bastion
+maintenance session; newly created instances always receive the current files.

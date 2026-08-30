@@ -107,8 +107,8 @@ variable "boot_volume_size_gbs" {
   default     = 50
 
   validation {
-    condition     = var.boot_volume_size_gbs >= 50 && var.boot_volume_size_gbs <= 100
-    error_message = "boot_volume_size_gbs must be between 50 and 100 GB."
+    condition     = var.boot_volume_size_gbs >= 50 && var.boot_volume_size_gbs <= 100 && floor(var.boot_volume_size_gbs) == var.boot_volume_size_gbs
+    error_message = "boot_volume_size_gbs must be a whole number between 50 and 100 GB."
   }
 }
 
@@ -118,8 +118,8 @@ variable "data_volume_size_gbs" {
   default     = 100
 
   validation {
-    condition     = var.data_volume_size_gbs >= 50 && var.data_volume_size_gbs <= 150
-    error_message = "data_volume_size_gbs must be between 50 and 150 GB."
+    condition     = var.data_volume_size_gbs >= 50 && var.data_volume_size_gbs <= 150 && floor(var.data_volume_size_gbs) == var.data_volume_size_gbs
+    error_message = "data_volume_size_gbs must be a whole number between 50 and 150 GB."
   }
 }
 
@@ -129,8 +129,8 @@ variable "data_device" {
   default     = "/dev/oracleoci/oraclevdb"
 
   validation {
-    condition     = startswith(var.data_device, "/dev/oracleoci/")
-    error_message = "data_device must use a /dev/oracleoci device path."
+    condition     = can(regex("^/dev/oracleoci/oraclevd[b-z]$", var.data_device))
+    error_message = "data_device must select a non-boot OCI device from /dev/oracleoci/oraclevdb through /dev/oracleoci/oraclevdz."
   }
 }
 

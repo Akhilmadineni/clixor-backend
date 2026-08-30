@@ -67,6 +67,9 @@ resource "oci_core_instance" "clixor" {
     ssh_authorized_keys = trimspace(var.ssh_public_key)
     user_data = base64encode(templatefile("${path.module}/cloud-init.yaml.tftpl", {
       data_device                   = var.data_device
+      data_volume_size_gbs          = var.data_volume_size_gbs
+      mount_data_script             = file("${path.module}/clixor-mount-data.sh")
+      mount_data_unit               = file("${path.module}/clixor-data-volume.service")
       bastion_private_endpoint_cidr = "${oci_bastion_bastion.clixor.private_endpoint_ip_address}/32"
     }))
   }
@@ -75,6 +78,11 @@ resource "oci_core_instance" "clixor" {
   freeform_tags        = local.tags
 
   lifecycle {
+    # Cloud-init is a first-boot contract. Changing user_data on an existing OCI
+    # instance is ForceNew in the provider, so reconcile the live host through
+    # the reviewed operational scripts instead of unexpectedly replacing it.
+    ignore_changes = [metadata["user_data"]]
+
     precondition {
       condition     = var.boot_volume_size_gbs + var.data_volume_size_gbs <= 200
       error_message = "Boot and data volumes together must not exceed the 200-GB Always Free block-volume allowance."
@@ -111,5 +119,6 @@ resource "oci_core_volume_attachment" "clixor_data" {
   display_name    = "clixor-prod-data-attachment"
   instance_id     = oci_core_instance.clixor.id
   volume_id       = oci_core_volume.clixor_data.id
+  device          = var.data_device
   is_read_only    = false
 }
