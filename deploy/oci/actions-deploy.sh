@@ -36,5 +36,19 @@ actual_sha="$(/usr/bin/git -c safe.directory="${canonical_source_root}" \
   -C "${canonical_source_root}" status --porcelain --untracked-files=all)" ] || \
   fail "checkout contains uncommitted or untracked files"
 
+api_env=/srv/clixor/secrets/api.env
+[ -f "${api_env}" ] && [ ! -L "${api_env}" ] || \
+  fail "production API configuration is missing or unsafe"
+[ "$(stat -c %u "${api_env}")" -eq 0 ] || \
+  fail "production API configuration is not root-owned"
+[ "$(stat -c %a "${api_env}")" = "600" ] || \
+  fail "production API configuration must have mode 0600"
+grep -qx 'CLUSTER_ENV=production' "${api_env}" || \
+  fail "Actions deploys require CLUSTER_ENV=production"
+grep -qx 'CLUSTER_VERIFICATION_PROVIDER=telnyx' "${api_env}" || \
+  fail "Actions deploys require the Telnyx verification provider"
+grep -qx 'CLUSTER_MAIL_PROVIDER=smtp' "${api_env}" || \
+  fail "Actions deploys require durable SMTP password-reset delivery"
+
 exec /bin/sh "${canonical_source_root}/deploy/oci/deploy.sh" \
   "${canonical_source_root}" "${source_sha}" "${run_id}"

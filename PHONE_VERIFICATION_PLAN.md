@@ -46,7 +46,9 @@ operational review because the global limits are also cost-containment controls.
    `https://clustr-api.atlanteanz.com/v1/webhooks/telnyx/messaging`.
 5. Install the API key, sender number, Telnyx public signing key, and a new
    independent OTP HMAC secret in the OCI root-only
-   `/srv/clixor/secrets/runtime.env`. Never commit populated values.
+   `/srv/clixor/secrets/api.env`. Never commit populated values. The retained
+   `runtime.env` is only a non-consumed migration checkpoint and must not contain
+   `CLUSTER_*` credentials.
 6. Deploy an immutable API image, verify readiness, run a real-device delivery
    canary, and monitor send/verify/delivery outcome metrics before enabling the
    phone-auth UI for all users.

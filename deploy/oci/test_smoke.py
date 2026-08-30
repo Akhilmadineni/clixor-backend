@@ -204,7 +204,15 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertEqual(script.count("CLIXOR_SKIP_PACKAGES=true sh"), 1)
         self.assertIn('printf \'first-deploy\\n\'', script)
         self.assertIn("database files and forward migrations were not restored", script)
-        self.assertNotIn("pg_restore", script)
+        self.assertIn("pg_restore --list", script)
+        self.assertIn("sha256sum --check", script)
+        self.assertNotIn("pg_restore --clean", script)
+        self.assertIn("scoped_runtime_ready", script)
+        self.assertIn('cmp -s "${selected_rollback_compose}" "${compose_file}"', script)
+        self.assertIn('if [ "${actual_image}" != "${previous_image}" ]', script)
+        release_pointer = script.index('mv -Tf "${release_dir}/current-link.pending"')
+        release_complete = script.rindex("rollback_needed=0")
+        self.assertLess(release_pointer, release_complete)
 
     def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
         installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
@@ -266,9 +274,20 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("github.event.workflow_run.head_branch == 'main'", deploy_workflow)
         self.assertIn("clixor-oci-production", deploy_workflow)
         self.assertIn("cancel-in-progress: false", deploy_workflow)
+        self.assertIn("timeout-minutes: 90", deploy_workflow)
         self.assertIn('[ "${#source_sha}" -eq 40 ]', wrapper)
         self.assertIn('[ "${actual_sha}" = "${source_sha}" ]', wrapper)
         self.assertIn("status --porcelain --untracked-files=all", wrapper)
+        self.assertIn("CLUSTER_ENV=production", wrapper)
+        self.assertIn("CLUSTER_VERIFICATION_PROVIDER=telnyx", wrapper)
+        self.assertIn("CLUSTER_MAIL_PROVIDER=smtp", wrapper)
+
+        dockerfile = (repository_root / "Dockerfile").read_text(encoding="utf-8")
+        syntax = dockerfile.splitlines()[0]
+        self.assertRegex(
+            syntax,
+            r"^# syntax=docker/dockerfile:[^@]+@sha256:[0-9a-f]{64}$",
+        )
 
         compose = (self.oci_root / "compose.yaml").read_text(encoding="utf-8")
         dependency_images = re.findall(r"^\s+image:\s+([^\s]+)", compose, re.MULTILINE)
@@ -307,6 +326,20 @@ class ReleaseHardeningTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertIn(filename, package_script)
         self.assertNotIn("terraform.tfstate", package_script)
+
+    def test_bootstrap_preserves_the_durable_backup_target(self) -> None:
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        self.assertIn("existing_backup_bucket", bootstrap)
+        self.assertIn("existing_backup_prefix", bootstrap)
+        self.assertIn(
+            "CLIXOR_OCI_BACKUP_BUCKET conflicts with the durable backup configuration",
+            bootstrap,
+        )
+        self.assertIn(
+            "CLIXOR_OCI_BACKUP_PREFIX conflicts with the durable backup configuration",
+            bootstrap,
+        )
+        self.assertIn('if [ ! -f "${backup_config}" ]; then', bootstrap)
 
     def test_email_delivery_foundation_excludes_credentials_and_private_keys(self) -> None:
         terraform_root = self.oci_root / "terraform"
@@ -430,6 +463,8 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("CapabilityBoundingSet=", service)
         self.assertIn("OnUnitActiveSec=6h", backup_timer)
         self.assertIn("OnUnitActiveSec=1h", health_timer)
+        self.assertIn("TimeoutStartSec=15m", service)
+        self.assertIn("TimeoutStartSec=30m", restore_service)
         self.assertIn(
             "clixor-offsite-backup.service clixor-restore-drill.service", health
         )

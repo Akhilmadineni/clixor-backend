@@ -149,6 +149,10 @@ workflow accepts only a successful `push`-triggered `CI` run on this repository'
 `main`, checks out that exact approved SHA, serializes production deployments, and
 uses the same snapshot, migration, readiness, and application-rollback path as a
 manual deployment. No OCI or application credential belongs in GitHub Actions.
+The root-owned entrypoint additionally refuses automated deployment unless the
+scoped API configuration is mode `0600`, root-owned, and explicitly enables
+production, Telnyx verification, and durable SMTP reset delivery. Manual staging
+deployments remain available for provider canaries before this gate is enabled.
 
 Create a dedicated unprivileged account and fixed runner directory:
 
@@ -368,6 +372,13 @@ primary media store and is not copied into the VM backup directory.
 Bootstrap installs root-owned backup programs in `/usr/local/libexec/clixor`, a
 mode-0600 non-secret bucket/prefix file at `/etc/clixor/offsite-backup.env`, and
 three hardened timer pairs:
+
+Once created, that file is the durable backup target. Later bootstraps preserve
+it and fail on conflicting transient `CLIXOR_OCI_BACKUP_BUCKET` or
+`CLIXOR_OCI_BACKUP_PREFIX` values, so an automated deploy cannot silently switch
+to a default or different bucket. To migrate the backup target, use a reviewed
+operator procedure that first proves bucket policy and restore access, then
+updates the root-owned file explicitly.
 
 - `clixor-offsite-backup.timer` checks for a locally generated dump no more than
   eight hours old and uploads every six hours. It uses only the VM instance

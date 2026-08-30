@@ -44,7 +44,7 @@ case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
 
-for command_name in curl docker find flock rsync systemctl touch; do
+for command_name in cmp curl docker find flock rsync sha256sum systemctl touch; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
@@ -89,6 +89,7 @@ release_tag="oci-$(printf '%s' "${source_sha}" | cut -c1-12)-${run_id}"
 release_dir="${release_root}/${release_tag}"
 previous_compose="${release_dir}/previous-compose.yaml"
 rollback_compose="${previous_compose}"
+scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
 pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
@@ -129,8 +130,28 @@ else
     'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --no-owner --no-privileges --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
     > "${pre_migration_dump}.partial"
   [ -s "${pre_migration_dump}.partial" ] || fail "pre-change PostgreSQL snapshot is empty"
+  docker exec -i clixor-oci-postgres pg_restore --list \
+    < "${pre_migration_dump}.partial" >/dev/null || \
+    fail "pre-change PostgreSQL snapshot failed archive validation"
   chmod 0600 "${pre_migration_dump}.partial"
   mv "${pre_migration_dump}.partial" "${pre_migration_dump}"
+  (
+    cd "${release_dir}"
+    sha256sum "$(basename -- "${pre_migration_dump}")" > \
+      "$(basename -- "${pre_migration_dump}").sha256.partial"
+    sha256sum --check "$(basename -- "${pre_migration_dump}").sha256.partial" \
+      >/dev/null
+    chmod 0600 "$(basename -- "${pre_migration_dump}").sha256.partial"
+    mv "$(basename -- "${pre_migration_dump}").sha256.partial" \
+      "$(basename -- "${pre_migration_dump}").sha256"
+  )
+
+  # If bootstrap completes the one-time least-privilege secret split, rollback
+  # must use this reviewed, digest-pinned Compose model with the prior API image.
+  # Until the split commits, the captured prior Compose remains authoritative.
+  cp "${source_root}/deploy/oci/compose.yaml" "${scoped_rollback_compose}"
+  [ -s "${scoped_rollback_compose}" ] || \
+    fail "scoped rollback Compose model is empty"
 fi
 printf '%s\n' "${source_sha}" > "${release_dir}/source-sha"
 if [ "${first_deploy}" = "true" ]; then
@@ -144,6 +165,19 @@ else
 fi
 
 rollback_needed=0
+scoped_runtime_ready() {
+  [ -f "${runtime_env}" ] && [ ! -L "${runtime_env}" ] || return 1
+  for scoped_env in \
+    "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
+    "${grafana_env}" "${backup_env}" "${migrate_env}"
+  do
+    [ -f "${scoped_env}" ] && [ ! -L "${scoped_env}" ] && [ -s "${scoped_env}" ] || \
+      return 1
+  done
+  ! grep -Eq '^(CLUSTER_[A-Z0-9_]+|POSTGRES_(DB|USER|PASSWORD)|REDIS_PASSWORD|NATS_AUTH_TOKEN|GF_SECURITY_ADMIN_(USER|PASSWORD))=' \
+    "${runtime_env}"
+}
+
 rollback() {
   status=$?
   trap - 0
@@ -151,31 +185,59 @@ rollback() {
     set +e
     if [ "${first_deploy}" = "false" ]; then
       log "deployment failed; attempting application rollback to ${previous_image}"
-      [ -s "${rollback_compose}" ] || \
+      selected_rollback_compose="${rollback_compose}"
+      if scoped_runtime_ready; then
+        selected_rollback_compose="${scoped_rollback_compose}"
+      fi
+      rollback_failed=0
+      if [ ! -s "${selected_rollback_compose}" ]; then
         log "ERROR: rollback Compose model is unavailable" >&2
+        rollback_failed=1
+      fi
       previous_tag=${previous_image#clixor-api:}
-      cp "${rollback_compose}" "${compose_file}"
-      CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
-        --file "${compose_file}" up -d --no-build --remove-orphans
+      if [ "${rollback_failed}" -eq 0 ]; then
+        if ! cp "${selected_rollback_compose}" "${compose_file}" || \
+          ! cmp -s "${selected_rollback_compose}" "${compose_file}"; then
+          log "ERROR: could not restore the rollback Compose model" >&2
+          rollback_failed=1
+        fi
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
+          --file "${compose_file}" up -d --no-build --remove-orphans; then
+        log "ERROR: rollback Compose reconciliation failed" >&2
+        rollback_failed=1
+      fi
+
+      for replica in clixor-oci-api-a clixor-oci-api-b; do
+        actual_image="$(docker inspect "${replica}" \
+          --format '{{.Config.Image}}' 2>/dev/null || true)"
+        if [ "${actual_image}" != "${previous_image}" ]; then
+          log "ERROR: ${replica} did not restore the prior API image" >&2
+          rollback_failed=1
+        fi
+      done
 
       rollback_attempt=1
       rollback_ready=false
-      until curl --fail --silent --show-error --max-time 5 \
-        "${gateway_readiness_url}" >/dev/null; do
-        if [ "${rollback_attempt}" -ge 30 ]; then
-          break
+      if [ "${rollback_failed}" -eq 0 ]; then
+        until curl --fail --silent --show-error --max-time 5 \
+          "${gateway_readiness_url}" >/dev/null; do
+          if [ "${rollback_attempt}" -ge 30 ]; then
+            break
+          fi
+          rollback_attempt=$((rollback_attempt + 1))
+          sleep 2
+        done
+        if curl --fail --silent --show-error --max-time 5 \
+          "${gateway_readiness_url}" >/dev/null; then
+          rollback_ready=true
         fi
-        rollback_attempt=$((rollback_attempt + 1))
-        sleep 2
-      done
-      if curl --fail --silent --show-error --max-time 5 \
-        "${gateway_readiness_url}" >/dev/null; then
-        rollback_ready=true
       fi
-      if [ "${rollback_ready}" = "true" ]; then
+      if [ "${rollback_failed}" -eq 0 ] && [ "${rollback_ready}" = "true" ]; then
         log "application rollback completed; database migrations were not reversed"
       else
-        log "ERROR: previous application did not become ready after rollback" >&2
+        log "ERROR: application rollback did not restore and verify the prior release" >&2
       fi
     else
       log "first deployment failed; stopping the incomplete application stack"
@@ -201,17 +263,6 @@ docker buildx build --load \
   "${source_root}"
 image_architecture="$(docker image inspect "${new_image}" --format '{{.Architecture}}')"
 [ "${image_architecture}" = "arm64" ] || fail "built ${image_architecture}, expected arm64"
-
-# The one-time secret split makes the retired all-secrets Compose model
-# unusable for rollback. Capture the new scoped model before bootstrap mutates
-# runtime.env, so even an early failure can keep the previous API image on
-# least-privilege service files.
-if [ "${first_deploy}" = "false" ] && \
-  ! grep -q '/srv/clixor/secrets/api.env' "${previous_compose}"; then
-  rollback_compose="${release_dir}/rollback-compose.yaml"
-  cp "${source_root}/deploy/oci/compose.yaml" "${rollback_compose}"
-  [ -s "${rollback_compose}" ] || fail "scoped rollback Compose model is empty"
-fi
 
 # Everything below can mutate the active runtime. Arm application rollback
 # before refreshing configuration, syncing Compose, reconciling dependencies,
@@ -362,6 +413,9 @@ systemctl start clixor-restore-drill.service
 systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
 systemctl start clixor-backup-health.service
 
+ln -s "${release_dir}" "${release_dir}/current-link.pending"
+mv -Tf "${release_dir}/current-link.pending" "${release_root}/current"
+[ "$(readlink "${release_root}/current")" = "${release_dir}" ] || \
+  fail "current release pointer did not update atomically"
 rollback_needed=0
-ln -sfn "${release_dir}" "${release_root}/current"
 log "deployed ${new_image}; API readiness passed"

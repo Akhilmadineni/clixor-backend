@@ -48,8 +48,49 @@ if ! command -v oci >/dev/null 2>&1; then
   sh "${script_root}/install-oci-cli.sh"
 fi
 
-oci_backup_bucket=${CLIXOR_OCI_BACKUP_BUCKET:-clixor-prod-backups}
-oci_backup_prefix=${CLIXOR_OCI_BACKUP_PREFIX:-clixor}
+backup_config_root=/etc/clixor
+backup_config="${backup_config_root}/offsite-backup.env"
+existing_backup_bucket=
+existing_backup_prefix=
+if [ -e "${backup_config}" ] || [ -L "${backup_config}" ]; then
+  [ -f "${backup_config}" ] && [ ! -L "${backup_config}" ] || {
+    echo "Existing backup configuration must be a regular file." >&2
+    exit 1
+  }
+  [ "$(stat -c %u "${backup_config}")" -eq 0 ] && \
+    [ "$(stat -c %a "${backup_config}")" = "600" ] || {
+    echo "Existing backup configuration must be root-owned with mode 0600." >&2
+    exit 1
+  }
+  awk -F= '
+    /^[[:space:]]*$/ || /^[[:space:]]*#/ { next }
+    !/^(OCI_BACKUP_BUCKET|OCI_BACKUP_PREFIX)=[A-Za-z0-9._-]+$/ { exit 1 }
+    { if (seen[$1]++) exit 1 }
+    END {
+      if (seen["OCI_BACKUP_BUCKET"] != 1 || seen["OCI_BACKUP_PREFIX"] != 1) exit 1
+    }
+  ' "${backup_config}" || {
+    echo "Existing backup configuration is malformed or contains unsupported keys." >&2
+    exit 1
+  }
+  existing_backup_bucket="$(sed -n 's/^OCI_BACKUP_BUCKET=//p' "${backup_config}")"
+  existing_backup_prefix="$(sed -n 's/^OCI_BACKUP_PREFIX=//p' "${backup_config}")"
+fi
+
+if [ -n "${CLIXOR_OCI_BACKUP_BUCKET:-}" ] && \
+  [ -n "${existing_backup_bucket}" ] && \
+  [ "${CLIXOR_OCI_BACKUP_BUCKET}" != "${existing_backup_bucket}" ]; then
+  echo "CLIXOR_OCI_BACKUP_BUCKET conflicts with the durable backup configuration." >&2
+  exit 1
+fi
+if [ -n "${CLIXOR_OCI_BACKUP_PREFIX:-}" ] && \
+  [ -n "${existing_backup_prefix}" ] && \
+  [ "${CLIXOR_OCI_BACKUP_PREFIX}" != "${existing_backup_prefix}" ]; then
+  echo "CLIXOR_OCI_BACKUP_PREFIX conflicts with the durable backup configuration." >&2
+  exit 1
+fi
+oci_backup_bucket=${existing_backup_bucket:-${CLIXOR_OCI_BACKUP_BUCKET:-clixor-prod-backups}}
+oci_backup_prefix=${existing_backup_prefix:-${CLIXOR_OCI_BACKUP_PREFIX:-clixor}}
 case "${oci_backup_bucket}" in
   ''|*[!A-Za-z0-9._-]*)
     echo "CLIXOR_OCI_BACKUP_BUCKET contains unsupported characters." >&2
@@ -87,8 +128,6 @@ runtime_env="${secret_root}/runtime.env"
 api_env="${secret_root}/api.env"
 runtime_root="${project_root}/runtime"
 backup_tool_root=/usr/local/libexec/clixor
-backup_config_root=/etc/clixor
-backup_config="${backup_config_root}/offsite-backup.env"
 systemd_unit_root=/etc/systemd/system
 
 install -d -m 0750 "${project_root}" "${project_root}/repo" \
@@ -283,14 +322,16 @@ do
   install -m 0644 -o 0 -g 0 "${script_root}/${unit_name}" \
     "${systemd_unit_root}/${unit_name}"
 done
-backup_config_partial="$(mktemp "${backup_config_root}/offsite-backup.env.XXXXXXXX")"
-{
-  printf 'OCI_BACKUP_BUCKET=%s\n' "${oci_backup_bucket}"
-  printf 'OCI_BACKUP_PREFIX=%s\n' "${oci_backup_prefix}"
-} > "${backup_config_partial}"
-chmod 0600 "${backup_config_partial}"
-chown 0:0 "${backup_config_partial}"
-mv "${backup_config_partial}" "${backup_config}"
+if [ ! -f "${backup_config}" ]; then
+  backup_config_partial="$(mktemp "${backup_config_root}/offsite-backup.env.XXXXXXXX")"
+  {
+    printf 'OCI_BACKUP_BUCKET=%s\n' "${oci_backup_bucket}"
+    printf 'OCI_BACKUP_PREFIX=%s\n' "${oci_backup_prefix}"
+  } > "${backup_config_partial}"
+  chmod 0600 "${backup_config_partial}"
+  chown 0:0 "${backup_config_partial}"
+  mv "${backup_config_partial}" "${backup_config}"
+fi
 install -m 0400 -o 65534 -g 65534 "${script_root}/prometheus.yml" \
   "${runtime_root}/prometheus/prometheus.yml"
 chown 65534:65534 "${runtime_root}/prometheus/metrics.token"
