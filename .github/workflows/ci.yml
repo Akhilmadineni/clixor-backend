@@ -48,6 +48,10 @@ jobs:
         with:
           go-version: "1.26.6"
           cache: true
+      - name: Reject retired NAS automation
+        run: |
+          test ! -e .github/workflows/deploy-nas.yml
+          test ! -e .github/workflows/configure-legal-hostname.yml
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Vet
@@ -95,7 +99,9 @@ jobs:
       - name: Validate the OCI Resource Manager stack
         run: terraform validate -no-color
       - name: Check OCI deployment entrypoints
-        run: sh -n ../bootstrap.sh ../deploy.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh
+        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh
+      - name: Test OCI public smoke harness offline
+        run: python3 -m unittest -v ../test_smoke.py
       - name: Check the data-volume mount helper
         run: bash -n clixor-mount-data.sh
       - name: Verify the break-glass upload bundle

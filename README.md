@@ -7,7 +7,8 @@ with Telnyx SMS transport, and APNs.
 This is the sole source repository for the backend. The
 `Uthejmopathi/Clustr` repository contains the Swift/iOS client; retained `clustr`
 runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
-the existing NAS deployment.
+the retired NAS deployment package. OCI is the active production target; see
+`deploy/oci/README.md`.
 
 ## Contributors
 
@@ -53,7 +54,7 @@ and launch gates.
 Operational SLOs, deployment sequencing, backup/restore requirements, and incident
 steps are in `RUNBOOK.md`.
 
-Phone authentication keeps its challenge and fraud-control state on the NAS. See
+Phone authentication keeps its challenge and fraud-control state in Redis. See
 `PHONE_VERIFICATION_PLAN.md` for its security policy, Telnyx sender-registration
 prerequisites, secret contract, and rollout gates.
 

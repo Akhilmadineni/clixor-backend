@@ -106,6 +106,82 @@ sudo env CLIXOR_IMAGE_TAG="$(basename "$(readlink /srv/clixor/releases/current)"
 The exact SHA argument is the deployment boundary. Deploying `main` does not
 silently include features that exist only on another branch.
 
+### GitHub Actions production runner
+
+After the first manual deployment and Cloudflare cutover are verified, a
+repository-scoped runner can enable `.github/workflows/deploy-oci.yml`. The
+workflow accepts only a successful `push`-triggered `CI` run on this repository's
+`main`, checks out that exact approved SHA, serializes production deployments, and
+uses the same snapshot, migration, readiness, and application-rollback path as a
+manual deployment. No OCI or application credential belongs in GitHub Actions.
+
+Create a dedicated unprivileged account and fixed runner directory:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends git
+sudo useradd --create-home --shell /bin/bash github-runner-clixor
+sudo install -d -o github-runner-clixor -g github-runner-clixor -m 0750 \
+  /opt/actions-runner-clixor
+```
+
+In GitHub, open this repository's **Settings > Actions > Runners > New
+self-hosted runner**, select Linux ARM64, and use its current download URL and
+SHA-256 checksum to install the runner into `/opt/actions-runner-clixor`. Never
+paste its one-time registration token into this repository, shell history, or an
+issue. Register from an interactive root shell like this:
+
+```sh
+sudo -iu github-runner-clixor
+cd /opt/actions-runner-clixor
+read -r -s -p 'One-time GitHub runner token: ' ONE_TIME_RUNNER_TOKEN
+printf '\n'
+./config.sh \
+  --url https://github.com/Akhilmadineni/clixor-backend \
+  --token "$ONE_TIME_RUNNER_TOKEN" \
+  --name clixor-oci-prod-01 \
+  --labels clixor-oci-production \
+  --work _work \
+  --unattended \
+  --replace
+unset ONE_TIME_RUNNER_TOKEN
+exit
+```
+
+The runner automatically receives the `self-hosted`, `Linux`, and `ARM64`
+labels. The additional `clixor-oci-production` label prevents unrelated
+self-hosted runners from taking this job. Install the small root-owned validation
+entrypoint and grant only that entrypoint through passwordless sudo:
+
+```sh
+sudo install -o root -g root -m 0755 \
+  /home/ubuntu/clixor-backend/deploy/oci/actions-deploy.sh \
+  /usr/local/sbin/clixor-actions-deploy
+sudo visudo -f /etc/sudoers.d/clixor-actions-deploy
+```
+
+The sudoers file must contain exactly this rule and be mode `0440`:
+
+```sudoers
+github-runner-clixor ALL=(root) NOPASSWD: /usr/local/sbin/clixor-actions-deploy
+```
+
+Then install and start the runner service from its installation directory:
+
+```sh
+cd /opt/actions-runner-clixor
+sudo ./svc.sh install github-runner-clixor
+sudo ./svc.sh start
+sudo ./svc.sh status
+```
+
+Keep the runner repository-scoped and dedicated to production. Do not add the
+custom production label to the retired NAS runner or any shared runner. Leave the
+OCI runner offline until `/srv/clixor/secrets/runtime.env`, native OCI media,
+backups, and the Cloudflare tunnel have passed their manual release gates. If the
+runner installation path, repository name, or work-directory name changes, update
+and reinstall the root-owned validation entrypoint before enabling it.
+
 API startup creates an OCI instance-principal signer and performs `HeadBucket` on
 the configured media bucket. Therefore, successful readiness for both replicas
 also proves that their egress bridge can reach OCI IMDS and Object Storage and
@@ -121,24 +197,41 @@ specific.
 ## 4. Move Cloudflare ingress
 
 Install `cloudflared` from Cloudflare's signed package repository. Create a new,
-locally managed tunnel for this VM; do not reuse a NAS connector connected to a
-different database.
-
-Copy `cloudflared-config.yml.example` to `/etc/cloudflared/config.yml`, substitute
-the new tunnel UUID, and install the generated credentials JSON under
-`/etc/cloudflared` as root with mode 0600. Route these names to the new tunnel:
+remotely managed tunnel for this VM; do not reuse a NAS connector connected to a
+different database. Configure these public hostname routes on that tunnel:
 
 - `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
 - `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
 
-Start and enable the `cloudflared` service, then verify four outbound tunnel
-connections and test:
+Download the tunnel token into a temporary protected file without printing it or
+putting it in shell history, then install it and the hardened connector unit:
+
+```sh
+sudo install -d -o root -g root -m 0700 /etc/cloudflared
+sudo install -o root -g root -m 0600 /secure/input/clixor-cloudflare-token \
+  /etc/cloudflared/token
+sudo sh deploy/oci/install-cloudflared-service.sh \
+  "$PWD/deploy/oci/cloudflared.service"
+sudo systemctl status --no-pager cloudflared.service
+```
+
+The token stays root-owned at mode `0600`; systemd exposes it to the dynamic
+connector identity only through `LoadCredential`. Do not place it in
+`runtime.env`, a cloud-init payload, GitHub Actions, or the `cloudflared` command
+line. Verify four outbound tunnel connections and test:
 
 ```sh
 curl --fail https://clustr-api.atlanteanz.com/health/ready
 curl --fail https://clixor.atlanteanz.com/privacy
 curl --fail https://clixor.atlanteanz.com/terms
+curl --fail --header 'Accept: application/json' \
+  https://clixor.atlanteanz.com/.well-known/apple-app-site-association
 ```
+
+The association document authorizes only `/join` and `/join/*` universal links
+for Apple application `H9S3BAQ9U8.com.Clustr.Clustr.Clustr`. It must return
+directly with HTTP 200 and `Content-Type: application/json`; do not put a login,
+HTML error page, or redirect in front of it.
 
 Never leave the old NAS and new OCI connectors serving the same hostnames against
 different databases. That creates split-brain writes and inconsistent sessions.

@@ -289,8 +289,20 @@ func (s *Server) removeMember(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
+	s.removeConversationMember(w, r, conversationID, id.UserID, userID)
+}
+
+func (s *Server) removeSelfMember(w http.ResponseWriter, r *http.Request) {
+	id, conversationID, ok := requestConversation(w, r)
+	if !ok {
+		return
+	}
+	s.removeConversationMember(w, r, conversationID, id.UserID, id.UserID)
+}
+
+func (s *Server) removeConversationMember(w http.ResponseWriter, r *http.Request, conversationID, actorID, userID uuid.UUID) {
 	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	if err := s.store.RemoveConversationMember(r.Context(), conversationID, id.UserID, userID); err != nil {
+	if err := s.store.RemoveConversationMember(r.Context(), conversationID, actorID, userID); err != nil {
 		writeDomainError(w, err)
 		return
 	}

@@ -1,0 +1,44 @@
+[Unit]
+Description=Clixor Cloudflare Tunnel connector
+Documentation=https://developers.cloudflare.com/tunnel/
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=notify
+DynamicUser=yes
+LoadCredential=cloudflare-token:/etc/cloudflared/token
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol quic run --token-file %d/cloudflare-token
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=0
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+TasksMax=512
+LimitNOFILE=70000
+
+[Install]
+WantedBy=multi-user.target

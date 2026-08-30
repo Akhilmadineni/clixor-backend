@@ -1,0 +1,49 @@
+name: Deploy OCI
+
+run-name: Deploy clixor-backend ${{ github.event.workflow_run.head_sha }} to OCI
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clixor-backend-oci-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, Linux, ARM64, clixor-oci-production]
+    timeout-minutes: 60
+    steps:
+      - name: Check out the CI-approved revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Deploy the approved revision
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: >-
+          sudo -n /usr/local/sbin/clixor-actions-deploy
+          "$GITHUB_WORKSPACE" "$DEPLOY_SHA" "$DEPLOY_RUN_ID"
+
+      - name: Verify public OCI ingress
+        run: |
+          curl --fail --show-error --silent --retry 12 --retry-all-errors --retry-delay 5 --max-time 10 \
+            https://clustr-api.atlanteanz.com/health/ready >/dev/null
+          curl --fail --show-error --silent --retry 6 --retry-all-errors --retry-delay 5 --max-time 10 \
+            https://clixor.atlanteanz.com/.well-known/apple-app-site-association >/dev/null

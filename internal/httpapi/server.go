@@ -42,6 +42,11 @@ type Server struct {
 	trustedProxyCIDRs []netip.Prefix
 }
 
+const (
+	realtimeRoute = "/realtime"
+	realtimePath  = "/v1" + realtimeRoute
+)
+
 func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
 	return &Server{
@@ -57,13 +62,14 @@ func (s *Server) Router() http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(s.requestIDHeader)
 	router.Use(middleware.Recoverer)
-	router.Use(middleware.Timeout(30 * time.Second))
+	router.Use(timeoutRESTRequests(30 * time.Second))
 	router.Use(s.securityHeaders)
 	router.Use(s.requestLogger)
 	router.Use(s.rateLimit("api", 600, time.Minute, false))
 
 	router.Get("/health/live", s.live)
 	router.Get("/health/ready", s.ready)
+	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
 	router.Get("/", s.legal)
 	router.Get("/privacy", s.legal)
 	router.Get("/legal", s.legal)
@@ -114,6 +120,7 @@ func (s *Server) Router() http.Handler {
 					router.Delete("/", s.deleteConversation)
 					router.Get("/members", s.listMembers)
 					router.Post("/members", s.addMember)
+					router.Delete("/members/me", s.removeSelfMember)
 					router.Delete("/members/{userID}", s.removeMember)
 					router.Put("/owner", s.transferOwner)
 					router.Get("/messages", s.listMessages)
@@ -128,10 +135,25 @@ func (s *Server) Router() http.Handler {
 			})
 			router.Post("/media/{mediaID}/complete", s.completeMediaUpload)
 			router.Get("/media/{mediaID}/download", s.mediaDownload)
-			router.Get("/realtime", s.realtime)
+			router.Get(realtimeRoute, s.realtime)
 		})
 	})
 	return router
+}
+
+func timeoutRESTRequests(timeout time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		withTimeout := middleware.Timeout(timeout)(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Realtime connections have their own heartbeat and socket deadlines and
+			// must remain open beyond the REST request budget.
+			if r.URL.Path == realtimePath {
+				next.ServeHTTP(w, r)
+				return
+			}
+			withTimeout.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (s *Server) requestIDHeader(next http.Handler) http.Handler {

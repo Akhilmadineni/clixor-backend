@@ -8,6 +8,16 @@ import (
 //go:embed legal/index.html
 var legalDocument []byte
 
+//go:embed wellknown/apple-app-site-association
+var appleAppSiteAssociationDocument []byte
+
+func (s *Server) appleAppSiteAssociation(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(appleAppSiteAssociationDocument)
+}
+
 func (s *Server) legal(w http.ResponseWriter, r *http.Request) {
 	if r.Host == "clustr-api.atlanteanz.com" {
 		http.Redirect(w, r, "https://clixor.atlanteanz.com"+r.URL.RequestURI(), http.StatusPermanentRedirect)

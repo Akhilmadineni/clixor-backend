@@ -83,6 +83,114 @@ func TestLegacyLegalHostnameRedirectsToClixor(t *testing.T) {
 	}
 }
 
+func TestRequestTimeoutExemptsRealtimeOnly(t *testing.T) {
+	t.Parallel()
+	handler := timeoutRESTRequests(10 * time.Millisecond)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasDeadline := r.Context().Deadline()
+		if r.URL.Path == realtimePath {
+			if hasDeadline {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if !hasDeadline {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		<-r.Context().Done()
+	}))
+
+	realtime := httptest.NewRecorder()
+	handler.ServeHTTP(realtime, httptest.NewRequest(http.MethodGet, realtimePath, nil))
+	if realtime.Code != http.StatusNoContent {
+		t.Fatalf("realtime status = %d, want %d", realtime.Code, http.StatusNoContent)
+	}
+
+	rest := httptest.NewRecorder()
+	handler.ServeHTTP(rest, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if rest.Code != http.StatusGatewayTimeout {
+		t.Fatalf("REST status = %d, want %d", rest.Code, http.StatusGatewayTimeout)
+	}
+}
+
+func TestAppleAppSiteAssociationIsPublicAndScopedToInviteLinks(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	request, err := http.NewRequest(
+		http.MethodGet,
+		server.URL+"/.well-known/apple-app-site-association",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "clixor.atlanteanz.com"
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	if contentType := response.Header.Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("content type = %q", contentType)
+	}
+	if cacheControl := response.Header.Get("Cache-Control"); cacheControl != "public, max-age=3600" {
+		t.Fatalf("cache control = %q", cacheControl)
+	}
+
+	var document struct {
+		AppLinks struct {
+			Apps    []string `json:"apps"`
+			Details []struct {
+				AppID string   `json:"appID"`
+				Paths []string `json:"paths"`
+			} `json:"details"`
+		} `json:"applinks"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&document); err != nil {
+		t.Fatal(err)
+	}
+	if len(document.AppLinks.Apps) != 0 {
+		t.Fatalf("legacy apps must be empty: %v", document.AppLinks.Apps)
+	}
+	if len(document.AppLinks.Details) != 1 {
+		t.Fatalf("details = %+v", document.AppLinks.Details)
+	}
+	detail := document.AppLinks.Details[0]
+	if detail.AppID != "H9S3BAQ9U8.com.Clustr.Clustr.Clustr" {
+		t.Fatalf("app ID = %q", detail.AppID)
+	}
+	if len(detail.Paths) != 2 || detail.Paths[0] != "/join" || detail.Paths[1] != "/join/*" {
+		t.Fatalf("paths = %v", detail.Paths)
+	}
+}
+
+func TestAppleAppSiteAssociationDoesNotRedirectOnLegacyAPIHostname(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	request, err := http.NewRequest(
+		http.MethodGet,
+		server.URL+"/.well-known/apple-app-site-association",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = "clustr-api.atlanteanz.com"
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
 func TestMessagingLifecycleAndIsolation(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)
@@ -226,6 +334,33 @@ func TestRealtimeMessageDelivery(t *testing.T) {
 		*event.ConversationID != conversation.ID {
 		t.Fatalf("unexpected realtime event: %+v", event)
 	}
+}
+
+func TestGroupMemberCanLeaveThroughSelfCompatibilityRoute(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	owner := registerTestUser(t, server.URL, "self-remove-owner@example.com")
+	member := registerTestUser(t, server.URL, "self-remove-member@example.com")
+
+	var group domain.Conversation
+	owner.do(t, http.MethodPost, "/v1/conversations/", map[string]any{
+		"kind": "group", "title": "Leave compatibility", "member_ids": []uuid.UUID{member.user.ID},
+	}, http.StatusCreated, &group)
+	member.do(t, http.MethodDelete,
+		"/v1/conversations/"+group.ID.String()+"/members/me",
+		nil, http.StatusNoContent, nil)
+	member.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(),
+		nil, http.StatusForbidden, nil)
+
+	var members domain.Page[domain.ConversationMember]
+	owner.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String()+"/members",
+		nil, http.StatusOK, &members)
+	if len(members.Items) != 1 || members.Items[0].UserID != owner.user.ID {
+		t.Fatalf("self-removal left unexpected members: %+v", members.Items)
+	}
+	owner.do(t, http.MethodDelete,
+		"/v1/conversations/"+group.ID.String()+"/members/me",
+		nil, http.StatusForbidden, nil)
 }
 
 func TestGroupMembershipInvariantsAndOwnershipTransfer(t *testing.T) {
