@@ -460,6 +460,10 @@ class LegacyBaselineTests(unittest.TestCase):
     def _git_object_store(self, fixture: RuntimeFixture) -> tuple[Path, str, bytes]:
         work = fixture.root / "legacy-git-work"
         shutil.copytree(fixture.source, work)
+        # Real 9e41-style application history predates both boot helpers.  The
+        # transition must source them from the separately pinned controller.
+        for name in ("hydrate-vault-secrets.py", "prepare-runtime-secrets.sh"):
+            (work / "deploy" / "oci" / name).unlink()
         original_go_mod = (work / "go.mod").read_bytes()
         subprocess.run(
             ["/usr/bin/git", "init", "--initial-branch=main", str(work)],
@@ -597,7 +601,7 @@ class LegacyBaselineTests(unittest.TestCase):
             ):
                 selected = RECONCILER.establish_legacy_baseline(
                     fixture.root,
-                    fixture.source,
+                    SCRIPT_ROOT.parent.parent,
                     runner,
                     fixture.cloudflared,
                     git_directory,
@@ -615,6 +619,18 @@ class LegacyBaselineTests(unittest.TestCase):
                 ).read_bytes(),
                 approved_go_mod,
             )
+            self.assertFalse(
+                (legacy / runtime_bundle.BUNDLE_DIRECTORY / "source" / "deploy" / "oci" / "hydrate-vault-secrets.py").exists()
+            )
+            provenance = json.loads(
+                (legacy / runtime_bundle.BUNDLE_DIRECTORY / RECONCILER.LEGACY_SOURCE_PROVENANCE).read_text(encoding="ascii")
+            )
+            self.assertEqual(provenance["source_sha"], source_sha)
+            self.assertEqual(provenance["controller_id"], RECONCILER.LEGACY_CONTROLLER_ID)
+            self.assertEqual(
+                provenance["controller_revision"],
+                "cd94bac4a47e786670aa0f87972203938dace7c9",
+            )
             self.assertTrue(any((fixture.releases / "quarantine").iterdir()))
             self.assertEqual(database.read_text(), "never restore or delete me\n")
             # An interrupted/retried explicit transition validates and returns
@@ -625,13 +641,22 @@ class LegacyBaselineTests(unittest.TestCase):
                 self.assertEqual(
                     RECONCILER.establish_legacy_baseline(
                         fixture.root,
-                        fixture.source,
+                        SCRIPT_ROOT.parent.parent,
                         runner,
                         fixture.cloudflared,
                         git_directory,
                     ),
                     legacy,
                 )
+
+    def test_legacy_controller_cohort_rejects_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="clixor-controller-", dir=TEMP_ROOT) as temporary:
+            source = Path(temporary) / "source"
+            shutil.copytree(SCRIPT_ROOT, source / "deploy" / "oci")
+            target = source / "deploy" / "oci" / "prepare-runtime-secrets.sh"
+            target.write_bytes(target.read_bytes() + b"\n# injected drift\n")
+            with self.assertRaisesRegex(RECONCILER.ReconcileError, "cohort digest"):
+                RECONCILER._verified_legacy_controller(source)
 
     def test_legacy_transition_fails_closed_on_live_image_mismatch(self) -> None:
         with tempfile.TemporaryDirectory(
@@ -1061,6 +1086,30 @@ class SecretSelectionTests(unittest.TestCase):
                     self.release, self.root, RECONCILER.CommandRunner()
                 )
 
+    def test_captured_staging_cloudflare_token_is_integrity_bound(self) -> None:
+        self._mode("staging")
+        uid, gid = self.root.stat().st_uid, self.root.stat().st_gid
+        for name, (_, _, mode) in RECONCILER._runtime_secret_file_specs(
+            uid, gid, vault=False
+        ).items():
+            path = self.staging_secrets / name
+            path.write_text(f"complete staging secret {name}\n", encoding="ascii")
+            path.chmod(mode)
+        apns = self.staging_secrets / "apns"
+        apns.mkdir(mode=0o750)
+        apns.chmod(0o750)
+        token = self.staging_secrets / "cloudflare-token"
+        token.write_text("captured tunnel token\n", encoding="ascii")
+        token.chmod(0o600)
+        with mock.patch.object(RECONCILER, "STAGING_SECRET_ROOT", self.staging_secrets):
+            RECONCILER.snapshot_staging_secret_manifest(self.release, self.root)
+            manifest = json.loads((self.release / RECONCILER.STAGING_SECRET_MANIFEST).read_text())
+            self.assertIn("cloudflare-token", [record["path"] for record in manifest["artifacts"]])
+            token.write_text("attacker changed token\n", encoding="ascii")
+            token.chmod(0o600)
+            with self.assertRaisesRegex(RECONCILER.ReconcileError, "content changed"):
+                RECONCILER._validate_staging_secret_manifest(self.release, self.root)
+
     def test_vault_selection_rejects_symlink_cohort_marker_and_verifier_drift(self) -> None:
         marker, verify = self._vault_fixture()
         with mock.patch.object(
@@ -1344,6 +1393,39 @@ class FailClosedStopTests(unittest.TestCase):
             ("/usr/bin/docker", "stop", "--time", "30", container)
         )
         self.assertLess(connector_stop, docker_stop)
+
+    def test_total_control_plane_failure_installs_verified_kernel_network_cut(self) -> None:
+        failure = RECONCILER.ReconcileError("injected total control failure")
+        outputs: dict[tuple[str, ...], object] = {}
+        systemd_calls = [
+            ("/usr/bin/systemctl", "show", "cloudflared.service", "--property=LoadState", "--value"),
+            ("/usr/bin/systemctl", "stop", "cloudflared.service"),
+            ("/usr/bin/systemctl", "disable", "cloudflared.service"),
+            ("/usr/bin/systemctl", "show", "cloudflared.service", "--property=ActiveState", "--value"),
+            ("/usr/bin/systemctl", "is-active", "--quiet", "cloudflared.service"),
+            ("/usr/bin/systemctl", "kill", "--kill-who=all", "--signal=SIGKILL", "cloudflared.service"),
+        ]
+        for call in systemd_calls:
+            outputs[call] = failure
+        for container in RECONCILER.KNOWN_CONTAINERS:
+            outputs[("/usr/bin/docker", "inspect", container)] = failure
+        nft_list = (RECONCILER.NFT_BINARY, "list", "table", "inet", "clixor_fail_closed")
+        outputs[nft_list] = (
+            0,
+            b"chain input { type filter hook input priority -300; policy drop; }\n"
+            b"chain output { type filter hook output priority -300; policy drop; }\n",
+        )
+        runner = FakeRunner(outputs)
+        with tempfile.TemporaryDirectory(prefix="no-cgroups-", dir=TEMP_ROOT) as temporary, mock.patch.object(
+            RECONCILER, "CGROUP_SYSTEM_SLICE", Path(temporary)
+        ):
+            with self.assertRaisesRegex(RECONCILER.ReconcileError, "shutdown"):
+                RECONCILER._stop_ingress_and_containers(runner)
+        self.assertIn(
+            (RECONCILER.NFT_BINARY, "add", "table", "inet", "clixor_fail_closed"),
+            runner.calls,
+        )
+        self.assertIn(nft_list, runner.calls)
 
 
 class PreMigrationDurabilityTests(unittest.TestCase):

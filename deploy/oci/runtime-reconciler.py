@@ -57,6 +57,8 @@ KNOWN_CONTAINERS = (
     "clixor-oci-prometheus",
     "clixor-oci-grafana",
 )
+CGROUP_SYSTEM_SLICE = Path("/sys/fs/cgroup/system.slice")
+NFT_BINARY = "/usr/sbin/nft"
 PHASES = (
     "prepared",
     "secrets-hydrating",
@@ -75,6 +77,34 @@ PHASES = (
 PHASE_INDEX = {phase: index for index, phase in enumerate(PHASES)}
 IMAGE_REF_RE = re.compile(r"^clixor-api:oci-[0-9a-f]{12}-[A-Za-z0-9._-]{1,160}$")
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+
+# The raw 9e41-era application commit predates the recovery helpers.  Those
+# helpers and the host model therefore come from this separately reviewed,
+# content-addressed controller cohort.  This allowlist is deliberately data in
+# the installed controller: mutable /srv/clixor/repo content is never an input.
+LEGACY_CONTROLLER_REVISION = "cd94bac4a47e786670aa0f87972203938dace7c9"
+LEGACY_CONTROLLER_FILES = {
+    "deploy/oci/backup-health.sh": "0f0faf1a077b78bec4d0305aaba3f606cd76906a205155c3ba2373f028c23d02",
+    "deploy/oci/backup_manifest.py": "e569004d5c6357e5a8e78bd85cd1091fce7fb768f05f743c8f9f5936dfbebecc",
+    "deploy/oci/backup.sh": "75d13409deca9d64c7a2c9486f2a8922482217a42d0571dcb925214ebf3ad83c",
+    "deploy/oci/clixor-backup-health.service": "132c69f6f7a03601302ba312ea1932d2ac5649e288c696c9855200f82639776c",
+    "deploy/oci/clixor-backup-health.timer": "07bd84da1e6d4e3476bce0b00c8d0e61de543f3b3c7672ca8c1ed988fc7817db",
+    "deploy/oci/clixor-offsite-backup.service": "209472ac8b08ccb8b3403e6f6ca505c798b5df664fed1ec9637ee6581618ff6e",
+    "deploy/oci/clixor-offsite-backup.timer": "c6049aae7a9889f2448677af8d32b9bb6772175b0c6d7d10d4fb220444b2e057",
+    "deploy/oci/clixor-restore-drill.service": "775fd13e967a423ceb70c3196a0903ec31129646a85442beb8310cb957a05f9a",
+    "deploy/oci/clixor-restore-drill.timer": "d4758ed25878071de8ebe8ad091cb1171191c57c22fb4777f5bfda9c195baf72",
+    "deploy/oci/cloudflared.service": "64aecc58b03879642f0052db54e3a2924ae95e826f72e9dfc28ec7e88d3207bf",
+    "deploy/oci/compose.yaml": "98a7bc7c3cc8daec6cf4198d7db5a410530bf633b2e777e03a73a9b984eba3c3",
+    "deploy/oci/hydrate-vault-secrets.py": "b0865ebc228f3a7a8a151b8f32c01211a910e534ce104fbb2be6de603ad1de29",
+    "deploy/oci/prepare-runtime-secrets.sh": "bde732854eb1f6ebae4e877a59b7bf4ea1a9bebe9679508ac7a585131ccb0e21",
+    "deploy/oci/restore-drill.sh": "8f5952f93de53dab17aedbc0a8ef634f0f96e294645901dfe67f7f15013bfe4c",
+}
+LEGACY_CONTROLLER_ID = hashlib.sha256(
+    b"".join(
+        (name + "\0" + digest + "\n").encode("ascii")
+        for name, digest in sorted(LEGACY_CONTROLLER_FILES.items())
+    )
+).hexdigest()
 
 
 class ReconcileError(RuntimeError):
@@ -785,8 +815,75 @@ def _atomic_install(
             pass
 
 
+def _kill_cgroup(path: Path) -> bool:
+    """Use cgroup v2's kernel kill primitive and prove the group is empty."""
+
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            return False
+        with (path / "cgroup.kill").open("wb", buffering=0) as output:
+            output.write(b"1\n")
+        return (path / "cgroup.procs").read_bytes().strip() == b""
+    except OSError:
+        return False
+
+
+def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
+    """Install and verify a kernel firewall cut on all host ingress/egress."""
+
+    table = "clixor_fail_closed"
+    runner.run([NFT_BINARY, "delete", "table", "inet", table], check=False)
+    created = runner.run([NFT_BINARY, "add", "table", "inet", table], check=False)
+    inbound = runner.run(
+        [NFT_BINARY, "add", "chain", "inet", table, "input",
+         "{ type filter hook input priority -300; policy drop; }"],
+        check=False,
+    )
+    outbound = runner.run(
+        [NFT_BINARY, "add", "chain", "inet", table, "output",
+         "{ type filter hook output priority -300; policy drop; }"],
+        check=False,
+    )
+    if any(result.returncode != 0 for result in (created, inbound, outbound)):
+        return False
+    verified = runner.run(
+        [NFT_BINARY, "list", "table", "inet", table],
+        check=False,
+        capture=True,
+    )
+    if verified.returncode != 0:
+        return False
+    try:
+        content = verified.stdout.decode("ascii", errors="strict")
+    except UnicodeError:
+        return False
+    return (
+        "hook input" in content
+        and "hook output" in content
+        and content.count("policy drop") >= 2
+    )
+
+
+def _kernel_fail_closed(runner: CommandRunner) -> bool:
+    """Kill known cgroups or prove an immediate whole-host network cut."""
+
+    connector_empty = _kill_cgroup(CGROUP_SYSTEM_SLICE / "cloudflared.service")
+    try:
+        docker_groups = list(CGROUP_SYSTEM_SLICE.glob("docker-*.scope"))
+    except OSError:
+        docker_groups = []
+    runtime_empty = bool(docker_groups) and all(
+        _kill_cgroup(path) for path in docker_groups
+    )
+    if connector_empty and runtime_empty:
+        return True
+    return _activate_emergency_network_cut(runner)
+
+
 def _stop_ingress_and_containers(runner: CommandRunner) -> None:
     errors: list[str] = []
+    requires_kernel_fallback = False
     try:
         READY_MARKER.unlink()
     except FileNotFoundError:
@@ -902,12 +999,14 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
         errors.append("cloudflared disable failed")
     if not inactive:
         errors.append("cloudflared ingress did not stop")
+        requires_kernel_fallback = True
 
     existing: list[str] = []
     for name in KNOWN_CONTAINERS:
         result, inspect_error = attempt(["/usr/bin/docker", "inspect", name])
         if inspect_error:
             errors.append(f"runtime container state is unavailable: {name}")
+            requires_kernel_fallback = True
             continue
         if result.returncode == 0:
             existing.append(name)
@@ -934,6 +1033,14 @@ def _stop_ingress_and_containers(runner: CommandRunner) -> None:
                 stopped_value = ""
             if verify_error or result.returncode != 0 or stopped_value != "false":
                 errors.append("a runtime container did not stop")
+                requires_kernel_fallback = True
+    if requires_kernel_fallback:
+        try:
+            fallback_verified = _kernel_fail_closed(runner)
+        except (OSError, ReconcileError):
+            fallback_verified = False
+        if not fallback_verified:
+            errors.append("kernel fail-closed fallback could not be verified")
     if errors:
         raise ReconcileError(
             "runtime shutdown could not be verified fail-closed: " + "; ".join(errors)
@@ -1028,6 +1135,18 @@ def _staging_secret_artifact_specs(
     expected_uid: int, expected_gid: int, staging_root: Path
 ) -> dict[str, tuple[int, int, int]]:
     specs = _runtime_secret_file_specs(expected_uid, expected_gid, vault=False)
+    # cloudflared consumes this file directly from the selected cohort.  Older
+    # staging installs may not have captured a token yet, but once present it
+    # must be inseparable from the integrity snapshot.
+    cloudflare_token = staging_root / "cloudflare-token"
+    try:
+        cloudflare_token.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise ReconcileError("staging Cloudflare token is unavailable") from None
+    else:
+        specs["cloudflare-token"] = (expected_uid, expected_gid, 0o600)
     apns_gid = 65532 if expected_uid == 0 else expected_gid
     apns_root = staging_root / "apns"
     if not _owned_mode_directory(apns_root, expected_uid, apns_gid, 0o750):
@@ -2115,44 +2234,21 @@ def _legacy_git_tree(
     return tree_sha
 
 
-def _legacy_git_boot_files(
-    git_directory: Path,
-    source_sha: str,
-    runner: CommandRunner,
-) -> Mapping[str, bytes]:
-    environment = _legacy_git_environment()
+def _verified_legacy_controller(controller_source: Path) -> Mapping[str, bytes]:
+    """Authenticate every controller file consumed by the legacy transition."""
+
     result: dict[str, bytes] = {}
-    for name in (
-        "hydrate-vault-secrets.py",
-        "prepare-runtime-secrets.sh",
-    ):
-        relative = f"deploy/oci/{name}"
-        listing = runner.run(
-            _legacy_git_arguments(
-                git_directory, "ls-tree", source_sha, "--", relative
-            ),
-            capture=True,
-            environment=environment,
+    for relative, expected_digest in LEGACY_CONTROLLER_FILES.items():
+        content = _regular_file_bytes(
+            controller_source / relative,
+            expected_uid=controller_source.lstat().st_uid,
+            expected_gid=controller_source.lstat().st_gid,
+            expected_mode=stat.S_IMODE((controller_source / relative).lstat().st_mode),
+            maximum_size=MAX_SECRET_ARTIFACT_BYTES,
         )
-        try:
-            line = listing.stdout.decode("ascii", errors="strict").strip()
-        except UnicodeError:
-            raise ReconcileError("legacy Git boot-secret tree is invalid") from None
-        match = re.fullmatch(
-            r"100755 blob ([0-9a-f]{40})\t" + re.escape(relative), line
-        )
-        if match is None:
-            raise ReconcileError("legacy Git boot-secret tree is invalid")
-        content = runner.run(
-            _legacy_git_arguments(
-                git_directory, "cat-file", "blob", match.group(1)
-            ),
-            capture=True,
-            environment=environment,
-        ).stdout
-        if not content or len(content) > MAX_SECRET_ARTIFACT_BYTES:
-            raise ReconcileError("legacy Git boot-secret source is incomplete")
-        result[name] = content
+        if hashlib.sha256(content).hexdigest() != expected_digest:
+            raise ReconcileError("legacy controller cohort digest is invalid")
+        result[relative] = content
     return result
 
 
@@ -2164,6 +2260,9 @@ def _legacy_provenance_content(source_sha: str, tree_sha: str) -> bytes:
                 "source_sha": source_sha,
                 "tree_sha": tree_sha,
                 "source_kind": "root-owned-git-archive",
+                "controller_id": LEGACY_CONTROLLER_ID,
+                "controller_kind": "installed-content-addressed-cohort",
+                "controller_revision": LEGACY_CONTROLLER_REVISION,
             },
             ensure_ascii=True,
             indent=2,
@@ -2357,9 +2456,11 @@ def establish_legacy_baseline(
     tree_sha = _legacy_git_tree(
         project_root, legacy_git_directory, source_sha, runner
     )
-    boot_files = _legacy_git_boot_files(
-        legacy_git_directory, source_sha, runner
-    )
+    controller_files = _verified_legacy_controller(controller_source)
+    boot_files = {
+        name: controller_files[f"deploy/oci/{name}"]
+        for name in ("hydrate-vault-secrets.py", "prepare-runtime-secrets.sh")
+    }
     # Only after the exact live image commit exists and passes Git object
     # validation may a raw legacy release gain the new boot-secret authority.
     _establish_legacy_staging_boot_cohort(
