@@ -95,6 +95,13 @@ root-owned quarantine and a retry reconstructs it. Bootstrap refuses this
 one-time transition for Vault mode or any source/image/PKI mismatch; resolve the
 mismatch instead of bypassing the check.
 
+The stable boot/recovery controller is intentionally operator-managed rather
+than replaced by an automated release. Before the first deploy of a revision
+that adds a required controller capability, rerun this bootstrap from that exact
+reviewed revision. Deploy probes for the pre-migration durability command before
+creating a candidate and fails without runtime mutation when the installed
+controller is older.
+
 The bootstrap preserves and pins an existing `/srv/clixor/secrets/pki/ca.crt`
 trust root. It fails closed if that certificate and its private key are missing
 as a pair, do not match, or change after being pinned. The CA signs three
@@ -365,8 +372,9 @@ The deploy script:
    exit-trap rollback;
 4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
-   --list` and SHA-256 verification before changing the active runtime; a clean
-   first deployment records an explicit first-deploy marker;
+   --list` and SHA-256 verification, then fsyncs the dump, checksum, and pending
+   candidate directory in that order before changing the active runtime; a
+   clean first deployment records an explicit first-deploy marker;
 5. creates and fsyncs the schema-2 deployment journal before secrets or active
    runtime can change, then advances it consecutively through secret hydration,
    runtime mutation, migration, candidate validation, publication, and pointer
@@ -428,16 +436,23 @@ not an automatic rollback mechanism.
 
 Docker is not the boot authority. Every persistent Compose service has
 `restart: "no"`, so Docker cannot independently revive whichever candidate
-containers happened to exist when the VM lost power. After release-pinned secret
-hydration and Docker, `clixor-runtime-reconcile.service` stops ingress and known
-containers, validates only the absolute immediate child selected by
-`releases/current`, restores its complete checksummed runtime bundle,
+containers happened to exist when the VM lost power.
+`clixor-runtime-reconcile.service` stops ingress and known containers, validates
+only the absolute immediate child selected by `releases/current`, and verifies
+that release's exact staging selection or mapping/cohort-bound Vault generation.
+If a pre-pointer candidate had switched the tmpfs secret link, it runs only the
+current release's checksummed worker to restore the exact approved versions and
+then verifies the selection again before touching runtime files or containers.
+A healthy boot/watchdog uses the local marker plus the release-local verifier
+and does not perform a duplicate Vault fetch. It then restores the selected
+release's complete checksummed runtime bundle,
 force-recreates its exact image/Compose selection, restores the release-selected
 cloudflared executable, verifies both replicas plus exact local revision
 readiness, and only then writes `/run/clixor/runtime-ready`. Cloudflared and the
 backup/restore/health services are ordered after that reconciler and require the
-ready marker. The reconciler never copies, restores, removes, or rolls back
-PostgreSQL data files.
+ready marker. A verified first boot with no cloudflared unit is handled
+idempotently; any active or unverifiable ingress state still fails closed. The
+reconciler never copies, restores, removes, or rolls back PostgreSQL data files.
 
 The durable journal is `/srv/clixor/runtime/deploy-transaction.json`. Its file
 and parent are fsynced on creation and every consecutive phase change.

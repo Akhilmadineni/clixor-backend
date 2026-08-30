@@ -828,6 +828,9 @@ do
     [ "$(stat -c '%u:%g:%a' "${stable_runtime_file}")" = "0:0:500" ] || \
     fail "stable runtime controller is missing or unsafe; run the explicit bootstrap transition"
 done
+/usr/bin/python3 "${stable_runtime_controller}" --help 2>/dev/null | \
+  grep -q 'commit-pre-migration-boundary' || \
+  fail "stable runtime controller is outdated; rerun the explicit bootstrap transition"
 
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
@@ -1015,6 +1018,9 @@ else
     mv "$(basename -- "${pre_migration_dump}").sha256.partial" \
       "$(basename -- "${pre_migration_dump}").sha256"
   )
+  /usr/bin/python3 "${stable_runtime_controller}" \
+    commit-pre-migration-boundary --candidate "${release_dir}" || \
+    fail "pre-migration recovery boundary was not durably committed"
 
   # If bootstrap completes the one-time least-privilege secret split, rollback
   # must use this reviewed, digest-pinned Compose model with the prior API image.

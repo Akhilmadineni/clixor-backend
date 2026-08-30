@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -592,8 +594,9 @@ class BootSelectionContractTests(unittest.TestCase):
                 mock.patch.object(RECONCILER, "_compose_up"),
                 mock.patch.object(RECONCILER, "_wait_ready"),
                 mock.patch.object(RECONCILER, "_publish_ready_marker"),
+                mock.patch.object(RECONCILER, "_prepare_current_secrets"),
             )
-            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10]:
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
                 self.assertEqual(
                     RECONCILER.reconcile_current(root, FakeRunner(), boot=True), old
                 )
@@ -628,6 +631,11 @@ class BootSelectionContractTests(unittest.TestCase):
         self.assertIn("publish-release", deploy)
         self.assertIn("quarantine-pending", deploy)
         self.assertIn("establish-legacy-baseline", bootstrap)
+        controller_probe = deploy.index(
+            "stable runtime controller is outdated; rerun the explicit bootstrap transition"
+        )
+        candidate_creation = deploy.index('mkdir "${release_dir}"')
+        self.assertLess(controller_probe, candidate_creation)
         ordered = [
             "journal_phase secrets-hydrating",
             "journal_phase secrets-hydrated",
@@ -643,6 +651,511 @@ class BootSelectionContractTests(unittest.TestCase):
         ]
         positions = [deploy.index(item) for item in ordered]
         self.assertEqual(positions, sorted(positions))
+        dump_publish = deploy.index(
+            'mv "$(basename -- "${pre_migration_dump}").sha256.partial"'
+        )
+        durability_commit = deploy.index(
+            "commit-pre-migration-boundary", dump_publish
+        )
+        journal_create = deploy.index("journal-create", durability_commit)
+        runtime_mutation = deploy.index("journal_phase runtime-mutating")
+        migration = deploy.index("journal_phase migrating")
+        self.assertLess(dump_publish, durability_commit)
+        self.assertLess(durability_commit, journal_create)
+        self.assertLess(journal_create, runtime_mutation)
+        self.assertLess(runtime_mutation, migration)
+
+
+class SecretRecoveryTests(unittest.TestCase):
+    setUp = JournalRecoveryTests.setUp
+    _candidate = JournalRecoveryTests._candidate
+    _advance = JournalRecoveryTests._advance
+
+    def _runtime_manifest(self) -> dict[str, object]:
+        return {
+            "source_sha": SOURCE_SHA,
+            "image": {
+                "ref": "clixor-api:oci-aaaaaaaaaaaa-old",
+                "id": IMAGE_ID,
+            },
+            "state": {
+                "cloudflared": {"enabled": False, "active": False},
+                "observability": {"prometheus": False, "grafana": False},
+                "timers": {
+                    "clixor-offsite-backup.timer": False,
+                    "clixor-restore-drill.timer": False,
+                    "clixor-backup-health.timer": False,
+                },
+            },
+        }
+
+    def test_every_post_hydration_pre_pointer_fault_restores_current_secrets_first(self) -> None:
+        first = RECONCILER.PHASE_INDEX["secrets-hydrated"]
+        last = RECONCILER.PHASE_INDEX["pointer-committing"]
+        for phase in RECONCILER.PHASES[first : last + 1]:
+            with self.subTest(phase=phase):
+                self._advance(phase)
+                runner = FakeRunner()
+                runtime_observations: list[bool] = []
+
+                def restore_source(release, project_root, selected_runner):
+                    del project_root, selected_runner
+                    worker = (
+                        "/bin/sh",
+                        str(release / "boot-secrets" / "prepare-runtime-secrets.sh"),
+                        str(release),
+                    )
+                    runtime_observations.append(worker in runner.calls)
+
+                with mock.patch.object(
+                    RECONCILER, "_stop_ingress_and_containers"
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_validate_bundle",
+                    return_value=self._runtime_manifest(),
+                ), mock.patch.object(
+                    RECONCILER, "_boot_bundle_validate"
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_validate_image",
+                    return_value=("clixor-api:oci-aaaaaaaaaaaa-old", IMAGE_ID),
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_secret_selection_matches_release",
+                    side_effect=(False, True),
+                ), mock.patch.object(
+                    RECONCILER, "_restore_source", side_effect=restore_source
+                ), mock.patch.object(
+                    RECONCILER, "_restore_runtime"
+                ), mock.patch.object(
+                    RECONCILER, "_restore_host_tools"
+                ), mock.patch.object(
+                    RECONCILER, "_set_service_selection"
+                ), mock.patch.object(
+                    RECONCILER, "_compose_up"
+                ), mock.patch.object(
+                    RECONCILER, "_wait_ready"
+                ), mock.patch.object(
+                    RECONCILER, "_publish_ready_marker"
+                ):
+                    self.assertEqual(
+                        RECONCILER.watchdog(self.root, runner), "recovered"
+                    )
+                self.assertEqual(runtime_observations, [True])
+                worker_calls = [call for call in runner.calls if call[0] == "/bin/sh"]
+                self.assertEqual(len(worker_calls), 1)
+                self.assertEqual(worker_calls[0][2], str(self.old))
+                for path in (self.root / "runtime" / "deploy-transactions").iterdir():
+                    path.unlink()
+
+
+class SecretSelectionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="clixor-secret-selection-", dir=TEMP_ROOT
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.release = self.root / "releases" / "oci-0123456789ab-test"
+        self.release.mkdir(parents=True, mode=0o700)
+        self.runtime_secrets = self.root / "run-secrets"
+        self.runtime_secrets.mkdir(mode=0o700)
+        self.staging_secrets = self.root / "staging-secrets"
+        self.staging_secrets.mkdir(mode=0o700)
+
+    def _mode(self, value: str) -> None:
+        path = self.release / "secret-mode"
+        path.write_text(value + "\n", encoding="ascii")
+        path.chmod(0o400)
+
+    def _vault_fixture(self) -> tuple[Path, tuple[str, ...]]:
+        self._mode("vault")
+        mapping_content = b"api_env=ocid1.vaultsecret.oc1.us-phoenix-1.fixture0123456789\n"
+        mapping = self.release / "vault-secrets.map"
+        mapping.write_bytes(mapping_content)
+        mapping.chmod(0o400)
+        cohort_digest = "a" * 64
+        manifest = self.release / "vault-approved-cohort.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "release_cohort": self.release.name,
+                    "mapping_sha256": hashlib.sha256(mapping_content).hexdigest(),
+                    "cohort_sha256": cohort_digest,
+                    "artifacts": [],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        manifest.chmod(0o400)
+        generation = (
+            self.runtime_secrets
+            / "vault-generations"
+            / "gen-1-0123456789abcdef"
+        )
+        generation.mkdir(parents=True, mode=0o700)
+        generation.parent.chmod(0o700)
+        marker = generation / ".vault-hydrated"
+        marker.write_text(
+            "schema=2\n"
+            f"release_cohort={self.release.name}\n"
+            f"mapping_sha256={hashlib.sha256(mapping_content).hexdigest()}\n"
+            f"cohort_sha256={cohort_digest}\n",
+            encoding="ascii",
+        )
+        marker.chmod(0o400)
+        (self.runtime_secrets / "active").symlink_to(
+            "vault-generations/gen-1-0123456789abcdef"
+        )
+        verify = (
+            "/usr/bin/python3",
+            str(self.release / "boot-secrets" / "hydrate-vault-secrets.py"),
+            "--verify-candidate-manifest",
+            str(manifest),
+            "--release-cohort",
+            self.release.name,
+        )
+        return marker, verify
+
+    def test_staging_selection_rejects_active_link_and_release_metadata_drift(self) -> None:
+        self._mode("staging")
+        active = self.runtime_secrets / "active"
+        active.symlink_to(self.staging_secrets)
+        with mock.patch.object(
+            RECONCILER, "RUNTIME_SECRET_ROOT", self.runtime_secrets
+        ), mock.patch.object(
+            RECONCILER, "STAGING_SECRET_ROOT", self.staging_secrets
+        ):
+            self.assertTrue(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner()
+                )
+            )
+            active.unlink()
+            active.symlink_to(self.root / "wrong-secrets")
+            self.assertFalse(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner()
+                )
+            )
+            active.unlink()
+            active.symlink_to(self.staging_secrets)
+            forbidden = self.release / "vault-secrets.map"
+            forbidden.write_text("unexpected\n", encoding="ascii")
+            self.assertFalse(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner()
+                )
+            )
+
+    def test_vault_selection_rejects_symlink_cohort_marker_and_verifier_drift(self) -> None:
+        marker, verify = self._vault_fixture()
+        with mock.patch.object(
+            RECONCILER, "RUNTIME_SECRET_ROOT", self.runtime_secrets
+        ):
+            self.assertTrue(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner({verify: (0, b"")})
+                )
+            )
+            marker.chmod(0o600)
+            marker.write_text(
+                marker.read_text().replace(self.release.name, "oci-ffffffffffff-wrong"),
+                encoding="ascii",
+            )
+            marker.chmod(0o400)
+            self.assertFalse(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner({verify: (0, b"")})
+                )
+            )
+            marker.chmod(0o600)
+            marker.write_text(
+                marker.read_text().replace("oci-ffffffffffff-wrong", self.release.name),
+                encoding="ascii",
+            )
+            marker.chmod(0o400)
+            active = self.runtime_secrets / "active"
+            active.unlink()
+            active.symlink_to("vault-generations/gen-1-fedcba9876543210")
+            self.assertFalse(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner({verify: (0, b"")})
+                )
+            )
+            active.unlink()
+            active.symlink_to("vault-generations/gen-1-0123456789abcdef")
+            self.assertFalse(
+                RECONCILER._secret_selection_matches_release(
+                    self.release, self.root, FakeRunner({verify: (1, b"")})
+                )
+            )
+
+    def test_healthy_vault_selection_does_not_fetch_or_run_prepare_worker(self) -> None:
+        _, verify = self._vault_fixture()
+        runner = FakeRunner({verify: (0, b"")})
+        with mock.patch.object(
+            RECONCILER, "RUNTIME_SECRET_ROOT", self.runtime_secrets
+        ):
+            RECONCILER._prepare_current_secrets(self.release, self.root, runner)
+        self.assertEqual(runner.calls, [verify])
+
+    def test_runtime_match_rejects_secret_selection_drift_before_runtime_checks(self) -> None:
+        current = self.release.parent / "current"
+        current.symlink_to(self.release)
+        ready = self.root / "runtime-ready"
+        ready.write_text(str(self.release) + "\n", encoding="ascii")
+        with mock.patch.object(
+            RECONCILER, "READY_MARKER", ready
+        ), mock.patch.object(
+            RECONCILER, "_validate_bundle", return_value={}
+        ), mock.patch.object(
+            RECONCILER, "_secret_selection_matches_release", return_value=False
+        ) as secret_check:
+            self.assertFalse(
+                RECONCILER._runtime_matches_current(self.root, FakeRunner())
+            )
+        secret_check.assert_called_once_with(self.release, self.root, mock.ANY)
+
+    def test_failed_secret_restore_stays_fail_closed(self) -> None:
+        current = self.release.parent / "current"
+        current.symlink_to(self.release)
+        runner = FakeRunner()
+        with mock.patch.object(
+            RECONCILER,
+            "_secret_selection_matches_release",
+            side_effect=(False, False),
+        ):
+            with self.assertRaisesRegex(RECONCILER.ReconcileError, "not restored"):
+                RECONCILER._prepare_current_secrets(
+                    self.release, self.root, runner
+                )
+        self.assertEqual(
+            [call for call in runner.calls if call[0] == "/bin/sh"],
+            [
+                (
+                    "/bin/sh",
+                    str(
+                        self.release
+                        / "boot-secrets"
+                        / "prepare-runtime-secrets.sh"
+                    ),
+                    str(self.release),
+                )
+            ],
+        )
+
+
+class FailClosedStopTests(unittest.TestCase):
+    def _absent_outputs(self) -> dict[tuple[str, ...], tuple[int, bytes]]:
+        outputs = {
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "cloudflared.service",
+                "--property=LoadState",
+                "--value",
+            ): (0, b"not-found\n"),
+            (
+                "/usr/bin/systemctl",
+                "is-active",
+                "--quiet",
+                "cloudflared.service",
+            ): (3, b""),
+        }
+        for container in RECONCILER.KNOWN_CONTAINERS:
+            outputs[("/usr/bin/docker", "inspect", container)] = (1, b"")
+        return outputs
+
+    def test_first_boot_absent_cloudflared_unit_is_idempotently_safe(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="clixor-ready-", dir=TEMP_ROOT
+        ) as temporary:
+            marker = Path(temporary) / "runtime-ready"
+            marker.write_text("stale\n", encoding="ascii")
+            with mock.patch.object(RECONCILER, "READY_MARKER", marker):
+                for _ in range(2):
+                    RECONCILER._stop_ingress_and_containers(
+                        FakeRunner(self._absent_outputs())
+                    )
+            self.assertFalse(marker.exists())
+
+    def test_absent_unit_still_fails_if_systemd_reports_active_ingress(self) -> None:
+        outputs = self._absent_outputs()
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "is-active",
+                "--quiet",
+                "cloudflared.service",
+            )
+        ] = (0, b"")
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "remained active"):
+            RECONCILER._stop_ingress_and_containers(FakeRunner(outputs))
+
+    def test_absent_unit_fails_closed_when_activity_check_is_indeterminate(self) -> None:
+        outputs = self._absent_outputs()
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "is-active",
+                "--quiet",
+                "cloudflared.service",
+            )
+        ] = (1, b"")
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "cannot be verified"):
+            RECONCILER._stop_ingress_and_containers(FakeRunner(outputs))
+
+    def test_recovery_stops_and_verifies_a_loaded_ingress_unit(self) -> None:
+        outputs = self._absent_outputs()
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "cloudflared.service",
+                "--property=LoadState",
+                "--value",
+            )
+        ] = (0, b"loaded\n")
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "cloudflared.service",
+                "--property=ActiveState",
+                "--value",
+            )
+        ] = (0, b"inactive\n")
+        runner = FakeRunner(outputs)
+        RECONCILER._stop_ingress_and_containers(runner)
+        self.assertIn(
+            ("/usr/bin/systemctl", "stop", "cloudflared.service"), runner.calls
+        )
+
+    def test_recovery_fails_closed_when_loaded_ingress_stays_active(self) -> None:
+        outputs = self._absent_outputs()
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "cloudflared.service",
+                "--property=LoadState",
+                "--value",
+            )
+        ] = (0, b"loaded\n")
+        outputs[
+            (
+                "/usr/bin/systemctl",
+                "show",
+                "cloudflared.service",
+                "--property=ActiveState",
+                "--value",
+            )
+        ] = (0, b"active\n")
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "did not stop"):
+            RECONCILER._stop_ingress_and_containers(FakeRunner(outputs))
+
+
+class PreMigrationDurabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="clixor-pre-migration-", dir=TEMP_ROOT
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.candidate = (
+            self.root / "releases" / "pending" / "oci-0123456789ab-test"
+        )
+        self.candidate.mkdir(parents=True, mode=0o700)
+        dump = self.candidate / "pre-migration.dump"
+        dump.write_bytes(b"operator recovery boundary\n")
+        dump.chmod(0o600)
+        checksum = self.candidate / "pre-migration.dump.sha256"
+        checksum.write_text(
+            f"{hashlib.sha256(dump.read_bytes()).hexdigest()}  pre-migration.dump\n",
+            encoding="ascii",
+        )
+        checksum.chmod(0o600)
+
+    def test_valid_dump_checksum_and_candidate_are_fsynced(self) -> None:
+        RECONCILER.durably_commit_pre_migration_boundary(
+            self.root, self.candidate
+        )
+
+    def test_checksum_or_symlink_tampering_fails_before_directory_commit(self) -> None:
+        checksum = self.candidate / "pre-migration.dump.sha256"
+        checksum.chmod(0o600)
+        checksum.write_text(
+            f"{'0' * 64}  pre-migration.dump\n", encoding="ascii"
+        )
+        checksum.chmod(0o600)
+        with mock.patch.object(RECONCILER, "_fsync") as directory_fsync:
+            with self.assertRaisesRegex(RECONCILER.ReconcileError, "checksum"):
+                RECONCILER.durably_commit_pre_migration_boundary(
+                    self.root, self.candidate
+                )
+        directory_fsync.assert_not_called()
+
+        checksum.unlink()
+        checksum.symlink_to(self.candidate / "pre-migration.dump")
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "unavailable"):
+            RECONCILER.durably_commit_pre_migration_boundary(
+                self.root, self.candidate
+            )
+
+    def test_fault_order_never_crosses_an_uncommitted_durability_stage(self) -> None:
+        for failed_stage, expected in (
+            ("dump", ["dump"]),
+            ("checksum", ["dump", "checksum"]),
+            ("directory", ["dump", "checksum", "directory"]),
+        ):
+            with self.subTest(failed_stage=failed_stage):
+                events: list[str] = []
+                digest = hashlib.sha256(
+                    (self.candidate / "pre-migration.dump").read_bytes()
+                ).hexdigest()
+
+                def commit_dump(*args, **kwargs):
+                    del args, kwargs
+                    events.append("dump")
+                    if failed_stage == "dump":
+                        raise OSError("injected dump fsync fault")
+                    return digest
+
+                def commit_checksum(*args, **kwargs):
+                    del args, kwargs
+                    events.append("checksum")
+                    if failed_stage == "checksum":
+                        raise OSError("injected checksum fsync fault")
+                    return f"{digest}  pre-migration.dump\n".encode("ascii")
+
+                def commit_directory(path):
+                    del path
+                    events.append("directory")
+                    if failed_stage == "directory":
+                        raise OSError("injected directory fsync fault")
+
+                with mock.patch.object(
+                    RECONCILER,
+                    "_digest_and_fsync_regular",
+                    side_effect=commit_dump,
+                ), mock.patch.object(
+                    RECONCILER,
+                    "_read_and_fsync_regular",
+                    side_effect=commit_checksum,
+                ), mock.patch.object(
+                    RECONCILER, "_fsync", side_effect=commit_directory
+                ):
+                    with self.assertRaises(OSError):
+                        RECONCILER.durably_commit_pre_migration_boundary(
+                            self.root, self.candidate
+                        )
+                self.assertEqual(events, expected)
 
 
 if __name__ == "__main__":
