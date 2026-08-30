@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/mediakey"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -1406,6 +1407,57 @@ func (s *Store) CreateProfileMedia(ctx context.Context, media domain.MediaObject
 	return media, nil
 }
 
+func (s *Store) PersistMediaUploadCapability(
+	ctx context.Context,
+	id, actorID uuid.UUID,
+	revocationToken string,
+) error {
+	revocationToken = strings.TrimSpace(revocationToken)
+	if id == uuid.Nil || actorID == uuid.Nil || revocationToken == "" || len(revocationToken) > 1024 {
+		return domain.ErrInvalid
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE media_objects SET upload_capability_id=$3
+		WHERE id=$1 AND owner_id=$2 AND status='pending'
+		  AND (upload_capability_id IS NULL OR upload_capability_id=$3)`,
+		id, actorID, revocationToken)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		tag, err = s.pool.Exec(ctx, `
+			UPDATE profile_media_objects SET upload_capability_id=$3
+			WHERE id=$1 AND owner_id=$2 AND status='pending'
+			  AND (upload_capability_id IS NULL OR upload_capability_id=$3)`,
+			id, actorID, revocationToken)
+		if err != nil {
+			return err
+		}
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := s.mediaForOwner(ctx, id, actorID); err != nil {
+			return err
+		}
+		return domain.ErrConflict
+	}
+	return nil
+}
+
+func (s *Store) MediaUploadCapability(
+	ctx context.Context,
+	id, actorID uuid.UUID,
+) (string, error) {
+	var token string
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(upload_capability_id,'') FROM media_objects
+		WHERE id=$1 AND owner_id=$2 AND status<>'deleted'
+		UNION ALL
+		SELECT COALESCE(upload_capability_id,'') FROM profile_media_objects
+		WHERE id=$1 AND owner_id=$2 AND status<>'deleted'
+		LIMIT 1`, id, actorID).Scan(&token)
+	return token, mapError(err)
+}
+
 func lockMediaQuota(ctx context.Context, tx pgx.Tx, scope string, id uuid.UUID) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "media:"+scope+":"+id.String())
 	return err
@@ -1625,33 +1677,21 @@ func (s *Store) mediaForOwner(ctx context.Context, id, actorID uuid.UUID) (domai
 func (s *Store) MarkMediaReady(
 	ctx context.Context,
 	id, actorID, leaseToken uuid.UUID,
+	publishedObjectKey string,
 ) (domain.MediaObject, error) {
 	if leaseToken == uuid.Nil {
 		return domain.MediaObject{}, domain.ErrConflict
 	}
-	var media domain.MediaObject
-	err := s.pool.QueryRow(ctx, `
-		UPDATE media_objects
-		SET status='ready',expires_at=NULL,verification_lease_token=NULL,
-			verification_locked_until=NULL,updated_at=now()
-		WHERE id=$1 AND owner_id=$2 AND status='pending' AND expires_at>now()
-		  AND verification_lease_token=$3 AND verification_locked_until>now()
-		RETURNING id,owner_id,conversation_id,object_key,content_type,byte_size,
-			ciphertext_sha256,status,expires_at,upload_valid_until,
-			verification_lease_token,verification_locked_until,created_at,updated_at`,
-		id, actorID, leaseToken,
-	).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
-		&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
-		&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
-		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
-	if err == nil {
-		media.Scope = domain.MediaScopeConversation
-		return media, nil
+	if err := mediakey.Validate(publishedObjectKey); err != nil {
+		return domain.MediaObject{}, domain.ErrInvalid
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.MediaObject{}, mapError(err)
+	ready, err := s.markConversationMediaReady(
+		ctx, id, actorID, leaseToken, publishedObjectKey,
+	)
+	if err == nil || !errors.Is(err, domain.ErrNotFound) {
+		return ready, err
 	}
-	ready, err := s.markProfileMediaReady(ctx, id, actorID, leaseToken)
+	ready, err = s.markProfileMediaReady(ctx, id, actorID, leaseToken, publishedObjectKey)
 	if err == nil || !errors.Is(err, domain.ErrNotFound) {
 		return ready, err
 	}
@@ -1669,9 +1709,71 @@ func (s *Store) MarkMediaReady(
 	return domain.MediaObject{}, domain.ErrConflict
 }
 
+func (s *Store) markConversationMediaReady(
+	ctx context.Context,
+	id, actorID, leaseToken uuid.UUID,
+	publishedObjectKey string,
+) (domain.MediaObject, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
+	defer tx.Rollback(ctx)
+	var media domain.MediaObject
+	err = tx.QueryRow(ctx, `
+		SELECT id,owner_id,conversation_id,object_key,content_type,byte_size,
+			ciphertext_sha256,status,expires_at,upload_valid_until,
+			verification_lease_token,verification_locked_until,created_at,updated_at
+		FROM media_objects
+		WHERE id=$1 AND owner_id=$2 AND status='pending' AND expires_at>now()
+		  AND verification_lease_token=$3 AND verification_locked_until>now()
+		FOR UPDATE`, id, actorID, leaseToken,
+	).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
+		&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
+		&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
+		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+	if err != nil {
+		return domain.MediaObject{}, mapError(err)
+	}
+	stagingObjectKey := media.ObjectKey
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `
+		UPDATE media_objects
+		SET object_key=$4,status='ready',expires_at=NULL,upload_capability_id=NULL,
+			verification_lease_token=NULL,verification_locked_until=NULL,updated_at=$5
+		WHERE id=$1 AND owner_id=$2 AND verification_lease_token=$3
+		  AND verification_locked_until>now()`,
+		id, actorID, leaseToken, publishedObjectKey, now)
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.MediaObject{}, domain.ErrConflict
+	}
+	if stagingObjectKey != publishedObjectKey {
+		if err := enqueueExactMediaDeletesAt(
+			ctx, tx, actorID, []string{stagingObjectKey}, mediaDeleteNotBefore(media.UploadValidUntil),
+		); err != nil {
+			return domain.MediaObject{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.MediaObject{}, err
+	}
+	media.ObjectKey = publishedObjectKey
+	media.Status = "ready"
+	media.ExpiresAt = nil
+	media.VerificationLeaseToken = nil
+	media.VerificationLockedUntil = nil
+	media.UpdatedAt = now
+	media.Scope = domain.MediaScopeConversation
+	return media, nil
+}
+
 func (s *Store) markProfileMediaReady(
 	ctx context.Context,
 	id, actorID, leaseToken uuid.UUID,
+	publishedObjectKey string,
 ) (domain.MediaObject, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -1707,17 +1809,25 @@ func (s *Store) markProfileMediaReady(
 		return domain.MediaObject{}, mapError(err)
 	}
 	now := time.Now().UTC()
+	stagingObjectKey := media.ObjectKey
 	readyTag, err := tx.Exec(ctx, `
 		UPDATE profile_media_objects
-		SET status='ready',expires_at=NULL,verification_lease_token=NULL,
-			verification_locked_until=NULL,updated_at=$2
+		SET object_key=$4,status='ready',expires_at=NULL,upload_capability_id=NULL,
+			verification_lease_token=NULL,verification_locked_until=NULL,updated_at=$2
 		WHERE id=$1 AND verification_lease_token=$3 AND verification_locked_until>now()`,
-		id, now, leaseToken)
+		id, now, leaseToken, publishedObjectKey)
 	if err != nil {
 		return domain.MediaObject{}, err
 	}
 	if readyTag.RowsAffected() != 1 {
 		return domain.MediaObject{}, domain.ErrConflict
+	}
+	if stagingObjectKey != publishedObjectKey {
+		if err := enqueueExactMediaDeletesAt(
+			ctx, tx, actorID, []string{stagingObjectKey}, mediaDeleteNotBefore(media.UploadValidUntil),
+		); err != nil {
+			return domain.MediaObject{}, err
+		}
 	}
 	reference := "clustr-media://" + id.String()
 	if _, err := tx.Exec(ctx, `
@@ -1753,6 +1863,7 @@ func (s *Store) markProfileMediaReady(
 		return domain.MediaObject{}, err
 	}
 	media.Status = "ready"
+	media.ObjectKey = publishedObjectKey
 	media.ExpiresAt = nil
 	media.VerificationLeaseToken = nil
 	media.VerificationLockedUntil = nil
@@ -2074,18 +2185,56 @@ func enqueueMediaDeletesAt(
 	if len(objectKeys) < 1 || len(objectKeys) > store.MediaDeleteBatchSize {
 		return domain.ErrInvalid
 	}
+	seen := make(map[string]struct{}, len(objectKeys)*2)
+	expanded := make([]string, 0, len(objectKeys)*2)
+	for _, objectKey := range objectKeys {
+		keys, err := mediakey.DeletionKeys(objectKey)
+		if err != nil {
+			return domain.ErrInvalid
+		}
+		for _, key := range keys {
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			expanded = append(expanded, key)
+		}
+	}
+	return enqueueExactMediaDeletesAt(ctx, tx, aggregateID, expanded, notBefore)
+}
+
+func enqueueExactMediaDeletesAt(
+	ctx context.Context,
+	tx pgx.Tx,
+	aggregateID uuid.UUID,
+	objectKeys []string,
+	notBefore time.Time,
+) error {
+	if len(objectKeys) < 1 {
+		return domain.ErrInvalid
+	}
 	if notBefore.IsZero() {
 		return domain.ErrInvalid
 	}
 	notBefore = notBefore.UTC()
-	payload, err := json.Marshal(store.NewMediaDeletePayloadAt(objectKeys, notBefore))
-	if err != nil {
-		return err
+	for _, objectKey := range objectKeys {
+		if err := mediakey.Validate(objectKey); err != nil {
+			return domain.ErrInvalid
+		}
 	}
-	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events(topic,aggregate_id,payload,available_at)
-		VALUES('media.delete',$1,$2,$3)`, aggregateID, payload, notBefore)
-	return err
+	for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
+		end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
+		payload, err := json.Marshal(store.NewMediaDeletePayloadAt(objectKeys[start:end], notBefore))
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO outbox_events(topic,aggregate_id,payload,available_at)
+			VALUES('media.delete',$1,$2,$3)`, aggregateID, payload, notBefore); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func mediaDeleteNotBefore(uploadValidUntil time.Time) time.Time {

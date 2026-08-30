@@ -98,7 +98,9 @@ func TestCompletedMediaStillConsumesStoredQuotaUntilDeleted(t *testing.T) {
 	if err != nil || claim.VerificationLeaseToken == nil {
 		t.Fatalf("claim media verification: media=%+v error=%v", claim, err)
 	}
-	if _, err := persistence.MarkMediaReady(ctx, first.ID, user.ID, *claim.VerificationLeaseToken); err != nil {
+	if _, err := persistence.MarkMediaReady(
+		ctx, first.ID, user.ID, *claim.VerificationLeaseToken, first.ObjectKey,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := persistence.CreateMedia(
@@ -150,10 +152,18 @@ func TestExpiredMediaReservationsQueueDurableDeletion(t *testing.T) {
 		}
 	}
 	keys := mediaDeletionKeys(t, persistence)
-	want := []string{conversationMedia.ObjectKey, profileMedia.ObjectKey}
+	want := []string{
+		conversationMedia.ObjectKey, "published/" + conversationMedia.ObjectKey,
+		profileMedia.ObjectKey, "published/" + profileMedia.ObjectKey,
+	}
 	sort.Strings(want)
-	if len(keys) != len(want) || keys[0] != want[0] || keys[1] != want[1] {
+	if len(keys) != len(want) {
 		t.Fatalf("queued keys=%v want=%v", keys, want)
+	}
+	for index := range want {
+		if keys[index] != want[index] {
+			t.Fatalf("queued keys=%v want=%v", keys, want)
+		}
 	}
 }
 
@@ -185,7 +195,7 @@ func TestConversationDeletionQueuesMediaBeforeRowsDisappear(t *testing.T) {
 		t.Fatalf("claim media verification: media=%+v error=%v", claim, err)
 	}
 	if _, err := persistence.MarkMediaReady(
-		ctx, createdSecond.ID, user.ID, *claim.VerificationLeaseToken,
+		ctx, createdSecond.ID, user.ID, *claim.VerificationLeaseToken, createdSecond.ObjectKey,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -199,10 +209,18 @@ func TestConversationDeletionQueuesMediaBeforeRowsDisappear(t *testing.T) {
 		t.Fatal("ready media row survived conversation deletion")
 	}
 	keys := mediaDeletionKeys(t, persistence)
-	want := []string{first.ObjectKey, second.ObjectKey}
+	want := []string{
+		first.ObjectKey, "published/" + first.ObjectKey,
+		second.ObjectKey, "published/" + second.ObjectKey,
+	}
 	sort.Strings(want)
-	if len(keys) != 2 || keys[0] != want[0] || keys[1] != want[1] {
+	if len(keys) != len(want) {
 		t.Fatalf("queued keys=%v want=%v", keys, want)
+	}
+	for index := range want {
+		if keys[index] != want[index] {
+			t.Fatalf("queued keys=%v want=%v", keys, want)
+		}
 	}
 }
 
@@ -270,14 +288,16 @@ func TestMediaVerificationClaimIsExclusiveAndFencedAcrossReclaim(t *testing.T) {
 	if *reclaimed.VerificationLeaseToken == staleToken {
 		t.Fatal("reclaim reused the stale fencing token")
 	}
-	if _, err := persistence.MarkMediaReady(ctx, created.ID, user.ID, staleToken); !errors.Is(err, domain.ErrConflict) {
+	if _, err := persistence.MarkMediaReady(
+		ctx, created.ID, user.ID, staleToken, created.ObjectKey,
+	); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("stale completion returned %v", err)
 	}
 	if _, err := persistence.RejectMediaVerification(ctx, created.ID, user.ID, staleToken); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("stale rejection returned %v", err)
 	}
 	ready, err := persistence.MarkMediaReady(
-		ctx, created.ID, user.ID, *reclaimed.VerificationLeaseToken,
+		ctx, created.ID, user.ID, *reclaimed.VerificationLeaseToken, created.ObjectKey,
 	)
 	if err != nil || ready.Status != "ready" {
 		t.Fatalf("current fence completion: media=%+v error=%v", ready, err)
@@ -285,6 +305,66 @@ func TestMediaVerificationClaimIsExclusiveAndFencedAcrossReclaim(t *testing.T) {
 	idempotent, err := persistence.ClaimMediaVerification(ctx, created.ID, user.ID, time.Minute)
 	if err != nil || idempotent.Status != "ready" || idempotent.VerificationLeaseToken != nil {
 		t.Fatalf("ready claim was not idempotent: media=%+v error=%v", idempotent, err)
+	}
+}
+
+func TestPublishedProfileMediaAccountDeletionRestoresStagingCleanup(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "published-delete@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := persistence.CreateProfileMedia(
+		ctx, testProfileMedia(user.ID, 3), store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.PersistMediaUploadCapability(ctx, created.ID, user.ID, "oci-write-par-id"); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.PersistMediaUploadCapability(ctx, created.ID, user.ID, "oci-write-par-id"); err != nil {
+		t.Fatalf("idempotent capability persistence: %v", err)
+	}
+	if err := persistence.PersistMediaUploadCapability(ctx, created.ID, user.ID, "different-par-id"); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("capability replacement returned %v", err)
+	}
+	claim, err := persistence.ClaimMediaVerification(ctx, created.ID, user.ID, time.Minute)
+	if err != nil || claim.VerificationLeaseToken == nil {
+		t.Fatalf("claim media: media=%+v err=%v", claim, err)
+	}
+	publishedKey := "published/" + created.ObjectKey
+	ready, err := persistence.MarkMediaReady(
+		ctx, created.ID, user.ID, *claim.VerificationLeaseToken, publishedKey,
+	)
+	if err != nil || ready.ObjectKey != publishedKey {
+		t.Fatalf("ready media=%+v err=%v", ready, err)
+	}
+	if capability, err := persistence.MediaUploadCapability(ctx, created.ID, user.ID); err != nil || capability != "" {
+		t.Fatalf("ready capability=%q err=%v", capability, err)
+	}
+	if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	persistence.mu.RLock()
+	defer persistence.mu.RUnlock()
+	queued := make(map[string]bool)
+	for _, event := range persistence.outbox {
+		if event.Topic != "media.delete" {
+			continue
+		}
+		var payload store.MediaDeletePayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range payload.ObjectKeys {
+			queued[key] = true
+		}
+	}
+	if len(queued) != 2 || !queued[created.ObjectKey] || !queued[publishedKey] {
+		t.Fatalf("account deletion keys=%v", queued)
 	}
 }
 
@@ -334,7 +414,9 @@ func TestReadyMediaDeletionUsesImmutableUploadValidityDeadline(t *testing.T) {
 	if err != nil || claim.VerificationLeaseToken == nil {
 		t.Fatalf("claim: media=%+v error=%v", claim, err)
 	}
-	ready, err := persistence.MarkMediaReady(ctx, created.ID, user.ID, *claim.VerificationLeaseToken)
+	ready, err := persistence.MarkMediaReady(
+		ctx, created.ID, user.ID, *claim.VerificationLeaseToken, created.ObjectKey,
+	)
 	if err != nil || ready.UploadValidUntil.IsZero() || ready.ExpiresAt != nil {
 		t.Fatalf("ready media lost immutable upload deadline: media=%+v error=%v", ready, err)
 	}
@@ -491,7 +573,9 @@ func markMemoryMediaReady(
 	if err != nil || claim.VerificationLeaseToken == nil {
 		t.Fatalf("claim media: media=%+v error=%v", claim, err)
 	}
-	if _, err := persistence.MarkMediaReady(ctx, object.ID, userID, *claim.VerificationLeaseToken); err != nil {
+	if _, err := persistence.MarkMediaReady(
+		ctx, object.ID, userID, *claim.VerificationLeaseToken, object.ObjectKey,
+	); err != nil {
 		t.Fatal(err)
 	}
 }

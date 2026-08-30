@@ -296,7 +296,7 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || len(mediaRecorder.deleted) != 1 {
+	if len(events) != 1 || len(mediaRecorder.deleted) != 2 {
 		t.Fatalf("failed deletion was not retained for retry: events=%+v calls=%+v", events, mediaRecorder.deleted)
 	}
 
@@ -309,7 +309,7 @@ func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 0 || len(mediaRecorder.deleted) != 2 {
+	if len(events) != 0 || len(mediaRecorder.deleted) != 4 {
 		t.Fatalf("successful deletion was not acknowledged: events=%+v calls=%+v", events, mediaRecorder.deleted)
 	}
 }
@@ -1214,6 +1214,7 @@ func (*countingBus) Subscribe(context.Context, uuid.UUID) (events.Subscription, 
 func (*countingBus) Close() {}
 
 type recordingMedia struct {
+	mu        sync.Mutex
 	deleted   []string
 	deleteErr error
 }
@@ -1226,11 +1227,13 @@ func (*recordingMedia) DownloadURL(context.Context, string, time.Duration) (*url
 	return nil, media.ErrUnavailable
 }
 
-func (*recordingMedia) Verify(context.Context, string, int64, string, string) error {
-	return media.ErrUnavailable
+func (*recordingMedia) FinalizeUpload(context.Context, string, string, int64, string, string) (string, error) {
+	return "", media.ErrUnavailable
 }
 
 func (r *recordingMedia) Delete(_ context.Context, objectKey string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.deleted = append(r.deleted, objectKey)
 	return r.deleteErr
 }
@@ -1250,8 +1253,8 @@ func (*blockingDeleteMedia) DownloadURL(context.Context, string, time.Duration) 
 	return nil, media.ErrUnavailable
 }
 
-func (*blockingDeleteMedia) Verify(context.Context, string, int64, string, string) error {
-	return media.ErrUnavailable
+func (*blockingDeleteMedia) FinalizeUpload(context.Context, string, string, int64, string, string) (string, error) {
+	return "", media.ErrUnavailable
 }
 
 func (m *blockingDeleteMedia) Delete(ctx context.Context, _ string) error {
@@ -1283,8 +1286,8 @@ func (*concurrentDeleteMedia) DownloadURL(context.Context, string, time.Duration
 	return nil, media.ErrUnavailable
 }
 
-func (*concurrentDeleteMedia) Verify(context.Context, string, int64, string, string) error {
-	return media.ErrUnavailable
+func (*concurrentDeleteMedia) FinalizeUpload(context.Context, string, string, int64, string, string) (string, error) {
+	return "", media.ErrUnavailable
 }
 
 func (m *concurrentDeleteMedia) Delete(ctx context.Context, _ string) error {

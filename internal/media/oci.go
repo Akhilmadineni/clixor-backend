@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/mediakey"
 	"github.com/google/uuid"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/common/auth"
@@ -40,6 +41,7 @@ type ociObjectStorageClient interface {
 	ListPreauthenticatedRequests(context.Context, objectstorage.ListPreauthenticatedRequestsRequest) (objectstorage.ListPreauthenticatedRequestsResponse, error)
 	DeletePreauthenticatedRequest(context.Context, objectstorage.DeletePreauthenticatedRequestRequest) (objectstorage.DeletePreauthenticatedRequestResponse, error)
 	HeadObject(context.Context, objectstorage.HeadObjectRequest) (objectstorage.HeadObjectResponse, error)
+	RenameObject(context.Context, objectstorage.RenameObjectRequest) (objectstorage.RenameObjectResponse, error)
 	DeleteObject(context.Context, objectstorage.DeleteObjectRequest) (objectstorage.DeleteObjectResponse, error)
 }
 
@@ -142,22 +144,27 @@ func (s *OCIObjectStorage) PrepareUpload(
 	if parsed, _, err := mime.ParseMediaType(contentType); err != nil || !strings.EqualFold(parsed, contentType) {
 		return UploadInstructions{}, errors.New("invalid OCI media upload content type")
 	}
-	uploadURL, err := s.createPAR(
+	uploadURL, revocationToken, err := s.createPAR(
 		ctx, objectKey, expiry, objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectwrite,
 	)
 	if err != nil {
 		return UploadInstructions{}, err
 	}
-	return instructions(uploadURL, map[string]string{
+	result := instructions(uploadURL, map[string]string{
 		"Content-Type":           contentType,
 		"Content-Length":         strconv.FormatInt(byteSize, 10),
 		"opc-checksum-algorithm": "SHA256",
 		"opc-content-sha256":     base64.StdEncoding.EncodeToString(digest),
-	}), nil
+	})
+	result.RevocationToken = revocationToken
+	return result, nil
 }
 
 func (s *OCIObjectStorage) DownloadURL(ctx context.Context, objectKey string, expiry time.Duration) (*url.URL, error) {
-	return s.createPAR(ctx, objectKey, expiry, objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectread)
+	downloadURL, _, err := s.createPAR(
+		ctx, objectKey, expiry, objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeObjectread,
+	)
+	return downloadURL, err
 }
 
 func (s *OCIObjectStorage) createPAR(
@@ -165,12 +172,12 @@ func (s *OCIObjectStorage) createPAR(
 	objectKey string,
 	expiry time.Duration,
 	accessType objectstorage.CreatePreauthenticatedRequestDetailsAccessTypeEnum,
-) (*url.URL, error) {
+) (*url.URL, string, error) {
 	if err := validateOCIObjectKey(objectKey); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if expiry <= 0 || expiry > ociMaxPARExpiry {
-		return nil, fmt.Errorf("OCI media URL expiry must be between 1ns and %s", ociMaxPARExpiry)
+		return nil, "", fmt.Errorf("OCI media URL expiry must be between 1ns and %s", ociMaxPARExpiry)
 	}
 	expiresAt := common.SDKTime{Time: time.Now().UTC().Add(expiry)}
 	response, err := s.client.CreatePreauthenticatedRequest(ctx, objectstorage.CreatePreauthenticatedRequestRequest{
@@ -184,17 +191,20 @@ func (s *OCIObjectStorage) createPAR(
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create OCI media pre-authenticated request: %w", err)
+		return nil, "", fmt.Errorf("create OCI media pre-authenticated request: %w", err)
 	}
 	if response.AccessUri == nil {
-		return nil, errors.New("OCI media pre-authenticated request omitted its access URI")
+		return nil, "", errors.New("OCI media pre-authenticated request omitted its access URI")
+	}
+	if response.Id == nil || strings.TrimSpace(*response.Id) == "" {
+		return nil, "", errors.New("OCI media pre-authenticated request omitted its identifier")
 	}
 	accessURI, err := url.Parse(*response.AccessUri)
 	if err != nil || accessURI.IsAbs() || accessURI.Host != "" || accessURI.User != nil ||
 		accessURI.RawQuery != "" || accessURI.Fragment != "" || !strings.HasPrefix(accessURI.EscapedPath(), "/p/") {
-		return nil, errors.New("OCI media pre-authenticated request returned an invalid access URI")
+		return nil, "", errors.New("OCI media pre-authenticated request returned an invalid access URI")
 	}
-	return s.endpoint.ResolveReference(accessURI), nil
+	return s.endpoint.ResolveReference(accessURI), strings.TrimSpace(*response.Id), nil
 }
 
 func (s *OCIObjectStorage) Verify(
@@ -203,19 +213,90 @@ func (s *OCIObjectStorage) Verify(
 	expectedSize int64,
 	expectedSHA256, expectedContentType string,
 ) error {
+	_, err := s.headVerified(ctx, objectKey, expectedSize, expectedSHA256, expectedContentType)
+	return err
+}
+
+// FinalizeUpload moves a verified upload out of the PAR-writable staging name
+// into a deterministic backend-only name. Revocation closes new writes; the
+// source ETag fence and destination create-only condition make already
+// authorized in-flight PUTs harmless as well.
+func (s *OCIObjectStorage) FinalizeUpload(
+	ctx context.Context,
+	objectKey string,
+	revocationToken string,
+	expectedSize int64,
+	expectedSHA256, expectedContentType string,
+) (string, error) {
+	publishedKey, err := mediakey.Published(objectKey)
+	if err != nil {
+		return "", err
+	}
+	if publishedKey == objectKey {
+		return "", errors.New("OCI media upload is already published")
+	}
+	if err := s.revokeObjectWritePARs(ctx, objectKey, revocationToken); err != nil {
+		return "", err
+	}
+
+	// Completion is retry-safe after a rename succeeded but the database write
+	// or response failed. Never touch the destination again once it validates.
+	if _, err := s.headVerified(ctx, publishedKey, expectedSize, expectedSHA256, expectedContentType); err == nil {
+		return publishedKey, nil
+	} else if !errors.Is(err, ErrUploadMissing) {
+		return "", err
+	}
+
+	staged, err := s.headVerified(ctx, objectKey, expectedSize, expectedSHA256, expectedContentType)
+	if err != nil {
+		return "", err
+	}
+	if staged.ETag == nil || strings.TrimSpace(*staged.ETag) == "" {
+		return "", fmt.Errorf("%w: OCI object omitted ETag", ErrVerificationMismatch)
+	}
+	_, renameErr := s.client.RenameObject(ctx, objectstorage.RenameObjectRequest{
+		NamespaceName: common.String(s.namespace),
+		BucketName:    common.String(s.bucket),
+		RenameObjectDetails: objectstorage.RenameObjectDetails{
+			SourceName:            common.String(objectKey),
+			NewName:               common.String(publishedKey),
+			SrcObjIfMatchETag:     common.String(strings.TrimSpace(*staged.ETag)),
+			NewObjIfNoneMatchETag: common.String("*"),
+		},
+	})
+	// A timeout can hide a successful rename, and a competing idempotent
+	// completion can legitimately win the destination. Inspect the immutable
+	// destination before classifying any rename response.
+	if _, err := s.headVerified(ctx, publishedKey, expectedSize, expectedSHA256, expectedContentType); err == nil {
+		return publishedKey, nil
+	} else if !errors.Is(err, ErrUploadMissing) {
+		return "", err
+	}
+	if renameErr != nil {
+		return "", fmt.Errorf("%w: publish OCI media object: %v", ErrUnavailable, renameErr)
+	}
+	return "", fmt.Errorf("%w: published OCI media object is not yet visible", ErrUnavailable)
+}
+
+func (s *OCIObjectStorage) headVerified(
+	ctx context.Context,
+	objectKey string,
+	expectedSize int64,
+	expectedSHA256, expectedContentType string,
+) (objectstorage.HeadObjectResponse, error) {
 	if err := validateOCIObjectKey(objectKey); err != nil {
-		return err
+		return objectstorage.HeadObjectResponse{}, err
 	}
 	if expectedSize < 1 {
-		return errors.New("expected OCI media size must be positive")
+		return objectstorage.HeadObjectResponse{}, errors.New("expected OCI media size must be positive")
 	}
 	expectedDigest, err := hex.DecodeString(expectedSHA256)
 	if err != nil || len(expectedDigest) != sha256.Size {
-		return errors.New("expected OCI media SHA-256 must be 64 hexadecimal characters")
+		return objectstorage.HeadObjectResponse{}, errors.New("expected OCI media SHA-256 must be 64 hexadecimal characters")
 	}
 	expectedType, _, err := mime.ParseMediaType(expectedContentType)
 	if err != nil || strings.TrimSpace(expectedType) == "" {
-		return errors.New("expected OCI media content type is invalid")
+		return objectstorage.HeadObjectResponse{}, errors.New("expected OCI media content type is invalid")
 	}
 	response, err := s.client.HeadObject(ctx, objectstorage.HeadObjectRequest{
 		NamespaceName: common.String(s.namespace),
@@ -224,34 +305,96 @@ func (s *OCIObjectStorage) Verify(
 	})
 	if err != nil {
 		if ociStatus(err, 404) {
-			return fmt.Errorf("%w: inspect OCI media object", ErrUploadMissing)
+			return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: inspect OCI media object", ErrUploadMissing)
 		}
-		return fmt.Errorf("%w: inspect OCI media object: %v", ErrUnavailable, err)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: inspect OCI media object: %v", ErrUnavailable, err)
 	}
 	if response.ContentLength == nil {
-		return fmt.Errorf("%w: OCI object omitted content length", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: OCI object omitted content length", ErrVerificationMismatch)
 	}
 	if *response.ContentLength != expectedSize {
-		return fmt.Errorf("%w: size expected %d, received %d", ErrVerificationMismatch, expectedSize, *response.ContentLength)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: size expected %d, received %d", ErrVerificationMismatch, expectedSize, *response.ContentLength)
 	}
 	if response.ContentType == nil {
-		return fmt.Errorf("%w: OCI object omitted content type", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: OCI object omitted content type", ErrVerificationMismatch)
 	}
 	actualType, _, err := mime.ParseMediaType(*response.ContentType)
 	if err != nil || !strings.EqualFold(actualType, expectedType) {
-		return fmt.Errorf("%w: content type", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: content type", ErrVerificationMismatch)
 	}
 	if response.OpcContentSha256 == nil || strings.TrimSpace(*response.OpcContentSha256) == "" {
-		return fmt.Errorf("%w: OCI object omitted SHA-256 metadata", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: OCI object omitted SHA-256 metadata", ErrVerificationMismatch)
 	}
 	actualDigest, err := base64.StdEncoding.DecodeString(*response.OpcContentSha256)
 	if err != nil || len(actualDigest) != sha256.Size {
-		return fmt.Errorf("%w: OCI object returned invalid SHA-256 metadata", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: OCI object returned invalid SHA-256 metadata", ErrVerificationMismatch)
 	}
 	if subtle.ConstantTimeCompare(actualDigest, expectedDigest) != 1 {
-		return fmt.Errorf("%w: SHA-256", ErrVerificationMismatch)
+		return objectstorage.HeadObjectResponse{}, fmt.Errorf("%w: SHA-256", ErrVerificationMismatch)
+	}
+	return response, nil
+}
+
+func (s *OCIObjectStorage) revokeObjectWritePARs(ctx context.Context, objectKey, revocationToken string) error {
+	revocationToken = strings.TrimSpace(revocationToken)
+	if revocationToken != "" {
+		if _, err := s.client.DeletePreauthenticatedRequest(ctx, objectstorage.DeletePreauthenticatedRequestRequest{
+			NamespaceName: common.String(s.namespace),
+			BucketName:    common.String(s.bucket),
+			ParId:         common.String(revocationToken),
+		}); err != nil && !ociStatus(err, 404) {
+			return fmt.Errorf("%w: revoke persisted OCI media write capability: %v", ErrUnavailable, err)
+		}
+	}
+	if err := s.revokeDiscoveredObjectWritePARs(ctx, objectKey); err != nil {
+		if revocationToken == "" {
+			// Compatibility for an upload created by a pre-migration replica: the
+			// exact PAR was not persisted, so discovery is integrity-critical.
+			return err
+		}
+		// The persisted capability is the only URL ever returned by the current
+		// API. Prefix enumeration just cleans duplicates and legacy orphans; do
+		// not make completion unavailable in buckets with a large PAR history.
+		s.logger.Warn("OCI media orphan capability cleanup failed", "error", err)
 	}
 	return nil
+}
+
+func (s *OCIObjectStorage) revokeDiscoveredObjectWritePARs(ctx context.Context, objectKey string) error {
+	var page *string
+	for pageNumber := 0; pageNumber < ociPARCleanupMaxPages; pageNumber++ {
+		response, err := s.client.ListPreauthenticatedRequests(ctx, objectstorage.ListPreauthenticatedRequestsRequest{
+			NamespaceName:    common.String(s.namespace),
+			BucketName:       common.String(s.bucket),
+			ObjectNamePrefix: common.String(objectKey),
+			Limit:            common.Int(ociPARCleanupPageLimit),
+			Page:             page,
+		})
+		if err != nil {
+			return fmt.Errorf("%w: list OCI media write capabilities: %v", ErrUnavailable, err)
+		}
+		for _, item := range response.Items {
+			if item.ObjectName == nil || *item.ObjectName != objectKey ||
+				item.AccessType != objectstorage.PreauthenticatedRequestSummaryAccessTypeObjectwrite {
+				continue
+			}
+			if item.Id == nil || strings.TrimSpace(*item.Id) == "" {
+				return fmt.Errorf("%w: OCI media write capability omitted its identifier", ErrUnavailable)
+			}
+			if _, err := s.client.DeletePreauthenticatedRequest(ctx, objectstorage.DeletePreauthenticatedRequestRequest{
+				NamespaceName: common.String(s.namespace),
+				BucketName:    common.String(s.bucket),
+				ParId:         common.String(*item.Id),
+			}); err != nil && !ociStatus(err, 404) {
+				return fmt.Errorf("%w: revoke OCI media write capability: %v", ErrUnavailable, err)
+			}
+		}
+		if response.OpcNextPage == nil || *response.OpcNextPage == "" {
+			return nil
+		}
+		page = response.OpcNextPage
+	}
+	return fmt.Errorf("%w: too many OCI media write capabilities to revoke", ErrUnavailable)
 }
 
 func (s *OCIObjectStorage) Delete(ctx context.Context, objectKey string) error {

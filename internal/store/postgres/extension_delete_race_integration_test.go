@@ -51,7 +51,9 @@ func TestPostgresLegacyDeleteSerializesNewExtensionWrites(t *testing.T) {
 			t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
 		}
 		err = legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {
-			_, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken)
+			_, err := persistence.MarkMediaReady(
+				ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken, mediaObject.ObjectKey,
+			)
 			return err
 		})
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -71,7 +73,9 @@ func TestPostgresLegacyDeleteSerializesNewExtensionWrites(t *testing.T) {
 		if err != nil || claimed.VerificationLeaseToken == nil {
 			t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
 		}
-		if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken); err != nil {
+		if _, err := persistence.MarkMediaReady(
+			ctx, mediaObject.ID, user, *claimed.VerificationLeaseToken, mediaObject.ObjectKey,
+		); err != nil {
 			t.Fatal(err)
 		}
 		err = legacyTombstoneWhileWriteBlocked(t, ctx, persistence, user, nil, func() error {

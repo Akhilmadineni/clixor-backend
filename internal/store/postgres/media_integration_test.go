@@ -120,7 +120,7 @@ func TestPostgresMediaQuotasExpiryAndConversationDeletion(t *testing.T) {
 		t.Fatalf("claim media verification: media=%+v error=%v", claim, err)
 	}
 	if _, err := persistence.MarkMediaReady(
-		ctx, ready.ID, user.ID, *claim.VerificationLeaseToken,
+		ctx, ready.ID, user.ID, *claim.VerificationLeaseToken, ready.ObjectKey,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +141,14 @@ func TestPostgresMediaQuotasExpiryAndConversationDeletion(t *testing.T) {
 	fenced := postgresTestMedia(user.ID, storedConversation.ID)
 	if _, err := persistence.CreateMedia(ctx, fenced, store.DefaultMediaReservationLimits()); err != nil {
 		t.Fatal(err)
+	}
+	if err := persistence.PersistMediaUploadCapability(
+		ctx, fenced.ID, user.ID, "oci-write-par-id",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if capability, err := persistence.MediaUploadCapability(ctx, fenced.ID, user.ID); err != nil || capability != "oci-write-par-id" {
+		t.Fatalf("persisted capability=%q err=%v", capability, err)
 	}
 	const claimers = 8
 	claimResults := make(chan domain.MediaObject, claimers)
@@ -188,13 +196,25 @@ func TestPostgresMediaQuotasExpiryAndConversationDeletion(t *testing.T) {
 	if err != nil || reclaimed.VerificationLeaseToken == nil || *reclaimed.VerificationLeaseToken == staleToken {
 		t.Fatalf("reclaim media: media=%+v error=%v", reclaimed, err)
 	}
-	if _, err := persistence.MarkMediaReady(ctx, fenced.ID, user.ID, staleToken); !errors.Is(err, domain.ErrConflict) {
+	if _, err := persistence.MarkMediaReady(
+		ctx, fenced.ID, user.ID, staleToken, fenced.ObjectKey,
+	); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("stale completion returned %v", err)
 	}
+	publishedFencedKey := "published/" + fenced.ObjectKey
 	if _, err := persistence.MarkMediaReady(
-		ctx, fenced.ID, user.ID, *reclaimed.VerificationLeaseToken,
+		ctx, fenced.ID, user.ID, *reclaimed.VerificationLeaseToken, publishedFencedKey,
 	); err != nil {
 		t.Fatal(err)
+	}
+	if capability, err := persistence.MediaUploadCapability(ctx, fenced.ID, user.ID); err != nil || capability != "" {
+		t.Fatalf("ready capability=%q err=%v", capability, err)
+	}
+	if published, err := persistence.Media(ctx, fenced.ID, user.ID); err != nil || published.ObjectKey != publishedFencedKey {
+		t.Fatalf("published media=%+v err=%v", published, err)
+	}
+	if _, found := postgresMediaDeletionKeys(t, ctx, persistence)[fenced.ObjectKey]; !found {
+		t.Fatalf("staging object %q was not queued for cleanup", fenced.ObjectKey)
 	}
 	idempotent, err := persistence.ClaimMediaVerification(ctx, fenced.ID, user.ID, time.Minute)
 	if err != nil || idempotent.Status != "ready" || idempotent.VerificationLeaseToken != nil {

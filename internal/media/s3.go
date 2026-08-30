@@ -165,6 +165,19 @@ func (s *S3) Verify(
 	return nil
 }
 
+func (s *S3) FinalizeUpload(
+	ctx context.Context,
+	objectKey string,
+	_ string,
+	expectedSize int64,
+	expectedSHA256, expectedContentType string,
+) (string, error) {
+	if err := s.Verify(ctx, objectKey, expectedSize, expectedSHA256, expectedContentType); err != nil {
+		return "", err
+	}
+	return objectKey, nil
+}
+
 func verificationStorageError(operation string, err error) error {
 	response := minio.ToErrorResponse(err)
 	switch response.Code {

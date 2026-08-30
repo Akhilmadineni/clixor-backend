@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/mediakey"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 )
@@ -39,6 +40,7 @@ type Store struct {
 	receipts                  map[string]domain.Receipt
 	entities                  map[string]domain.Entity
 	media                     map[uuid.UUID]domain.MediaObject
+	mediaUploadCapabilities   map[uuid.UUID]string
 	outbox                    []domain.OutboxEvent
 	nextOutboxID              int64
 	pushDeliveries            map[int64]domain.PushDelivery
@@ -68,6 +70,7 @@ func New() *Store {
 		receipts:                  make(map[string]domain.Receipt),
 		entities:                  make(map[string]domain.Entity),
 		media:                     make(map[uuid.UUID]domain.MediaObject),
+		mediaUploadCapabilities:   make(map[uuid.UUID]string),
 		nextOutboxID:              1,
 		pushDeliveries:            make(map[int64]domain.PushDelivery),
 		pushDeliveryByEventDevice: make(map[string]int64),
@@ -436,6 +439,7 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 				mediaDeleteNotBefore = candidate
 			}
 			delete(s.media, id)
+			delete(s.mediaUploadCapabilities, id)
 		}
 	}
 	for conversationID, phones := range s.invites {
@@ -524,11 +528,7 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 	}
 	if len(objectKeys) > 0 {
 		sort.Strings(objectKeys)
-		for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
-			end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
-			payload, _ := json.Marshal(store.NewMediaDeletePayloadAt(objectKeys[start:end], mediaDeleteNotBefore))
-			s.appendOutboxAt("media.delete", userID, payload, mediaDeleteNotBefore)
-		}
+		s.appendMediaDeletesAt(userID, objectKeys, mediaDeleteNotBefore)
 	}
 	return nil
 }
@@ -848,6 +848,7 @@ func (s *Store) DeleteConversation(_ context.Context, conversationID, actorID uu
 				deleteNotBefore = candidate
 			}
 			delete(s.media, id)
+			delete(s.mediaUploadCapabilities, id)
 		}
 	}
 	filtered := s.outbox[:0]
@@ -1414,6 +1415,50 @@ func (s *Store) CreateProfileMedia(_ context.Context, media domain.MediaObject, 
 	return s.createMediaLocked(media, limits)
 }
 
+func (s *Store) PersistMediaUploadCapability(
+	_ context.Context,
+	id, actorID uuid.UUID,
+	revocationToken string,
+) error {
+	revocationToken = strings.TrimSpace(revocationToken)
+	if id == uuid.Nil || actorID == uuid.Nil || revocationToken == "" || len(revocationToken) > 1024 {
+		return domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	media, ok := s.media[id]
+	if !ok || media.Status == "deleted" {
+		return domain.ErrNotFound
+	}
+	if media.OwnerID != actorID {
+		return domain.ErrForbidden
+	}
+	if media.Status != "pending" {
+		return domain.ErrConflict
+	}
+	if existing := s.mediaUploadCapabilities[id]; existing != "" && existing != revocationToken {
+		return domain.ErrConflict
+	}
+	s.mediaUploadCapabilities[id] = revocationToken
+	return nil
+}
+
+func (s *Store) MediaUploadCapability(
+	_ context.Context,
+	id, actorID uuid.UUID,
+) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	media, ok := s.media[id]
+	if !ok || media.Status == "deleted" {
+		return "", domain.ErrNotFound
+	}
+	if media.OwnerID != actorID {
+		return "", domain.ErrForbidden
+	}
+	return s.mediaUploadCapabilities[id], nil
+}
+
 func (s *Store) createMediaLocked(media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
 	if media.ID == uuid.Nil || media.OwnerID == uuid.Nil || media.ByteSize < 1 ||
 		strings.TrimSpace(media.ObjectKey) == "" || strings.TrimSpace(media.ContentType) == "" {
@@ -1538,7 +1583,11 @@ func (s *Store) ClaimMediaVerification(
 func (s *Store) MarkMediaReady(
 	_ context.Context,
 	id, actorID, leaseToken uuid.UUID,
+	publishedObjectKey string,
 ) (domain.MediaObject, error) {
+	if err := mediakey.Validate(publishedObjectKey); err != nil {
+		return domain.MediaObject{}, domain.ErrInvalid
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	media, ok := s.media[id]
@@ -1559,12 +1608,20 @@ func (s *Store) MarkMediaReady(
 	if media.ExpiresAt == nil || !media.ExpiresAt.After(time.Now().UTC()) {
 		return domain.MediaObject{}, domain.ErrMediaExpired
 	}
+	stagingObjectKey := media.ObjectKey
+	media.ObjectKey = publishedObjectKey
 	media.Status = "ready"
 	media.UpdatedAt = time.Now().UTC()
 	media.ExpiresAt = nil
 	media.VerificationLeaseToken = nil
 	media.VerificationLockedUntil = nil
 	s.media[id] = media
+	delete(s.mediaUploadCapabilities, id)
+	if stagingObjectKey != publishedObjectKey {
+		s.appendExactMediaDeletesAt(
+			actorID, []string{stagingObjectKey}, memoryMediaDeleteNotBefore(media.UploadValidUntil),
+		)
+	}
 	if media.Scope == domain.MediaScopeProfile {
 		reference := "clustr-media://" + media.ID.String()
 		user := s.users[actorID]
@@ -1581,6 +1638,7 @@ func (s *Store) MarkMediaReady(
 				old.VerificationLeaseToken = nil
 				old.VerificationLockedUntil = nil
 				s.media[oldID] = old
+				delete(s.mediaUploadCapabilities, oldID)
 				s.appendMediaDeletesAt(
 					actorID,
 					[]string{old.ObjectKey},
@@ -1656,6 +1714,7 @@ func (s *Store) rejectPendingMedia(
 	media.VerificationLeaseToken = nil
 	media.VerificationLockedUntil = nil
 	s.media[id] = media
+	delete(s.mediaUploadCapabilities, id)
 	s.appendMediaDeletesAt(actorID, []string{media.ObjectKey}, deleteNotBefore)
 	return media, nil
 }
@@ -1678,6 +1737,7 @@ func (s *Store) DeleteMedia(_ context.Context, id, actorID uuid.UUID) (domain.Me
 	media.VerificationLeaseToken = nil
 	media.VerificationLockedUntil = nil
 	s.media[id] = media
+	delete(s.mediaUploadCapabilities, id)
 	if media.Scope == domain.MediaScopeProfile {
 		user := s.users[actorID]
 		if profileMediaID(user.AvatarURL) == id {
@@ -1720,6 +1780,7 @@ func (s *Store) ExpirePendingMedia(_ context.Context, cutoff time.Time, limit in
 		object.VerificationLeaseToken = nil
 		object.VerificationLockedUntil = nil
 		s.media[expired.id] = object
+		delete(s.mediaUploadCapabilities, expired.id)
 		keys = append(keys, object.ObjectKey)
 	}
 	if len(keys) > 0 {
@@ -1735,8 +1796,30 @@ func (s *Store) ExpirePendingMedia(_ context.Context, cutoff time.Time, limit in
 }
 
 func (s *Store) appendMediaDeletesAt(aggregateID uuid.UUID, objectKeys []string, notBefore time.Time) {
-	payload, _ := json.Marshal(store.NewMediaDeletePayloadAt(objectKeys, notBefore))
-	s.appendOutboxAt("media.delete", aggregateID, payload, notBefore)
+	seen := make(map[string]struct{}, len(objectKeys)*2)
+	expanded := make([]string, 0, len(objectKeys)*2)
+	for _, objectKey := range objectKeys {
+		keys, err := mediakey.DeletionKeys(objectKey)
+		if err != nil {
+			keys = []string{objectKey}
+		}
+		for _, key := range keys {
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			expanded = append(expanded, key)
+		}
+	}
+	s.appendExactMediaDeletesAt(aggregateID, expanded, notBefore)
+}
+
+func (s *Store) appendExactMediaDeletesAt(aggregateID uuid.UUID, objectKeys []string, notBefore time.Time) {
+	for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
+		end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
+		payload, _ := json.Marshal(store.NewMediaDeletePayloadAt(objectKeys[start:end], notBefore))
+		s.appendOutboxAt("media.delete", aggregateID, payload, notBefore)
+	}
 }
 
 func memoryMediaDeleteNotBefore(uploadValidUntil time.Time) time.Time {

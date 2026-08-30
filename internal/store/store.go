@@ -183,9 +183,11 @@ type Store interface {
 
 	CreateMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
 	CreateProfileMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
+	PersistMediaUploadCapability(context.Context, uuid.UUID, uuid.UUID, string) error
+	MediaUploadCapability(context.Context, uuid.UUID, uuid.UUID) (string, error)
 	Media(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
 	ClaimMediaVerification(context.Context, uuid.UUID, uuid.UUID, time.Duration) (domain.MediaObject, error)
-	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string) (domain.MediaObject, error)
 	ReleaseMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 	RejectMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
 	RejectPendingMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)

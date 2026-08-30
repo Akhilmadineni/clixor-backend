@@ -170,7 +170,8 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 			}
 		}
 	}
-	if !found || len(deletion.ObjectKeys) != 1 || deletion.ObjectKeys[0] != mediaObject.ObjectKey {
+	if !found || len(deletion.ObjectKeys) != 2 || deletion.ObjectKeys[0] != mediaObject.ObjectKey ||
+		deletion.ObjectKeys[1] != "published/"+mediaObject.ObjectKey {
 		t.Fatalf("durable media deletion was not queued: %+v", events)
 	}
 }

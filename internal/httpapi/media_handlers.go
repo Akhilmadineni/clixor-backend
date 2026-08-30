@@ -118,6 +118,17 @@ func (s *Server) writeMediaUpload(w http.ResponseWriter, r *http.Request, record
 		writeDomainError(w, errors.New("media provider returned incomplete upload instructions"))
 		return
 	}
+	if upload.RevocationToken != "" {
+		if err := s.store.PersistMediaUploadCapability(
+			r.Context(), record.ID, record.OwnerID, upload.RevocationToken,
+		); err != nil {
+			_, _ = s.store.RejectPendingMedia(r.Context(), record.ID, record.OwnerID)
+			s.logger.Error("persist_media_upload_capability_failed", "error", err, "media_id", record.ID)
+			writeError(w, http.StatusServiceUnavailable, "media_unavailable",
+				"Media uploads are temporarily unavailable. Retry with a new upload reservation.")
+			return
+		}
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"media": record,
 		"upload": map[string]any{
@@ -146,6 +157,11 @@ func (s *Server) completeMediaUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if record.Status == "ready" {
 		writeJSON(w, http.StatusOK, record)
+		return
+	}
+	revocationToken, err := s.store.MediaUploadCapability(r.Context(), mediaID, id.UserID)
+	if err != nil {
+		writeDomainError(w, err)
 		return
 	}
 	select {
@@ -183,10 +199,14 @@ func (s *Server) completeMediaUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	leaseToken := *record.VerificationLeaseToken
-	if err := s.media.Verify(
-		r.Context(), record.ObjectKey, record.ByteSize,
+	publishedObjectKey, err := s.media.FinalizeUpload(
+		r.Context(), record.ObjectKey, revocationToken, record.ByteSize,
 		record.CiphertextSHA256, record.ContentType,
-	); err != nil {
+	)
+	if err == nil && strings.TrimSpace(publishedObjectKey) == "" {
+		err = media.ErrUnavailable
+	}
+	if err != nil {
 		if !media.IsDefinitiveVerificationFailure(err) {
 			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Second)
 			releaseErr := s.store.ReleaseMediaVerification(releaseCtx, mediaID, id.UserID, leaseToken)
@@ -221,7 +241,9 @@ func (s *Server) completeMediaUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "upload_incomplete", "The uploaded object does not match its declaration.")
 		return
 	}
-	ready, err := s.store.MarkMediaReady(r.Context(), mediaID, id.UserID, leaseToken)
+	ready, err := s.store.MarkMediaReady(
+		r.Context(), mediaID, id.UserID, leaseToken, publishedObjectKey,
+	)
 	if err != nil {
 		if latest, lookupErr := s.store.Media(r.Context(), mediaID, id.UserID); lookupErr == nil && latest.Status == "ready" {
 			writeJSON(w, http.StatusOK, latest)

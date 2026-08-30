@@ -26,10 +26,18 @@ rows stop consuming quota. Conversation upload reservations also have a dedicate
 OCI completion checks length, content type, and the Object Storage-computed SHA-256
 with a `HEAD` request, so a 1 GiB object is never streamed through an API replica.
 A missing checksum header is a definitive mismatch, not permission to publish an
-unverified object. S3 completion independently streams the ciphertext through
-SHA-256 before marking it ready. Expired, rejected, deleted, and
+unverified object. The API persists the write PAR identifier before returning its
+URL, revokes that exact capability at completion, and conditionally renames the
+staging object to a deterministic `published/` key using the verified source ETag
+and destination `If-None-Match: *`. An already-authorized PUT can therefore only
+recreate the unserved staging key; it cannot overwrite a ready object. Publication,
+capability-state clearing, and durable staging cleanup are committed in one
+PostgreSQL transaction. S3 completion independently streams the ciphertext through
+SHA-256 and retains its existing key before marking it ready. Expired, rejected, deleted, and
 conversation-owned objects are removed through durable `media.delete`
 outbox events; database cascades never run before their object keys are captured.
+Destructive database paths enqueue both staging and published forms so deletion
+remains complete across a rename/database-commit or rolling-replica race.
 Deletion jobs wait three minutes after the upload capability expires so an upload accepted just
 before URL expiry cannot normally commit after an already-successful delete.
 Definitive missing-object or declaration mismatches reject the reservation and

@@ -26,7 +26,12 @@ type fakeOCIObjectStorageClient struct {
 
 	headObjectResponse objectstorage.HeadObjectResponse
 	headObjectError    error
+	headObjectResults  []fakeOCIHeadResult
 	headObjectRequests []objectstorage.HeadObjectRequest
+
+	renameObjectResponse objectstorage.RenameObjectResponse
+	renameObjectError    error
+	renameObjectRequests []objectstorage.RenameObjectRequest
 
 	deleteObjectError    error
 	deleteObjectRequests []objectstorage.DeleteObjectRequest
@@ -37,6 +42,11 @@ type fakeOCIObjectStorageClient struct {
 
 	deletePARError    error
 	deletePARRequests []objectstorage.DeletePreauthenticatedRequestRequest
+}
+
+type fakeOCIHeadResult struct {
+	response objectstorage.HeadObjectResponse
+	err      error
 }
 
 type fakeOCIServiceError struct{ status int }
@@ -91,7 +101,20 @@ func (f *fakeOCIObjectStorageClient) HeadObject(
 	request objectstorage.HeadObjectRequest,
 ) (objectstorage.HeadObjectResponse, error) {
 	f.headObjectRequests = append(f.headObjectRequests, request)
+	if len(f.headObjectResults) > 0 {
+		result := f.headObjectResults[0]
+		f.headObjectResults = f.headObjectResults[1:]
+		return result.response, result.err
+	}
 	return f.headObjectResponse, f.headObjectError
+}
+
+func (f *fakeOCIObjectStorageClient) RenameObject(
+	_ context.Context,
+	request objectstorage.RenameObjectRequest,
+) (objectstorage.RenameObjectResponse, error) {
+	f.renameObjectRequests = append(f.renameObjectRequests, request)
+	return f.renameObjectResponse, f.renameObjectError
 }
 
 func (f *fakeOCIObjectStorageClient) DeleteObject(
@@ -118,6 +141,7 @@ func ociHeadResponse(size int64, contentType, digestHex string) objectstorage.He
 	checksum := base64.StdEncoding.EncodeToString(digest)
 	return objectstorage.HeadObjectResponse{
 		ContentLength: &size, ContentType: &contentType, OpcContentSha256: &checksum,
+		ETag: common.String("staged-etag"),
 	}
 }
 
@@ -126,6 +150,7 @@ func TestOCIPrepareUploadCreatesObjectSpecificWritePARAndChecksumHeaders(t *test
 		createResponse: objectstorage.CreatePreauthenticatedRequestResponse{
 			PreauthenticatedRequest: objectstorage.PreauthenticatedRequest{
 				AccessUri: common.String("/p/opaque-token/n/testnamespace/b/clixor-media/o/conversations/id/media"),
+				Id:        common.String("write-par-id"),
 			},
 		},
 	}
@@ -145,6 +170,9 @@ func TestOCIPrepareUploadCreatesObjectSpecificWritePARAndChecksumHeaders(t *test
 		upload.Headers["Content-Length"] != "42" || upload.Headers["opc-checksum-algorithm"] != "SHA256" ||
 		upload.Headers["opc-content-sha256"] != "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=" {
 		t.Fatalf("OCI upload instructions = %+v", upload)
+	}
+	if upload.RevocationToken != "write-par-id" {
+		t.Fatalf("revocation token = %q", upload.RevocationToken)
 	}
 	if len(client.createRequests) != 1 {
 		t.Fatalf("create request count = %d, want 1", len(client.createRequests))
@@ -176,6 +204,7 @@ func TestOCIDownloadURLCreatesObjectSpecificReadPAR(t *testing.T) {
 		createResponse: objectstorage.CreatePreauthenticatedRequestResponse{
 			PreauthenticatedRequest: objectstorage.PreauthenticatedRequest{
 				AccessUri: common.String("/p/read-token/n/testnamespace/b/clixor-media/o/conversations/id/media"),
+				Id:        common.String("read-par-id"),
 			},
 		},
 	}
@@ -188,11 +217,29 @@ func TestOCIDownloadURLCreatesObjectSpecificReadPAR(t *testing.T) {
 	}
 }
 
+func TestOCIPrepareUploadFailsClosedWithoutDurablePARIdentity(t *testing.T) {
+	client := &fakeOCIObjectStorageClient{
+		createResponse: objectstorage.CreatePreauthenticatedRequestResponse{
+			PreauthenticatedRequest: objectstorage.PreauthenticatedRequest{
+				AccessUri: common.String("/p/write-token/n/testnamespace/b/clixor-media/o/conversations/id/media"),
+			},
+		},
+	}
+	store := newTestOCIStore(t, client)
+	if _, err := store.PrepareUpload(
+		context.Background(), "conversations/id/media", "application/octet-stream", 3,
+		testSHA256, 15*time.Minute,
+	); err == nil || !strings.Contains(err.Error(), "omitted its identifier") {
+		t.Fatalf("missing PAR identity error=%v", err)
+	}
+}
+
 func TestOCIRejectsAbsolutePARAccessURI(t *testing.T) {
 	client := &fakeOCIObjectStorageClient{
 		createResponse: objectstorage.CreatePreauthenticatedRequestResponse{
 			PreauthenticatedRequest: objectstorage.PreauthenticatedRequest{
 				AccessUri: common.String("https://attacker.example/p/stolen"),
+				Id:        common.String("invalid-uri-par-id"),
 			},
 		},
 	}
@@ -272,6 +319,145 @@ func TestOCIVerifyClassifiesMissingAndTransientStorageErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOCIFinalizeRevokesWriteCapabilitiesAndConditionallyPublishes(t *testing.T) {
+	client := &fakeOCIObjectStorageClient{
+		headObjectResults: []fakeOCIHeadResult{
+			{err: fakeOCIServiceError{status: 404}},
+			{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+			{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+		},
+		listResponses: []objectstorage.ListPreauthenticatedRequestsResponse{{
+			Items: []objectstorage.PreauthenticatedRequestSummary{{
+				Id: common.String("orphan-write-par"), ObjectName: common.String("conversations/id/media"),
+				AccessType: objectstorage.PreauthenticatedRequestSummaryAccessTypeObjectwrite,
+			}},
+		}},
+	}
+	store := newTestOCIStore(t, client)
+	published, err := store.FinalizeUpload(
+		context.Background(), "conversations/id/media", "persisted-write-par", 3,
+		testSHA256, "application/octet-stream",
+	)
+	if err != nil || published != "published/conversations/id/media" {
+		t.Fatalf("published=%q err=%v", published, err)
+	}
+	if len(client.deletePARRequests) != 2 || *client.deletePARRequests[0].ParId != "persisted-write-par" ||
+		*client.deletePARRequests[1].ParId != "orphan-write-par" {
+		t.Fatalf("revoked PARs=%#v", client.deletePARRequests)
+	}
+	if len(client.listRequests) != 1 || client.listRequests[0].ObjectNamePrefix == nil ||
+		*client.listRequests[0].ObjectNamePrefix != "conversations/id/media" {
+		t.Fatalf("PAR lookup=%#v", client.listRequests)
+	}
+	if len(client.renameObjectRequests) != 1 {
+		t.Fatalf("rename count=%d", len(client.renameObjectRequests))
+	}
+	rename := client.renameObjectRequests[0]
+	if rename.SourceName == nil || *rename.SourceName != "conversations/id/media" ||
+		rename.NewName == nil || *rename.NewName != published ||
+		rename.SrcObjIfMatchETag == nil || *rename.SrcObjIfMatchETag != "staged-etag" ||
+		rename.NewObjIfNoneMatchETag == nil || *rename.NewObjIfNoneMatchETag != "*" {
+		t.Fatalf("unsafe rename request=%#v", rename)
+	}
+}
+
+func TestOCIFinalizeIsIdempotentAfterAmbiguousPublication(t *testing.T) {
+	client := &fakeOCIObjectStorageClient{
+		headObjectResults: []fakeOCIHeadResult{{
+			response: ociHeadResponse(3, "application/octet-stream", testSHA256),
+		}},
+	}
+	store := newTestOCIStore(t, client)
+	published, err := store.FinalizeUpload(
+		context.Background(), "conversations/id/media", "persisted-write-par", 3,
+		testSHA256, "application/octet-stream",
+	)
+	if err != nil || published != "published/conversations/id/media" {
+		t.Fatalf("published=%q err=%v", published, err)
+	}
+	if len(client.renameObjectRequests) != 0 || len(client.deletePARRequests) != 1 {
+		t.Fatalf("idempotent calls: rename=%d revoke=%d", len(client.renameObjectRequests), len(client.deletePARRequests))
+	}
+}
+
+func TestOCIFinalizeAcceptsSuccessfulDestinationAfterRenameTimeout(t *testing.T) {
+	client := &fakeOCIObjectStorageClient{
+		headObjectResults: []fakeOCIHeadResult{
+			{err: fakeOCIServiceError{status: 404}},
+			{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+			{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+		},
+		renameObjectError: fakeOCIServiceError{status: 503},
+	}
+	store := newTestOCIStore(t, client)
+	published, err := store.FinalizeUpload(
+		context.Background(), "conversations/id/media", "persisted-write-par", 3,
+		testSHA256, "application/octet-stream",
+	)
+	if err != nil || published != "published/conversations/id/media" {
+		t.Fatalf("ambiguous publication was not recovered: published=%q err=%v", published, err)
+	}
+}
+
+func TestOCIFinalizeRequiresPersistedRevocationButBoundsOrphanCleanup(t *testing.T) {
+	t.Run("persisted revocation failure blocks publication", func(t *testing.T) {
+		client := &fakeOCIObjectStorageClient{
+			headObjectResults: []fakeOCIHeadResult{
+				{err: fakeOCIServiceError{status: 404}},
+				{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+			},
+			deletePARError: fakeOCIServiceError{status: 503},
+		}
+		store := newTestOCIStore(t, client)
+		_, err := store.FinalizeUpload(
+			context.Background(), "conversations/id/media", "persisted-write-par", 3,
+			testSHA256, "application/octet-stream",
+		)
+		if !errors.Is(err, ErrUnavailable) || len(client.renameObjectRequests) != 0 {
+			t.Fatalf("err=%v rename=%d", err, len(client.renameObjectRequests))
+		}
+	})
+
+	t.Run("orphan enumeration is best effort with persisted identity", func(t *testing.T) {
+		client := &fakeOCIObjectStorageClient{
+			headObjectResults: []fakeOCIHeadResult{
+				{err: fakeOCIServiceError{status: 404}},
+				{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+				{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+			},
+			listError: fakeOCIServiceError{status: 503},
+		}
+		store := newTestOCIStore(t, client)
+		if _, err := store.FinalizeUpload(
+			context.Background(), "conversations/id/media", "persisted-write-par", 3,
+			testSHA256, "application/octet-stream",
+		); err != nil {
+			t.Fatal(err)
+		}
+		if len(client.renameObjectRequests) != 1 {
+			t.Fatalf("rename count=%d", len(client.renameObjectRequests))
+		}
+	})
+
+	t.Run("legacy upload needs successful discovery", func(t *testing.T) {
+		client := &fakeOCIObjectStorageClient{
+			headObjectResults: []fakeOCIHeadResult{
+				{err: fakeOCIServiceError{status: 404}},
+				{response: ociHeadResponse(3, "application/octet-stream", testSHA256)},
+			},
+			listError: fakeOCIServiceError{status: 503},
+		}
+		store := newTestOCIStore(t, client)
+		_, err := store.FinalizeUpload(
+			context.Background(), "conversations/id/media", "", 3,
+			testSHA256, "application/octet-stream",
+		)
+		if !errors.Is(err, ErrUnavailable) || len(client.renameObjectRequests) != 0 {
+			t.Fatalf("err=%v rename=%d", err, len(client.renameObjectRequests))
+		}
+	})
 }
 
 func TestOCICleanupDeletesOnlyExpiredOwnedPARsAcrossPages(t *testing.T) {

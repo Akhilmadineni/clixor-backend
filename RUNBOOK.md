@@ -42,10 +42,15 @@ do not rewrite already-applied migration 9.
 
 Migration 10 adds bounded media reservations, stored-media quota indexes, pending
 expiry, verification leases, and delayed object-deletion scheduling. Migration 11
-adds the published-outbox retention index. Apply both in numeric order before
-rolling out this binary. Never publish a different migration body under an
-already-applied version. Migration 12 remains reserved for the push-token database
-constraint after migrations 10 and 11 have landed.
+adds the published-outbox retention index. Migration 14 persists upload-capability
+identity and makes legacy account deletion cover both OCI staging and immutable
+published keys; 12 and 13 remain reserved for mail and push work. Apply every
+available migration in numeric order before rolling out this binary. Never publish
+a different migration body under an already-applied version.
+The migration's ready-row constraint prevents a production-05b replica from
+publishing a capability-bearing upload without revocation. Drain old replicas
+before promotion so newly created and legacy in-flight OCI uploads complete on
+the immutable-publication code path; old rows with no capability remain readable.
 
 `clustr_messaging_transition_messages_total` counts accepted messages from the
 installed production-05b codec. Those payloads are base64-encoded JSON,
@@ -115,6 +120,10 @@ causes the just-created challenge to be canceled.
   multipart uploads, stored-object limits match the product plan, the configured
   conversation ceiling remains 1 GiB while production-05b is supported, and a
   missing `opc-content-sha256` can never transition an object to ready.
+- Alert on completion failures during PAR revocation or conditional rename. A
+  ready OCI row must reference `published/`; investigate pending rows with a
+  persisted capability older than their expiry and verify staging cleanup outbox
+  work is draining before retrying promotion.
 - Redis presence/rate limits and NATS realtime fan-out are rebuildable. PostgreSQL
   messages plus the transactional outbox are the recovery source of truth.
 - Export backup success and restore-point age as monitored metrics.

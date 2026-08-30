@@ -137,7 +137,9 @@ func TestProduction05bStoredMediaReferenceReplaysAfterConversationAccessIsLost(t
 	if err != nil || claimed.VerificationLeaseToken == nil {
 		t.Fatalf("claim media verification: media=%+v err=%v", claimed, err)
 	}
-	if _, err := persistence.MarkMediaReady(ctx, mediaObject.ID, user.ID, *claimed.VerificationLeaseToken); err != nil {
+	if _, err := persistence.MarkMediaReady(
+		ctx, mediaObject.ID, user.ID, *claimed.VerificationLeaseToken, mediaObject.ObjectKey,
+	); err != nil {
 		t.Fatal(err)
 	}
 	reference := "clustr-media://" + mediaObject.ID.String()

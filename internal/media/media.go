@@ -29,12 +29,19 @@ type UploadInstructions struct {
 	Method  string
 	URL     *url.URL
 	Headers map[string]string
+	// RevocationToken is provider-opaque capability identity that must be
+	// persisted before URL instructions are returned to the client. It is never
+	// serialized in the public response.
+	RevocationToken string
 }
 
 type Service interface {
 	PrepareUpload(context.Context, string, string, int64, string, time.Duration) (UploadInstructions, error)
 	DownloadURL(context.Context, string, time.Duration) (*url.URL, error)
-	Verify(context.Context, string, int64, string, string) error
+	// FinalizeUpload verifies the staged object and returns the immutable key
+	// that may be published to clients. Providers without a separate staging
+	// namespace return objectKey unchanged after verification.
+	FinalizeUpload(context.Context, string, string, int64, string, string) (string, error)
 	Delete(context.Context, string) error
 	Close()
 }
@@ -47,8 +54,8 @@ func (Unavailable) PrepareUpload(context.Context, string, string, int64, string,
 func (Unavailable) DownloadURL(context.Context, string, time.Duration) (*url.URL, error) {
 	return nil, ErrUnavailable
 }
-func (Unavailable) Verify(context.Context, string, int64, string, string) error {
-	return ErrUnavailable
+func (Unavailable) FinalizeUpload(context.Context, string, string, int64, string, string) (string, error) {
+	return "", ErrUnavailable
 }
 func (Unavailable) Delete(context.Context, string) error { return ErrUnavailable }
 func (Unavailable) Close()                               {}

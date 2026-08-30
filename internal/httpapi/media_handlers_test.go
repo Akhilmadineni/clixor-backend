@@ -27,12 +27,15 @@ import (
 )
 
 type testMediaService struct {
-	verifyErr      error
-	verifiedKey    string
-	verifiedSize   int64
-	verifiedSHA256 string
-	verifiedType   string
-	uploadHeaders  map[string]string
+	verifyErr       error
+	verifiedKey     string
+	verifiedToken   string
+	verifiedSize    int64
+	verifiedSHA256  string
+	verifiedType    string
+	publishedKey    string
+	uploadHeaders   map[string]string
+	revocationToken string
 }
 
 func (m *testMediaService) PrepareUpload(_ context.Context, _ string, contentType string, byteSize int64, _ string, _ time.Duration) (media.UploadInstructions, error) {
@@ -48,9 +51,10 @@ func (m *testMediaService) PrepareUpload(_ context.Context, _ string, contentTyp
 		}
 	}
 	return media.UploadInstructions{
-		Method:  http.MethodPut,
-		URL:     uploadURL,
-		Headers: headers,
+		Method:          http.MethodPut,
+		URL:             uploadURL,
+		Headers:         headers,
+		RevocationToken: m.revocationToken,
 	}, nil
 }
 
@@ -58,9 +62,21 @@ func (*testMediaService) DownloadURL(_ context.Context, _ string, _ time.Duratio
 	return url.Parse("https://media.example/download")
 }
 
-func (m *testMediaService) Verify(_ context.Context, key string, size int64, sha256, contentType string) error {
-	m.verifiedKey, m.verifiedSize, m.verifiedSHA256, m.verifiedType = key, size, sha256, contentType
-	return m.verifyErr
+func (m *testMediaService) FinalizeUpload(
+	_ context.Context,
+	key, revocationToken string,
+	size int64,
+	sha256, contentType string,
+) (string, error) {
+	m.verifiedKey, m.verifiedToken = key, revocationToken
+	m.verifiedSize, m.verifiedSHA256, m.verifiedType = size, sha256, contentType
+	if m.verifyErr != nil {
+		return "", m.verifyErr
+	}
+	if m.publishedKey != "" {
+		return m.publishedKey, nil
+	}
+	return key, nil
 }
 
 func (*testMediaService) Delete(context.Context, string) error { return nil }
@@ -91,6 +107,42 @@ func TestMediaUploadReturnsProviderNeutralInstructions(t *testing.T) {
 		upload.Upload.Headers["opc-content-sha256"] != "provider-digest" ||
 		upload.Upload.Headers["X-Amz-Checksum-Sha256"] != "" {
 		t.Fatalf("provider instructions were altered: %+v", upload.Upload)
+	}
+}
+
+func TestMediaCompletionPersistsCapabilityAndPublishesReturnedObjectKey(t *testing.T) {
+	t.Parallel()
+	const publishedKey = "published/users/test/avatar"
+	mediaService := &testMediaService{
+		revocationToken: "oci-write-par-id",
+		publishedKey:    publishedKey,
+	}
+	server, persistence := newTestHTTPServerWithMediaStore(t, mediaService, DefaultMediaPolicy())
+	user := registerTestUser(t, server.URL, "immutable-publication@example.com")
+	var upload struct {
+		Media domain.MediaObject `json:"media"`
+	}
+	user.client.do(t, http.MethodPost, "/v1/me/avatar", map[string]any{
+		"byte_size":         3,
+		"ciphertext_sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+		"content_type":      "image/jpeg",
+	}, http.StatusCreated, &upload)
+	capability, err := persistence.MediaUploadCapability(
+		context.Background(), upload.Media.ID, user.user.ID,
+	)
+	if err != nil || capability != "oci-write-par-id" {
+		t.Fatalf("persisted capability=%q err=%v", capability, err)
+	}
+	user.client.do(t, http.MethodPost, "/v1/media/"+upload.Media.ID.String()+"/complete", nil, http.StatusOK, nil)
+	stored, err := persistence.Media(context.Background(), upload.Media.ID, user.user.ID)
+	if err != nil || stored.ObjectKey != publishedKey || stored.Status != "ready" {
+		t.Fatalf("published media=%+v err=%v", stored, err)
+	}
+	capability, err = persistence.MediaUploadCapability(
+		context.Background(), upload.Media.ID, user.user.ID,
+	)
+	if err != nil || capability != "" || mediaService.verifiedToken != "oci-write-par-id" {
+		t.Fatalf("cleared capability=%q finalize token=%q err=%v", capability, mediaService.verifiedToken, err)
 	}
 }
 
@@ -432,12 +484,12 @@ type blockingVerifyMedia struct {
 	calls   atomic.Int32
 }
 
-func (m *blockingVerifyMedia) Verify(
+func (m *blockingVerifyMedia) FinalizeUpload(
 	ctx context.Context,
-	_ string,
+	key, _ string,
 	_ int64,
 	_, _ string,
-) error {
+) (string, error) {
 	m.calls.Add(1)
 	select {
 	case m.entered <- struct{}{}:
@@ -445,8 +497,8 @@ func (m *blockingVerifyMedia) Verify(
 	}
 	select {
 	case <-m.release:
-		return nil
+		return key, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	}
 }

@@ -278,10 +278,16 @@ For OCI that includes `Content-Type`, `Content-Length`,
 `opc-checksum-algorithm: SHA256`, and a base64 `opc-content-sha256`. Completion
 uses Object Storage `HEAD` metadata to verify all three declarations without
 streaming a production-05b-compatible 1 GiB object through an API container. A
-missing checksum header is rejected and queued for durable deletion. Migrations
-10 and 11 must be applied before this binary starts; migration 10 adds media
+missing checksum header is rejected and queued for durable deletion. Before an
+upload URL is returned, migration 14 stores its opaque PAR identifier. Completion
+revokes it, conditionally renames the verified staging object to a backend-only
+`published/` key with source-ETag and destination-create fences, then atomically
+stores that key and queues staging cleanup. Migrations 10, 11, and 14 must be
+applied before this binary starts; migration 10 adds media
 reservations, immutable upload expiry, verification leases, and deletion
-scheduling, while migration 11 adds the bounded published-outbox retention index.
+scheduling, migration 11 adds the bounded published-outbox retention index, and
+migration 14 closes write-PAR replay during publication. Versions 12 and 13 are
+reserved for the independently delivered mail and push migrations.
 
 ## 5. Provider credentials and production promotion
 

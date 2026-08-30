@@ -38,7 +38,43 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	}
 	for want := int64(1); want <= maximum; want++ {
 		if _, exists := versions[want]; !exists {
+			if want == 12 || want == 13 {
+				// Reserved for durable mail and push-token uniqueness. This
+				// independently cherry-pickable media migration must remain 14.
+				continue
+			}
 			t.Fatalf("missing migration version %d", want)
+		}
+	}
+}
+
+func TestImmutableMediaPublicationMigrationIsRollingCompatible(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000014_media_immutable_publication.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"ADD COLUMN upload_capability_id text",
+		"status <> 'ready' OR upload_capability_id IS NULL",
+		"VALIDATE CONSTRAINT media_objects_ready_capability_revoked_check",
+		"CREATE OR REPLACE FUNCTION cleanup_account_extensions_on_delete()",
+		"'published/' || object_key",
+		"substring(object_key FROM 11)",
+		"upload_valid_until + interval '3 minutes'",
+		"'not_before', deletion.not_before",
+		"available_at",
+		"/ 500 AS batch_number",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("immutable media migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"DROP TABLE", "DROP COLUMN", "ALTER COLUMN object_key",
+	} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("immutable media migration contains rolling-incompatible %q", forbidden)
 		}
 	}
 }

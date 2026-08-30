@@ -186,6 +186,10 @@ Object Storage API, so the stack creates no S3 customer secret key. Configure
 the backend from the `object_storage_namespace`, `media_bucket_name`,
 `object_storage_region`, and `object_storage_native_endpoint` outputs. The
 bucket stays private; clients receive only expiring, object-specific PAR URLs.
+Write PAR identifiers are persisted before their URLs leave the API, revoked at
+completion, and their verified objects are conditionally renamed from staging to
+backend-only `published/` names. The existing bucket-scoped `manage objects` and
+PAR permissions cover rename and revocation; no additional credential is needed.
 
 The cloud-init template only hardens the host, installs packages, validates and
 mounts the attached data volume at `/srv/clixor`, restricts SSH, and prevents
