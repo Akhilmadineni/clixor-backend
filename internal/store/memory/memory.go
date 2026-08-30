@@ -443,6 +443,7 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	}
 	now := time.Now().UTC()
 	deletedConversations := make(map[uuid.UUID]struct{})
+	sharedConversations := make(map[uuid.UUID]struct{})
 	var objectKeys []string
 	mediaDeleteNotBefore := now.Add(store.MediaDeleteGrace)
 	var updatedEntities []domain.Entity
@@ -461,6 +462,7 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			delete(s.messages, conversationID)
 			continue
 		}
+		sharedConversations[conversationID] = struct{}{}
 
 		successor := oldestMember(members, userID)
 		conversation := s.conversations[conversationID]
@@ -520,6 +522,37 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	for key, entity := range s.entities {
 		if _, deleted := deletedConversations[entity.ConversationID]; deleted {
 			delete(s.entities, key)
+		}
+	}
+	for operationID, operation := range s.choreRotations {
+		if _, deleted := deletedConversations[operation.ConversationID]; deleted {
+			delete(s.choreRotations, operationID)
+			continue
+		}
+		if _, shared := sharedConversations[operation.ConversationID]; !shared {
+			continue
+		}
+		chorePayload, choreChanged, choreErr := store.AnonymizeAccountJSON(
+			operation.Result.Chore.Payload, identity,
+		)
+		feedPayload, feedChanged, feedErr := store.AnonymizeAccountJSON(
+			operation.Result.FeedItem.Payload, identity,
+		)
+		// An operation result is a replay cache, not the source of financial
+		// truth. Fail closed by discarding an unexpectedly malformed snapshot
+		// instead of retaining identity data account deletion cannot inspect.
+		if choreErr != nil || feedErr != nil {
+			delete(s.choreRotations, operationID)
+			continue
+		}
+		if choreChanged {
+			operation.Result.Chore.Payload = chorePayload
+		}
+		if feedChanged {
+			operation.Result.FeedItem.Payload = feedPayload
+		}
+		if choreChanged || feedChanged {
+			s.choreRotations[operationID] = operation
 		}
 	}
 	for id, mediaObject := range s.media {

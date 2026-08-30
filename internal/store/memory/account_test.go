@@ -2,8 +2,10 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,5 +175,111 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 	if !found || len(deletion.ObjectKeys) != 2 || deletion.ObjectKeys[0] != mediaObject.ObjectKey ||
 		deletion.ObjectKeys[1] != "published/"+mediaObject.ObjectKey {
 		t.Fatalf("durable media deletion was not queued: %+v", events)
+	}
+}
+
+func TestDeleteAccountSanitizesLiveAndReplayableChoreCreatorPII(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "rotation-delete@example.com", Phone: "+13125550991",
+		DisplayName: "Rotation Delete", PasswordHash: "hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err = persistence.UpdateUserProfile(ctx, deleted.ID, json.RawMessage(
+		`{"username":"@rotation_delete","display_name":"Rotation Delete"}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: deleted.ID, MemberIDs: []uuid.UUID{remaining.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choreID, operationID, financialID := uuid.New(), uuid.New(), uuid.New()
+	base := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` +
+		conversation.ID.String() + `","createdBy":"` + deleted.ID.String() +
+		`","assignedTo":"` + remaining.ID.String() + `"}`)
+	chore, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "chore", ID: choreID,
+		CreatedBy: deleted.ID, Payload: base,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` +
+		conversation.ID.String() + `","createdBy":"` + deleted.ID.String() +
+		`","assignedTo":"` + remaining.ID.String() +
+		`","creatorName":"Rotation Delete","createdByDisplayName":"Rotation Delete",` +
+		`"description":"Rotation Delete (@rotation_delete) rotation-delete@example.com +13125550991",` +
+		`"financialId":"` + financialID.String() + `","amount":73.25}`)
+	feed := json.RawMessage(`{"id":"` + operationID.String() + `","groupId":"` +
+		conversation.ID.String() + `","createdBy":"` + deleted.ID.String() +
+		`","relatedId":"` + choreID.String() + `","type":"note",` +
+		`"creatorDisplayName":"Rotation Delete","createdByName":"Rotation Delete",` +
+		`"description":"Rotation Delete <rotation-delete@example.com> @rotation_delete +13125550991",` +
+		`"financialId":"` + financialID.String() + `","amount":73.25}`)
+	digest := sha256.Sum256(append(append([]byte(nil), rotated...), feed...))
+	if _, err := persistence.RotateChore(ctx, store.RotateChoreParams{
+		OperationID: operationID, ConversationID: conversation.ID, ChoreID: choreID,
+		ActorID: deleted.ID, ExpectedChoreVersion: chore.Version,
+		ChorePayload: rotated, FeedPayload: feed, RequestHash: digest[:],
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	chores, err := persistence.ListEntities(
+		ctx, conversation.ID, remaining.ID, "chore", time.Time{}, 10,
+	)
+	if err != nil || len(chores) != 1 {
+		t.Fatalf("live chore missing: chores=%+v err=%v", chores, err)
+	}
+	feeds, err := persistence.ListEntities(
+		ctx, conversation.ID, remaining.ID, "feed_item", time.Time{}, 10,
+	)
+	if err != nil || len(feeds) != 1 {
+		t.Fatalf("live feed missing: feeds=%+v err=%v", feeds, err)
+	}
+	persistence.mu.RLock()
+	operation, retained := persistence.choreRotations[operationID]
+	persistence.mu.RUnlock()
+	if !retained || operation.ExpiresAt.Before(time.Now().Add(89*24*time.Hour)) {
+		t.Fatalf("90-day rotation replay row was not retained: %+v", operation)
+	}
+	replayJSON, err := json.Marshal(operation.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for label, raw := range map[string][]byte{
+		"live chore":      chores[0].Payload,
+		"live feed":       feeds[0].Payload,
+		"rotation replay": replayJSON,
+	} {
+		text := string(raw)
+		for _, forbidden := range []string{
+			"Rotation Delete", "rotation-delete@example.com", "@rotation_delete", "+13125550991",
+		} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+				t.Fatalf("%s retained %q: %s", label, forbidden, text)
+			}
+		}
+		for _, retainedValue := range []string{deleted.ID.String(), financialID.String(), `"amount":73.25`} {
+			if !strings.Contains(text, retainedValue) {
+				t.Fatalf("%s removed shared value %q: %s", label, retainedValue, text)
+			}
+		}
 	}
 }

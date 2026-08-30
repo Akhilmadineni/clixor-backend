@@ -985,6 +985,21 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(offsite_proof, disarm)
         self.assertLess(disarm, retention_call)
 
+    def test_membership_bridge_ledger_is_gated_before_release_mutation(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        gate = deploy.index("\n  preflight_membership_bridge_rollout\n")
+        release_create = deploy.index('mkdir "${release_dir}"')
+        snapshot = deploy.index("capturing a pre-change PostgreSQL snapshot")
+        migration = deploy.index("applying transactional forward migrations")
+        self.assertLess(gate, release_create)
+        self.assertLess(gate, snapshot)
+        self.assertLess(gate, migration)
+        self.assertIn("WHERE version=16", deploy)
+        self.assertIn("WHERE version=20", deploy)
+        self.assertIn("conversation_members_bridge_identity_insert", deploy)
+        self.assertIn("conversation_members_bridge_tombstone_delete", deploy)
+        self.assertIn("restore the pre-rollout snapshot", deploy)
+
     def test_api_replicas_roll_sequentially_before_gateway_reload(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
         nginx = (self.oci_root / "api-gateway-nginx.conf").read_text(

@@ -43,6 +43,80 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	}
 }
 
+func TestVersionOnlyMigrationRunnerCannotSkipAmendedMembershipBridge(t *testing.T) {
+	migration17, err := migrationFiles.ReadFile("migrations/000017_account_deletion_intents.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration20, err := migrationFiles.ReadFile("migrations/000020_legacy_membership_write_bridge.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string][]byte{"migration 17": migration17, "migration 20": migration20} {
+		sql := string(raw)
+		for _, required := range []string{
+			"conversation_members_bridge_identity_insert",
+			"reserve_conversation_member_bridge_identity",
+			"conversation_members_bridge_tombstone_delete",
+			"preserve_conversation_member_bridge_tombstone",
+			"ERRCODE='55000'",
+		} {
+			if !strings.Contains(sql, required) {
+				t.Fatalf("%s lacks version-only bridge gate %q", name, required)
+			}
+		}
+	}
+	gate := strings.Index(string(migration17), "DO $$")
+	firstMutation := strings.Index(string(migration17), "CREATE TABLE account_deletion_intents")
+	if gate < 0 || firstMutation < 0 || gate > firstMutation {
+		t.Fatal("migration 17 must reject a skipped migration-16 bridge before its first durable mutation")
+	}
+	gate = strings.Index(string(migration20), "DO $$")
+	firstRepair := strings.Index(string(migration20), "CREATE OR REPLACE FUNCTION")
+	if gate < 0 || firstRepair < 0 || gate > firstRepair {
+		t.Fatal("migration 20 must validate the migration-16 bridge before attempting a repair")
+	}
+}
+
+func TestConversationMemberLegacyBridgeIsRollingCompatible(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000016_conversation_member_local_ids.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"SET LOCAL statement_timeout = '30s'",
+		"LOCK TABLE users IN EXCLUSIVE MODE",
+		"LOCK TABLE conversations IN EXCLUSIVE MODE",
+		"IN SHARE ROW EXCLUSIVE MODE",
+		"resolve_conversation_member_bridge_local_id",
+		"conversation_members_bridge_identity_insert",
+		"AFTER INSERT ON conversation_members",
+		"conversation_members_bridge_tombstone_delete",
+		"BEFORE DELETE ON conversation_members",
+		"conversation member tombstone disagrees with immutable local identity",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("legacy membership bridge is missing %q", required)
+		}
+	}
+	backfill := strings.Index(sql, "INSERT INTO conversation_member_local_ids")
+	insertTrigger := strings.Index(sql, "CREATE TRIGGER conversation_members_bridge_identity_insert")
+	deleteTrigger := strings.Index(sql, "CREATE TRIGGER conversation_members_bridge_tombstone_delete")
+	if backfill < 0 || insertTrigger < backfill || deleteTrigger < backfill {
+		t.Fatal("legacy bridge triggers must be installed after the fenced initial backfill")
+	}
+	for _, forbidden := range []string{
+		"UPDATE conversation_member_local_ids SET",
+		"ON CONFLICT (conversation_id,user_id) DO UPDATE",
+	} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("legacy membership bridge can rewrite immutable history via %q", forbidden)
+		}
+	}
+}
+
 func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T) {
 	raw, err := migrationFiles.ReadFile("migrations/000018_conversation_member_identity_namespace.sql")
 	if err != nil {

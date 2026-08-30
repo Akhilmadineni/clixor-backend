@@ -268,6 +268,69 @@ func (s *Store) deleteAccountTx(
 			}
 			updatedEntities = append(updatedEntities, entity)
 		}
+
+		// Idempotent chore commands retain their complete response for 90 days.
+		// Those response snapshots are externally replayable and therefore need
+		// the same erasure treatment as the live chore/feed entities.
+		rotationRows, err := tx.Query(ctx, `
+			SELECT operation_id,chore_result,feed_result
+			FROM chore_rotation_operations
+			WHERE conversation_id=ANY($1)
+			FOR UPDATE`, sharedConversationIDs)
+		if err != nil {
+			return err
+		}
+		type rotationSnapshot struct {
+			operationID uuid.UUID
+			choreResult json.RawMessage
+			feedResult  json.RawMessage
+		}
+		var snapshots []rotationSnapshot
+		for rotationRows.Next() {
+			var snapshot rotationSnapshot
+			if err := rotationRows.Scan(
+				&snapshot.operationID, &snapshot.choreResult, &snapshot.feedResult,
+			); err != nil {
+				rotationRows.Close()
+				return err
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		if err := rotationRows.Err(); err != nil {
+			rotationRows.Close()
+			return err
+		}
+		rotationRows.Close()
+		for _, snapshot := range snapshots {
+			choreResult, choreChanged, err := store.AnonymizeAccountJSON(
+				snapshot.choreResult, identity,
+			)
+			if err != nil {
+				return err
+			}
+			feedResult, feedChanged, err := store.AnonymizeAccountJSON(
+				snapshot.feedResult, identity,
+			)
+			if err != nil {
+				return err
+			}
+			if !choreChanged && !feedChanged {
+				continue
+			}
+			if !choreChanged {
+				choreResult = snapshot.choreResult
+			}
+			if !feedChanged {
+				feedResult = snapshot.feedResult
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE chore_rotation_operations
+				SET chore_result=$2,feed_result=$3
+				WHERE operation_id=$1`,
+				snapshot.operationID, choreResult, feedResult); err != nil {
+				return err
+			}
+		}
 	}
 
 	statements := []struct {

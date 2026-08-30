@@ -42,3 +42,51 @@ func TestAnonymizeAccountJSONPreservesStableIDsAndRemovesIdentity(t *testing.T) 
 		}
 	}
 }
+
+func TestAnonymizeAccountJSONCoversCreatorAliasesAndIdentityInProse(t *testing.T) {
+	userID := uuid.New()
+	expenseID := uuid.New()
+	raw := json.RawMessage(`{
+		"createdBy":"` + userID.String() + `",
+		"creatorName":"Akhil Madineni",
+		"creatorDisplayName":"Akhil Madineni",
+		"createdByName":"Akhil Madineni",
+		"createdByDisplayName":"Akhil Madineni",
+		"actorName":"Akhil Madineni",
+		"actorDisplayName":"Akhil Madineni",
+		"ownerName":"Akhil Madineni",
+		"ownerDisplayName":"Akhil Madineni",
+		"description":"Akhil Madineni (@akhil) paid 42.75; email akhil@example.com or call +13125550177.",
+		"mentions":["@akhil","contact akhil@example.com"],
+		"repeated":"Akhil Madineni / Akhil Madineni",
+		"expenseId":"` + expenseID.String() + `",
+		"amount":42.75,
+		"currency":"USD"
+	}`)
+	anonymized, changed, err := AnonymizeAccountJSON(raw, AccountIdentity{
+		UserID: userID, Email: "akhil@example.com", Phone: "+13125550177",
+		DisplayName: "Akhil Madineni", Username: "@akhil",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("creator-owned JSON was not anonymized")
+	}
+	text := string(anonymized)
+	for _, forbidden := range []string{
+		"Akhil Madineni", "@akhil", "akhil@example.com", "+13125550177",
+	} {
+		if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+			t.Fatalf("anonymized creator JSON retained %q: %s", forbidden, text)
+		}
+	}
+	for _, retained := range []string{
+		userID.String(), expenseID.String(), `"amount":42.75`, `"currency":"USD"`,
+		DeletedUserDisplayName,
+	} {
+		if !strings.Contains(text, retained) {
+			t.Fatalf("anonymized creator JSON removed required %q: %s", retained, text)
+		}
+	}
+}

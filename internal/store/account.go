@@ -2,8 +2,12 @@ package store
 
 import (
 	"encoding/json"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -60,7 +64,14 @@ func anonymizeJSONValue(value any, identity AccountIdentity) bool {
 	switch typed := value.(type) {
 	case []any:
 		changed := false
-		for _, item := range typed {
+		for index, item := range typed {
+			if text, ok := item.(string); ok {
+				if redacted, textChanged := redactAccountIdentityText(text, identity); textChanged {
+					typed[index] = redacted
+					changed = true
+				}
+				continue
+			}
 			changed = anonymizeJSONValue(item, identity) || changed
 		}
 		return changed
@@ -85,6 +96,13 @@ func anonymizeJSONValue(value any, identity AccountIdentity) bool {
 			if isText && isIdentifierJSONKey(normalized) && matchesIdentity(text, identity) {
 				delete(typed, key)
 				changed = true
+				continue
+			}
+			if isText {
+				if redacted, textChanged := redactAccountIdentityText(text, identity); textChanged {
+					typed[key] = redacted
+					changed = true
+				}
 			}
 		}
 		if owned {
@@ -120,7 +138,7 @@ func objectBelongsToAccount(object map[string]any, userID uuid.UUID) bool {
 	wanted := userID.String()
 	for key, item := range object {
 		switch normalizeJSONKey(key) {
-		case "backenduserid", "userid", "useruuid", "owneruserid", "createdbyuserid":
+		case "backenduserid", "userid", "useruuid", "owneruserid", "createdbyuserid", "createdby", "creatorid", "actorid":
 			if text, ok := item.(string); ok && strings.EqualFold(text, wanted) {
 				return true
 			}
@@ -145,11 +163,77 @@ func normalizeJSONKey(key string) string {
 
 func isNameJSONKey(key string) bool {
 	switch key {
-	case "name", "displayname", "membername", "payername", "creatorname", "creatordisplayname":
+	case "name", "displayname",
+		"membername", "memberdisplayname",
+		"payername", "payerdisplayname",
+		"creatorname", "creatordisplayname",
+		"createdbyname", "createdbydisplayname",
+		"actorname", "actordisplayname",
+		"ownername", "ownerdisplayname":
 		return true
 	default:
 		return false
 	}
+}
+
+// redactAccountIdentityText removes bounded occurrences from human-readable
+// fields (for example feed descriptions and chore titles). Identifiers embedded
+// in prose are PII just as much as dedicated email/phone/name fields. Stable
+// UUIDs are deliberately not among the needles.
+func redactAccountIdentityText(value string, identity AccountIdentity) (string, bool) {
+	needles := []string{identity.Email, identity.Phone, identity.Username, identity.DisplayName}
+	sort.SliceStable(needles, func(i, j int) bool { return len(needles[i]) > len(needles[j]) })
+	changed := false
+	for _, needle := range needles {
+		needle = strings.TrimSpace(needle)
+		if needle == "" || strings.EqualFold(needle, DeletedUserDisplayName) {
+			continue
+		}
+		pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(needle))
+		if err != nil {
+			continue
+		}
+		matches := pattern.FindAllStringIndex(value, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		var redacted strings.Builder
+		redacted.Grow(len(value))
+		cursor := 0
+		needleChanged := false
+		for _, match := range matches {
+			if !identityTextBoundaryBefore(value, match[0]) ||
+				!identityTextBoundaryAfter(value, match[1]) {
+				continue
+			}
+			redacted.WriteString(value[cursor:match[0]])
+			redacted.WriteString(DeletedUserDisplayName)
+			cursor = match[1]
+			needleChanged = true
+		}
+		if needleChanged {
+			redacted.WriteString(value[cursor:])
+			value = redacted.String()
+			changed = true
+		}
+	}
+	return value, changed
+}
+
+func identityTextBoundaryBefore(value string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(value[:index])
+	return r != '_' && !unicode.IsLetter(r) && !unicode.IsNumber(r)
+}
+
+func identityTextBoundaryAfter(value string, index int) bool {
+	if index == len(value) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(value[index:])
+	return r != '_' && !unicode.IsLetter(r) && !unicode.IsNumber(r)
 }
 
 func isIdentifierJSONKey(key string) bool {
