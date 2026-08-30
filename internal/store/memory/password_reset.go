@@ -167,6 +167,12 @@ func (s *Store) consumePasswordResetChallenge(
 			s.sessions[sessionID] = session
 		}
 	}
+	for deviceID, device := range s.devices {
+		if device.UserID == user.ID {
+			device.PushToken = ""
+			s.devices[deviceID] = device
+		}
+	}
 	for challengeID, existing := range s.passwordResets {
 		if existing.UserID == user.ID && existing.ConsumedAt == nil {
 			existing.ConsumedAt = &now

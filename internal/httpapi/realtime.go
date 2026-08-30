@@ -50,6 +50,10 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		return connection.SetReadDeadline(time.Now().Add(70 * time.Second))
 	})
 
+	if !s.realtimeSessionActive(r.Context(), id) {
+		s.closeRealtimeSession(connection)
+		return
+	}
 	hello, _ := json.Marshal(map[string]any{
 		"user_id": id.UserID, "device_id": id.DeviceID, "heartbeat_seconds": 25,
 	})
@@ -75,6 +79,16 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 			if frame.Type == "ping" {
 				_ = connection.WriteControl(websocket.PongMessage, nil, time.Now().Add(5*time.Second))
 			} else if frame.Type == "typing" && frame.ConversationID != nil {
+				active, err := s.store.SessionActive(
+					r.Context(), id.SessionID, id.UserID, id.DeviceID,
+				)
+				if err != nil {
+					s.logger.Error("realtime_session_check_failed", "error", err)
+					return
+				}
+				if !active {
+					return
+				}
 				if time.Since(lastTypingEvent) < 300*time.Millisecond {
 					continue
 				}
@@ -109,6 +123,10 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		case <-readDone:
 			return
 		case <-ticker.C:
+			if !s.realtimeSessionActive(r.Context(), id) {
+				s.closeRealtimeSession(connection)
+				return
+			}
 			_ = s.presence.Heartbeat(r.Context(), id.UserID, id.DeviceID)
 			if err := connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
 				return
@@ -117,10 +135,37 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
+			if !s.realtimeSessionActive(r.Context(), id) {
+				s.closeRealtimeSession(connection)
+				return
+			}
+			// Revocation signals are internal control messages. They are never
+			// exposed to clients; a matching durable revocation was already
+			// enforced by the check immediately above.
+			if event.Type == sessionRevokedEventType {
+				continue
+			}
 			_ = connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := connection.WriteJSON(event); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func (s *Server) realtimeSessionActive(ctx context.Context, id identity) bool {
+	active, err := s.store.SessionActive(ctx, id.SessionID, id.UserID, id.DeviceID)
+	if err != nil {
+		s.logger.Error("realtime_session_check_failed", "error", err)
+		return false
+	}
+	return active
+}
+
+func (s *Server) closeRealtimeSession(connection *websocket.Conn) {
+	_ = connection.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session revoked"),
+		time.Now().Add(5*time.Second),
+	)
 }

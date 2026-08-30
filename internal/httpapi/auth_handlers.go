@@ -129,6 +129,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	s.publishSessionRevocation(r.Context(), id.UserID, &id.SessionID)
 	if err := s.store.ClearDevicePushToken(r.Context(), id.UserID, id.DeviceID); err != nil &&
 		!errors.Is(err, domain.ErrNotFound) {
 		writeDomainError(w, err)
@@ -153,6 +154,7 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	s.publishSessionRevocation(r.Context(), id.UserID, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 

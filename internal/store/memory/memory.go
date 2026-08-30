@@ -399,6 +399,7 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			members[successor.UserID] = successor
 		}
 		delete(members, userID)
+		s.projectConversationMembersLocked(conversationID)
 		delete(s.receipts, conversationID.String()+":"+userID.String())
 
 		for key, entity := range s.entities {
@@ -776,6 +777,13 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 		}
 	}
 	now := time.Now().UTC()
+	memberIDs := append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...)
+	for _, id := range uniqueUUIDs(memberIDs) {
+		user, exists := s.users[id]
+		if !exists || string(user.Profile) == `{"deleted":true}` {
+			return domain.Conversation{}, domain.ErrNotFound
+		}
+	}
 	conversationID := p.ID
 	if conversationID == uuid.Nil {
 		conversationID = uuid.New()
@@ -793,7 +801,6 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 	s.conversations[conversation.ID] = conversation
 	s.members[conversation.ID] = make(map[uuid.UUID]domain.ConversationMember)
 	s.invites[conversation.ID] = make(map[string]uuid.UUID)
-	memberIDs := append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...)
 	for _, id := range uniqueUUIDs(memberIDs) {
 		role := "member"
 		if id == p.CreatedBy {
@@ -802,6 +809,12 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 		s.members[conversation.ID][id] = domain.ConversationMember{
 			ConversationID: conversation.ID, UserID: id, Role: role, JoinedAt: now,
 		}
+	}
+	if conversation.Kind == "group" {
+		conversation.Metadata, _ = store.ProjectConversationMembers(
+			conversation.Metadata, s.conversationMembersLocked(conversation.ID),
+		)
+		s.conversations[conversation.ID] = conversation
 	}
 	for _, phone := range p.InvitePhones {
 		s.invites[conversation.ID][phone] = p.CreatedBy
@@ -830,6 +843,11 @@ func (s *Store) UpdateConversation(_ context.Context, conversationID, actorID uu
 	}
 	if p.Metadata != nil {
 		conversation.Metadata = cloneJSON(*p.Metadata)
+	}
+	if conversation.Kind == "group" {
+		conversation.Metadata, _ = store.ProjectConversationMembers(
+			conversation.Metadata, s.conversationMembersLocked(conversationID),
+		)
 	}
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
@@ -924,11 +942,36 @@ func (s *Store) ListConversationMembers(_ context.Context, conversationID, actor
 	if _, ok := members[actorID]; !ok {
 		return nil, domain.ErrForbidden
 	}
+	return s.conversationMembersLocked(conversationID), nil
+}
+
+func (s *Store) conversationMembersLocked(conversationID uuid.UUID) []domain.ConversationMember {
+	members := s.members[conversationID]
 	result := make([]domain.ConversationMember, 0, len(members))
 	for _, member := range members {
+		if user, ok := s.users[member.UserID]; ok {
+			member = store.ConversationMemberWithPublicIdentity(member, user)
+		}
 		result = append(result, member)
 	}
-	return result, nil
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].JoinedAt.Equal(result[j].JoinedAt) {
+			return result[i].UserID.String() < result[j].UserID.String()
+		}
+		return result[i].JoinedAt.Before(result[j].JoinedAt)
+	})
+	return result
+}
+
+func (s *Store) projectConversationMembersLocked(conversationID uuid.UUID) {
+	conversation, ok := s.conversations[conversationID]
+	if !ok || conversation.Kind != "group" {
+		return
+	}
+	conversation.Metadata, _ = store.ProjectConversationMembers(
+		conversation.Metadata, s.conversationMembersLocked(conversationID),
+	)
+	s.conversations[conversationID] = conversation
 }
 
 func (s *Store) ConversationMemberIDs(_ context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -965,6 +1008,12 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	if s.conversations[conversationID].Kind != "group" {
 		return domain.ErrInvalid
 	}
+	if role != "member" && role != "admin" {
+		return domain.ErrInvalid
+	}
+	if user, exists := s.users[userID]; !exists || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
 	if actor := members[actorID]; actor.Role != "owner" && actor.Role != "admin" {
 		return domain.ErrForbidden
 	}
@@ -975,12 +1024,17 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	if !targetExists && len(members) >= 1024 {
 		return domain.ErrInvalid
 	}
+	joinedAt := time.Now().UTC()
+	if targetExists {
+		joinedAt = target.JoinedAt
+	}
 	members[userID] = domain.ConversationMember{
-		ConversationID: conversationID, UserID: userID, Role: role, JoinedAt: time.Now().UTC(),
+		ConversationID: conversationID, UserID: userID, Role: role, JoinedAt: joinedAt,
 	}
 	conversation := s.conversations[conversationID]
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	s.projectConversationMembersLocked(conversationID)
 	if !targetExists {
 		payload, _ := json.Marshal(domain.ConversationMemberAdded{
 			ConversationID: conversationID, ActorID: actorID, UserID: userID,
@@ -1019,7 +1073,15 @@ func (s *Store) ClaimConversationInvites(_ context.Context, userID uuid.UUID, ph
 			s.members[conversationID][userID] = domain.ConversationMember{
 				ConversationID: conversationID, UserID: userID, Role: "member", JoinedAt: time.Now().UTC(),
 			}
+			payload, _ := json.Marshal(domain.ConversationMemberAdded{
+				ConversationID: conversationID, ActorID: userID, UserID: userID,
+			})
+			s.appendOutbox("conversation.member_added", conversationID, payload)
 		}
+		conversation := s.conversations[conversationID]
+		conversation.UpdatedAt = time.Now().UTC()
+		s.conversations[conversationID] = conversation
+		s.projectConversationMembersLocked(conversationID)
 		claimed = append(claimed, conversationID)
 	}
 	return claimed, nil
@@ -1117,6 +1179,8 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 	s.inviteLinks[tokenKey] = invite
 	conversation.UpdatedAt = now
 	s.conversations[conversation.ID] = conversation
+	s.projectConversationMembersLocked(conversation.ID)
+	conversation = s.conversations[conversation.ID]
 	payload, _ := json.Marshal(domain.ConversationMemberAdded{
 		ConversationID: conversation.ID, ActorID: userID, UserID: userID,
 	})
@@ -1185,6 +1249,7 @@ func (s *Store) RemoveConversationMember(_ context.Context, conversationID, acto
 	conversation := s.conversations[conversationID]
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	s.projectConversationMembersLocked(conversationID)
 	return nil
 }
 

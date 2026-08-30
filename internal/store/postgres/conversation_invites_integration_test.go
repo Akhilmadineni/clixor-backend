@@ -79,6 +79,9 @@ func TestPostgresSecureConversationInviteLifecycle(t *testing.T) {
 	if err != nil || !accepted.Joined {
 		t.Fatalf("first acceptance failed: accepted=%+v err=%v", accepted, err)
 	}
+	if !bytes.Contains(accepted.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("invite acceptance did not project new ACL member: %s", accepted.Conversation.Metadata)
+	}
 	retried, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
 	if err != nil || retried.Joined {
 		t.Fatalf("idempotent acceptance failed: accepted=%+v err=%v", retried, err)

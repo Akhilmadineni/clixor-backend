@@ -149,7 +149,8 @@ func TestPostgresPasswordResetIsAtomicAndRevokesSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	device, err := persistence.UpsertDevice(ctx, domain.Device{
-		ID: uuid.New(), UserID: user.ID, Name: "iPhone", Platform: "ios", CreatedAt: time.Now(),
+		ID: uuid.New(), UserID: user.ID, Name: "iPhone", Platform: "ios",
+		PushToken: "aabbccdd", CreatedAt: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -186,6 +187,10 @@ func TestPostgresPasswordResetIsAtomicAndRevokesSessions(t *testing.T) {
 	active, err := persistence.SessionActive(ctx, session.ID, user.ID, device.ID)
 	if err != nil || active {
 		t.Fatalf("session remained active=%v err=%v", active, err)
+	}
+	resetDevice, err := persistence.Device(ctx, user.ID, device.ID)
+	if err != nil || resetDevice.PushToken != "" {
+		t.Fatalf("password reset retained push token=%q err=%v", resetDevice.PushToken, err)
 	}
 	if _, err := persistence.ConsumePasswordResetChallenge(
 		ctx, challenge.ID, challenge.CodeHash, "third-hash", 5,

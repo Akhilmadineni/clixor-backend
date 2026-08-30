@@ -152,7 +152,7 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 	codeHash := passwordResetCodeHash(
 		s.passwordReset.HMACSecret, challengeID, strings.TrimSpace(request.Code),
 	)
-	_, err = s.store.ConsumePasswordResetChallengeWithMail(
+	resetEmail, err := s.store.ConsumePasswordResetChallengeWithMail(
 		r.Context(), challengeID, codeHash, newPasswordHash, s.passwordReset.MaxAttempts,
 		func(recipient string) (domain.MailDelivery, error) {
 			return s.mailQueue.SealPasswordChanged(challengeID, recipient)
@@ -166,6 +166,11 @@ func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("password_reset_consume_failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
 		return
+	}
+	if user, lookupErr := s.store.UserByEmail(r.Context(), resetEmail); lookupErr == nil {
+		s.publishSessionRevocation(r.Context(), user.ID, nil)
+	} else if !errors.Is(lookupErr, domain.ErrNotFound) {
+		s.logger.Warn("password_reset_revocation_signal_lookup_failed", "error", lookupErr)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

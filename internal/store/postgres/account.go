@@ -180,6 +180,15 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 			conversation.id, userID); err != nil {
 			return err
 		}
+		metadata, err = projectConversationMetadata(ctx, tx, conversation.id, metadata)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE conversations SET metadata=$2 WHERE id=$1`,
+			conversation.id, metadata); err != nil {
+			return err
+		}
 		sharedConversationIDs = append(sharedConversationIDs, conversation.id)
 	}
 

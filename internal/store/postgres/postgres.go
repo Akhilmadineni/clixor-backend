@@ -506,6 +506,13 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 	}
 	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
+	members := uniqueUUIDs(append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...))
+	sort.Slice(members, func(i, j int) bool { return members[i].String() < members[j].String() })
+	for _, userID := range members {
+		if err := lockLiveUser(ctx, tx, userID); err != nil {
+			return domain.Conversation{}, err
+		}
+	}
 	conversationID := p.ID
 	if conversationID == uuid.Nil {
 		conversationID = uuid.New()
@@ -550,7 +557,6 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 		}
 		return conversation, nil
 	}
-	members := uniqueUUIDs(append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...))
 	for _, userID := range members {
 		role := "member"
 		if userID == p.CreatedBy {
@@ -572,6 +578,19 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 			return domain.Conversation{}, mapError(err)
 		}
 	}
+	if conversation.Kind == "group" {
+		conversation.Metadata, err = projectConversationMetadata(
+			ctx, tx, conversation.ID, conversation.Metadata,
+		)
+		if err != nil {
+			return domain.Conversation{}, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE conversations SET metadata=$2 WHERE id=$1`,
+			conversation.ID, conversation.Metadata); err != nil {
+			return domain.Conversation{}, err
+		}
+	}
 	payload, _ := json.Marshal(conversation)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('conversation.created',$1,$2)`,
@@ -586,14 +605,24 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 
 func (s *Store) Conversation(ctx context.Context, id, userID uuid.UUID) (domain.Conversation, error) {
 	var conversation domain.Conversation
+	var member bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,c.created_at,c.updated_at
-		FROM conversations c JOIN conversation_members m ON m.conversation_id=c.id
-		WHERE c.id=$1 AND m.user_id=$2`, id, userID,
+		SELECT c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,c.created_at,c.updated_at,
+		       EXISTS(SELECT 1 FROM conversation_members m WHERE m.conversation_id=c.id AND m.user_id=$2)
+		FROM conversations c WHERE c.id=$1`, id, userID,
 	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
 		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
-		&conversation.CreatedAt, &conversation.UpdatedAt)
-	return conversation, mapError(err)
+		&conversation.CreatedAt, &conversation.UpdatedAt, &member)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Conversation{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	if !member {
+		return domain.Conversation{}, domain.ErrForbidden
+	}
+	return conversation, nil
 }
 
 func (s *Store) ListConversations(ctx context.Context, userID uuid.UUID, before time.Time, limit int) ([]domain.Conversation, error) {
@@ -623,37 +652,61 @@ func (s *Store) ListConversations(ctx context.Context, userID uuid.UUID, before 
 }
 
 func (s *Store) UpdateConversation(ctx context.Context, conversationID, actorID uuid.UUID, p store.UpdateConversationParams) (domain.Conversation, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	defer tx.Rollback(ctx)
 	var conversation domain.Conversation
-	var title, avatarURL any
+	var actorRole string
+	err = tx.QueryRow(ctx, `
+		SELECT c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,
+		       c.created_at,c.updated_at,m.role
+		FROM conversations c
+		JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
+		WHERE c.id=$1
+		FOR UPDATE OF c`, conversationID, actorID,
+	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
+		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
+		&conversation.CreatedAt, &conversation.UpdatedAt, &actorRole)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && actorRole != "owner" && actorRole != "admin") {
+		return domain.Conversation{}, domain.ErrForbidden
+	}
+	if err != nil {
+		return domain.Conversation{}, err
+	}
 	if p.Title != nil {
-		title = *p.Title
+		conversation.Title = *p.Title
 	}
 	if p.AvatarURL != nil {
-		avatarURL = *p.AvatarURL
+		conversation.AvatarURL = *p.AvatarURL
 	}
-	var metadata any
 	if p.Metadata != nil {
-		metadata = *p.Metadata
+		conversation.Metadata = *p.Metadata
 	}
-	err := s.pool.QueryRow(ctx, `
-		UPDATE conversations c SET
-		  title=CASE WHEN $3::boolean THEN $4 ELSE c.title END,
-		  avatar_url=CASE WHEN $5::boolean THEN $6 ELSE c.avatar_url END,
-		  metadata=CASE WHEN $7::boolean THEN $8::jsonb ELSE c.metadata END,
-		  updated_at=now()
-		FROM conversation_members m
-		WHERE c.id=$1 AND m.conversation_id=c.id AND m.user_id=$2
-		  AND m.role IN ('owner','admin')
-		RETURNING c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,c.created_at,c.updated_at`,
-		conversationID, actorID,
-		p.Title != nil, title, p.AvatarURL != nil, avatarURL, p.Metadata != nil, metadata,
+	if conversation.Kind == "group" {
+		conversation.Metadata, err = projectConversationMetadata(
+			ctx, tx, conversationID, conversation.Metadata,
+		)
+		if err != nil {
+			return domain.Conversation{}, err
+		}
+	}
+	err = tx.QueryRow(ctx, `
+		UPDATE conversations SET title=$2,avatar_url=$3,metadata=$4,updated_at=now()
+		WHERE id=$1
+		RETURNING id,kind,title,avatar_url,metadata,created_by,last_seq,created_at,updated_at`,
+		conversationID, conversation.Title, conversation.AvatarURL, conversation.Metadata,
 	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
 		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
 		&conversation.CreatedAt, &conversation.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Conversation{}, domain.ErrForbidden
+	if err != nil {
+		return domain.Conversation{}, mapError(err)
 	}
-	return conversation, mapError(err)
+	if err := tx.Commit(ctx); err != nil {
+		return domain.Conversation{}, err
+	}
+	return conversation, nil
 }
 
 func (s *Store) DeleteConversation(ctx context.Context, conversationID, actorID uuid.UUID) error {
@@ -730,9 +783,19 @@ func (s *Store) ListConversationMembers(ctx context.Context, conversationID, act
 	if err := s.requireMember(ctx, s.pool, conversationID, actorID); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT conversation_id,user_id,role,joined_at,muted_until
-		FROM conversation_members WHERE conversation_id=$1 ORDER BY joined_at`, conversationID)
+	return listConversationMembers(ctx, s.pool, conversationID)
+}
+
+func listConversationMembers(ctx context.Context, query interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, conversationID uuid.UUID) ([]domain.ConversationMember, error) {
+	rows, err := query.Query(ctx, `
+		SELECT m.conversation_id,m.user_id,m.role,m.joined_at,m.muted_until,
+		       u.display_name,u.avatar_url,u.profile
+		FROM conversation_members m
+		JOIN users u ON u.id=m.user_id
+		WHERE m.conversation_id=$1
+		ORDER BY m.joined_at,m.user_id`, conversationID)
 	if err != nil {
 		return nil, err
 	}
@@ -740,12 +803,31 @@ func (s *Store) ListConversationMembers(ctx context.Context, conversationID, act
 	var result []domain.ConversationMember
 	for rows.Next() {
 		var member domain.ConversationMember
-		if err := rows.Scan(&member.ConversationID, &member.UserID, &member.Role, &member.JoinedAt, &member.MutedUntil); err != nil {
+		var user domain.User
+		if err := rows.Scan(
+			&member.ConversationID, &member.UserID, &member.Role, &member.JoinedAt,
+			&member.MutedUntil, &user.DisplayName, &user.AvatarURL, &user.Profile,
+		); err != nil {
 			return nil, err
 		}
-		result = append(result, member)
+		result = append(result, store.ConversationMemberWithPublicIdentity(member, user))
 	}
 	return result, rows.Err()
+}
+
+func projectConversationMetadata(
+	ctx context.Context,
+	query interface {
+		Query(context.Context, string, ...any) (pgx.Rows, error)
+	},
+	conversationID uuid.UUID,
+	metadata json.RawMessage,
+) (json.RawMessage, error) {
+	members, err := listConversationMembers(ctx, query, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	return store.ProjectConversationMembers(metadata, members)
 }
 
 func (s *Store) ConversationMemberIDs(ctx context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -769,11 +851,15 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, userID); err != nil {
+		return err
+	}
 	var kind, actorRole string
+	var metadata json.RawMessage
 	err = tx.QueryRow(ctx, `
-		SELECT c.kind,m.role FROM conversations c
+		SELECT c.kind,m.role,c.metadata FROM conversations c
 		JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
-		WHERE c.id=$1 FOR UPDATE OF c`, conversationID, actorID).Scan(&kind, &actorRole)
+		WHERE c.id=$1 FOR UPDATE OF c`, conversationID, actorID).Scan(&kind, &actorRole, &metadata)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrForbidden
 	}
@@ -813,7 +899,13 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 		conversationID, userID, role); err != nil {
 		return mapError(err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at=now() WHERE id=$1`, conversationID); err != nil {
+	metadata, err = projectConversationMetadata(ctx, tx, conversationID, metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations SET metadata=$2,updated_at=now() WHERE id=$1`,
+		conversationID, metadata); err != nil {
 		return err
 	}
 	if errors.Is(targetErr, pgx.ErrNoRows) {
@@ -868,10 +960,13 @@ func (s *Store) ClaimConversationInvites(ctx context.Context, userID uuid.UUID, 
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, userID); err != nil {
+		return nil, err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT conversation_id FROM conversation_invites
 		WHERE phone=$1 AND claimed_at IS NULL
-		FOR UPDATE`, phone)
+		ORDER BY conversation_id`, phone)
 	if err != nil {
 		return nil, err
 	}
@@ -889,10 +984,30 @@ func (s *Store) ClaimConversationInvites(ctx context.Context, userID uuid.UUID, 
 		return nil, err
 	}
 	for _, conversationID := range conversationIDs {
-		if _, err := tx.Exec(ctx, `
+		var kind string
+		var metadata json.RawMessage
+		if err := tx.QueryRow(ctx, `
+			SELECT kind,metadata FROM conversations WHERE id=$1 FOR UPDATE`,
+			conversationID).Scan(&kind, &metadata); err != nil {
+			return nil, mapError(err)
+		}
+		if kind != "group" {
+			return nil, domain.ErrInvalid
+		}
+		var inviteStillPending bool
+		if err := tx.QueryRow(ctx, `
+			SELECT true FROM conversation_invites
+			WHERE conversation_id=$1 AND phone=$2 AND claimed_at IS NULL
+			FOR UPDATE`, conversationID, phone).Scan(&inviteStillPending); errors.Is(err, pgx.ErrNoRows) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
 			VALUES($1,$2,'member',now())
-			ON CONFLICT(conversation_id,user_id) DO NOTHING`, conversationID, userID); err != nil {
+			ON CONFLICT(conversation_id,user_id) DO NOTHING`, conversationID, userID)
+		if err != nil {
 			return nil, mapError(err)
 		}
 		if _, err := tx.Exec(ctx, `
@@ -900,8 +1015,24 @@ func (s *Store) ClaimConversationInvites(ctx context.Context, userID uuid.UUID, 
 			WHERE conversation_id=$1 AND phone=$3`, conversationID, userID, phone); err != nil {
 			return nil, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at=now() WHERE id=$1`, conversationID); err != nil {
+		metadata, err = projectConversationMetadata(ctx, tx, conversationID, metadata)
+		if err != nil {
 			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE conversations SET metadata=$2,updated_at=now() WHERE id=$1`,
+			conversationID, metadata); err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() > 0 {
+			payload, _ := json.Marshal(domain.ConversationMemberAdded{
+				ConversationID: conversationID, ActorID: userID, UserID: userID,
+			})
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO outbox_events(topic,aggregate_id,payload)
+				VALUES('conversation.member_added',$1,$2)`, conversationID, payload); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -917,10 +1048,11 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 	}
 	defer tx.Rollback(ctx)
 	var kind, actorRole string
+	var metadata json.RawMessage
 	err = tx.QueryRow(ctx, `
-		SELECT c.kind,m.role FROM conversations c
+		SELECT c.kind,m.role,c.metadata FROM conversations c
 		JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
-		WHERE c.id=$1 FOR UPDATE OF c`, conversationID, actorID).Scan(&kind, &actorRole)
+		WHERE c.id=$1 FOR UPDATE OF c`, conversationID, actorID).Scan(&kind, &actorRole, &metadata)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrForbidden
 	}
@@ -952,7 +1084,13 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 	if tag.RowsAffected() == 0 {
 		return domain.ErrNotFound
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at=now() WHERE id=$1`, conversationID); err != nil {
+	metadata, err = projectConversationMetadata(ctx, tx, conversationID, metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations SET metadata=$2,updated_at=now() WHERE id=$1`,
+		conversationID, metadata); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

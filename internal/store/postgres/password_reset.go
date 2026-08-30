@@ -217,6 +217,10 @@ func (s *Store) consumePasswordResetChallenge(
 		return "", err
 	}
 	if _, err := tx.Exec(ctx, `
+		UPDATE devices SET push_token='' WHERE user_id=$1`, userID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE password_reset_challenges SET consumed_at=$2
 		WHERE user_id=$1 AND consumed_at IS NULL`, userID, now); err != nil {
 		return "", err

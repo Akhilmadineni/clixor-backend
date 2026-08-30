@@ -172,10 +172,16 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		UPDATE conversation_invite_links SET uses=uses+1 WHERE id=$1`, invite.ID); err != nil {
 		return domain.ConversationInviteAcceptance{}, err
 	}
+	conversation.Metadata, err = projectConversationMetadata(
+		ctx, tx, conversation.ID, conversation.Metadata,
+	)
+	if err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
 	err = tx.QueryRow(ctx, `
-		UPDATE conversations SET updated_at=$2 WHERE id=$1
+		UPDATE conversations SET metadata=$2,updated_at=$3 WHERE id=$1
 		RETURNING id,kind,title,avatar_url,metadata,created_by,last_seq,created_at,updated_at`,
-		conversation.ID, now,
+		conversation.ID, conversation.Metadata, now,
 	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
 		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
 		&conversation.CreatedAt, &conversation.UpdatedAt)

@@ -325,6 +325,51 @@ paths:
                   items: {$ref: "#/components/schemas/PreKey"}
       responses:
         "204": {description: Prekeys stored}
+  /users/lookup:
+    post:
+      operationId: lookupUsers
+      description: Exact contact/username discovery. Responses never expose email or private profile fields; an exact phone match only echoes a phone number already supplied in this request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                phones:
+                  type: array
+                  maxItems: 1024
+                  items: {type: string, pattern: "^\\+[1-9][0-9]{7,14}$"}
+                usernames:
+                  type: array
+                  maxItems: 1024
+                  items: {type: string, maxLength: 31}
+      responses:
+        "200":
+          description: Discovery-safe user page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/PublicUser"}}}}
+  /users/search:
+    get:
+      operationId: searchUsersByUsername
+      description: Prefix search over usernames. Email and phone are never returned.
+      parameters:
+        - {name: q, in: query, required: true, schema: {type: string, minLength: 1}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 50, default: 20}}
+      responses:
+        "200":
+          description: Discovery-safe user page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/PublicUser"}}}}
   /users/{user_id}/prekeys:claim:
     post:
       operationId: claimPrekeys
@@ -383,7 +428,14 @@ paths:
       parameters:
         - {$ref: "#/components/parameters/ConversationID"}
       responses:
-        "200": {description: Current conversation membership}
+        "200":
+          description: Authoritative relational membership with public identity fields only
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/ConversationMember"}}}}
     post:
       operationId: addConversationMember
       parameters:
@@ -781,6 +833,27 @@ components:
         profile: {type: object, additionalProperties: true}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    PublicUser:
+      type: object
+      additionalProperties: false
+      required: [id, created_at, updated_at]
+      description: Discovery-safe identity. Email is never present. Phone is present only as an exact echo for a number supplied to /users/lookup.
+      properties:
+        id: {type: string, format: uuid}
+        phone: {type: string, description: Exact matched input phone; omitted for username lookup/search}
+        display_name: {type: string}
+        avatar_url: {type: string}
+        profile:
+          type: object
+          additionalProperties: false
+          properties:
+            display_name: {type: string}
+            avatar_color: {type: string}
+            username: {type: string}
+            bio: {type: string}
+            profile_image_url: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
     ProfilePatch:
       type: object
       minProperties: 1
@@ -875,6 +948,21 @@ components:
         last_seq: {type: integer, format: int64}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    ConversationMember:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, user_id, role, joined_at]
+      description: Relational ACL membership enriched only with public profile fields. Email and phone are never returned.
+      properties:
+        conversation_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [owner, admin, member]}
+        joined_at: {type: string, format: date-time}
+        muted_until: {type: string, format: date-time}
+        display_name: {type: string}
+        username: {type: string}
+        avatar_url: {type: string}
+        avatar_color: {type: string}
     ConversationInvite:
       type: object
       additionalProperties: false
