@@ -141,9 +141,9 @@ install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
 # host users.
 install -d -m 0750 -o 0 -g 65532 "${apns_root}"
 
-install -d -m 0750 -o 99 -g 99 "${runtime_root}/dependency-tls"
-install -d -m 0750 -o 70 -g 70 "${runtime_root}/postgres-tls"
-install -d -m 0750 -o 1000 -g 1000 "${runtime_root}/nats-tls"
+install -d -m 0750 -o 0 -g 99 "${runtime_root}/dependency-tls"
+install -d -m 0750 -o 0 -g 70 "${runtime_root}/postgres-tls"
+install -d -m 0750 -o 0 -g 1000 "${runtime_root}/nats-tls"
 install -d -m 0750 -o 101 -g 101 "${runtime_root}/api-gateway"
 install -d -m 0750 -o 0 -g 0 "${runtime_root}/postgres-backup"
 install -d -m 0750 -o 65534 -g 65534 "${runtime_root}/prometheus"
@@ -154,39 +154,9 @@ for directory in postgres redis nats prometheus grafana; do
 done
 install -d -m 0700 "${project_root}/backups/postgres"
 
-if [ ! -s "${pki_root}/ca.crt" ]; then
-  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-    -out "${pki_root}/ca.key"
-  openssl req -x509 -new -sha256 -days 3650 \
-    -key "${pki_root}/ca.key" \
-    -subj "/CN=Clixor OCI Internal CA" \
-    -out "${pki_root}/ca.crt"
-
-  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-    -out "${pki_root}/server.key"
-  openssl req -new -sha256 \
-    -key "${pki_root}/server.key" \
-    -subj "/CN=clixor-tls" \
-    -out "${pki_root}/server.csr"
-  printf '%s\n' \
-    "subjectAltName=DNS:clixor-tls,DNS:dependency-tls,DNS:postgres.clixor.internal,DNS:nats.clixor.internal" \
-    "extendedKeyUsage=serverAuth" \
-    "keyUsage=digitalSignature,keyEncipherment" > "${pki_root}/server.ext"
-  openssl x509 -req -sha256 -days 825 \
-    -in "${pki_root}/server.csr" \
-    -CA "${pki_root}/ca.crt" \
-    -CAkey "${pki_root}/ca.key" \
-    -CAcreateserial \
-    -extfile "${pki_root}/server.ext" \
-    -out "${pki_root}/server.crt"
-  {
-    sed -n '1,$p' "${pki_root}/server.key"
-    sed -n '1,$p' "${pki_root}/server.crt"
-  } > "${pki_root}/server.pem"
-  chmod 0600 "${pki_root}/ca.key" "${pki_root}/server.key" \
-    "${pki_root}/server.pem"
-  chmod 0644 "${pki_root}/ca.crt" "${pki_root}/server.crt"
-fi
+python3 "${script_root}/dependency_pki.py" ensure \
+  --pki-root "${pki_root}" \
+  --runtime-root "${runtime_root}"
 
 if [ ! -f "${runtime_env}" ]; then
   oci_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get --query data --raw-output)"
@@ -287,18 +257,8 @@ metrics_token="$(sed -n 's/^CLUSTER_METRICS_TOKEN=//p' "${api_env}" | tail -n 1)
 }
 printf '%s' "${metrics_token}" > "${runtime_root}/prometheus/metrics.token"
 
-install -m 0400 -o 99 -g 99 "${pki_root}/server.pem" \
-  "${runtime_root}/dependency-tls/server.pem"
 install -m 0400 -o 99 -g 99 "${script_root}/haproxy.cfg" \
   "${runtime_root}/dependency-tls/haproxy.cfg"
-install -m 0400 -o 70 -g 70 "${pki_root}/server.key" \
-  "${runtime_root}/postgres-tls/server.key"
-install -m 0444 -o 70 -g 70 "${pki_root}/server.crt" \
-  "${runtime_root}/postgres-tls/server.crt"
-install -m 0400 -o 1000 -g 1000 "${pki_root}/server.key" \
-  "${runtime_root}/nats-tls/server.key"
-install -m 0444 -o 1000 -g 1000 "${pki_root}/server.crt" \
-  "${runtime_root}/nats-tls/server.crt"
 install -m 0400 -o 101 -g 101 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
@@ -368,6 +328,12 @@ for required_path in \
   "${secret_root}/backup.env" \
   "${secret_root}/migrate.env" \
   "${pki_root}/ca.crt" \
+  "${runtime_root}/dependency-pki.desired" \
+  "${runtime_root}/dependency-tls/current/server.pem" \
+  "${runtime_root}/postgres-tls/current/server.key" \
+  "${runtime_root}/postgres-tls/current/server.crt" \
+  "${runtime_root}/nats-tls/current/server.key" \
+  "${runtime_root}/nats-tls/current/server.crt" \
   "${runtime_root}/dependency-tls/haproxy.cfg" \
   "${runtime_root}/api-gateway/nginx.conf"
 do

@@ -80,6 +80,25 @@ Docker configuration still contains legacy `CLUSTER_*` values are force-replaced
 once (a stopped Grafana container is removed); persistent data volumes are not
 deleted.
 
+The bootstrap preserves and pins an existing `/srv/clixor/secrets/pki/ca.crt`
+trust root. It fails closed if that certificate and its private key are missing
+as a pair, do not match, or change after being pinned. The CA signs three
+independent P-256 server leaves: HAProxy's Redis endpoint is valid only for
+`clixor-tls` and `dependency-tls`, PostgreSQL only for
+`postgres.clixor.internal`, and NATS only for `nats.clixor.internal`. Leaves are
+valid for 397 days and are replaced inside a 30-day renewal window. Key,
+certificate, and combined-PEM generations are published through atomic
+same-filesystem symlink changes; private keys are never written to deployment
+output.
+
+Each deploy compares the desired leaf digests with the last successfully
+applied set. It force-recreates only the TLS-bearing dependency containers whose
+leaf changed, waits for dependency health, and records the new set only after
+both API replicas pass readiness. This desired/applied record also preserves a
+pending restart when bootstrap is run separately or a deployment fails. The CA
+is intentionally not rotated automatically: a coordinated trust rollover is
+required before it enters the minimum validity window for a full new leaf.
+
 The first configuration is deliberately `CLUSTER_ENV=staging` with Telnyx and
 APNs disabled. This does not relax the application's production checks. Changing
 `CLUSTER_ENV` to `production` still requires complete TLS dependency, Telnyx,

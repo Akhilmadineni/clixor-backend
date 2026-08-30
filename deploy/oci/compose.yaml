@@ -48,8 +48,8 @@ services:
           - postgres.clixor.internal
     volumes:
       - /srv/clixor/data/postgres:/var/lib/postgresql/data
-      - /srv/clixor/runtime/postgres-tls/server.crt:/run/postgres-tls/server.crt:ro
-      - /srv/clixor/runtime/postgres-tls/server.key:/run/postgres-tls/server.key:ro
+      - /srv/clixor/runtime/postgres-tls/current/server.crt:/run/postgres-tls/server.crt:ro
+      - /srv/clixor/runtime/postgres-tls/current/server.key:/run/postgres-tls/server.key:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
@@ -102,8 +102,8 @@ services:
           - nats.clixor.internal
     volumes:
       - /srv/clixor/data/nats:/data
-      - /srv/clixor/runtime/nats-tls/server.crt:/run/nats-tls/server.crt:ro
-      - /srv/clixor/runtime/nats-tls/server.key:/run/nats-tls/server.key:ro
+      - /srv/clixor/runtime/nats-tls/current/server.crt:/run/nats-tls/server.crt:ro
+      - /srv/clixor/runtime/nats-tls/current/server.key:/run/nats-tls/server.key:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz"]
       interval: 5s
@@ -133,7 +133,7 @@ services:
           - clixor-tls
     volumes:
       - /srv/clixor/runtime/dependency-tls/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - /srv/clixor/runtime/dependency-tls/server.pem:/run/pki/server.pem:ro
+      - /srv/clixor/runtime/dependency-tls/current/server.pem:/run/pki/server.pem:ro
     healthcheck:
       test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
       interval: 10s

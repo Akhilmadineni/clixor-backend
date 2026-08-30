@@ -111,8 +111,8 @@ jobs:
           CLIXOR_IMAGE_TAG=ci docker compose --file ../compose.yaml config --quiet
       - name: Test OCI backup health gate
         run: sh ../test-backup.sh
-      - name: Test OCI public smoke harness offline
-        run: python3 -m unittest -v ../test_smoke.py
+      - name: Test OCI deployment helpers offline
+        run: python3 -m unittest discover -v -s .. -p 'test_*.py'
       - name: Check the data-volume mount helper
         run: bash -n clixor-mount-data.sh
       - name: Verify the break-glass upload bundle

@@ -15,6 +15,8 @@ backup_env="${project_root}/secrets/backup.env"
 migrate_env="${project_root}/secrets/migrate.env"
 lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
+pki_desired="${project_root}/runtime/dependency-pki.desired"
+pki_applied="${project_root}/runtime/dependency-pki.applied"
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
 source_root=${1:-}
 source_sha=${2:-}
@@ -44,7 +46,7 @@ case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
 
-for command_name in cmp curl docker find flock rsync sha256sum systemctl touch; do
+for command_name in cmp curl docker find flock python3 rsync sha256sum systemctl touch; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
@@ -102,6 +104,7 @@ previous_image="$(docker inspect clixor-oci-api-a --format '{{.Config.Image}}' 2
 previous_postgres_id="$(docker inspect clixor-oci-postgres --format '{{.Id}}' 2>/dev/null || true)"
 previous_release="$(readlink "${release_root}/current" 2>/dev/null || true)"
 first_deploy=false
+previous_compose_uses_scoped=false
 
 if [ -z "${previous_image}" ] && [ ! -e "${compose_file}" ] && [ -z "${previous_postgres_id}" ]; then
   first_deploy=true
@@ -124,6 +127,9 @@ else
 
   cp "${compose_file}" "${previous_compose}"
   [ -s "${previous_compose}" ] || fail "captured previous Compose model is empty"
+  if grep -q '/srv/clixor/secrets/api.env' "${previous_compose}"; then
+    previous_compose_uses_scoped=true
+  fi
 
   log "capturing a pre-change PostgreSQL snapshot"
   docker exec clixor-oci-postgres sh -ec \
@@ -186,7 +192,7 @@ rollback() {
     if [ "${first_deploy}" = "false" ]; then
       log "deployment failed; attempting application rollback to ${previous_image}"
       selected_rollback_compose="${rollback_compose}"
-      if scoped_runtime_ready; then
+      if [ "${previous_compose_uses_scoped}" = "false" ] && scoped_runtime_ready; then
         selected_rollback_compose="${scoped_rollback_compose}"
       fi
       rollback_failed=0
@@ -244,6 +250,7 @@ rollback() {
       if [ -s "${compose_file}" ]; then
         CLIXOR_IMAGE_TAG="${release_tag}" docker compose \
           --file "${compose_file}" down --remove-orphans
+        rm -f -- "${compose_file}"
       fi
       log "first-deploy cleanup completed; database files and forward migrations were not restored or deleted"
     fi
@@ -305,6 +312,13 @@ do
   grep -Eq "^${required_key}=.+" "${api_env}" || \
     fail "runtime configuration is missing ${required_key}"
 done
+[ -s "${pki_desired}" ] || fail "desired dependency PKI state is missing"
+install -m 0600 -o 0 -g 0 "${pki_desired}" \
+  "${release_dir}/dependency-pki.desired"
+pki_restart_services="$(python3 "${source_root}/deploy/oci/dependency_pki.py" \
+  pending-restarts \
+  --desired "${release_dir}/dependency-pki.desired" \
+  --applied "${pki_applied}")"
 
 log "syncing the approved revision into ${stable_root}"
 rsync -a --delete \
@@ -315,14 +329,73 @@ rsync -a --delete \
   "${source_root}/" "${stable_root}/"
 
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" config --quiet
-if [ "${legacy_dependency_scope}" = "true" ]; then
-  log "replacing legacy data containers to remove inherited API credentials"
+for dependency_service in ${pki_restart_services}; do
+  case "${dependency_service}" in
+    postgres|nats|dependency-tls) ;;
+    *) fail "dependency PKI requested an unexpected service restart" ;;
+  esac
+done
+
+for dependency_service in postgres redis nats; do
+  recreate_dependency=false
+  if [ "${legacy_dependency_scope}" = "true" ]; then
+    recreate_dependency=true
+  fi
+  case " ${pki_restart_services} " in
+    *" ${dependency_service} "*) recreate_dependency=true ;;
+  esac
+  if [ "${recreate_dependency}" = "true" ]; then
+    log "recreating ${dependency_service} for scoped secrets or its new TLS leaf"
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+      up -d --no-build --no-deps --force-recreate "${dependency_service}"
+  else
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+      up -d --no-build --no-deps "${dependency_service}"
+  fi
+done
+
+for dependency_container in clixor-oci-postgres clixor-oci-redis clixor-oci-nats; do
+  attempt=1
+  while :; do
+    health_status="$(docker inspect "${dependency_container}" \
+      --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+      2>/dev/null || true)"
+    [ "${health_status}" = "healthy" ] && break
+    case "${health_status}" in
+      exited|dead) fail "${dependency_container} stopped while waiting for health" ;;
+    esac
+    [ "${attempt}" -lt 60 ] || fail "${dependency_container} did not become healthy"
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+done
+
+recreate_dependency_tls=${legacy_dependency_scope}
+case " ${pki_restart_services} " in
+  *" dependency-tls "*) recreate_dependency_tls=true ;;
+esac
+if [ "${recreate_dependency_tls}" = "true" ]; then
+  log "recreating dependency-tls for scoped secrets or its new Redis TLS leaf"
   CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-    up -d --no-build --force-recreate postgres redis nats dependency-tls
+    up -d --no-build --no-deps --force-recreate dependency-tls
 else
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
-    postgres redis nats dependency-tls
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    up -d --no-build --no-deps dependency-tls
 fi
+
+attempt=1
+while :; do
+  health_status="$(docker inspect clixor-oci-dependency-tls \
+    --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+    2>/dev/null || true)"
+  [ "${health_status}" = "healthy" ] && break
+  case "${health_status}" in
+    exited|dead) fail "dependency-tls stopped while waiting for health" ;;
+  esac
+  [ "${attempt}" -lt 60 ] || fail "dependency-tls did not become healthy"
+  attempt=$((attempt + 1))
+  sleep 2
+done
 
 if [ "${first_deploy}" = "true" ]; then
   [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
@@ -412,6 +485,10 @@ systemctl start clixor-restore-drill.service
   fail "the isolated restore drill did not produce a fresh success marker"
 systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
 systemctl start clixor-backup-health.service
+
+python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
+  --desired "${release_dir}/dependency-pki.desired" \
+  --applied "${pki_applied}"
 
 ln -s "${release_dir}" "${release_dir}/current-link.pending"
 mv -Tf "${release_dir}/current-link.pending" "${release_root}/current"

@@ -100,7 +100,9 @@ grep -q '/srv/clixor/secrets/runtime.env' "${script_root}/compose.yaml" && \
   fail "Compose still consumes legacy runtime.env"
 grep -q "grep -q '^CLUSTER_'" "${script_root}/deploy.sh" || \
   fail "deploy does not detect immutable containers with legacy API secrets"
-grep -q -- '--force-recreate postgres redis nats' "${script_root}/deploy.sh" || \
+grep -q '\[ "${legacy_dependency_scope}" = "true" \]' "${script_root}/deploy.sh" || \
+  fail "deploy does not route legacy containers through forced reconciliation"
+grep -q -- '--force-recreate "${dependency_service}"' "${script_root}/deploy.sh" || \
   fail "deploy does not replace legacy data containers"
 
 duplicate_root="${test_root}/duplicate"
