@@ -2,15 +2,6 @@ data "oci_identity_availability_domains" "available" {
   compartment_id = var.tenancy_ocid
 }
 
-data "oci_core_images" "ubuntu_arm64" {
-  compartment_id           = var.tenancy_ocid
-  operating_system         = "Canonical Ubuntu"
-  operating_system_version = "24.04"
-  shape                    = var.instance_shape
-  sort_by                  = "TIMECREATED"
-  sort_order               = "DESC"
-}
-
 resource "oci_core_instance" "clixor" {
   availability_domain = local.availability_domain
   compartment_id      = local.deployment_compartment_id
@@ -86,11 +77,6 @@ resource "oci_core_instance" "clixor" {
     precondition {
       condition     = var.boot_volume_size_gbs + var.data_volume_size_gbs <= 200
       error_message = "Boot and data volumes together must not exceed the 200-GB Always Free block-volume allowance."
-    }
-
-    precondition {
-      condition     = length(data.oci_core_images.ubuntu_arm64.images) > 0
-      error_message = "No Ubuntu 24.04 ARM64 image compatible with VM.Standard.A1.Flex was found in this region."
     }
 
     precondition {

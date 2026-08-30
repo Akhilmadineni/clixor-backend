@@ -9,7 +9,7 @@ output "availability_domain" {
 }
 
 output "ubuntu_image_id" {
-  description = "Resolved Canonical Ubuntu 24.04 ARM64 image OCID."
+  description = "Source-controlled Canonical Ubuntu 24.04 ARM64 image OCID."
   value       = local.ubuntu_image_id
 }
 

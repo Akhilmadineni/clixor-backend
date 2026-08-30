@@ -9,7 +9,8 @@ Requires=docker.service
 Type=notify
 DynamicUser=yes
 LoadCredential=cloudflare-token:/etc/cloudflared/token
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol quic run --token-file %d/cloudflare-token
+# `auto` prefers QUIC and falls back to HTTP/2 when UDP is unavailable.
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol auto run --token-file %d/cloudflare-token
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=0

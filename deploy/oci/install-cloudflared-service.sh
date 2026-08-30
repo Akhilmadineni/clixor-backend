@@ -4,6 +4,7 @@ umask 077
 
 token_file=/etc/cloudflared/token
 unit_source=${1:-}
+minimum_cloudflared_version=2025.4.0
 
 fail() {
   printf '[clixor-cloudflared] ERROR: %s\n' "$*" >&2
@@ -14,6 +15,15 @@ fail() {
 [ -n "${unit_source}" ] || fail "cloudflared service unit path is required"
 [ -f "${unit_source}" ] || fail "service unit does not exist: ${unit_source}"
 [ -x /usr/bin/cloudflared ] || fail "install the signed cloudflared package first"
+[ -x /usr/bin/dpkg ] || fail "dpkg is required to validate the cloudflared version"
+
+cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
+  sed -n 's/^cloudflared version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+[ -n "${cloudflared_version}" ] || fail "could not parse cloudflared --version"
+/usr/bin/dpkg --compare-versions \
+  "${cloudflared_version}" ge "${minimum_cloudflared_version}" || \
+  fail "cloudflared ${minimum_cloudflared_version} or newer is required for --token-file (found ${cloudflared_version})"
+
 [ -s "${token_file}" ] || fail "install the tunnel token at ${token_file} first"
 
 token_owner="$(stat -c '%u:%g' "${token_file}")"

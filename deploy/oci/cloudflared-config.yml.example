@@ -3,7 +3,8 @@
 # outside the repository with mode 0600.
 tunnel: REPLACE_WITH_TUNNEL_UUID
 credentials-file: /etc/cloudflared/REPLACE_WITH_TUNNEL_UUID.json
-protocol: quic
+# Prefer QUIC and fall back to HTTP/2 when UDP is unavailable.
+protocol: auto
 
 ingress:
   - hostname: clustr-api.atlanteanz.com

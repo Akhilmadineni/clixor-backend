@@ -77,23 +77,33 @@ From the source checkout:
 
 ```sh
 revision="$(git rev-parse HEAD)"
-sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-1
+sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-20260830T120000Z
 ```
+
+Use a new non-secret run identifier for every attempt. Release directories are
+append-only audit records, so the script refuses to overwrite an earlier run.
 
 The deploy script:
 
 1. takes an exclusive host lock;
-2. builds and verifies an ARM64 API image tagged with the source revision;
-3. synchronizes that exact source to `/srv/clixor/repo`;
-4. starts and health-checks the internal dependencies;
-5. captures a mode-0600 pre-migration PostgreSQL dump;
+2. for an upgrade, captures the previous Compose model, API image, release
+   pointer, and a non-empty mode-0600 PostgreSQL dump before changing the active
+   runtime; a clean first deployment records an explicit first-deploy marker;
+3. builds and verifies an ARM64 API image tagged with the source revision;
+4. arms application rollback before refreshing runtime configuration,
+   synchronizing source, or reconciling containers;
+5. synchronizes that exact source to `/srv/clixor/repo` and starts and
+   health-checks the internal dependencies;
 6. runs the one-shot migration command;
 7. starts both API replicas and the internal gateway; and
 8. requires gateway and per-replica readiness before recording success.
 
-A failed application rollout restores the previous Compose model and API image
-when one exists. Database migrations are forward-only and are never automatically
-reversed. The very first deployment has no previous release to restore.
+A failed upgrade restores the previous Compose model and API image when one
+exists. A failed first deployment stops the incomplete Compose stack without
+deleting its bind-mounted data. Database migrations are forward-only: neither
+path automatically runs `pg_restore`, reverses migrations, or deletes database
+files. The pre-change dump is an operator recovery artifact, not an automatic
+rollback mechanism.
 
 Check local state:
 
@@ -105,6 +115,17 @@ sudo env CLIXOR_IMAGE_TAG="$(basename "$(readlink /srv/clixor/releases/current)"
 
 The exact SHA argument is the deployment boundary. Deploying `main` does not
 silently include features that exist only on another branch.
+
+All third-party GitHub Actions used by CI and deployment are pinned to immutable
+40-character commits. Container base images, CI service images, and OCI runtime
+dependency images still use version tags because their current multi-platform
+manifest digests were not independently verified in this change. An exact
+source SHA does not make those upstream tags immutable, and `deploy.sh --pull`
+can observe a republished tag. Before the public production gate, resolve each
+tag through its official registry, verify that the manifest list contains the
+required `linux/arm64` image (and `linux/amd64` where CI builds it), then review
+and pin the manifest-list digest. Keep dependency upgrades separate from
+application-only releases.
 
 ### GitHub Actions production runner
 
@@ -196,9 +217,11 @@ specific.
 
 ## 4. Move Cloudflare ingress
 
-Install `cloudflared` from Cloudflare's signed package repository. Create a new,
-remotely managed tunnel for this VM; do not reuse a NAS connector connected to a
-different database. Configure these public hostname routes on that tunnel:
+Install cloudflared **2025.4.0 or newer** from Cloudflare's signed package
+repository; `--token-file` is unavailable in older releases and the installer
+rejects them. Create a new, remotely managed tunnel for this VM; do not reuse a
+NAS connector connected to a different database. Configure these public
+hostname routes on that tunnel:
 
 - `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
 - `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
@@ -218,7 +241,9 @@ sudo systemctl status --no-pager cloudflared.service
 The token stays root-owned at mode `0600`; systemd exposes it to the dynamic
 connector identity only through `LoadCredential`. Do not place it in
 `runtime.env`, a cloud-init payload, GitHub Actions, or the `cloudflared` command
-line. Verify four outbound tunnel connections and test:
+line. The unit uses Cloudflare's `auto` transport so it prefers QUIC and can fall
+back to HTTP/2 if UDP is unavailable. Verify four outbound tunnel connections
+and test:
 
 ```sh
 curl --fail https://clustr-api.atlanteanz.com/health/ready

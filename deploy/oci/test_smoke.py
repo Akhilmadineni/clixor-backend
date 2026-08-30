@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import struct
 import sys
@@ -173,6 +174,105 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(fake.roles, ["owner", "owner", "member", "member"])
         self.assertTrue(all(account.deleted for account in suite.accounts))
+
+
+class ReleaseHardeningTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.oci_root = Path(__file__).resolve().parent
+
+    def test_snapshot_and_rollback_are_armed_before_runtime_mutation(self) -> None:
+        script = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        snapshot = script.index('log "capturing a pre-change PostgreSQL snapshot"')
+        rollback_arm = script.index("\nrollback_needed=1\n")
+        bootstrap = script.index('CLIXOR_SKIP_PACKAGES=true sh')
+        sync = script.index('log "syncing the approved revision')
+        dependency_reconcile = script.index(
+            'docker compose --file "${compose_file}" up -d --no-build \\\n  postgres redis nats dependency-tls'
+        )
+        migration = script.index('log "applying transactional forward migrations"')
+
+        self.assertLess(snapshot, rollback_arm)
+        self.assertLess(rollback_arm, bootstrap)
+        self.assertLess(rollback_arm, sync)
+        self.assertLess(rollback_arm, dependency_reconcile)
+        self.assertLess(rollback_arm, migration)
+        self.assertIn('printf \'first-deploy\\n\'', script)
+        self.assertIn("database files and forward migrations were not restored", script)
+        self.assertNotIn("pg_restore", script)
+
+    def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
+        installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
+            encoding="utf-8"
+        )
+        unit = (self.oci_root / "cloudflared.service").read_text(encoding="utf-8")
+        local_config = (self.oci_root / "cloudflared-config.yml.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("minimum_cloudflared_version=2025.4.0", installer)
+        self.assertIn("dpkg --compare-versions", installer)
+        self.assertIn("--protocol auto", unit)
+        self.assertNotIn("--protocol quic", unit)
+        self.assertIn("protocol: auto", local_config)
+        self.assertNotIn("protocol: quic", local_config)
+        self.assertIn("LoadCredential=cloudflare-token:/etc/cloudflared/token", unit)
+
+    def test_terraform_uses_the_deployed_image_ocid_not_latest_lookup(self) -> None:
+        terraform_root = self.oci_root / "terraform"
+        compute = (terraform_root / "compute.tf").read_text(encoding="utf-8")
+        locals_file = (terraform_root / "locals.tf").read_text(encoding="utf-8")
+        self.assertNotIn('data "oci_core_images"', compute)
+        self.assertIn(
+            "ocid1.image.oc1.phx.aaaaaaaa2xgl5y6skitgkee2aiprxzydi3nnxlqojrxtcifdb5d6a3djexuq",
+            locals_file,
+        )
+
+    def test_actions_and_resource_manager_manifest_are_immutable_and_complete(self) -> None:
+        repository_root = self.oci_root.parent.parent
+        workflow_paths = sorted(
+            list((repository_root / ".github" / "workflows").glob("*.yml"))
+            + list((repository_root / ".github" / "workflows").glob("*.yaml"))
+        )
+        workflow_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in workflow_paths
+        )
+        uses = re.findall(r"^\s*-?\s*uses:\s*([^\s#]+)", workflow_text, re.MULTILINE)
+        self.assertTrue(uses)
+        for action in uses:
+            with self.subTest(action=action):
+                self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$")
+
+        deploy_workflow = (
+            repository_root / ".github" / "workflows" / "deploy-oci.yml"
+        ).read_text(encoding="utf-8")
+        wrapper = (self.oci_root / "actions-deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("github.event.workflow_run.head_sha", deploy_workflow)
+        self.assertIn("github.event.workflow_run.event == 'push'", deploy_workflow)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", deploy_workflow)
+        self.assertIn("clixor-oci-production", deploy_workflow)
+        self.assertIn("cancel-in-progress: false", deploy_workflow)
+        self.assertIn('[ "${#source_sha}" -eq 40 ]', wrapper)
+        self.assertIn('[ "${actual_sha}" = "${source_sha}" ]', wrapper)
+        self.assertIn("status --porcelain --untracked-files=all", wrapper)
+
+        terraform_root = self.oci_root / "terraform"
+        package_script = (terraform_root / "package-stack.sh").read_text(
+            encoding="utf-8"
+        )
+        required = {
+            path.name for path in terraform_root.glob("*.tf")
+        } | {
+            ".terraform.lock.hcl",
+            "schema.yaml",
+            "cloud-init.yaml.tftpl",
+            "clixor-mount-data.sh",
+            "clixor-data-volume.service",
+        }
+        for filename in sorted(required):
+            with self.subTest(filename=filename):
+                self.assertIn(filename, package_script)
+        self.assertNotIn("terraform.tfstate", package_script)
 
 
 if __name__ == "__main__":

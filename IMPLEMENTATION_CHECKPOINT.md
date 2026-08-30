@@ -1,10 +1,10 @@
 # Clixor backend repository checkpoint
 
-Last updated: 2026-08-19 (America/Chicago)
+Last updated: 2026-08-30 (America/Chicago)
 
 Repository: `https://github.com/Akhilmadineni/clixor-backend`
 
-Branch: `feature/akhil/delete-account-backend`
+Active deployment target: OCI Phoenix (`deploy/oci`); NAS automation is retired.
 
 ## Account deletion implementation checkpoint
 
@@ -14,7 +14,7 @@ Branch: `feature/akhil/delete-account-backend`
 - Single-member conversations are deleted. Their MinIO object keys are queued in bounded durable outbox batches; the relay retries idempotent MinIO deletion until it succeeds.
 - Shared messages, expenses, and settlements remain available to other members. Embedded member identity is rewritten to `Deleted user` while stable accounting IDs remain intact.
 - Migration `000004_account_deletion.sql`, OpenAPI documentation, HTTP contract tests, store tests, PostgreSQL integration coverage, and MinIO retry coverage are included.
-- Validation on Go 1.26.6 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. Migration 000004 and the account-deletion integration suite also pass against a fresh PostgreSQL 17 database on the NAS; the temporary test database was removed immediately afterward. CI and the production image are pinned to Go 1.26.6, with `golang.org/x/net` v0.55.0, to address the August 2026 Go security advisories caught by `govulncheck`.
+- Validation on Go 1.26.6 passes `gofmt`, `go vet`, `go test ./...`, and `go test -race ./...`. Migration 000004 and the account-deletion integration suite passed against a fresh PostgreSQL 17 database during the earlier NAS phase; that temporary test database was removed immediately afterward. CI and the production image are pinned to Go 1.26.6, with `golang.org/x/net` v0.55.0, to address the August 2026 Go security advisories caught by `govulncheck`.
 
 ## Current state
 
@@ -24,7 +24,7 @@ Branch: `feature/akhil/delete-account-backend`
 - The split has been reconciled through combined-repository `main` commit
   `b38233b`. Post-split phone linking, pilot authentication, unique usernames,
   username discovery, persistent chat state, and unread-state changes are all
-  present here alongside the NAS-owned OTP/fraud engine and Telnyx transport.
+  present here alongside the backend-owned OTP/fraud engine and Telnyx transport.
 - The former Twilio adapter is intentionally not carried forward: Telnyx is the
   production SMS transport and the disabled provider remains the safe fallback.
   No active backend implementation remains owned by the combined iOS repository.
@@ -34,38 +34,37 @@ Branch: `feature/akhil/delete-account-backend`
   migrate live data.
 - CI checks formatting, vet, race-enabled PostgreSQL/Redis tests, vulnerability
   scanning, binary builds, and the production Docker image.
-- A successful CI run for `main` triggers the dedicated NAS runner labelled
-  `self-hosted`, `nas`, and `clixor`. Deployment is serialized, builds an
-  immutable revision-labelled image, refreshes runtime configuration without
-  exporting NAS secrets, captures a private pre-migration PostgreSQL snapshot,
-  applies transactional migrations, gates on readiness, and rolls back the API
-  image and Compose model on unhealthy rollout.
-- Application secrets remain only under `/volume1/docker/clustr/secrets` on the
-  NAS. No populated credential belongs in this repository or GitHub Actions.
-- The repository-scoped runner `atlanteans-nas-clixor` is registered with
-  `self-hosted`, `Linux`, `X64`, `nas`, and `clixor` labels. Its
-  `github-runner-clixor.service` systemd unit is enabled, active, and listening
-  for jobs on runner version 2.336.0.
-- This implementation is merged into `main`. Every future push or merge to
-  `main` starts CI; a successful CI run then dispatches the serialized NAS
-  deployment workflow.
-- The first main-branch deployment hardened the runtime privilege boundary:
-  root-owned material is validated inside the capability-limited bootstrap
-  container; the dedicated deployment group gets traverse-only access to the
-  secret directory and read access only to Compose's `runtime.env`; PKI private
-  material remains root-only.
+- After the OCI workflow is merged to `main` and its dedicated runner is
+  registered, a successful push-triggered `CI` run for `main` dispatches the
+  serialized runner labelled `self-hosted`, `Linux`, `ARM64`, and
+  `clixor-oci-production`. It checks out the exact CI-approved SHA and passes it
+  through a root-owned validation wrapper before deployment.
+- An OCI upgrade captures the previous Compose model, API image, release pointer,
+  and a non-empty PostgreSQL dump before active-runtime mutation. Application
+  rollback is armed before source sync, dependency reconciliation, or forward
+  migration. Schema migrations are never automatically reversed or restored.
+- OCI application secrets belong only in root-owned paths under
+  `/srv/clixor/secrets`; the Cloudflare token belongs at
+  `/etc/cloudflared/token` with root ownership and mode `0600`. No populated
+  credential belongs in this repository or GitHub Actions.
+- The former NAS deployment workflows are deleted and CI rejects their return.
+  A recovered NAS must not receive the OCI production runner label or serve the
+  production Cloudflare hostnames.
 
 ## Repository ownership boundary
 
 - This repository owns all backend application code, database migrations,
   OpenAPI definitions, backend tests, production Compose/Kubernetes manifests,
-  NAS deployment automation, operational runbooks, and backend CI/CD.
+  OCI deployment automation, operational runbooks, and backend CI/CD. The
+  checked-in `deploy/nas` package is retired historical material and is not an
+  active deployment target.
 - The combined `Uthejmopathi/Clustr` repository owns the Swift/iOS client only.
   Its historical backend directory and backend-specific GitHub Actions were
   removed from `main` in commit `610ff55` after this repository's reconciled
   production rollout succeeded.
 - Existing `CLUSTER_*` configuration keys, `clustr-*` runtime names, database
-  names, public hostnames, and NAS paths are compatibility identifiers, not an
-  indication that their source belongs in the iOS repository.
+  names, and public hostnames are compatibility identifiers, not an indication
+  that their source belongs in the iOS repository. References to NAS paths in
+  the retired deployment package are historical and must not be used for OCI.
 
 No live credential is stored in this repository.

@@ -33,6 +33,16 @@ creating its first key. OCI can briefly publish the Vault management endpoint
 before its unique hostname is resolvable, which otherwise makes a clean
 Resource Manager apply fail and succeed only on retry.
 
+The compute image is deliberately pinned in `locals.tf` to the exact Phoenix
+Ubuntu 24.04 ARM64 image already used by `clixor-prod-1`:
+`ocid1.image.oc1.phx.aaaaaaaa2xgl5y6skitgkee2aiprxzydi3nnxlqojrxtcifdb5d6a3djexuq`.
+Do not replace it with a "latest image" lookup: a newly published Canonical
+image would change the instance boot source during an otherwise unrelated plan.
+Treat an image upgrade as a separate, reviewed host-replacement operation with
+verified backups and rollback capacity. With existing Resource Manager state,
+this literal must plan as the same `source_id`; reject any plan that replaces or
+updates the compute instance or boot volume.
+
 ## Cost guardrails
 
 The variables reject non-A1 shapes, more than 2 OCPUs, more than 12 GB RAM, and
