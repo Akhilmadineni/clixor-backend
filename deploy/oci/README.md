@@ -234,6 +234,34 @@ described below; it requires proof of an approved-manifest reboot, a current-boo
 restore drill, and all provider canaries. It moves values to root-only quarantine
 and never purges them. Never remove the externally recoverable Vault versions.
 
+### Release-approved boot tooling
+
+Every immutable release contains `boot-secrets/prepare-runtime-secrets.sh`, its
+matching `hydrate-vault-secrets.py`, and a strict `SHA256SUMS`. Deploy stages
+them root-owned with modes `0500`, stores the checksum manifest at `0400`,
+revalidates and fsyncs the files and directories, and only then advances
+`releases/current`. The stable systemd service executes only the small
+root-owned launcher in `/usr/local/libexec/clixor`. That launcher fails closed
+unless `releases/current` is a root-owned symlink to one immediate mode-0700
+release, the release-local bundle has the exact expected files and modes, and
+every checksum matches. It passes the resolved release path to that release's
+worker, so an uncommitted candidate directory cannot affect a reboot. Vault
+boot hydration uses only the approved manifest and exact OCI version numbers
+from the resolved release; it never resolves provider `CURRENT`.
+
+The `/etc/clixor/secret-mode` fallback is limited to the initial staging boot
+before any `oci-*` release history exists. Once history exists, a missing or
+unsafe `releases/current` pointer is a hard boot failure rather than a silent
+staging downgrade. For a fresh host, run the explicit bootstrap in staging mode
+and then commit the first staging release. For a host created before
+release-local boot tooling, first deploy one staging release while the legacy
+boot unit remains installed. After that release is current, run the explicit
+operator bootstrap once to install the stable launcher/unit, reboot, and prove
+the pinned staging release before any Vault cutover. Bootstrap refuses the
+unsafe reverse order. Automated deploy calls set host-tool activation deferral
+and cannot overwrite the launcher, initial fallback worker, unit, or Docker
+ordering drop-in.
+
 ### Explicit staging-secret quarantine maintenance
 
 This workflow is never called by bootstrap, hydration, Actions, or deploy. Run it
@@ -246,9 +274,11 @@ sudo install -m 0600 -o 0 -g 0 /proc/sys/kernel/random/boot_id \
 ```
 
 Reboot the VM. Confirm that the boot ID changed, the `active` link selects a
-`vault-generations/...` directory whose `.vault-hydrated` marker has the SHA-256
-of the reviewed `/etc/clixor/vault-secrets.map`, and the approved release is still
-current. During this new boot, run a fresh offsite backup and isolated restore
+`vault-generations/...` directory whose schema-2 `.vault-hydrated` marker names
+the exact current release cohort and contains the mapping and cohort SHA-256
+values from that release's root-owned mapping and approved manifest. Never
+attest mutable `/etc` mapping or mode files. During this new boot, run a fresh
+offsite backup and isolated restore
 drill. Then complete real Telnyx OTP, APNs production/sandbox notification, SMTP
 reset-mailbox, OCI media upload/verify/download/delete, and both Cloudflare
 hostname canaries. A paper review or local readiness alone is not a provider
@@ -259,9 +289,10 @@ After those checks pass, create
 exactly these non-secret fields, be owned by `root:root`, and have mode `0600`:
 
 ```text
-schema=1
+schema=2
 change_ticket=CHANGE-1234
 approved_mapping_sha256=<64 lowercase hex characters>
+approved_cohort_sha256=<64 lowercase hex characters from the schema-2 marker>
 pre_reboot_boot_id=<boot ID recorded before reboot>
 approved_boot_id=<current boot ID>
 approved_release=/srv/clixor/releases/oci-<approved release tag>
@@ -280,7 +311,11 @@ sudo sh deploy/oci/quarantine-staging-secrets.sh quarantine \
 ```
 
 The script revalidates every precondition, current local API readiness, Docker,
-cloudflared, file types, ownership, checksums, boot IDs, and release pointer. It
+cloudflared, file types, ownership, boot IDs, and the exact current release
+pointer. It verifies the release-local boot bundle checksum, mode and mapping,
+the approved manifest's calculated cohort digest, and the active schema-2
+marker with that release's own checksummed verifier. It never falls back to
+mutable `/etc/clixor/secret-mode` or `/etc/clixor/vault-secrets.map`. It
 moves `/srv/clixor/secrets` candidates to a unique mode-0700 directory below
 `/srv/clixor/quarantine/staging-secrets` and the legacy connector token to a
 matching directory below `/etc/cloudflared/quarantine`. It appends a non-secret,
@@ -311,7 +346,8 @@ The deploy script:
    creating a release or snapshot; when both paths share one filesystem, the
    requirements are added rather than counted twice;
 3. writes the release-local secret mode; stages and checksums that release's
-   host backup/restore/health programs, systemd units, and
+   boot worker and Vault hydrator, then its host backup/restore/health programs,
+   systemd units, and
    `cloudflared.service`; validates the connector unit with systemd; captures
    the exact effective old connector-unit content/checksum and enabled/active
    state; and captures the active backup-tool versions plus timer state;
@@ -346,9 +382,11 @@ The deploy script:
 14. creates and uploads a fresh post-migration backup, restores it into an
     isolated PostgreSQL container, runs integrity checks, enables the verified
     timers, and runs backup health;
-15. records the dependency PKI state and atomically advances the current-release
-    pointer, thereby approving the application and exact Vault cohort together,
-    before disarming rollback; and
+15. records the dependency PKI state, revalidates and fsyncs the release-local
+    boot bundle, and atomically advances and fsyncs the current-release pointer,
+    thereby approving the application, boot worker, and exact Vault cohort
+    together; successful pointer observation disarms application, Vault,
+    connector, and host-tool rollback before any post-swap failure can run; and
 16. after the fresh offsite marker and successful release are durable, retains
     the current and immediate previous rollback boundaries plus three small audit
     releases, deletes pre-migration dumps from non-boundary audit releases, and

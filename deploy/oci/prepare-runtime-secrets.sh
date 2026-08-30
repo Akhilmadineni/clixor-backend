@@ -3,84 +3,78 @@ set -eu
 umask 077
 ulimit -c 0
 
-fallback_mode_file=/etc/clixor/secret-mode
 release_root=/srv/clixor/releases
-release_mode_file="${release_root}/current/secret-mode"
-approved_manifest="${release_root}/current/vault-approved-cohort.json"
 runtime_root=/run/clixor/secrets
 staging_root=/srv/clixor/secrets
-hydrator=/usr/local/libexec/clixor/hydrate-vault-secrets.py
 
 fail() {
-  printf '[clixor-runtime-secrets] ERROR: %s\n' "$*" >&2
+  printf '[clixor-release-runtime-secrets] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
-[ "$(awk 'END { print NR }' /proc/swaps)" = "1" ] || \
-  fail "swap must be disabled before preparing runtime secrets"
-if [ -e "${release_mode_file}" ] || [ -L "${release_mode_file}" ]; then
-  [ -L "${release_root}/current" ] || \
-    fail "current release must be selected by a symbolic link"
-  current_release_target="$(readlink -- "${release_root}/current")"
-  case "${current_release_target}" in
-    "${release_root}"/oci-*) ;;
-    *) fail "current release pointer targets an unexpected location" ;;
-  esac
-  [ "${current_release_target%/*}" = "${release_root}" ] && \
-    [ "$(readlink -f -- "${release_root}/current")" = "${current_release_target}" ] && \
-    [ -d "${current_release_target}" ] && [ ! -L "${current_release_target}" ] && \
-    [ "$(stat -c '%u:%g:%a' "${current_release_target}")" = "0:0:700" ] || \
-    fail "current release pointer does not select an immediate release child"
-  [ -f "${release_mode_file}" ] && [ ! -L "${release_mode_file}" ] || \
-    fail "approved release secret mode must be a regular file"
-  [ "$(stat -c '%u:%g:%a' "${release_mode_file}")" = "0:0:400" ] || \
-    fail "approved release secret mode has unsafe ownership or mode"
-  mode_file=${release_mode_file}
-else
-  if [ -d "${release_root}" ] && \
-    [ -n "$(find "${release_root}" -mindepth 1 -maxdepth 1 -type d -name 'oci-*' -print -quit)" ]; then
-    fail "release history exists but the boot approval pointer is unavailable"
-  fi
-  [ -f "${fallback_mode_file}" ] && [ ! -L "${fallback_mode_file}" ] || \
-    fail "fallback secret mode must be a regular file"
-  [ "$(stat -c '%u:%g:%a' "${fallback_mode_file}")" = "0:0:600" ] || \
-    fail "fallback secret mode has unsafe ownership or mode"
-  mode_file=${fallback_mode_file}
-fi
-mode="$(sed -n '1p' "${mode_file}")"
+[ "$#" -eq 1 ] || fail "usage: prepare-runtime-secrets.sh /srv/clixor/releases/oci-<release>"
+release=$1
+case "${release}" in
+  "${release_root}"/oci-*) ;;
+  *) fail "release path is invalid" ;;
+esac
+[ "${release%/*}" = "${release_root}" ] && \
+  [ -d "${release}" ] && [ ! -L "${release}" ] && \
+  [ "$(readlink -f -- "${release}")" = "${release}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${release}")" = "0:0:700" ] || \
+  fail "release must be an immediate root-owned mode-0700 child"
+
+boot_root="${release}/boot-secrets"
+hydrator="${boot_root}/hydrate-vault-secrets.py"
+mode_file="${release}/secret-mode"
+approved_mapping="${release}/vault-secrets.map"
+approved_manifest="${release}/vault-approved-cohort.json"
+release_cohort=${release##*/}
+
+[ -d "${boot_root}" ] && [ ! -L "${boot_root}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${boot_root}")" = "0:0:700" ] || \
+  fail "release boot-tool directory is unavailable or unsafe"
+[ -f "${hydrator}" ] && [ ! -L "${hydrator}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${hydrator}")" = "0:0:500" ] || \
+  fail "release-local Vault hydrator is unavailable or unsafe"
+[ -f "${mode_file}" ] && [ ! -L "${mode_file}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${mode_file}")" = "0:0:400" ] || \
+  fail "release secret mode is unavailable or unsafe"
 [ "$(wc -l < "${mode_file}" | tr -d '[:space:]')" = "1" ] || \
-  fail "secret mode file is invalid"
+  fail "release secret mode is invalid"
+mode="$(sed -n '1p' "${mode_file}")"
 case "${mode}" in
   staging|vault) ;;
-  *) fail "secret mode must be staging or vault" ;;
+  *) fail "release secret mode must be staging or vault" ;;
 esac
 
-install -d -m 0700 -o 0 -g 0 /run/clixor
-install -d -m 0700 -o 0 -g 0 "${runtime_root}"
+[ "$(awk 'END { print NR }' /proc/swaps)" = "1" ] || \
+  fail "swap must be disabled before preparing runtime secrets"
+install -d -m 0700 -o 0 -g 0 /run/clixor "${runtime_root}"
 [ "$(findmnt --noheadings --output FSTYPE --target "${runtime_root}" | tr -d '[:space:]')" = "tmpfs" ] || \
   fail "runtime secret root is not on tmpfs"
 
 if [ "${mode}" = "vault" ]; then
-  [ -f "${hydrator}" ] && [ ! -L "${hydrator}" ] || \
-    fail "installed Vault hydrator is unavailable"
-  [ "$(stat -c '%u:%g:%a' "${hydrator}")" = "0:0:755" ] || \
-    fail "installed Vault hydrator has unsafe ownership or mode"
-  [ -f "${approved_manifest}" ] && [ ! -L "${approved_manifest}" ] || \
-    fail "approved Vault cohort is unavailable from the current release"
+  for approved_file in "${approved_mapping}" "${approved_manifest}"; do
+    [ -f "${approved_file}" ] && [ ! -L "${approved_file}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${approved_file}")" = "0:0:400" ] || \
+      fail "approved Vault release metadata is unavailable or unsafe"
+  done
   exec /usr/bin/python3 "${hydrator}" \
-    --approved-manifest "${approved_manifest}"
+    --approved-release-manifest "${approved_manifest}" \
+    --release-cohort "${release_cohort}"
 fi
 
-if [ -e "${approved_manifest}" ] || [ -L "${approved_manifest}" ]; then
-  fail "a staging release must not contain an approved Vault cohort"
-fi
-
-[ -d "${staging_root}" ] && [ ! -L "${staging_root}" ] || \
-  fail "staging secret root is unavailable"
-[ "$(stat -c '%u:%g:%a' "${staging_root}")" = "0:0:700" ] || \
-  fail "staging secret root has unsafe ownership or mode"
+for forbidden_vault_file in "${approved_mapping}" "${approved_manifest}"; do
+  [ ! -e "${forbidden_vault_file}" ] && [ ! -L "${forbidden_vault_file}" ] || \
+    fail "a staging release must not contain approved Vault metadata"
+done
+[ -d "${staging_root}" ] && [ ! -L "${staging_root}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${staging_root}")" = "0:0:700" ] || \
+  fail "staging secret root is unavailable or unsafe"
 temporary_link="${runtime_root}/.active.$$"
-rm -f -- "${temporary_link}"
+trap 'rm -f -- "${temporary_link}"' EXIT HUP INT TERM
 ln -s "${staging_root}" "${temporary_link}"
 mv -Tf -- "${temporary_link}" "${runtime_root}/active"
+trap - EXIT HUP INT TERM

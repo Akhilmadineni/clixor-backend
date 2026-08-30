@@ -225,8 +225,8 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn('cmp -s "${selected_rollback_compose}" "${compose_file}"', script)
         self.assertIn('if [ "${actual_image}" != "${previous_image}" ]', script)
         self.assertIn('rm -f -- "${compose_file}"', script)
-        release_pointer = script.index('mv -Tf "${release_dir}/current-link.pending"')
-        release_complete = script.rindex("rollback_needed=0")
+        release_pointer = script.index("release_pointer_committed || fail")
+        release_complete = script.rindex("\ndisarm_committed_release_rollback\n")
         self.assertLess(release_pointer, release_complete)
 
     def test_vault_rotation_rejects_single_node_credential_changes(self) -> None:
@@ -279,15 +279,9 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(nats_reject, image_build)
         self.assertIn("rollback secret consumers did not restart", deploy)
 
-        release_pointer = deploy.index(
-            'mv -Tf "${release_dir}/current-link.pending"'
-        )
-        rollback_disarm = deploy.rindex("rollback_needed=0")
-        vault_disarm = deploy.index(
-            "vault_generation_changed=false", rollback_disarm
-        )
+        release_pointer = deploy.index("release_pointer_committed || fail")
+        rollback_disarm = deploy.rindex("\ndisarm_committed_release_rollback\n")
         self.assertLess(release_pointer, rollback_disarm)
-        self.assertLess(rollback_disarm, vault_disarm)
         self.assertNotIn("retire_persistent_staging_secrets", deploy)
         self.assertNotIn("quarantine-staging-secrets.sh", deploy)
 
@@ -299,6 +293,19 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("pre_reboot_boot_id", quarantine)
         self.assertIn("pre-retirement-boot-id", quarantine)
         self.assertIn("approved_mapping_sha256", quarantine)
+        self.assertIn("approved_cohort_sha256", quarantine)
+        self.assertIn('[ "${approval_schema}" = "2" ]', quarantine)
+        self.assertIn('release_secret_mode="${current_release}/secret-mode"', quarantine)
+        self.assertIn('approved_mapping="${current_release}/vault-secrets.map"', quarantine)
+        self.assertIn(
+            'approved_manifest="${current_release}/vault-approved-cohort.json"',
+            quarantine,
+        )
+        self.assertIn("--verify-candidate-manifest", quarantine)
+        self.assertIn('marker_value release_cohort', quarantine)
+        self.assertIn('marker_value cohort_sha256', quarantine)
+        self.assertNotIn("mapping_file=/etc/clixor/vault-secrets.map", quarantine)
+        self.assertNotIn("secret_mode_file=/etc/clixor/secret-mode", quarantine)
         self.assertIn(
             'provider_canaries}" = "apns,cloudflare,oci-media,smtp,telnyx"',
             quarantine,
@@ -387,10 +394,106 @@ class ReleaseHardeningTests(unittest.TestCase):
         public_gate = deploy.index(
             'if [ "${public_smoke_required}" = "true" ]; then', activate
         )
-        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        release_pointer = deploy.index("release_pointer_committed || fail")
         self.assertLess(rollback_arm, activate)
         self.assertLess(activate, public_gate)
         self.assertLess(public_gate, release_pointer)
+
+    def test_committed_pointer_disarms_every_rollback_domain(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        helper_start = deploy.index("disarm_committed_release_rollback() {")
+        helper_end = deploy.index("\n}\n\nrelease_pointer_committed()", helper_start)
+        helper = deploy[helper_start:helper_end]
+        for assignment in (
+            "rollback_needed=0",
+            "vault_generation_changed=false",
+            "cloudflare_state_activated=false",
+            "host_tools_activated=false",
+        ):
+            self.assertIn(assignment, helper)
+
+        rollback_start = deploy.index("rollback() {")
+        committed_guard = deploy.index(
+            'if [ "${status}" -ne 0 ] && release_pointer_committed; then',
+            rollback_start,
+        )
+        rollback_disarm = deploy.index(
+            "disarm_committed_release_rollback", committed_guard
+        )
+        first_restore = deploy.index("if restore_previous_vault_target; then", rollback_start)
+        self.assertLess(committed_guard, rollback_disarm)
+        self.assertLess(rollback_disarm, first_restore)
+
+        pointer_observation = deploy.index("release_pointer_committed || fail")
+        success_disarm = deploy.index(
+            "disarm_committed_release_rollback", pointer_observation
+        )
+        post_swap_failure = deploy.index(
+            'fail "release pointer committed but durable commit verification failed"',
+            success_disarm,
+        )
+        self.assertLess(pointer_observation, success_disarm)
+        self.assertLess(success_disarm, post_swap_failure)
+
+    def test_boot_secret_tooling_is_release_local_and_bootstrap_is_deferred(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        worker = (self.oci_root / "prepare-runtime-secrets.sh").read_text(
+            encoding="utf-8"
+        )
+        launcher = (
+            self.oci_root / "prepare-runtime-secrets-launcher.py"
+        ).read_text(encoding="utf-8")
+        unit = (self.oci_root / "clixor-runtime-secrets.service").read_text(
+            encoding="utf-8"
+        )
+
+        boot_stage = deploy.index("\nstage_release_boot_tooling\n")
+        host_stage = deploy.index("\nstage_host_tooling\n")
+        bootstrap_call = deploy.index("CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true")
+        commit_verify = deploy.index("--verify-release-bundle")
+        pointer_commit = deploy.index('--commit-candidate-release "${candidate_manifest}"')
+        self.assertLess(boot_stage, host_stage)
+        self.assertLess(host_stage, bootstrap_call)
+        self.assertLess(bootstrap_call, commit_verify)
+        self.assertLess(commit_verify, pointer_commit)
+        self.assertIn('boot_secret_stage="${release_dir}/boot-secrets"', deploy)
+        self.assertIn("sha256sum --check SHA256SUMS", deploy)
+        self.assertIn("--commit-staging-release", deploy)
+
+        guarded_install = bootstrap.index(
+            'if [ "${defer_host_tool_activation}" = "false" ]; then'
+        )
+        launcher_install = bootstrap.index(
+            "/usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py",
+            guarded_install,
+        )
+        unit_install = bootstrap.index(
+            "/etc/systemd/system/clixor-runtime-secrets.service",
+            guarded_install,
+        )
+        self.assertLess(guarded_install, launcher_install)
+        self.assertLess(guarded_install, unit_install)
+        self.assertIn(
+            "Initial stable-launcher transition requires a current staging release",
+            bootstrap,
+        )
+        self.assertIn('stable_launcher_installed=false', bootstrap)
+        self.assertNotIn(
+            "/usr/local/libexec/clixor/hydrate-vault-secrets.py", bootstrap
+        )
+        self.assertNotIn(
+            "/usr/local/libexec/clixor/prepare-runtime-secrets.sh", bootstrap
+        )
+        self.assertIn("--approved-release-manifest", worker)
+        self.assertIn('hydrator="${boot_root}/hydrate-vault-secrets.py"', worker)
+        self.assertNotIn("/etc/clixor/secret-mode", worker)
+        self.assertIn("release history exists", launcher)
+        self.assertIn("boot checksum manifest is incomplete", launcher)
+        self.assertIn(
+            "ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py",
+            unit,
+        )
 
     def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
         raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")
@@ -702,7 +805,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         health_enable = deploy.index(
             "systemctl enable --now \\\n  clixor-offsite-backup.timer"
         )
-        release_complete = deploy.rindex("rollback_needed=0")
+        release_complete = deploy.rindex("\ndisarm_committed_release_rollback\n")
         self.assertLess(activate_tools, fresh_gate)
         self.assertLess(fresh_gate, restart_backup)
         self.assertLess(restart_backup, newer_proof)
@@ -755,7 +858,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         vault_commit = deploy.index(
             '--commit-candidate-release "${candidate_manifest}"', restore_gate
         )
-        rollback_disarm = deploy.rindex("rollback_needed=0")
+        rollback_disarm = deploy.rindex("\ndisarm_committed_release_rollback\n")
         self.assertLess(activate_connector, public_smoke)
         self.assertLess(public_smoke, activate_tools)
         self.assertLess(activate_tools, offsite_gate)
@@ -825,7 +928,7 @@ class ReleaseHardeningTests(unittest.TestCase):
             '"${host_tool_stage}/bin/${tool_name}"', freeze_timers
         )
         health_gate = deploy.index("systemctl start clixor-backup-health.service")
-        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        release_pointer = deploy.index("release_pointer_committed || fail")
         self.assertLess(stage_call, capture_call)
         self.assertLess(capture_call, bootstrap_call)
         self.assertLess(freeze_timers, reject_old_job)
@@ -874,7 +977,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         offsite_proof = deploy.index(
             'find "${project_root}/backups/OFFSITE_LAST_SUCCESS"'
         )
-        disarm = deploy.rindex("rollback_needed=0")
+        disarm = deploy.rindex("\ndisarm_committed_release_rollback\n")
         retention_call = deploy.rindex("\nif ! prune_release_history; then")
         self.assertLess(offsite_proof, disarm)
         self.assertLess(disarm, retention_call)

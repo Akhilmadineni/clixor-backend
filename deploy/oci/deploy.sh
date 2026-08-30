@@ -217,6 +217,30 @@ preflight_disk_capacity() {
   log "capacity preflight passed for snapshots, restore workspace, and image build"
 }
 
+stage_release_boot_tooling() {
+  install -d -m 0700 -o 0 -g 0 "${boot_secret_stage}"
+  : > "${boot_secret_stage}/SHA256SUMS.partial"
+  for boot_tool_name in \
+    hydrate-vault-secrets.py prepare-runtime-secrets.sh
+  do
+    install -m 0500 -o 0 -g 0 \
+      "${source_root}/deploy/oci/${boot_tool_name}" \
+      "${boot_secret_stage}/${boot_tool_name}"
+    (
+      cd "${boot_secret_stage}"
+      sha256sum "${boot_tool_name}"
+    ) >> "${boot_secret_stage}/SHA256SUMS.partial"
+  done
+  chmod 0400 "${boot_secret_stage}/SHA256SUMS.partial"
+  chown 0:0 "${boot_secret_stage}/SHA256SUMS.partial"
+  mv "${boot_secret_stage}/SHA256SUMS.partial" \
+    "${boot_secret_stage}/SHA256SUMS"
+  (
+    cd "${boot_secret_stage}"
+    sha256sum --check SHA256SUMS >/dev/null
+  ) || fail "staged release boot tooling failed checksum verification"
+}
+
 stage_host_tooling() {
   install -d -m 0700 -o 0 -g 0 \
     "${host_tool_stage}/bin" "${host_tool_stage}/systemd"
@@ -871,6 +895,7 @@ rollback_compose="${previous_compose}"
 scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
 previous_runtime_root="${release_dir}/previous-runtime"
 host_tool_stage="${release_dir}/host-tools"
+boot_secret_stage="${release_dir}/boot-secrets"
 previous_host_tool_root="${release_dir}/previous-host-tools"
 previous_cloudflare_root="${release_dir}/previous-cloudflared"
 pre_migration_dump="${release_dir}/pre-migration.dump"
@@ -886,6 +911,7 @@ printf '%s\n' "${candidate_secret_mode}" > "${release_dir}/secret-mode.partial"
 chmod 0400 "${release_dir}/secret-mode.partial"
 chown 0:0 "${release_dir}/secret-mode.partial"
 mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
+stage_release_boot_tooling
 stage_host_tooling
 capture_host_tooling
 capture_cloudflared_state
@@ -1013,6 +1039,18 @@ fi
 rollback_needed=0
 host_tools_activated=false
 cloudflare_state_activated=false
+disarm_committed_release_rollback() {
+  rollback_needed=0
+  vault_generation_changed=false
+  cloudflare_state_activated=false
+  host_tools_activated=false
+}
+
+release_pointer_committed() {
+  [ -L "${release_root}/current" ] && \
+    [ "$(readlink -- "${release_root}/current" 2>/dev/null || true)" = "${release_dir}" ]
+}
+
 restore_previous_vault_target() {
   [ "${vault_generation_changed}" = "true" ] || return 0
   if [ -n "${current_vault_target}" ]; then
@@ -1065,15 +1103,13 @@ scoped_runtime_ready() {
 rollback() {
   status=$?
   trap - 0
-  if [ "${status}" -ne 0 ] && [ -L "${release_root}/current" ] && \
-    [ "$(readlink -- "${release_root}/current" 2>/dev/null || true)" = "${release_dir}" ]; then
+  if [ "${status}" -ne 0 ] && release_pointer_committed; then
     # The atomic release pointer is the commit record for the application and
     # exact Vault cohort. Never roll the running host back while leaving boot
     # approved for the new release if the parent was interrupted just after the
     # pointer swap.
     log "release pointer committed before interruption; preserving the committed application and secret cohort"
-    rollback_needed=0
-    vault_generation_changed=false
+    disarm_committed_release_rollback
   fi
   secret_rollback_failed=0
   cloudflare_rollback_failed=0
@@ -1709,20 +1745,27 @@ python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
   --applied "${pki_applied}"
 
 release_commit_status=0
+/usr/bin/python3 \
+  "${source_root}/deploy/oci/prepare-runtime-secrets-launcher.py" \
+  --verify-release-bundle "${release_dir}" || \
+  release_commit_status=$?
 if [ "${vault_hydration_mode}" = "true" ]; then
-  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
-    --commit-candidate-release "${candidate_manifest}" \
-    --release-cohort "${release_tag}" || \
-    release_commit_status=$?
+  if [ "${release_commit_status}" -eq 0 ]; then
+    /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
+      --commit-candidate-release "${candidate_manifest}" \
+      --release-cohort "${release_tag}" || \
+      release_commit_status=$?
+  fi
 else
-  ln -s "${release_dir}" "${release_dir}/current-link.pending"
-  mv -Tf "${release_dir}/current-link.pending" "${release_root}/current" || \
-    release_commit_status=$?
+  if [ "${release_commit_status}" -eq 0 ]; then
+    /usr/bin/python3 \
+      "${source_root}/deploy/oci/prepare-runtime-secrets-launcher.py" \
+      --commit-staging-release "${release_dir}" || \
+      release_commit_status=$?
+  fi
 fi
-[ "$(readlink "${release_root}/current")" = "${release_dir}" ] || \
-  fail "current release pointer did not update atomically"
-rollback_needed=0
-vault_generation_changed=false
+release_pointer_committed || fail "current release pointer did not update atomically"
+disarm_committed_release_rollback
 [ "${release_commit_status}" -eq 0 ] || \
   fail "release pointer committed but durable commit verification failed"
 log "deployed ${new_image}; API readiness passed"

@@ -335,25 +335,101 @@ if [ "${selected_secret_mode}" = "staging" ]; then
   sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
 fi
 
-install -m 0755 -o 0 -g 0 "${script_root}/hydrate-vault-secrets.py" \
-  /usr/local/libexec/clixor/hydrate-vault-secrets.py
-install -m 0755 -o 0 -g 0 "${script_root}/prepare-staging-secrets.py" \
-  /usr/local/libexec/clixor/prepare-staging-secrets.py
-install -m 0755 -o 0 -g 0 "${script_root}/prepare-runtime-secrets.sh" \
-  /usr/local/libexec/clixor/prepare-runtime-secrets.sh
-install -d -m 0755 -o 0 -g 0 /etc/systemd/system/docker.service.d
-install -m 0644 -o 0 -g 0 "${script_root}/clixor-runtime-secrets.service" \
-  /etc/systemd/system/clixor-runtime-secrets.service
-install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
-  /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
-if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
-  if [ "${selected_secret_mode}" = "staging" ]; then
-    /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  # Existing hosts must first commit one release containing boot-secrets while
+  # the legacy unit is still active. Only an explicit operator bootstrap may
+  # then replace these stable boot-critical host artifacts. Automated deploys
+  # set deferral and cannot overwrite the launcher, unit, drop-in, or fallback.
+  stable_secret_launcher=/usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
+  stable_initial_worker=/usr/local/libexec/clixor/prepare-initial-staging-secrets.sh
+  stable_secret_unit=/etc/systemd/system/clixor-runtime-secrets.service
+  stable_docker_dropin=/etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
+  stable_launcher_installed=false
+  if [ -e "${stable_docker_dropin}" ] || [ -L "${stable_docker_dropin}" ]; then
+    [ -f "${stable_docker_dropin}" ] && [ ! -L "${stable_docker_dropin}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${stable_docker_dropin}")" = "0:0:644" ] || {
+      echo "Existing Docker runtime-secret ordering drop-in is unsafe." >&2
+      exit 1
+    }
   fi
-  sh /usr/local/libexec/clixor/prepare-runtime-secrets.sh
+  if [ -e "${stable_secret_launcher}" ] || [ -L "${stable_secret_launcher}" ]; then
+    [ -f "${stable_secret_launcher}" ] && [ ! -L "${stable_secret_launcher}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${stable_secret_launcher}")" = "0:0:755" ] && \
+      [ -f "${stable_initial_worker}" ] && [ ! -L "${stable_initial_worker}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${stable_initial_worker}")" = "0:0:500" ] && \
+      [ -f "${stable_secret_unit}" ] && [ ! -L "${stable_secret_unit}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${stable_secret_unit}")" = "0:0:644" ] && \
+      grep -Fxq \
+        'ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py' \
+        "${stable_secret_unit}" || {
+      echo "Existing stable runtime-secret launcher installation is incomplete or unsafe." >&2
+      exit 1
+    }
+    stable_launcher_installed=true
+  else
+    if [ -e "${stable_initial_worker}" ] || [ -L "${stable_initial_worker}" ]; then
+      echo "Stable initial-staging worker exists without its validated launcher." >&2
+      exit 1
+    fi
+    if [ -e "${stable_secret_unit}" ] || [ -L "${stable_secret_unit}" ]; then
+      [ -f "${stable_secret_unit}" ] && [ ! -L "${stable_secret_unit}" ] && \
+        [ "$(stat -c '%u:%g:%a' "${stable_secret_unit}")" = "0:0:644" ] || {
+        echo "Existing runtime-secret unit is unsafe." >&2
+        exit 1
+      }
+      if grep -Fq 'prepare-runtime-secrets-launcher.py' "${stable_secret_unit}"; then
+        echo "Stable runtime-secret unit exists without its validated launcher." >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  if [ -L "${project_root}/releases/current" ]; then
+    selected_boot_release="$(readlink -- "${project_root}/releases/current")"
+    /usr/bin/python3 "${script_root}/prepare-runtime-secrets-launcher.py" \
+      --verify-release-bundle "${selected_boot_release}"
+    if [ "${stable_launcher_installed}" = "false" ]; then
+      [ -f "${selected_boot_release}/secret-mode" ] && \
+        [ ! -L "${selected_boot_release}/secret-mode" ] && \
+        [ "$(stat -c '%u:%g:%a' "${selected_boot_release}/secret-mode")" = "0:0:400" ] && \
+        [ "$(wc -l < "${selected_boot_release}/secret-mode" | tr -d '[:space:]')" = "1" ] && \
+        [ "$(sed -n '1p' "${selected_boot_release}/secret-mode")" = "staging" ] || {
+        echo "Initial stable-launcher transition requires a current staging release; reboot-prove it before Vault cutover." >&2
+        exit 1
+      }
+    fi
+  elif [ -d "${project_root}/releases" ] && \
+    [ -n "$(find "${project_root}/releases" -mindepth 1 -maxdepth 1 -name 'oci-*' -print -quit)" ]; then
+    echo "Release history exists without a boot approval pointer; repair it before installing the stable runtime-secret launcher." >&2
+    exit 1
+  elif [ "${stable_launcher_installed}" = "false" ] && \
+    [ "${selected_secret_mode}" != "staging" ]; then
+    echo "Initial stable-launcher bootstrap requires staging secret mode." >&2
+    exit 1
+  fi
+  install -m 0755 -o 0 -g 0 \
+    "${script_root}/prepare-runtime-secrets-launcher.py" \
+    /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
+  install -m 0500 -o 0 -g 0 \
+    "${script_root}/prepare-initial-staging-secrets.sh" \
+    /usr/local/libexec/clixor/prepare-initial-staging-secrets.sh
+  install -m 0755 -o 0 -g 0 "${script_root}/prepare-staging-secrets.py" \
+    /usr/local/libexec/clixor/prepare-staging-secrets.py
+  install -d -m 0755 -o 0 -g 0 /etc/systemd/system/docker.service.d
+  install -m 0644 -o 0 -g 0 "${script_root}/clixor-runtime-secrets.service" \
+    /etc/systemd/system/clixor-runtime-secrets.service
+  install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
+    /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
+  if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
+    if [ "${selected_secret_mode}" = "staging" ]; then
+      /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
+    fi
+    /usr/bin/python3 \
+      /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
+  fi
+  systemctl daemon-reload
+  systemctl enable clixor-runtime-secrets.service
 fi
-systemctl daemon-reload
-systemctl enable clixor-runtime-secrets.service
 
 runtime_secret_root=/run/clixor/secrets
 active_link="${runtime_secret_root}/active"

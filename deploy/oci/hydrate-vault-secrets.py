@@ -28,6 +28,12 @@ DEFAULT_OCI_BINARY = Path("/usr/local/bin/oci")
 DEFAULT_OPENSSL_BINARY = Path("/usr/bin/openssl")
 APPROVED_MANIFEST_NAME = "vault-approved-cohort.json"
 APPROVED_MAPPING_NAME = "vault-secrets.map"
+BOOT_SECRET_DIRECTORY_NAME = "boot-secrets"
+BOOT_CHECKSUM_NAME = "SHA256SUMS"
+BOOT_FILE_MODES = {
+    "hydrate-vault-secrets.py": 0o500,
+    "prepare-runtime-secrets.sh": 0o500,
+}
 MANIFEST_SCHEMA = 1
 GENERATION_ROOT_NAME = "vault-generations"
 ACTIVE_NAME = "active"
@@ -1089,6 +1095,7 @@ def hydrate(
     mapping_path: Path = DEFAULT_MAPPING,
     candidate_manifest_path: Path | None = None,
     approved_manifest_path: Path | None = None,
+    approved_release_manifest_path: Path | None = None,
     release_cohort: str | None = None,
     secret_root: Path = DEFAULT_SECRET_ROOT,
     oci_binary: Path = DEFAULT_OCI_BINARY,
@@ -1106,8 +1113,11 @@ def hydrate(
     os.umask(0o077)
     candidate_mode = candidate_manifest_path is not None
     approved_mode = approved_manifest_path is not None
-    if candidate_mode == approved_mode:
-        raise HydrationError("select exactly one candidate or approved cohort mode")
+    release_approved_mode = approved_release_manifest_path is not None
+    if sum((candidate_mode, approved_mode, release_approved_mode)) != 1:
+        raise HydrationError(
+            "select exactly one candidate, current-approved, or release-approved cohort mode"
+        )
 
     manifest_content: bytes | None = None
     manifest_cohort_sha256: str | None = None
@@ -1136,13 +1146,32 @@ def hydrate(
         )
         mapping = _parse_mapping(mapping_content)
     else:
-        if release_cohort is not None:
-            raise HydrationError("approved hydration cannot override its release cohort")
-        if approved_manifest_path is None:
-            raise HydrationError("approved manifest is required")
-        approved_release, approved_release_cohort = _resolve_approved_release(
-            approved_manifest_path, expected_uid, expected_gid
-        )
+        if approved_mode:
+            if release_cohort is not None:
+                raise HydrationError(
+                    "current-approved hydration cannot override its release cohort"
+                )
+            if approved_manifest_path is None:
+                raise HydrationError("approved manifest is required")
+            approved_release, approved_release_cohort = _resolve_approved_release(
+                approved_manifest_path, expected_uid, expected_gid
+            )
+        else:
+            if (
+                approved_release_manifest_path is None
+                or approved_release_manifest_path.name != APPROVED_MANIFEST_NAME
+                or release_cohort is None
+                or RELEASE_COHORT_RE.fullmatch(release_cohort) is None
+            ):
+                raise HydrationError("release-approved cohort arguments are invalid")
+            approved_release = approved_release_manifest_path.parent
+            approved_release_cohort = release_cohort
+            _validate_release_directory(
+                approved_release,
+                expected_uid,
+                expected_gid,
+                approved_release_cohort,
+            )
         _validate_release_secret_mode(
             approved_release, expected_uid, expected_gid, b"vault"
         )
@@ -1504,6 +1533,60 @@ def _fsync_regular_file(path: Path, expected_uid: int, expected_gid: int) -> Non
         os.close(descriptor)
 
 
+def _validate_and_fsync_boot_bundle(
+    release: Path, expected_uid: int, expected_gid: int
+) -> None:
+    boot_root = release / BOOT_SECRET_DIRECTORY_NAME
+    metadata = _safe_lstat(boot_root)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise HydrationError("release boot-tool root must be a regular directory")
+    if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError("release boot-tool root has the wrong owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise HydrationError("release boot-tool root must have mode 0700")
+    checksum_content = _read_release_file(
+        boot_root / BOOT_CHECKSUM_NAME,
+        expected_uid,
+        expected_gid,
+        0o400,
+        "release boot checksum manifest",
+        4096,
+    )
+    if not checksum_content.endswith(b"\n") or b"\x00" in checksum_content:
+        raise HydrationError("release boot checksum manifest is malformed")
+    try:
+        checksum_lines = checksum_content.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise HydrationError("release boot checksum manifest must be ASCII") from None
+    checksums: dict[str, str] = {}
+    for line in checksum_lines:
+        match = re.fullmatch(r"([a-f0-9]{64})  ([A-Za-z0-9._-]+)", line)
+        if match is None or match.group(2) not in BOOT_FILE_MODES:
+            raise HydrationError("release boot checksum manifest has an unsupported entry")
+        digest, name = match.groups()
+        if name in checksums:
+            raise HydrationError("release boot checksum manifest has a duplicate entry")
+        checksums[name] = digest
+    if set(checksums) != set(BOOT_FILE_MODES):
+        raise HydrationError("release boot checksum manifest is incomplete")
+    for name, mode in BOOT_FILE_MODES.items():
+        content = _read_release_file(
+            boot_root / name,
+            expected_uid,
+            expected_gid,
+            mode,
+            f"release boot file {name}",
+            512 * 1024,
+        )
+        if hashlib.sha256(content).hexdigest() != checksums[name]:
+            raise HydrationError(f"release boot checksum mismatch: {name}")
+        _fsync_regular_file(boot_root / name, expected_uid, expected_gid)
+    _fsync_regular_file(
+        boot_root / BOOT_CHECKSUM_NAME, expected_uid, expected_gid
+    )
+    _fsync_directory(boot_root)
+
+
 def commit_candidate_release(
     *,
     candidate_manifest_path: Path,
@@ -1531,6 +1614,7 @@ def commit_candidate_release(
         expected_uid=expected_uid,
         expected_gid=expected_gid,
     )
+    _validate_and_fsync_boot_bundle(release, expected_uid, expected_gid)
     for metadata_name in (
         "secret-mode",
         APPROVED_MAPPING_NAME,
@@ -1570,11 +1654,19 @@ def commit_candidate_release(
 def main(argv: list[str]) -> int:
     candidate_manifest_path: Path | None = None
     approved_manifest_path: Path | None = None
+    approved_release_manifest_path: Path | None = None
     release_cohort: str | None = None
     verify_only = False
     commit_release = False
     if len(argv) == 2 and argv[0] == "--approved-manifest":
         approved_manifest_path = Path(argv[1])
+    elif (
+        len(argv) == 4
+        and argv[0] == "--approved-release-manifest"
+        and argv[2] == "--release-cohort"
+    ):
+        approved_release_manifest_path = Path(argv[1])
+        release_cohort = argv[3]
     elif (
         len(argv) == 4
         and argv[0] == "--candidate-manifest"
@@ -1604,7 +1696,11 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    selected_path = candidate_manifest_path or approved_manifest_path
+    selected_path = (
+        candidate_manifest_path
+        or approved_manifest_path
+        or approved_release_manifest_path
+    )
     if selected_path is None or not selected_path.is_absolute():
         print("OCI Vault manifest path must be absolute.", file=sys.stderr)
         return 2
@@ -1628,6 +1724,7 @@ def main(argv: list[str]) -> int:
             hydrate(
                 candidate_manifest_path=candidate_manifest_path,
                 approved_manifest_path=approved_manifest_path,
+                approved_release_manifest_path=approved_release_manifest_path,
                 release_cohort=release_cohort,
             )
     except (HydrationError, OSError, ValueError) as exc:

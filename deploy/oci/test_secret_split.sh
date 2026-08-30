@@ -132,11 +132,11 @@ grep -Fq -- '--candidate-manifest "${candidate_manifest}"' \
 grep -Fq -- '--commit-candidate-release "${candidate_manifest}"' \
   "${script_root}/deploy.sh" || \
   fail "deploy does not atomically approve the release-local Vault cohort"
-grep -Fq -- '--approved-manifest "${approved_manifest}"' \
+grep -Fq -- '--approved-release-manifest "${approved_manifest}"' \
   "${script_root}/prepare-runtime-secrets.sh" || \
-  fail "boot-time hydration does not require the current release manifest"
+  fail "boot-time hydration does not require the resolved release manifest"
 grep -Fq 'release history exists but the boot approval pointer is unavailable' \
-  "${script_root}/prepare-runtime-secrets.sh" || \
+  "${script_root}/prepare-runtime-secrets-launcher.py" || \
   fail "boot can silently downgrade to staging after losing its release pointer"
 grep -Fq 'command.extend(("--version-number", str(version_number)))' \
   "${script_root}/hydrate-vault-secrets.py" || \
@@ -147,8 +147,17 @@ grep -q '^Requires=clixor-runtime-secrets.service$' "${script_root}/docker-runti
   fail "Docker is not ordered after boot-time secret hydration"
 grep -q '^RuntimeDirectory=clixor$' "${script_root}/clixor-runtime-secrets.service" || \
   fail "boot-time hydration does not create its tmpfs runtime parent"
+grep -Fq 'prepare-runtime-secrets-launcher.py' \
+  "${script_root}/clixor-runtime-secrets.service" || \
+  fail "boot service does not select release-local tooling through the stable launcher"
+grep -Fq 'if [ "${defer_host_tool_activation}" = "false" ]; then' \
+  "${script_root}/bootstrap.sh" || \
+  fail "normal deferred bootstrap can overwrite boot-critical host artifacts"
 grep -q 'LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token' \
   "${script_root}/cloudflared.service" || fail "cloudflared does not use the tmpfs generation"
+sh -n "${script_root}/prepare-runtime-secrets.sh" \
+  "${script_root}/prepare-initial-staging-secrets.sh"
+python3 "${script_root}/test_boot_secret_launcher.py"
 
 duplicate_root="${test_root}/duplicate"
 mkdir "${duplicate_root}"

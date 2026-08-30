@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -238,6 +239,21 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         mode_file = release / "secret-mode"
         mode_file.write_bytes(b"vault\n")
         mode_file.chmod(0o400)
+        boot_root = release / HYDRATOR.BOOT_SECRET_DIRECTORY_NAME
+        boot_root.mkdir(mode=0o700)
+        checksums = []
+        for name in sorted(HYDRATOR.BOOT_FILE_MODES):
+            source = SCRIPT_ROOT / name
+            destination = boot_root / name
+            content = source.read_bytes()
+            destination.write_bytes(content)
+            destination.chmod(HYDRATOR.BOOT_FILE_MODES[name])
+            checksums.append(
+                f"{hashlib.sha256(content).hexdigest()}  {name}\n"
+            )
+        checksum_path = boot_root / HYDRATOR.BOOT_CHECKSUM_NAME
+        checksum_path.write_text("".join(checksums), encoding="ascii")
+        checksum_path.chmod(0o400)
         self.last_release = release
         return release
 
@@ -282,6 +298,25 @@ exec /usr/bin/openssl pkey -in "$3" -noout
                     / "current"
                     / HYDRATOR.APPROVED_MANIFEST_NAME
                 ),
+                secret_root=self.secret_root,
+                oci_binary=self.fake_oci,
+                openssl_binary=self.fake_openssl,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+                validate_binary=False,
+                require_tmpfs=False,
+                require_root=False,
+            )
+        return changed, output.getvalue()
+
+    def _boot_release_local(self, release: Path) -> tuple[bool, str]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            changed = HYDRATOR.hydrate(
+                approved_release_manifest_path=(
+                    release / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=release.name,
                 secret_root=self.secret_root,
                 oci_binary=self.fake_oci,
                 openssl_binary=self.fake_openssl,
@@ -638,6 +673,59 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         selectors = [line.split()[1] for line in self.oci_log.read_text().splitlines()]
         self.assertEqual(selectors, ["--version-number"] * len(manifest["artifacts"]))
         self.assertNotIn("CURRENT", self.oci_log.read_text())
+
+    def test_release_local_boot_remains_pinned_after_pointer_changes(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-future-0123456789abcdefghijklmnopqr",
+        )
+        self._write_bundles(rotated)
+        self._hydrate()
+        replacement = self.last_release
+        self.assertIsNotNone(replacement)
+        assert replacement is not None
+        self.assertNotEqual(replacement, approved)
+        self._approve(replacement)
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        changed, output = self._boot_release_local(approved)
+
+        self.assertTrue(changed)
+        self.assertEqual(output, "")
+        self.assertIn(b"smtp-password-", (self._active() / "api.env").read_bytes())
+        self.assertNotIn("CURRENT", self.oci_log.read_text())
+        self.assertTrue(
+            all(
+                line.split()[1] == "--version-number"
+                for line in self.oci_log.read_text().splitlines()
+            )
+        )
+
+    def test_release_commit_rejects_tampered_boot_bundle_before_pointer_swap(self) -> None:
+        self._hydrate()
+        candidate = self.last_release
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        worker = candidate / HYDRATOR.BOOT_SECRET_DIRECTORY_NAME / "prepare-runtime-secrets.sh"
+        worker.chmod(0o600)
+        worker.write_bytes(worker.read_bytes() + b"# tampered\n")
+        worker.chmod(0o500)
+
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "checksum mismatch"):
+            HYDRATOR.commit_candidate_release(
+                candidate_manifest_path=(
+                    candidate / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=candidate.name,
+                secret_root=self.secret_root,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
+        self.assertFalse((self.release_root / "current").exists())
 
     def test_crash_before_release_pointer_commit_reboots_prior_cohort(self) -> None:
         self._hydrate()
