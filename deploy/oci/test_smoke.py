@@ -651,11 +651,23 @@ class ReleaseHardeningTests(unittest.TestCase):
         )
         self.assertLess(capture, restore)
         self.assertLess(restore, rollback_reconcile)
-        public_smoke = deploy.index("verify_public_ingress\n")
+        public_smoke = deploy.index('verify_public_ingress "${source_sha}"')
         release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
         rollback_disarm = deploy.rindex("rollback_needed=0")
         self.assertLess(public_smoke, release_pointer)
         self.assertLess(public_smoke, rollback_disarm)
+        self.assertIn('verify_public_ingress "${previous_revision}"', deploy)
+        self.assertIn('validate-public-smoke.py', deploy)
+        self.assertIn('public readiness came from a different release', (
+            self.oci_root / "validate-public-smoke.py"
+        ).read_text(encoding="utf-8"))
+        self.assertIn('clixor-oci-canary.atlanteanz.com/health/ready', deploy)
+        self.assertIn('[ "${#source_sha}" -eq 40 ]', deploy)
+        dockerfile = (self.oci_root.parent.parent / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ARG CLIXOR_REVISION=development", dockerfile)
+        self.assertIn("internal/httpapi.buildRevision=${CLIXOR_REVISION}", dockerfile)
 
         workflow = (
             self.oci_root.parent.parent / ".github" / "workflows" / "deploy-oci.yml"

@@ -20,6 +20,7 @@ func (s *Server) appleAppSiteAssociation(w http.ResponseWriter, _ *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", universalLinksCacheControl)
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("X-Clixor-Revision", buildRevision)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appleAppSiteAssociationDocument)
 }

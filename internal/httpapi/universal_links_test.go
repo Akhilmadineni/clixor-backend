@@ -50,6 +50,9 @@ func TestAppleAppSiteAssociationIsPublicAndExact(t *testing.T) {
 		if cache := response.Header.Get("Cache-Control"); cache != universalLinksCacheControl {
 			t.Fatalf("%s cache control = %q", path, cache)
 		}
+		if revision := response.Header.Get("X-Clixor-Revision"); revision != "development" {
+			t.Fatalf("%s revision = %q", path, revision)
+		}
 		assertUniversalLinkSecurityHeaders(t, response)
 
 		var document associationDocument

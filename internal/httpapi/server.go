@@ -47,6 +47,10 @@ type Server struct {
 	mediaVerifySlots  chan struct{}
 }
 
+// buildRevision is replaced with the exact reviewed Git object ID in release
+// images. Development binaries retain the explicit non-production sentinel.
+var buildRevision = "development"
+
 type PasswordResetPolicy struct {
 	Enabled     bool
 	HMACSecret  string
@@ -194,7 +198,6 @@ func (s *Server) Router() http.Handler {
 	})
 	return router
 }
-
 func requestTimeoutByRoute(
 	defaultTimeout time.Duration,
 	mediaCompletionTimeout time.Duration,
@@ -427,7 +430,11 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	w.Header().Set("X-Clixor-Revision", buildRevision)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":   "ready",
+		"revision": buildRevision,
+	})
 }
 
 func rawJSON(value any) json.RawMessage {

@@ -51,25 +51,55 @@ case "${vault_hydration_mode}" in
   true|false) ;;
   *) fail "CLIXOR_REQUIRE_VAULT_HYDRATION must be true or false" ;;
 esac
-case "${public_api_readiness_url}" in
-  https://*) ;;
-  *) fail "public API readiness URL must use HTTPS" ;;
-esac
-case "${public_association_url}" in
-  https://*) ;;
-  *) fail "public association URL must use HTTPS" ;;
+case "${public_api_readiness_url}|${public_association_url}" in
+  "https://clustr-api.atlanteanz.com/health/ready|https://clixor.atlanteanz.com/.well-known/apple-app-site-association"|\
+  "https://clixor-oci-canary.atlanteanz.com/health/ready|https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association") ;;
+  *) fail "public smoke URLs must be the approved production or OCI canary pair" ;;
 esac
 public_smoke_required=false
 [ "${public_smoke_mode}" = "true" ] && public_smoke_required=true
 
 verify_public_ingress() {
-  log "verifying public Cloudflare ingress before release finalization"
+  expected_public_revision=${1:-}
+  case "${expected_public_revision}" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#expected_public_revision}" -eq 40 ] || return 1
+  public_smoke_root="${release_dir}/public-smoke-${expected_public_revision}"
+  install -d -m 0700 -o 0 -g 0 "${public_smoke_root}"
+  api_headers="${public_smoke_root}/api.headers"
+  api_body="${public_smoke_root}/api.json"
+  association_headers="${public_smoke_root}/association.headers"
+  association_body="${public_smoke_root}/association.json"
+  rm -f -- \
+    "${api_headers}.partial" "${api_body}.partial" \
+    "${association_headers}.partial" "${association_body}.partial"
+  log "verifying public Cloudflare ingress for revision ${expected_public_revision}"
   curl --fail --silent --show-error --retry 12 --retry-all-errors \
-    --retry-delay 5 --max-time 10 "${public_api_readiness_url}" >/dev/null || \
+    --retry-delay 5 --max-time 10 --proto '=https' --tlsv1.2 \
+    --max-filesize 65536 --dump-header "${api_headers}.partial" \
+    --output "${api_body}.partial" "${public_api_readiness_url}" || \
     return 1
   curl --fail --silent --show-error --retry 6 --retry-all-errors \
-    --retry-delay 5 --max-time 10 --header 'Cache-Control: no-cache' \
-    "${public_association_url}" >/dev/null || return 1
+    --retry-delay 5 --max-time 10 --proto '=https' --tlsv1.2 \
+    --max-filesize 1048576 --header 'Cache-Control: no-cache' \
+    --header 'Pragma: no-cache' \
+    --dump-header "${association_headers}.partial" \
+    --output "${association_body}.partial" \
+    "${public_association_url}?release=${expected_public_revision}" || return 1
+  chmod 0600 \
+    "${api_headers}.partial" "${api_body}.partial" \
+    "${association_headers}.partial" "${association_body}.partial"
+  mv -f -- "${api_headers}.partial" "${api_headers}"
+  mv -f -- "${api_body}.partial" "${api_body}"
+  mv -f -- "${association_headers}.partial" "${association_headers}"
+  mv -f -- "${association_body}.partial" "${association_body}"
+  python3 "${source_root}/deploy/oci/validate-public-smoke.py" \
+    --api-headers "${api_headers}" \
+    --api-body "${api_body}" \
+    --association-headers "${association_headers}" \
+    --association-body "${association_body}" \
+    --expected-revision "${expected_public_revision}"
 }
 
 require_unsigned_integer() {
@@ -410,7 +440,8 @@ grep -q '^module github.com/Akhilmadineni/clixor-backend$' "${source_root}/go.mo
 case "${source_sha}" in
   ''|*[!0-9a-f]*) fail "source revision must be a lowercase Git object ID" ;;
 esac
-[ "${#source_sha}" -ge 12 ] || fail "source revision is too short"
+[ "${#source_sha}" -eq 40 ] || \
+  fail "source revision must be a full 40-character Git object ID"
 case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
@@ -498,6 +529,7 @@ previous_postgres_id="$(docker inspect clixor-oci-postgres --format '{{.Id}}' 2>
 previous_release="$(readlink "${release_root}/current" 2>/dev/null || true)"
 first_deploy=false
 previous_compose_uses_scoped=false
+previous_revision=
 
 if [ -z "${previous_image}" ] && [ ! -e "${compose_file}" ] && [ -z "${previous_postgres_id}" ]; then
   first_deploy=true
@@ -511,6 +543,13 @@ else
   esac
   docker image inspect "${previous_image}" >/dev/null 2>&1 || \
     fail "previous API image is unavailable for rollback: ${previous_image}"
+  previous_revision="$(docker image inspect "${previous_image}" \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+  case "${previous_revision}" in
+    ''|*[!0-9a-f]*) fail "previous API image has an invalid revision label" ;;
+  esac
+  [ "${#previous_revision}" -eq 40 ] || \
+    fail "previous API image revision label must be a full Git object ID"
   [ -s "${compose_file}" ] || \
     fail "partial previous deployment: stable Compose model is missing"
   [ -n "${previous_postgres_id}" ] || \
@@ -891,9 +930,8 @@ rollback() {
       fi
       if [ "${rollback_failed}" -eq 0 ] && \
         [ "${rollback_ready}" = "true" ] && \
-        [ "${cloudflare_secret_activated}" = "true" ] && \
-        [ -n "${previous_vault_target}" ]; then
-        if verify_public_ingress; then
+        [ "${public_smoke_required}" = "true" ]; then
+        if verify_public_ingress "${previous_revision}"; then
           cloudflare_rollback_failed=0
         else
           log "ERROR: public ingress did not recover after connector rollback" >&2
@@ -978,6 +1016,7 @@ fi
 log "building ARM64 release ${new_image}"
 docker buildx build --load \
   --pull \
+  --build-arg "CLIXOR_REVISION=${source_sha}" \
   --label "org.opencontainers.image.revision=${source_sha}" \
   --label "org.opencontainers.image.source=https://github.com/Akhilmadineni/clixor-backend" \
   --tag "${new_image}" \
@@ -1250,7 +1289,7 @@ if [ "${cloudflare_secret_changed}" = "true" ]; then
     fail "cloudflared did not become active with the rotated credential"
 fi
 if [ "${public_smoke_required}" = "true" ]; then
-  verify_public_ingress
+  verify_public_ingress "${source_sha}"
 else
   log "public ingress smoke is deferred for this non-production staging deployment"
 fi

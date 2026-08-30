@@ -112,6 +112,16 @@ func TestOptionalMailOutageDoesNotFailCoreReadiness(t *testing.T) {
 		body, _ := io.ReadAll(response.Body)
 		t.Fatalf("optional mail outage changed readiness to %d: %s", response.StatusCode, body)
 	}
+	if revision := response.Header.Get("X-Clixor-Revision"); revision != "development" {
+		t.Fatalf("readiness revision header = %q", revision)
+	}
+	var readiness map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&readiness); err != nil {
+		t.Fatal(err)
+	}
+	if readiness["status"] != "ready" || readiness["revision"] != "development" {
+		t.Fatalf("readiness payload = %#v", readiness)
+	}
 }
 
 func TestMessagingLifecycleAndIsolation(t *testing.T) {
