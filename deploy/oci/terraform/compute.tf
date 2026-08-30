@@ -54,6 +54,13 @@ resource "oci_core_instance" "clixor" {
   agent_config {
     is_management_disabled = false
     is_monitoring_disabled = false
+
+    # Managed SSH sessions require this plugin; OCI images leave it disabled by
+    # default even when Oracle Cloud Agent management itself is enabled.
+    plugins_config {
+      name          = "Bastion"
+      desired_state = "ENABLED"
+    }
   }
 
   metadata = {
