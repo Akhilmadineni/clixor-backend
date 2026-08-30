@@ -163,7 +163,10 @@ fi
 
 mkdir -p "$mount_point"
 if [[ "$target_is_mounted" == false ]]; then
-  mount "$mount_point"
+  if ! mount "$mount_point" && ! mountpoint -q "$mount_point"; then
+    echo "unable to mount the verified data filesystem at $mount_point" >&2
+    exit 6
+  fi
 fi
 
 read -r mounted_maj_min mounted_filesystem mounted_uuid < <(
