@@ -19,6 +19,11 @@ load balancer, managed database, or application secret.
 - private, versioned Object Storage backup bucket with bounded 14/21-day
   lifecycle retention and automatic cleanup of incomplete multipart uploads;
 - default OCI Vault and one software-protected AES key;
+- the regional `mail.atlanteanz.com` Email Delivery domain, an OCI-generated
+  DKIM key, and a gated `no-reply@mail.atlanteanz.com` approved sender;
+- a dedicated classic IAM SMTP user and group whose only enabled credential
+  capability is SMTP and whose policy grants `use approved-senders` only for
+  the exact `no-reply@mail.atlanteanz.com` address in the mail compartment;
 - an instance-principal dynamic group and scoped policy for secret-bundle reads,
   bucket-scoped media/PAR access, and create/inspect-only backup uploads (the VM
   cannot overwrite or delete off-site backup objects);
@@ -78,6 +83,75 @@ Terraform `prevent_destroy` guards the primary media bucket, backup bucket, and
 attached data volume. Removing one requires an explicit reviewed configuration
 change; do not bypass that guard during routine updates.
 
+## Email Delivery: two-phase DNS activation
+
+Email Delivery is regional, so this stack provisions the sending domain and IAM
+principal in Phoenix. It cannot safely create the approved sender on the first
+apply: Oracle must observe the DKIM record in public DNS and report the DKIM as
+`ACTIVE` first. Keep `create_mail_approved_sender=false` for the first plan and
+apply.
+
+After that apply, copy these non-sensitive Resource Manager outputs:
+
+- `mail_dkim_cname_name` and `mail_dkim_cname_value`;
+- `mail_spf_txt_name` and `mail_spf_txt_value`;
+- `mail_smtp_endpoint`; and
+- `mail_smtp_user_id`.
+
+In the Cloudflare DNS zone for `atlanteanz.com`:
+
+1. Create a **CNAME** whose name is `mail_dkim_cname_name` and target is
+   `mail_dkim_cname_value`. Set Proxy status to **DNS only**; DKIM validation
+   must not pass through the Cloudflare HTTP proxy.
+2. Create one **TXT** record at `mail_spf_txt_name` with
+   `mail_spf_txt_value`. For Phoenix/Americas, Terraform outputs
+   `v=spf1 include:rp.oracleemaildelivery.com ~all`. A DNS name must have only
+   one SPF record; merge mechanisms instead of publishing a second `v=spf1`
+   record if mail for this subdomain is ever delegated to another sender.
+3. Wait for both records to resolve publicly, then wait for the OCI Email
+   Delivery DKIM state to become `ACTIVE`. Cloudflare SSL/TLS settings do not
+   affect these DNS-only mail records.
+
+Verify from an independent resolver without copying any credential:
+
+```sh
+dig +short CNAME "<mail_dkim_cname_name output>"
+dig +short TXT mail.atlanteanz.com
+```
+
+Only after OCI reports DKIM `ACTIVE`, set
+`create_mail_approved_sender=true`, run a fresh plan, and apply. The sender
+resource has an apply-time precondition that refuses to proceed earlier. It
+creates only `no-reply@mail.atlanteanz.com`, not a domain-wide wildcard sender.
+Treat this switch as one-way in production: the sender is protected by
+`prevent_destroy`. Rotate DKIM by adding and activating a second selector before
+retiring the old selector rather than changing the protected resource in place.
+
+### Manual SMTP credential issuance
+
+Terraform creates the dedicated IAM user but **must never create any**
+`oci_identity_smtp_credential`, `oci_identity_domains_smtp_credential`, or
+`oci_identity_domains_my_smtp_credential` resource. Those resources return an
+Oracle-generated password and would persist it in Terraform/Resource Manager
+state. Likewise, the DKIM resource deliberately omits `private_key`; OCI
+generates and retains the signing key while Terraform records only public DNS
+metadata.
+
+After DNS activation and approved-sender creation, locate the IAM user by the
+`mail_smtp_user_id` output and generate one SMTP credential interactively in the
+OCI Console. Copy the one-time username/password directly into the approved
+secret-management path; never paste them into Terraform variables, outputs,
+Cloudflare, GitHub Actions, shell history, tickets, or this repository. Terraform
+does not create, read, rotate, or destroy that credential. Rotate it manually,
+with an overlap canary, and retain no more than the two OCI credentials allowed
+per user.
+
+Configure the application for mandatory STARTTLS using the
+`mail_smtp_endpoint` output and `no-reply@mail.atlanteanz.com`. Keep outbound
+mail disabled until an external mailbox receives a complete password-reset
+canary and DKIM/SPF headers pass. Add DMARC only after a monitored reporting
+mailbox exists; OCI Email Delivery does not provide an inbox for DMARC reports.
+
 For an audited break-glass import when GitHub is unavailable, generate the
 equivalent upload bundle locally and verify its checksum before upload:
 
@@ -92,8 +166,12 @@ If Oracle reports A1 host-capacity exhaustion, change
 
 ## Secret boundary
 
-Do not add secret resources or secret values to this Terraform configuration:
-Terraform would retain them in state. The stack creates an empty Vault and key,
+Do not add credential resources or secret values to this Terraform
+configuration: Terraform would retain them in state. In particular, the locked
+OCI provider exposes the generated SMTP password as a computed, state-bearing
+attribute, so SMTP credential resources are forbidden. A `sensitive` marker, if
+added by a future provider, would only redact CLI display and would not remove a
+value from state. The stack creates an empty Vault and key,
 but deliberately does not create secret values or a hydration service. The
 bundled host bootstrap generates a root-only **staging** runtime file. Before a
 production promotion, add an audited flow that writes secret values to Vault and

@@ -31,6 +31,9 @@ variableGroups:
       - private_subnet_cidr
       - media_bucket_name
       - backup_bucket_name
+  - title: "Outbound email"
+    variables:
+      - create_mail_approved_sender
 
 variables:
   tenancy_ocid:
@@ -134,6 +137,12 @@ variables:
     title: "Private media bucket"
     description: "Primary application-media bucket. It must differ from the backup bucket."
     default: "clixor-prod-media"
+  create_mail_approved_sender:
+    type: boolean
+    required: true
+    title: "Create approved mail sender"
+    description: "Leave disabled for the first apply. Enable only after publishing the output DKIM CNAME and SPF TXT records in Cloudflare and OCI reports DKIM ACTIVE."
+    default: false
 
 outputs:
   instance_private_ip:
@@ -160,3 +169,21 @@ outputs:
   vault_id:
     type: copyableString
     title: "Vault OCID"
+  mail_dkim_cname_name:
+    type: copyableString
+    title: "Mail DKIM CNAME name"
+  mail_dkim_cname_value:
+    type: copyableString
+    title: "Mail DKIM CNAME target"
+  mail_spf_txt_name:
+    type: copyableString
+    title: "Mail SPF TXT name"
+  mail_spf_txt_value:
+    type: copyableString
+    title: "Mail SPF TXT value"
+  mail_smtp_endpoint:
+    type: copyableString
+    title: "Mail SMTP STARTTLS endpoint"
+  mail_smtp_user_id:
+    type: copyableString
+    title: "Dedicated SMTP IAM user OCID"

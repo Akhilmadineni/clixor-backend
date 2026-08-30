@@ -17,6 +17,7 @@ rm -f -- "$output_file"
     clixor-mount-data.sh \
     cloud-init.yaml.tftpl \
     compute.tf \
+    email.tf \
     identity.tf \
     locals.tf \
     network.tf \

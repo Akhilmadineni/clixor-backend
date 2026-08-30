@@ -260,9 +260,10 @@ HTML error page, or redirect in front of it.
 
 Password-reset mail must use authenticated STARTTLS submission. For OCI Email
 Delivery in Phoenix, configure `smtp.email.us-phoenix-1.oci.oraclecloud.com:587`,
-the generated SMTP username/password, an approved `no-reply@atlanteanz.com`
-sender, and a distinct password-reset HMAC secret in the protected runtime
-secret. Keep `CLUSTER_MAIL_PROVIDER=disabled` until SPF, DKIM, DMARC, suppression
+the manually generated SMTP username/password, the Terraform-managed approved
+sender `no-reply@mail.atlanteanz.com`, and a distinct password-reset HMAC secret
+in the protected runtime secret. Keep `CLUSTER_MAIL_PROVIDER=disabled` until
+SPF, DKIM, DMARC, suppression
 handling, and a real-mailbox reset/confirmation canary pass; the reset endpoints
 then return 503 instead of offering an unsafe shortcut.
 

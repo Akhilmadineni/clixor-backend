@@ -274,6 +274,71 @@ class ReleaseHardeningTests(unittest.TestCase):
                 self.assertIn(filename, package_script)
         self.assertNotIn("terraform.tfstate", package_script)
 
+    def test_email_delivery_foundation_excludes_credentials_and_private_keys(self) -> None:
+        terraform_root = self.oci_root / "terraform"
+        email = (terraform_root / "email.tf").read_text(encoding="utf-8")
+        all_terraform = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(terraform_root.glob("*.tf"))
+        )
+
+        self.assertIn('mail_domain        = "mail.atlanteanz.com"', email)
+        self.assertIn('mail_sender        = "no-reply@${local.mail_domain}"', email)
+        for resource_type in (
+            "oci_email_email_domain",
+            "oci_email_dkim",
+            "oci_email_sender",
+            "oci_identity_user",
+            "oci_identity_user_capabilities_management",
+            "oci_identity_group",
+            "oci_identity_user_group_membership",
+            "oci_identity_policy",
+        ):
+            with self.subTest(resource_type=resource_type):
+                self.assertIn(f'resource "{resource_type}"', email)
+
+        self.assertIn("count = var.create_mail_approved_sender ? 1 : 0", email)
+        self.assertIn(
+            'oci_email_dkim.transactional_mail.state == "ACTIVE"', email
+        )
+        self.assertIn("can_use_smtp_credentials     = true", email)
+        for disabled_capability in (
+            "can_use_api_keys             = false",
+            "can_use_auth_tokens          = false",
+            "can_use_console_password     = false",
+            "can_use_customer_secret_keys = false",
+        ):
+            self.assertIn(disabled_capability, email)
+        self.assertIn("to use approved-senders", email)
+        self.assertIn(
+            "where target.approved-sender.emailaddress = '${local.mail_sender}'",
+            email,
+        )
+        self.assertNotIn("to use email-family", email)
+
+        for forbidden_resource in (
+            "oci_identity_smtp_credential",
+            "oci_identity_domains_smtp_credential",
+            "oci_identity_domains_my_smtp_credential",
+        ):
+            with self.subTest(forbidden_resource=forbidden_resource):
+                self.assertNotIn(f'resource "{forbidden_resource}"', all_terraform)
+        self.assertNotRegex(email, r"(?m)^\s*private_key\s*=")
+
+        outputs = (terraform_root / "outputs.tf").read_text(encoding="utf-8")
+        expected_mail_outputs = {
+            "mail_dkim_cname_name",
+            "mail_dkim_cname_value",
+            "mail_spf_txt_name",
+            "mail_spf_txt_value",
+            "mail_smtp_endpoint",
+            "mail_smtp_user_id",
+        }
+        actual_mail_outputs = set(
+            re.findall(r'^output "(mail_[^"]+)"', outputs, re.MULTILINE)
+        )
+        self.assertEqual(actual_mail_outputs, expected_mail_outputs)
+
 
 if __name__ == "__main__":
     unittest.main()

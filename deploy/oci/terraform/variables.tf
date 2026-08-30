@@ -174,3 +174,9 @@ variable "freeform_tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "create_mail_approved_sender" {
+  description = "Create no-reply@mail.atlanteanz.com only after the output DKIM CNAME and SPF TXT records are public and OCI reports the DKIM state ACTIVE."
+  type        = bool
+  default     = false
+}
