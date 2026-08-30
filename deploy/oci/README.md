@@ -26,12 +26,13 @@ E2EE message delivery, OCI PAR upload/download, authorization, and verified medi
 cleanup. Root-owned `canary-public-smoke.txt` binds that evidence to the exact
 release SHA. Before any production route edit, record the exact configuration
 digests and run the protected state machine. Give its separate control token
-only Tunnel Configuration Edit and DNS Edit for this account/zone; materialize
+only Tunnel Configuration Edit, DNS Edit, and Zone WAF Write for this
+account/zone; materialize
 it as root-owned mode 0400 tmpfs and pass it as a systemd credential, never as
 environment, argv, shell history, logs, or the connector token:
 
 ```json
-{"mode":"promote","change_window":"FROZEN-CHANGE-1234","account":"ACCOUNT_ID","zone":"ZONE_ID","old_tunnel":"OLD_TUNNEL_UUID","candidate_tunnel":"OCI_TUNNEL_UUID","old_target":"OLD_TUNNEL_UUID.cfargotunnel.com","candidate_target":"OCI_TUNNEL_UUID.cfargotunnel.com","old_revision":"OLD_RELEASE_SHA","revision":"NEW_RELEASE_SHA","old_config_sha":"REVIEWED_SHA256","candidate_config_sha":"REVIEWED_SHA256","evidence":"/srv/clixor/releases/oci-EXACT-TAG/canary-public-smoke.txt"}
+{"mode":"promote","change_window":"FROZEN-CHANGE-1234","account":"ACCOUNT_ID","zone":"ZONE_ID","old_tunnel":"OLD_TUNNEL_UUID","candidate_tunnel":"OCI_TUNNEL_UUID","old_target":"OLD_TUNNEL_UUID.cfargotunnel.com","candidate_target":"OCI_TUNNEL_UUID.cfargotunnel.com","old_revision":"OLD_40_CHAR_SHA","revision":"NEW_40_CHAR_SHA","old_config_sha":"REVIEWED_SHA256","candidate_config_sha":"REVIEWED_SHA256","evidence":"/srv/clixor/releases/oci-EXACT-TAG/canary-public-smoke.txt","evidence_sha":"EVIDENCE_SHA256","maintenance_ruleset":"CUSTOM_RULESET_ID","maintenance_ruleset_sha":"ZONE_CUSTOM_RULESET_SHA256","maintenance_rule":"PRECREATED_RULE_ID","maintenance_rule_sha":"DISABLED_EXACT_RULE_SHA256","probe_source_ip":"TERRAFORM_PROMOTION_PROBE_SOURCE_IPV4","dns":[{"id":"API_RECORD_ID","name":"clustr-api.atlanteanz.com","type":"CNAME","content":"OLD_TUNNEL_UUID.cfargotunnel.com","proxied":true,"ttl":1},{"id":"APP_RECORD_ID","name":"clixor.atlanteanz.com","type":"CNAME","content":"OLD_TUNNEL_UUID.cfargotunnel.com","proxied":true,"ttl":1}]}
 ```
 
 Install that exact JSON as `/run/operator/cloudflare-promotion-request.json`
@@ -46,19 +47,43 @@ sudo systemctl status clixor-cloudflare-promote.service
 ```
 
 Promotion is a control-plane ownership transfer, never another deploy. The
-state machine detects drift by exact re-reads around both tunnel configurations
-and both proxied CNAMEs. Cloudflare offers no conditional update primitive, so
+state machine first enables the pre-created `http_request_firewall_custom`
+zone rule that blocks both production hostnames except the exact IPv4 `/32`
+reported by Terraform as `promotion_probe_source_ipv4`. This independent fence
+is bound by ruleset ID, rule ID, exact action/expression/ref/description/enabled
+state, and digest. If it is missing or changed, promotion stops and does not
+claim writes are fenced. The state machine detects drift by exact re-reads around
+both dedicated tunnel configurations and the full IDs/name/type/content/proxied/
+TTL tuples of both CNAMEs. Cloudflare offers no conditional update primitive, so
 this is detection, not provider-side CAS: both tunnels must be dedicated to this
 change, the named change window must be externally frozen, and no other token or
 operator may modify them until completion. It then
-fences writes with `http_status:503` on both tunnels, and changes both records
-with Cloudflare's transactional DNS batch. Edge KV propagation is not atomic,
-so the fence stays until both hostnames repeatedly return the exact API/AASA
-revision. Mixed observations retain the fence and journal for operator action.
-Automatic rollback occurs only if both records still select the exact candidate;
+changes both records with Cloudflare's transactional DNS batch. Edge KV
+propagation is not atomic, so the WAF fence stays enabled through exact public
+API/AASA validation and is disabled last. Mixed observations retain the fence
+and journal for operator action. Every external mutation has durable before/after
+journal checkpoints. Restart reconciles forward or rollback direction without
+overwriting unknown tunnel, DNS, or WAF state; rollback intent can never resume
+forward. Automatic rollback occurs only through the explicit rollback direction;
 manual rollback changes `mode` to `rollback` in the exact request credential and
 restarts the same hardened service. Never configure live production routes on two tunnels or
 load balance them. Remove canary only after retaining production evidence.
+
+The dedicated maintenance rule must be first in its exact zone ruleset. The
+request digest binds the complete ordered rule-ID inventory so an earlier
+custom `skip` rule cannot bypass the fence. Rerunning a terminal promote or
+rollback only verifies exact remote authority and performs no writes. After
+retaining the terminal journal as change evidence, set request `mode` to
+`archive`: the service verifies terminal public/config/DNS/WAF state, durably
+writes a root-only archive, then removes the active journal. Only that audited
+transition permits a later frozen change window to begin.
+
+The old tunnel allowlist is exactly the two Clixor production host rules plus a
+404 catch-all. The candidate allowlist before promotion is exactly the canary
+rule plus a 404 catch-all; the promoter adds only those two production rules.
+The WAF exception is the reviewed OCI NAT address, never a workstation address.
+The service owns `/var/lib/clixor` through systemd `StateDirectory=clixor`, so a
+fresh boot creates the journal parent before `ExecStart`; core dumps are disabled.
 
 The remotely managed canary route must point to
 `unix:/run/clixor-origin/gateway.sock`; the checked-in example is the reviewed

@@ -23,6 +23,11 @@ output "instance_private_ip" {
   value       = oci_core_instance.clixor.private_ip
 }
 
+output "promotion_probe_source_ipv4" {
+  description = "Exact OCI NAT public IPv4 /32 to review in the Cloudflare maintenance-fence authority."
+  value       = oci_core_nat_gateway.outbound.nat_ip
+}
+
 output "bastion_id" {
   description = "OCI Bastion OCID."
   value       = oci_bastion_bastion.clixor.id

@@ -148,6 +148,8 @@ jobs:
         run: python3 -m unittest discover -v -s .. -p 'test_*.py'
       - name: Test privileged connector-only origin boundary
         run: sudo sh ../test-origin-boundary.sh
+      - name: Test systemd promotion state cold start
+        run: sudo sh ../test-cloudflare-promote-service.sh
       - name: Check the data-volume mount helper
         run: bash -n clixor-mount-data.sh
       - name: Verify the break-glass upload bundle

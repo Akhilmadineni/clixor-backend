@@ -1,355 +1,242 @@
 #!/usr/bin/env python3
-"""Manual, CAS-driven single-owner Cloudflare production promotion."""
+"""Crash-recoverable, independently fenced Cloudflare ownership promotion."""
 from __future__ import annotations
-
-import argparse
-import fcntl
-import hashlib
-import json
-import os
-import re
-import stat
-import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
+import argparse,fcntl,hashlib,ipaddress,json,os,re,stat,sys,time,urllib.error,urllib.request
 from pathlib import Path
 from typing import Any
-
-PRODUCTION_HOSTS = ("clustr-api.atlanteanz.com", "clixor.atlanteanz.com")
-CANARY_HOST = "clixor-oci-canary.atlanteanz.com"
-ORIGIN = "unix:/run/clixor-origin/gateway.sock"
-FENCE = "http_status:503"
-HEX_ID=re.compile(r"[0-9a-f]{32}")
-UUID=re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-REVISION=re.compile(r"[0-9a-f]{40}")
-ASSOCIATION = {"applinks":{"apps":[],"details":[{"appIDs":["H9S3BAQ9U8.com.Clustr.Clustr.Clustr"],"components":[{"/":"/join","comment":"Matches only the fixed Clixor invite landing path."}]}]}}
-
-def canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-def digest(value: Any) -> str:
-    return hashlib.sha256(canonical(value)).hexdigest()
-
-def validate_parent_chain(directory:Path,expected_uid:int)->None:
-    if not directory.is_absolute(): raise RuntimeError("authority path is invalid")
-    current=Path("/")
+PRODUCTION_HOSTS=("clustr-api.atlanteanz.com","clixor.atlanteanz.com"); CANARY_HOST="clixor-oci-canary.atlanteanz.com"; ORIGIN="unix:/run/clixor-origin/gateway.sock"
+HEX_ID=re.compile(r"[0-9a-f]{32}"); UUID=re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"); REVISION=re.compile(r"[0-9a-f]{40}"); SHA=re.compile(r"[0-9a-f]{64}")
+ASSOCIATION={"applinks":{"apps":[],"details":[{"appIDs":["H9S3BAQ9U8.com.Clustr.Clustr.Clustr"],"components":[{"/":"/join","comment":"Matches only the fixed Clixor invite landing path."}]}]}}
+def canonical(v:Any)->bytes:return json.dumps(v,sort_keys=True,separators=(",",":")).encode()
+def digest(v:Any)->str:return hashlib.sha256(canonical(v)).hexdigest()
+def validate_parent_chain(directory:Path,uid:int)->None:
+    if not directory.is_absolute():raise RuntimeError("authority path is invalid")
+    p=Path("/")
     for part in directory.parts[1:]:
-        current/=part; metadata=current.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=expected_uid or stat.S_IMODE(metadata.st_mode)&0o022:
-            raise RuntimeError("authority parent chain is unsafe")
-
-def secure_read(path:Path,expected_uid:int,mode:int,maximum:int)->bytes:
-    if path.name in ("",".","..") or not path.is_absolute(): raise RuntimeError("authority path is invalid")
-    if expected_uid==0:
-        validate_parent_chain(path.parent,0)
-    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        p/=part;s=p.lstat()
+        if stat.S_ISLNK(s.st_mode) or not stat.S_ISDIR(s.st_mode) or s.st_uid!=uid or stat.S_IMODE(s.st_mode)&0o022:raise RuntimeError("authority parent chain is unsafe")
+def secure_read(path:Path,uid:int,mode:int,maximum:int)->bytes:
+    if not path.is_absolute() or path.name in ("",".",".."):raise RuntimeError("authority path is invalid")
+    if uid==0:validate_parent_chain(path.parent,uid)
+    d=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
     try:
-        fd=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+        f=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=d)
         try:
-            metadata=os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid!=expected_uid or stat.S_IMODE(metadata.st_mode)!=mode or metadata.st_size>maximum:
-                raise RuntimeError("authority file metadata is unsafe")
-            chunks=[]; remaining=maximum+1
-            while remaining:
-                chunk=os.read(fd,min(65536,remaining))
-                if not chunk: break
-                chunks.append(chunk); remaining-=len(chunk)
-            value=b"".join(chunks)
-            if len(value)>maximum: raise RuntimeError("authority file is oversized")
-            return value
-        finally: os.close(fd)
-    finally: os.close(parent)
-
-def read_token(path: Path, expected_uid: int = 0) -> bytes:
-    value = secure_read(path,expected_uid,0o400,4096).strip()
-    if not 20 <= len(value) <= 4096 or any(byte < 33 or byte > 126 for byte in value):
-        raise RuntimeError("control credential is invalid")
-    return value
-
-def validate_evidence(path: Path, revision: str, expected_uid: int = 0) -> None:
-    lines=secure_read(path,expected_uid,0o400,65536).decode("utf-8").splitlines()
-    if len(lines)!=3 or lines[0]!=f"revision={revision}" or lines[1]!="stage=canary" or not lines[2].startswith("smoke=passed ") or not lines[2].endswith(" cleanup=passed"):
-        raise RuntimeError("canary evidence does not authorize this revision")
-
+            s=os.fstat(f)
+            if not stat.S_ISREG(s.st_mode) or s.st_uid!=uid or stat.S_IMODE(s.st_mode)!=mode or s.st_size>maximum:raise RuntimeError("authority file metadata is unsafe")
+            out=b""
+            while len(out)<=maximum:
+                b=os.read(f,min(65536,maximum+1-len(out)))
+                if not b:break
+                out+=b
+            if len(out)>maximum:raise RuntimeError("authority file is oversized")
+            return out
+        finally:os.close(f)
+    finally:os.close(d)
+def read_token(path:Path,expected_uid:int=0)->bytes:
+    v=secure_read(path,expected_uid,0o400,4096).strip()
+    if not 20<=len(v)<=4096 or any(c<33 or c>126 for c in v):raise RuntimeError("control credential is invalid")
+    return v
+def evidence_digest(path:Path,revision:str,expected_uid:int=0)->str:
+    raw=secure_read(path,expected_uid,0o400,65536);lines=raw.decode().splitlines()
+    if len(lines)!=3 or lines[0]!=f"revision={revision}" or lines[1]!="stage=canary" or not lines[2].startswith("smoke=passed ") or not lines[2].endswith(" cleanup=passed"):raise RuntimeError("canary evidence does not authorize this revision")
+    return hashlib.sha256(raw).hexdigest()
+def validate_evidence(path:Path,revision:str,expected_uid:int=0)->None:evidence_digest(path,revision,expected_uid)
 class API:
-    def __init__(self, token: bytes, base: str = "https://api.cloudflare.com/client/v4"):
-        self.token, self.base = token, base.rstrip("/")
-    def request(self, method: str, path: str, body: Any = None) -> Any:
-        data = None if body is None else canonical(body)
-        request = urllib.request.Request(self.base + path, data=data, method=method)
-        request.add_header("Authorization", "Bearer " + self.token.decode("ascii"))
-        request.add_header("Content-Type", "application/json")
+    def __init__(self,token:bytes,base="https://api.cloudflare.com/client/v4"):self.token,self.base=token,base.rstrip("/")
+    def request(self,method,path,body=None):
+        q=urllib.request.Request(self.base+path,data=None if body is None else canonical(body),method=method,headers={"Authorization":"Bearer "+self.token.decode(),"Content-Type":"application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                document = json.load(response)
-        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
-            raise RuntimeError("Cloudflare control request failed") from error
-        if not isinstance(document, dict) or document.get("success") is not True:
-            raise RuntimeError("Cloudflare control request was rejected")
-        return document.get("result")
-
-def ingress_config(api: API, account: str, tunnel: str) -> dict[str, Any]:
-    result = api.request("GET", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations")
-    if not isinstance(result, dict) or not isinstance(result.get("config"), dict):
-        raise RuntimeError("tunnel configuration response is invalid")
-    return result["config"]
-
-def set_config(api: API, account: str, tunnel: str, config: dict[str, Any], expected: dict[str,Any]|None=None) -> None:
-    current=ingress_config(api,account,tunnel)
-    if expected is not None and digest(current)!=digest(expected):
-        raise RuntimeError("concurrent tunnel configuration drift")
-    api.request("PUT", f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations", {"config": config})
-    if digest(ingress_config(api, account, tunnel)) != digest(config):
-        raise RuntimeError("tunnel configuration did not converge")
-
-def route(config: dict[str, Any], hosts: tuple[str, ...], service: str) -> dict[str, Any]:
-    result = json.loads(canonical(config))
-    if set(result)!={"ingress"}:
-        raise RuntimeError("tunnel is not a dedicated exact ingress authority")
-    ingress = result.get("ingress")
-    if not isinstance(ingress, list) or not ingress or ingress[-1].get("service") != "http_status:404":
-        raise RuntimeError("tunnel catch-all is not exact")
-    filtered = [rule for rule in ingress[:-1] if rule.get("hostname") not in hosts]
-    filtered.extend({"hostname": host, "service": service} for host in hosts)
-    filtered.append({"service": "http_status:404"})
-    result["ingress"] = filtered
-    return result
-
-def checkpoint(path:Path,state:dict[str,Any],phase:str)->None:
-    state["phase"]=phase; write_state(path,state)
-
-def dns_records(api: API, zone: str) -> list[dict[str, Any]]:
-    records=[]
-    for host in PRODUCTION_HOSTS:
-        result=api.request("GET", f"/zones/{zone}/dns_records?type=CNAME&name={host}")
-        if not isinstance(result, list) or len(result) != 1: raise RuntimeError("production DNS authority is ambiguous")
-        record=result[0]
-        if record.get("name") != host or record.get("type") != "CNAME" or record.get("proxied") is not True:
-            raise RuntimeError("production DNS record is not exact")
-        records.append(record)
-    return records
-
-def switch_dns(api: API, zone: str, records: list[dict[str, Any]], expected: str, target: str) -> None:
-    current=dns_records(api,zone)
-    authority=lambda values:[(item.get("id"),item.get("name"),item.get("type"),item.get("content"),item.get("proxied")) for item in values]
-    if authority(current)!=authority(records):
-        raise RuntimeError("concurrent production DNS drift")
-    records=current
-    if any(record.get("content") != expected for record in records):
-        raise RuntimeError("production DNS CAS conflict")
-    patches=[{"id":r["id"], "type":"CNAME", "name":r["name"], "content":target, "proxied":True, "ttl":1} for r in records]
-    api.request("POST", f"/zones/{zone}/dns_records/batch", {"patches":patches})
-    if any(record.get("content") != target for record in dns_records(api, zone)):
-        raise RuntimeError("atomic DNS batch did not converge")
-
-def write_state(path: Path, state: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.geteuid()==0:
-        os.chown(path.parent,0,0); os.chmod(path.parent,0o700)
-        validate_parent_chain(path.parent,0)
-    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-    temporary=f".promotion.{os.getpid()}.{os.urandom(8).hex()}"
-    fd=-1
-    try:
-        fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
-        payload=canonical(state)+b"\n"; offset=0
-        while offset<len(payload): offset+=os.write(fd,payload[offset:])
-        os.fsync(fd); os.fchmod(fd,0o400); os.close(fd); fd=-1
-        os.replace(temporary,path.name,src_dir_fd=parent,dst_dir_fd=parent); os.fsync(parent)
-    finally:
-        if fd >= 0: os.close(fd)
-        try: os.unlink(temporary,dir_fd=parent)
-        except FileNotFoundError: pass
-        os.close(parent)
-
-def read_state(path: Path, expected_uid: int = 0) -> dict[str, Any]:
-    value=json.loads(secure_read(path,expected_uid,0o400,1024*1024))
-    if not isinstance(value,dict): raise RuntimeError("promotion journal is invalid")
-    return value
-
-def verify_public(revision: str) -> None:
-    for attempt in range(12):
-        try:
-            request=urllib.request.Request(f"https://clustr-api.atlanteanz.com/health/ready?promotion={revision}-{attempt}",headers={"Cache-Control":"no-cache"})
-            with urllib.request.urlopen(request,timeout=10) as response:
-                ready=json.load(response); header=response.headers.get("X-Clixor-Revision")
-            request=urllib.request.Request(f"https://clixor.atlanteanz.com/.well-known/apple-app-site-association?promotion={revision}-{attempt}",headers={"Cache-Control":"no-cache"})
-            with urllib.request.urlopen(request,timeout=10) as response:
-                association=json.load(response); association_revision=response.headers.get("X-Clixor-Revision")
-            if ready=={"status":"ready","revision":revision} and header==revision and association==ASSOCIATION and association_revision==revision:
-                return
-        except (OSError,urllib.error.URLError,json.JSONDecodeError): pass
-        if attempt < 11: time.sleep(5)
-    raise RuntimeError("public API and association did not converge to the exact revision")
-
-def promote(api: API, args: argparse.Namespace) -> None:
-    validate_evidence(args.evidence,args.revision)
-    if not isinstance(args.change_window,str) or not args.change_window.startswith("FROZEN-"):
-        raise RuntimeError("externally frozen Cloudflare change window is not attested")
-    if args.state.exists() or args.state.is_symlink():
-        state=read_state(args.state)
-        reconcile(api,args,state); return
-    old=ingress_config(api,args.account,args.old_tunnel)
-    candidate=ingress_config(api,args.account,args.candidate_tunnel)
-    if digest(old) != args.old_config_sha or digest(candidate) != args.candidate_config_sha:
-        raise RuntimeError("tunnel configuration CAS conflict")
-    if not any(r.get("hostname")==CANARY_HOST and r.get("service")==ORIGIN for r in candidate.get("ingress",[])):
-        raise RuntimeError("candidate canary origin is not exact")
-    records=dns_records(api,args.zone)
-    state={"schema":1,"phase":"fencing","change_window":args.change_window,"account":args.account,"zone":args.zone,"revision":args.revision,"old_revision":args.old_revision,"old_tunnel":args.old_tunnel,"candidate_tunnel":args.candidate_tunnel,"old_target":args.old_target,"candidate_target":args.candidate_target,"old_config":old,"candidate_config":candidate}
-    write_state(args.state,state)
-    old_fenced=route(old,PRODUCTION_HOSTS,FENCE); candidate_fenced=route(candidate,PRODUCTION_HOSTS,FENCE)
-    try:
-        checkpoint(args.state,state,"before-old-fence")
-        set_config(api,args.account,args.old_tunnel,old_fenced,old)
-        checkpoint(args.state,state,"after-old-fence")
-        checkpoint(args.state,state,"before-candidate-fence")
-        set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate)
-        checkpoint(args.state,state,"after-candidate-fence")
-        checkpoint(args.state,state,"before-dns-candidate")
-        switch_dns(api,args.zone,records,args.old_target,args.candidate_target)
-        checkpoint(args.state,state,"after-dns-candidate")
-        candidate_live=route(candidate,PRODUCTION_HOSTS,ORIGIN)
-        checkpoint(args.state,state,"before-candidate-unfence")
-        set_config(api,args.account,args.candidate_tunnel,candidate_live,candidate_fenced)
-        checkpoint(args.state,state,"after-candidate-unfence")
-        verify_public(args.revision)
-        state.update(phase="promoted",candidate_live_config=candidate_live)
-        write_state(args.state,state)
-    except Exception:
-        # Best-effort fence both authorities. Never unfreeze on ambiguity.
-        for tunnel, config in ((args.old_tunnel,old_fenced),(args.candidate_tunnel,candidate_fenced)):
-            try:
-                current=ingress_config(api,args.account,tunnel)
-                allowed=(old,old_fenced) if tunnel==args.old_tunnel else (candidate,candidate_fenced,route(candidate,PRODUCTION_HOSTS,ORIGIN))
-                if any(digest(current)==digest(item) for item in allowed): set_config(api,args.account,tunnel,config,current)
-            except Exception: pass
-        try:
-            current=dns_records(api,args.zone)
-            targets={record.get("content") for record in current}
-            if targets == {args.candidate_target}:
-                switch_dns(api,args.zone,current,args.candidate_target,args.old_target)
-                set_config(api,args.account,args.old_tunnel,old)
-                verify_public(args.old_revision)
-                state["phase"]="automatically-rolled-back"
-            elif targets == {args.old_target}:
-                set_config(api,args.account,args.old_tunnel,old)
-                state["phase"]="aborted-before-switch"
-            else:
-                state["phase"]="ambiguous-fenced"
-        except Exception:
-            state["phase"]="ambiguous-fenced"
-        write_state(args.state,state); raise
-
-def reconcile(api:API,args:argparse.Namespace,state:dict[str,Any])->None:
-    authority={"account":args.account,"zone":args.zone,"old_tunnel":args.old_tunnel,"candidate_tunnel":args.candidate_tunnel,"old_target":args.old_target,"candidate_target":args.candidate_target,"revision":args.revision}
-    if any(state.get(key)!=value for key,value in authority.items()): raise RuntimeError("existing journal authority mismatch")
-    old=state["old_config"]; candidate=state["candidate_config"]
-    old_fenced=route(old,PRODUCTION_HOSTS,FENCE); candidate_fenced=route(candidate,PRODUCTION_HOSTS,FENCE); candidate_live=route(candidate,PRODUCTION_HOSTS,ORIGIN)
-    old_current=ingress_config(api,args.account,args.old_tunnel); candidate_current=ingress_config(api,args.account,args.candidate_tunnel); records=dns_records(api,args.zone); targets={r["content"] for r in records}
-    known_old=(old,old_fenced); known_candidate=(candidate,candidate_fenced,candidate_live)
-    if not any(digest(old_current)==digest(x) for x in known_old) or not any(digest(candidate_current)==digest(x) for x in known_candidate):
-        checkpoint(args.state,state,"ambiguous-concurrent-drift"); raise RuntimeError("remote drift requires operator-fenced resolution")
-    if targets not in ({args.old_target},{args.candidate_target}):
-        checkpoint(args.state,state,"reconcile-before-ambiguity-fence")
-        if digest(old_current)!=digest(old_fenced): set_config(api,args.account,args.old_tunnel,old_fenced,old_current)
-        if digest(candidate_current)!=digest(candidate_fenced): set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate_current)
-        checkpoint(args.state,state,"ambiguous-fenced"); raise RuntimeError("mixed DNS propagation remains write-fenced")
-    if targets=={args.candidate_target}:
-        if digest(old_current)!=digest(old_fenced):
-            checkpoint(args.state,state,"reconcile-before-old-fence")
-            set_config(api,args.account,args.old_tunnel,old_fenced,old_current)
-        if digest(candidate_current)==digest(candidate_fenced):
-            checkpoint(args.state,state,"before-candidate-unfence")
-            set_config(api,args.account,args.candidate_tunnel,candidate_live,candidate_fenced)
-            checkpoint(args.state,state,"after-candidate-unfence")
-        elif digest(candidate_current)!=digest(candidate_live):
-            set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate_current); checkpoint(args.state,state,"ambiguous-fenced"); raise RuntimeError("candidate authority was not safely resumable")
-        verify_public(args.revision); state["candidate_live_config"]=candidate_live; checkpoint(args.state,state,"promoted"); return
-    # DNS still selects old. Resume only through exact known phases.
-    if digest(old_current)==digest(old):
-        checkpoint(args.state,state,"reconcile-before-old-fence"); set_config(api,args.account,args.old_tunnel,old_fenced,old); checkpoint(args.state,state,"after-old-fence")
-    if digest(candidate_current)==digest(candidate):
-        checkpoint(args.state,state,"reconcile-before-candidate-fence"); set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate); checkpoint(args.state,state,"after-candidate-fence")
-    elif digest(candidate_current)==digest(candidate_live):
-        checkpoint(args.state,state,"reconcile-before-candidate-refence"); set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate_live); checkpoint(args.state,state,"candidate-refenced")
-    checkpoint(args.state,state,"reconcile-before-dns-candidate"); switch_dns(api,args.zone,dns_records(api,args.zone),args.old_target,args.candidate_target); checkpoint(args.state,state,"after-dns-candidate")
-    checkpoint(args.state,state,"reconcile-before-candidate-unfence"); set_config(api,args.account,args.candidate_tunnel,candidate_live,candidate_fenced); checkpoint(args.state,state,"after-candidate-unfence")
-    verify_public(args.revision); state["candidate_live_config"]=candidate_live; checkpoint(args.state,state,"promoted")
-
-def rollback(api: API, args: argparse.Namespace) -> None:
-    state=read_state(args.state)
-    if state.get("revision") != args.revision:
-        raise RuntimeError("rollback state is not an exact promoted candidate")
-    expected={"old_tunnel":args.old_tunnel,"candidate_tunnel":args.candidate_tunnel,"old_target":args.old_target,"candidate_target":args.candidate_target}
-    if any(state.get(key)!=value for key,value in expected.items()):
-        raise RuntimeError("rollback authority does not match the promotion journal")
-    candidate_live=state["candidate_live_config"]
-    candidate_fenced=route(state["candidate_config"],PRODUCTION_HOSTS,FENCE)
-    old_fenced=route(state["old_config"],PRODUCTION_HOSTS,FENCE)
-    candidate_current=ingress_config(api,args.account,args.candidate_tunnel)
-    old_current=ingress_config(api,args.account,args.old_tunnel)
-    if digest(candidate_current) not in (digest(candidate_live),digest(candidate_fenced)) or digest(old_current) not in (digest(state["old_config"]),digest(old_fenced)):
-        checkpoint(args.state,state,"rollback-ambiguous-drift"); raise RuntimeError("rollback authority changed; writes remain fenced")
-    records=dns_records(api,args.zone)
-    targets={record["content"] for record in records}
-    if targets not in ({args.old_target},{args.candidate_target}):
-        if digest(candidate_current)!=digest(candidate_fenced): set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate_current)
-        if digest(old_current)!=digest(old_fenced): set_config(api,args.account,args.old_tunnel,old_fenced,old_current)
-        checkpoint(args.state,state,"rollback-ambiguous-fenced"); raise RuntimeError("rollback DNS is mixed; writes remain fenced")
-    if digest(candidate_current)!=digest(candidate_fenced):
-        checkpoint(args.state,state,"rollback-before-candidate-fence")
-        set_config(api,args.account,args.candidate_tunnel,candidate_fenced,candidate_current)
-        checkpoint(args.state,state,"rollback-after-candidate-fence")
-    if targets=={args.candidate_target}:
-        checkpoint(args.state,state,"rollback-before-dns-old")
-        switch_dns(api,args.zone,dns_records(api,args.zone),args.candidate_target,args.old_target)
-        checkpoint(args.state,state,"rollback-after-dns-old")
-    old_current=ingress_config(api,args.account,args.old_tunnel)
-    if digest(old_current)!=digest(state["old_config"]):
-        checkpoint(args.state,state,"rollback-before-old-unfence")
-        set_config(api,args.account,args.old_tunnel,state["old_config"],old_current)
-        checkpoint(args.state,state,"rollback-after-old-unfence")
-    verify_public(state["old_revision"])
-    state["phase"]="rolled-back"; write_state(args.state,state)
-
-def main() -> int:
-    if len(sys.argv)>1 and sys.argv[1]=="execute":
-        parser=argparse.ArgumentParser(); parser.add_argument("mode",choices=("execute",)); parser.add_argument("--request-file",type=Path,default=Path("/run/credentials/clixor-cloudflare-promote.service/promotion-request")); parser.add_argument("--token-file",type=Path,default=Path("/run/credentials/clixor-cloudflare-promote.service/cloudflare-control-token")); parser.add_argument("--state",type=Path,default=Path("/var/lib/clixor/cloudflare-promotion.json")); parsed=parser.parse_args()
-        request=json.loads(secure_read(parsed.request_file,0,0o400,65536))
-        expected={"mode","change_window","account","zone","old_tunnel","candidate_tunnel","old_target","candidate_target","revision","old_revision","old_config_sha","candidate_config_sha","evidence"}
-        if not isinstance(request,dict) or set(request)!=expected: parser.error("promotion request inventory is not exact")
-        if request.get("mode") not in ("promote","rollback"): parser.error("promotion request mode is invalid")
-        args=argparse.Namespace(**request,token_file=parsed.token_file,state=parsed.state)
-        args.evidence=Path(args.evidence)
+            with urllib.request.urlopen(q,timeout=20) as r:doc=json.load(r)
+        except (OSError,urllib.error.URLError,json.JSONDecodeError) as e:raise RuntimeError("Cloudflare control request failed") from e
+        if not isinstance(doc,dict) or doc.get("success") is not True:raise RuntimeError("Cloudflare control request was rejected")
+        return doc.get("result")
+def ingress_config(api,account,tunnel):
+    r=api.request("GET",f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations")
+    if not isinstance(r,dict) or not isinstance(r.get("config"),dict):raise RuntimeError("tunnel configuration response is invalid")
+    return r["config"]
+def exact_config(config,kind):
+    if kind=="candidate":expected=[{"hostname":CANARY_HOST,"service":ORIGIN},{"service":"http_status:404"}]
     else:
-        parser=argparse.ArgumentParser(); parser.add_argument("mode",choices=("promote","rollback"))
-        for name in ("account","zone","old-tunnel","candidate-tunnel","old-target","candidate-target","revision"): parser.add_argument("--"+name,required=True)
-        parser.add_argument("--old-config-sha"); parser.add_argument("--candidate-config-sha")
-        parser.add_argument("--old-revision")
-        parser.add_argument("--change-window",required=True)
-        parser.add_argument("--evidence",type=Path)
-        parser.add_argument("--token-file",type=Path,default=Path("/run/credentials/clixor-cloudflare-promotion.service/cloudflare-control-token")); parser.add_argument("--state",type=Path,default=Path("/var/lib/clixor/cloudflare-promotion.json"))
-        args=parser.parse_args()
-    if HEX_ID.fullmatch(args.account) is None or HEX_ID.fullmatch(args.zone) is None: parser.error("account and zone must be exact lowercase IDs")
-    if UUID.fullmatch(args.old_tunnel) is None or UUID.fullmatch(args.candidate_tunnel) is None or args.old_tunnel==args.candidate_tunnel: parser.error("tunnel IDs must be distinct exact UUIDs")
-    if args.old_target != f"{args.old_tunnel}.cfargotunnel.com" or args.candidate_target != f"{args.candidate_tunnel}.cfargotunnel.com": parser.error("DNS targets must bind the exact tunnel IDs")
-    if REVISION.fullmatch(args.revision) is None: parser.error("revision must be an exact Git SHA")
-    if args.mode=="promote" and (not args.old_config_sha or not args.candidate_config_sha): parser.error("promotion requires both config CAS digests")
-    if args.mode=="promote" and not args.old_revision: parser.error("promotion requires --old-revision for verified rollback")
-    if args.mode=="promote" and args.evidence is None: parser.error("promotion requires exact canary evidence")
+        ingress=config.get("ingress") if isinstance(config,dict) else None
+        if not isinstance(ingress,list) or len(ingress)!=3 or ingress[-1]!={"service":"http_status:404"}:raise RuntimeError("old tunnel allowlist is not exact")
+        rules=ingress[:-1]
+        if {r.get("hostname") for r in rules}!=set(PRODUCTION_HOSTS) or any(set(r)!={"hostname","service"} or not isinstance(r["service"],str) or not r["service"] for r in rules):raise RuntimeError("old tunnel allowlist is not exact")
+        expected=ingress
+    if set(config)!={"ingress"} or config.get("ingress")!=expected:raise RuntimeError(f"{kind} tunnel allowlist is not exact")
+def candidate_live(config):
+    exact_config(config,"candidate");return {"ingress":[{"hostname":CANARY_HOST,"service":ORIGIN}]+[{"hostname":h,"service":ORIGIN} for h in PRODUCTION_HOSTS]+[{"service":"http_status:404"}]}
+def set_config(api,account,tunnel,new,expected):
+    if digest(ingress_config(api,account,tunnel))!=digest(expected):raise RuntimeError("concurrent tunnel configuration drift")
+    api.request("PUT",f"/accounts/{account}/cfd_tunnel/{tunnel}/configurations",{"config":new})
+    if digest(ingress_config(api,account,tunnel))!=digest(new):raise RuntimeError("tunnel configuration did not converge")
+def dns_records(api,zone):
+    out=[]
+    for h in PRODUCTION_HOSTS:
+        r=api.request("GET",f"/zones/{zone}/dns_records?type=CNAME&name={h}")
+        if not isinstance(r,list) or len(r)!=1:raise RuntimeError("production DNS authority is ambiguous")
+        out.append(r[0])
+    return out
+def dns_tuple(r):return {k:r.get(k) for k in ("id","name","type","content","proxied","ttl")}
+def check_dns(actual,bound,target):
+    if [dns_tuple(x) for x in actual]!=bound:raise RuntimeError("production DNS record identity drift")
+    if any(x["content"]!=target for x in bound):raise RuntimeError("production DNS target conflict")
+def switch_dns(api,zone,bound,expected,target):
+    check_dns(dns_records(api,zone),bound,expected);patches=[dict(r,id=r["id"],content=target) for r in bound]
+    api.request("POST",f"/zones/{zone}/dns_records/batch",{"patches":patches});wanted=[dict(r,content=target) for r in bound];check_dns(dns_records(api,zone),wanted,target)
+def rule_path(a):return f"/zones/{a.zone}/rulesets/{a.maintenance_ruleset}/rules/{a.maintenance_rule}"
+def ruleset_path(a):return f"/zones/{a.zone}/rulesets/{a.maintenance_ruleset}"
+def validate_ruleset(api,a):
+    r=api.request("GET",ruleset_path(a))
+    rules=r.get("rules") if isinstance(r,dict) else None
+    if not isinstance(rules,list) or not rules or any(not isinstance(x,dict) or not isinstance(x.get("id"),str) for x in rules):raise RuntimeError("maintenance ruleset order is unknown")
+    selected={"id":r.get("id"),"kind":r.get("kind"),"phase":r.get("phase"),"rule_order":[x["id"] for x in rules]}
+    if selected["id"]!=a.maintenance_ruleset or selected["kind"]!="zone" or selected["phase"]!="http_request_firewall_custom" or selected["rule_order"][0]!=a.maintenance_rule or selected["rule_order"].count(a.maintenance_rule)!=1 or digest(selected)!=a.maintenance_ruleset_sha:raise RuntimeError("maintenance ruleset authority is unknown")
+def expected_rule(a,enabled):
+    probe=ipaddress.ip_address(a.probe_source_ip)
+    if probe.version!=4 or str(probe)!=a.probe_source_ip:raise RuntimeError("probe source must be an exact IPv4 /32")
+    expr=f'(http.host in {{"{PRODUCTION_HOSTS[0]}" "{PRODUCTION_HOSTS[1]}"}} and ip.src ne {probe})'
+    return {"id":a.maintenance_rule,"action":"block","expression":expr,"description":"clixor-production-change-window","ref":"clixor-production-change-window","enabled":enabled}
+def get_rule(api,a):
+    r=api.request("GET",rule_path(a))
+    if not isinstance(r,dict):raise RuntimeError("maintenance fence response is invalid")
+    allowed={"id","version","action","expression","description","last_updated","ref","enabled"}
+    if not set(r)<=allowed:raise RuntimeError("maintenance fence contains unreviewed behavior")
+    return {k:r.get(k) for k in ("id","action","expression","description","ref","enabled")}
+def set_rule(api,a,enabled,expected):
+    if get_rule(api,a)!=expected:raise RuntimeError("maintenance fence authority is unknown")
+    wanted=expected_rule(a,enabled);body={k:v for k,v in wanted.items() if k!="id"};api.request("PATCH",rule_path(a),body)
+    if get_rule(api,a)!=wanted:raise RuntimeError("maintenance fence did not converge")
+def write_state(path,state):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    if os.geteuid()==0:os.chown(path.parent,0,0);os.chmod(path.parent,0o700);validate_parent_chain(path.parent,0)
+    d=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);name=f".promotion.{os.getpid()}.{os.urandom(8).hex()}"
     try:
-        args.state.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
-        if os.geteuid()==0:
-            os.chown(args.state.parent,0,0); os.chmod(args.state.parent,0o700); validate_parent_chain(args.state.parent,0)
-        lock=os.open(str(args.state)+".lock",os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        f=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=d)
         try:
-            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            api=API(read_token(args.token_file)); (promote if args.mode=="promote" else rollback)(api,args)
-        finally: os.close(lock)
-    except Exception as error:
-        print(f"promotion=failed reason={error}",file=sys.stderr); return 1
-    print(f"promotion={args.mode}-complete revision={args.revision}"); return 0
-if __name__=="__main__": raise SystemExit(main())
+            raw=canonical(state)+b"\n";offset=0
+            while offset<len(raw):offset+=os.write(f,raw[offset:])
+            os.fchmod(f,0o400);os.fsync(f)
+        finally:os.close(f)
+        os.replace(name,path.name,src_dir_fd=d,dst_dir_fd=d);os.fsync(d)
+    finally:
+        try:os.unlink(name,dir_fd=d)
+        except FileNotFoundError:pass
+        os.close(d)
+def read_state(path,expected_uid=0):
+    v=json.loads(secure_read(path,expected_uid,0o400,1024*1024))
+    if not isinstance(v,dict):raise RuntimeError("promotion journal is invalid")
+    return v
+def checkpoint(path,state,phase,direction=None):
+    state["phase"]=phase
+    if direction is not None:state["direction"]=direction
+    write_state(path,state)
+def mutate(path,state,before,after,fn,direction):checkpoint(path,state,before,direction);fn();checkpoint(path,state,after,direction)
+def verify_public(revision):
+    for n in range(12):
+        try:
+            q=f"?promotion={revision}-{n}";req=urllib.request.Request("https://clustr-api.atlanteanz.com/health/ready"+q,headers={"Cache-Control":"no-cache"})
+            with urllib.request.urlopen(req,timeout=10) as r:ready=json.load(r);rh=r.headers.get("X-Clixor-Revision")
+            req=urllib.request.Request("https://clixor.atlanteanz.com/.well-known/apple-app-site-association"+q,headers={"Cache-Control":"no-cache"})
+            with urllib.request.urlopen(req,timeout=10) as r:assoc=json.load(r);ah=r.headers.get("X-Clixor-Revision")
+            if ready=={"status":"ready","revision":revision} and rh==revision and assoc==ASSOCIATION and ah==revision:return
+        except Exception:pass
+        if n<11:time.sleep(5)
+    raise RuntimeError("public exact revision did not converge")
+AUTH_KEYS=("account","zone","change_window","revision","old_revision","old_tunnel","candidate_tunnel","old_target","candidate_target","old_config_sha","candidate_config_sha","evidence_sha","maintenance_ruleset","maintenance_ruleset_sha","maintenance_rule","maintenance_rule_sha","probe_source_ip","dns")
+def authority(a):return {k:getattr(a,k) for k in AUTH_KEYS}
+def validate_bound(a,s):
+    if s.get("authority")!=authority(a):raise RuntimeError("existing journal authority mismatch")
+    if s.get("schema")!=2 or s.get("direction") not in ("forward","rollback","terminal"):raise RuntimeError("existing journal state is invalid")
+    old=s.get("old_config");candidate=s.get("candidate_config");live=s.get("candidate_live_config")
+    exact_config(old,"old");exact_config(candidate,"candidate")
+    if digest(old)!=a.old_config_sha or digest(candidate)!=a.candidate_config_sha or live!=candidate_live(candidate):raise RuntimeError("existing journal configuration binding mismatch")
+def promote(api,a):
+    if evidence_digest(a.evidence,a.revision)!=a.evidence_sha:raise RuntimeError("evidence digest mismatch")
+    validate_ruleset(api,a)
+    if a.state.exists() or a.state.is_symlink():
+        s=read_state(a.state);validate_bound(a,s)
+        return rollback_state(api,a,s) if s.get("direction")=="rollback" else forward(api,a,s)
+    old=ingress_config(api,a.account,a.old_tunnel);candidate=ingress_config(api,a.account,a.candidate_tunnel);exact_config(old,"old");exact_config(candidate,"candidate")
+    if digest(old)!=a.old_config_sha or digest(candidate)!=a.candidate_config_sha:raise RuntimeError("tunnel configuration digest conflict")
+    check_dns(dns_records(api,a.zone),a.dns,a.old_target);disabled=expected_rule(a,False)
+    if digest(disabled)!=a.maintenance_rule_sha or get_rule(api,a)!=disabled:raise RuntimeError("maintenance fence authority is unknown")
+    s={"schema":2,"direction":"forward","phase":"prepared","authority":authority(a),"old_config":old,"candidate_config":candidate,"candidate_live_config":candidate_live(candidate)};write_state(a.state,s);return forward(api,a,s)
+def forward(api,a,s):
+    validate_ruleset(api,a)
+    if s.get("direction")=="terminal":return verify_terminal(api,a,s)
+    disabled,enabled=expected_rule(a,False),expected_rule(a,True);rule=get_rule(api,a)
+    if rule==disabled:mutate(a.state,s,"before-maintenance-enable","after-maintenance-enable",lambda:set_rule(api,a,True,disabled),"forward")
+    elif rule!=enabled:checkpoint(a.state,s,"unknown-maintenance-fence","forward");raise RuntimeError("maintenance fence authority is unknown")
+    old,candidate,live=s["old_config"],s["candidate_config"],s["candidate_live_config"];oc=ingress_config(api,a.account,a.old_tunnel);cc=ingress_config(api,a.account,a.candidate_tunnel)
+    if digest(oc)!=digest(old) or digest(cc) not in (digest(candidate),digest(live)):checkpoint(a.state,s,"ambiguous-tunnel-drift","forward");raise RuntimeError("tunnel authority drift; maintenance fence retained")
+    records=dns_records(api,a.zone);targets={r.get("content") for r in records}
+    if targets=={a.old_target}:mutate(a.state,s,"before-dns-candidate","after-dns-candidate",lambda:switch_dns(api,a.zone,a.dns,a.old_target,a.candidate_target),"forward")
+    elif targets=={a.candidate_target}:check_dns(records,[dict(x,content=a.candidate_target) for x in a.dns],a.candidate_target)
+    else:checkpoint(a.state,s,"ambiguous-dns","forward");raise RuntimeError("DNS is ambiguous; maintenance fence retained")
+    cc=ingress_config(api,a.account,a.candidate_tunnel)
+    if digest(cc)==digest(candidate):mutate(a.state,s,"before-candidate-live","after-candidate-live",lambda:set_config(api,a.account,a.candidate_tunnel,live,candidate),"forward")
+    elif digest(cc)!=digest(live):checkpoint(a.state,s,"ambiguous-candidate","forward");raise RuntimeError("candidate drift; maintenance fence retained")
+    checkpoint(a.state,s,"before-public-validation","forward");verify_public(a.revision);checkpoint(a.state,s,"after-public-validation","forward")
+    if get_rule(api,a)!=enabled:checkpoint(a.state,s,"unknown-maintenance-fence","forward");raise RuntimeError("maintenance fence changed")
+    mutate(a.state,s,"before-maintenance-disable","after-maintenance-disable",lambda:set_rule(api,a,False,enabled),"forward");checkpoint(a.state,s,"promoted","terminal")
+def rollback(api,a):
+    s=read_state(a.state);validate_bound(a,s);checkpoint(a.state,s,"rollback-requested","rollback");return rollback_state(api,a,s)
+def rollback_state(api,a,s):
+    validate_ruleset(api,a)
+    if s.get("direction")=="terminal":return verify_terminal(api,a,s)
+    disabled,enabled=expected_rule(a,False),expected_rule(a,True);rule=get_rule(api,a)
+    if rule==disabled:mutate(a.state,s,"rollback-before-maintenance-enable","rollback-after-maintenance-enable",lambda:set_rule(api,a,True,disabled),"rollback")
+    elif rule!=enabled:checkpoint(a.state,s,"rollback-unknown-maintenance-fence","rollback");raise RuntimeError("maintenance fence authority is unknown")
+    old,candidate,live=s["old_config"],s["candidate_config"],s["candidate_live_config"]
+    if digest(ingress_config(api,a.account,a.old_tunnel))!=digest(old):checkpoint(a.state,s,"rollback-ambiguous-old","rollback");raise RuntimeError("old tunnel drift; maintenance fence retained")
+    cc=ingress_config(api,a.account,a.candidate_tunnel)
+    if digest(cc)==digest(live):mutate(a.state,s,"rollback-before-candidate-canary","rollback-after-candidate-canary",lambda:set_config(api,a.account,a.candidate_tunnel,candidate,live),"rollback")
+    elif digest(cc)!=digest(candidate):checkpoint(a.state,s,"rollback-ambiguous-candidate","rollback");raise RuntimeError("candidate drift; maintenance fence retained")
+    records=dns_records(api,a.zone);targets={r.get("content") for r in records};candidate_dns=[dict(x,content=a.candidate_target) for x in a.dns]
+    if targets=={a.candidate_target}:mutate(a.state,s,"rollback-before-dns-old","rollback-after-dns-old",lambda:switch_dns(api,a.zone,candidate_dns,a.candidate_target,a.old_target),"rollback")
+    elif targets=={a.old_target}:check_dns(records,a.dns,a.old_target)
+    else:checkpoint(a.state,s,"rollback-ambiguous-dns","rollback");raise RuntimeError("DNS drift; maintenance fence retained")
+    checkpoint(a.state,s,"rollback-before-public-validation","rollback");verify_public(a.old_revision);checkpoint(a.state,s,"rollback-after-public-validation","rollback")
+    if get_rule(api,a)!=enabled:checkpoint(a.state,s,"rollback-unknown-maintenance-fence","rollback");raise RuntimeError("maintenance fence changed")
+    mutate(a.state,s,"rollback-before-maintenance-disable","rollback-after-maintenance-disable",lambda:set_rule(api,a,False,enabled),"rollback");checkpoint(a.state,s,"rolled-back","terminal")
+def verify_terminal(api,a,s):
+    if get_rule(api,a)!=expected_rule(a,False):raise RuntimeError("terminal maintenance fence authority drift")
+    old,candidate,live=s["old_config"],s["candidate_config"],s["candidate_live_config"]
+    if digest(ingress_config(api,a.account,a.old_tunnel))!=digest(old):raise RuntimeError("terminal old tunnel authority drift")
+    phase=s.get("phase")
+    if phase=="promoted":
+        if digest(ingress_config(api,a.account,a.candidate_tunnel))!=digest(live):raise RuntimeError("terminal candidate authority drift")
+        check_dns(dns_records(api,a.zone),[dict(x,content=a.candidate_target) for x in a.dns],a.candidate_target);verify_public(a.revision)
+    elif phase=="rolled-back":
+        if digest(ingress_config(api,a.account,a.candidate_tunnel))!=digest(candidate):raise RuntimeError("terminal candidate authority drift")
+        check_dns(dns_records(api,a.zone),a.dns,a.old_target);verify_public(a.old_revision)
+    else:raise RuntimeError("terminal journal phase is invalid")
+def archive_terminal(api,a):
+    s=read_state(a.state);validate_bound(a,s);validate_ruleset(api,a);verify_terminal(api,a,s)
+    archive=a.state.parent/"cloudflare-promotion-archive"/(a.revision+"-"+hashlib.sha256(a.change_window.encode()).hexdigest()[:12]+".json")
+    write_state(archive,s)
+    d=os.open(a.state.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.unlink(a.state.name,dir_fd=d);os.fsync(d)
+    finally:os.close(d)
+def main():
+    p=argparse.ArgumentParser();p.add_argument("mode",choices=("execute",));p.add_argument("--request-file",type=Path,default=Path("/run/credentials/clixor-cloudflare-promote.service/promotion-request"));p.add_argument("--token-file",type=Path,default=Path("/run/credentials/clixor-cloudflare-promote.service/cloudflare-control-token"));p.add_argument("--state",type=Path,default=Path("/var/lib/clixor/cloudflare-promotion.json"));x=p.parse_args()
+    try:
+        q=json.loads(secure_read(x.request_file,0,0o400,131072));required={"mode","evidence",*AUTH_KEYS}
+        if not isinstance(q,dict) or set(q)!=required or q["mode"] not in ("promote","rollback","archive"):raise RuntimeError("promotion request inventory is not exact")
+        a=argparse.Namespace(**q,state=x.state,token_file=x.token_file);a.evidence=Path(a.evidence)
+        if any(HEX_ID.fullmatch(getattr(a,k)) is None for k in ("account","zone","maintenance_ruleset","maintenance_rule")):raise RuntimeError("Cloudflare IDs are invalid")
+        if UUID.fullmatch(a.old_tunnel) is None or UUID.fullmatch(a.candidate_tunnel) is None or a.old_tunnel==a.candidate_tunnel:raise RuntimeError("tunnel IDs are invalid")
+        if REVISION.fullmatch(a.revision) is None or REVISION.fullmatch(a.old_revision) is None:raise RuntimeError("revision is not an exact Git SHA")
+        if any(SHA.fullmatch(getattr(a,k)) is None for k in ("old_config_sha","candidate_config_sha","evidence_sha","maintenance_ruleset_sha","maintenance_rule_sha")):raise RuntimeError("authority digest is invalid")
+        if not isinstance(a.change_window,str) or re.fullmatch(r"FROZEN-[A-Z0-9._-]+",a.change_window) is None:raise RuntimeError("change window is not frozen")
+        if a.old_target!=f"{a.old_tunnel}.cfargotunnel.com" or a.candidate_target!=f"{a.candidate_tunnel}.cfargotunnel.com":raise RuntimeError("DNS target does not bind tunnel")
+        if not isinstance(a.dns,list) or len(a.dns)!=2:raise RuntimeError("DNS authority is invalid")
+        x.state.parent.mkdir(parents=True,exist_ok=True,mode=0o700);lock=os.open(str(x.state)+".lock",os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);api=API(read_token(x.token_file))
+            (promote if a.mode=="promote" else rollback if a.mode=="rollback" else archive_terminal)(api,a)
+        finally:os.close(lock)
+    except Exception as e:print(f"promotion=failed reason={e}",file=sys.stderr);return 1
+    print(f"promotion={a.mode}-complete revision={a.revision}");return 0
+if __name__=="__main__":raise SystemExit(main())

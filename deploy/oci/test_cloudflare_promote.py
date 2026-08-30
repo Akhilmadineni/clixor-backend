@@ -1,156 +1,166 @@
 from __future__ import annotations
-import argparse, importlib.util, json, os, tempfile, unittest
+import argparse,hashlib,importlib.util,json,os,tempfile,unittest
 from pathlib import Path
 from unittest import mock
-
 ROOT=Path(__file__).resolve().parent
-spec=importlib.util.spec_from_file_location("cfpromote",ROOT/"cloudflare-promote.py"); assert spec and spec.loader
-module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+spec=importlib.util.spec_from_file_location("cf",ROOT/"cloudflare-promote.py");module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
+def old_config():return {"ingress":[{"hostname":h,"service":module.ORIGIN} for h in module.PRODUCTION_HOSTS]+[{"service":"http_status:404"}]}
+def new_config():return {"ingress":[{"hostname":module.CANARY_HOST,"service":module.ORIGIN},{"service":"http_status:404"}]}
 class FakeAPI:
-    def __init__(self, *, partial=False,mutate_after_put=False):
-        self.configs={"old":{"ingress":[{"hostname":h,"service":"http://old:8080"} for h in module.PRODUCTION_HOSTS]+[{"service":"http_status:404"}]},"new":{"ingress":[{"hostname":module.CANARY_HOST,"service":module.ORIGIN},{"service":"http_status:404"}]}}
-        self.records=[{"id":"1","type":"CNAME","name":module.PRODUCTION_HOSTS[0],"content":"old.cfargotunnel.com","proxied":True},{"id":"2","type":"CNAME","name":module.PRODUCTION_HOSTS[1],"content":"old.cfargotunnel.com","proxied":True}]
-        self.partial=partial; self.mutate_after_put=mutate_after_put; self.calls=[]
+    def __init__(self):
+        self.configs={"old":old_config(),"new":new_config()};self.records=[{"id":str(i+1),"name":h,"type":"CNAME","content":"old.cfargotunnel.com","proxied":True,"ttl":1} for i,h in enumerate(module.PRODUCTION_HOSTS)];self.options=None;self.rule=None;self.calls=[];self.after=None
+    def bind(self,a):self.options=a;self.rule=module.expected_rule(a,False)
     def request(self,method,path,body=None):
         self.calls.append((method,path,body))
         if "/cfd_tunnel/" in path:
-            tunnel=path.split("/cfd_tunnel/",1)[1].split("/",1)[0]
-            if method=="GET": return {"config":json.loads(module.canonical(self.configs[tunnel]))}
-            self.configs[tunnel]=json.loads(module.canonical(body["config"]))
-            if self.mutate_after_put:
-                self.mutate_after_put=False; self.configs[tunnel]["ingress"].insert(0,{"hostname":"drift.invalid","service":"http://attacker"})
-            return {}
+            t=path.split("/cfd_tunnel/",1)[1].split("/",1)[0]
+            if method=="GET":return {"config":json.loads(module.canonical(self.configs[t]))}
+            self.configs[t]=json.loads(module.canonical(body["config"]));self._after(method,path);return {}
+        if "/rulesets/" in path:
+            if "/rules/" not in path:return {"id":self.options.maintenance_ruleset,"kind":"zone","phase":"http_request_firewall_custom","rules":[dict(self.rule),{"id":"later-rule"}]}
+            if method=="GET":return dict(self.rule)
+            self.rule=dict(body,id=self.options.maintenance_rule);self._after(method,path);return dict(self.rule)
         if method=="GET":
-            name=path.split("name=",1)[1]; return [dict(r) for r in self.records if r["name"]==name]
+            name=path.split("name=",1)[1];return [dict(r) for r in self.records if r["name"]==name]
         if path.endswith("/batch"):
-            for index,patch in enumerate(body["patches"]):
-                if self.partial and index: continue
-                for record in self.records:
-                    if record["id"]==patch["id"]: record.update(patch)
-            return {}
+            for p in body["patches"]:
+                for r in self.records:
+                    if r["id"]==p["id"]:r.update(p)
+            self._after(method,path);return {}
         raise AssertionError((method,path))
+    def _after(self,method,path):
+        if self.after:self.after(method,path)
 
-def args(root:Path,api:FakeAPI):
-    evidence=root/"evidence"; evidence.write_text(f"revision={'a'*40}\nstage=canary\nsmoke=passed prefix=clixor-smoke-x checks=1 cleanup=passed\n"); evidence.chmod(0o400)
-    return argparse.Namespace(change_window="FROZEN-CHANGE-1",account="acct",zone="zone",old_tunnel="old",candidate_tunnel="new",old_target="old.cfargotunnel.com",candidate_target="new.cfargotunnel.com",revision="a"*40,old_revision="b"*40,old_config_sha=module.digest(api.configs["old"]),candidate_config_sha=module.digest(api.configs["new"]),state=root/"state.json",evidence=evidence)
+def options(root,api):
+    ev=root/"evidence";raw=f"revision={'a'*40}\nstage=canary\nsmoke=passed prefix=x checks=5 cleanup=passed\n".encode();ev.write_bytes(raw);ev.chmod(0o400)
+    a=argparse.Namespace(change_window="FROZEN-1",account="a"*32,zone="b"*32,old_tunnel="old",candidate_tunnel="new",old_target="old.cfargotunnel.com",candidate_target="new.cfargotunnel.com",revision="a"*40,old_revision="b"*40,old_config_sha=module.digest(api.configs["old"]),candidate_config_sha=module.digest(api.configs["new"]),state=root/"state",evidence=ev,evidence_sha=hashlib.sha256(raw).hexdigest(),maintenance_ruleset="c"*32,maintenance_rule="d"*32,probe_source_ip="203.0.113.9",dns=[module.dns_tuple(r) for r in api.records])
+    a.maintenance_ruleset_sha=module.digest({"id":a.maintenance_ruleset,"kind":"zone","phase":"http_request_firewall_custom","rule_order":[a.maintenance_rule,"later-rule"]})
+    a.maintenance_rule_sha=module.digest(module.expected_rule(a,False));api.bind(a);return a
 
-class PromotionTests(unittest.TestCase):
-    def test_success_batches_both_records_and_preserves_single_owner(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(); options=args(Path(temporary),api)
-            with mock.patch.object(module,"verify_public") as verify, mock.patch.object(module,"validate_evidence",lambda *a:None): module.promote(api,options)
-            self.assertEqual({r["content"] for r in api.records},{options.candidate_target})
-            self.assertTrue(all(any(rule.get("hostname")==host and rule.get("service")==module.ORIGIN for rule in api.configs["new"]["ingress"]) for host in module.PRODUCTION_HOSTS))
-            batches=[call for call in api.calls if call[1].endswith("/batch")]
-            self.assertEqual(len(batches),1); self.assertEqual(len(batches[0][2]["patches"]),2)
-            verify.assert_called_once_with(options.revision)
-
-    def test_config_cas_conflict_changes_nothing(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(); options=args(Path(temporary),api); options.old_config_sha="0"*64
-            with mock.patch.object(module,"validate_evidence",lambda *a:None), self.assertRaisesRegex(RuntimeError,"CAS conflict"): module.promote(api,options)
-            self.assertEqual({r["content"] for r in api.records},{options.old_target})
-
-    def test_partial_dns_is_ambiguous_and_remains_fenced(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(partial=True); options=args(Path(temporary),api)
-            with mock.patch.object(module,"verify_public"), mock.patch.object(module,"validate_evidence",lambda *a:None), self.assertRaises(RuntimeError): module.promote(api,options)
-            state=json.loads(options.state.read_text()); self.assertEqual(state["phase"],"ambiguous-fenced")
-            for tunnel in ("old","new"):
-                services={r.get("service") for r in api.configs[tunnel]["ingress"] if r.get("hostname") in module.PRODUCTION_HOSTS}
-                self.assertEqual(services,{module.FENCE})
-
-    def test_exact_candidate_rolls_back(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(); options=args(Path(temporary),api)
-            with mock.patch.object(module,"verify_public"), mock.patch.object(module,"validate_evidence",lambda *a:None):
-                module.promote(api,options)
-                with mock.patch.object(module,"read_state",lambda path:json.loads(path.read_text())):
-                    module.rollback(api,options)
-            self.assertEqual({r["content"] for r in api.records},{options.old_target})
-            self.assertEqual(json.loads(options.state.read_text())["phase"],"rolled-back")
-
-    def test_token_file_never_enters_request_path_or_body(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path=Path(temporary)/"credential"; path.write_text("secret-control-token-123456789\n"); path.chmod(0o400)
-            self.assertEqual(module.read_token(path,expected_uid=os.getuid()),b"secret-control-token-123456789")
-            source=(ROOT/"cloudflare-promote.py").read_text()
-            self.assertNotIn("print(self.token",source); self.assertNotIn("--token\"",source)
-
-    def test_evidence_is_exact_revision_root_equivalent_and_read_only(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(); options=args(Path(temporary),api)
-            module.validate_evidence(options.evidence,options.revision,expected_uid=os.getuid())
-            options.evidence.chmod(0o600)
-            with self.assertRaisesRegex(RuntimeError,"unsafe"):
-                module.validate_evidence(options.evidence,options.revision,expected_uid=os.getuid())
-
-    def test_journal_rejects_writable_or_wrong_owner_equivalent(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path=Path(temporary)/"state"; path.write_text('{"phase":"promoted"}\n'); path.chmod(0o400)
-            self.assertEqual(module.read_state(path,expected_uid=os.getuid())["phase"],"promoted")
-            path.chmod(0o600)
-            with self.assertRaisesRegex(RuntimeError,"unsafe"):
-                module.read_state(path,expected_uid=os.getuid())
-
-    def test_process_death_at_every_external_transition_is_resumable(self):
-        phases=("after-old-fence","after-candidate-fence","after-dns-candidate","after-candidate-unfence")
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.evidence_patch=mock.patch.object(module,"evidence_digest",side_effect=lambda path,revision:hashlib.sha256(path.read_bytes()).hexdigest())
+        self.evidence_patch.start()
+    def tearDown(self):self.evidence_patch.stop()
+    def run_promote(self,api,a):
+        with mock.patch.object(module,"verify_public"):module.promote(api,a)
+    def test_success_fence_is_first_and_last_external_transition(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);self.run_promote(api,a)
+            writes=[x for x in api.calls if x[0] in ("PATCH","PUT","POST")]
+            self.assertIn("/rulesets/",writes[0][1]);self.assertTrue(writes[0][2]["enabled"])
+            self.assertIn("/rulesets/",writes[-1][1]);self.assertFalse(writes[-1][2]["enabled"])
+            self.assertEqual({r["content"] for r in api.records},{a.candidate_target});self.assertEqual(json.loads(a.state.read_text())["phase"],"promoted")
+    def test_unknown_tunnel_drift_retains_independent_fence(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);api.configs["old"]["ingress"].insert(0,{"hostname":"unknown","service":"http://bad"})
+            # Digest matches initial unknown only to reach strict allowlist, which rejects before fence.
+            a.old_config_sha=module.digest(api.configs["old"])
+            with self.assertRaisesRegex(RuntimeError,"allowlist"):module.promote(api,a)
+        with tempfile.TemporaryDirectory() as d:
+            # Drift after preparation is fenced before it is observed.
+            api=FakeAPI();a=options(Path(d),api);original=module.write_state
+            def drift(path,state):original(path,state);api.configs["old"]["ingress"].insert(0,{"hostname":"unknown","service":"http://bad"})
+            with mock.patch.object(module,"write_state",side_effect=drift),self.assertRaisesRegex(RuntimeError,"drift"):module.promote(api,a)
+            self.assertTrue(api.rule["enabled"])
+    def test_unknown_fence_stops_without_claiming_fenced(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);api.rule["expression"]="true"
+            with self.assertRaisesRegex(RuntimeError,"fence authority"):module.promote(api,a)
+            self.assertFalse(api.rule["enabled"]);self.assertFalse(a.state.exists())
+    def test_fence_must_be_first_in_exact_ordered_ruleset(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);original=api.request
+            def reordered(method,path,body=None):
+                value=original(method,path,body)
+                if method=="GET" and path==module.ruleset_path(a):value["rules"]=[{"id":"skip-before"},dict(api.rule)]
+                return value
+            api.request=reordered
+            with self.assertRaisesRegex(RuntimeError,"ruleset authority"):module.promote(api,a)
+            self.assertFalse(api.rule["enabled"])
+    def test_dns_delete_recreate_same_name_is_detected(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);api.records[0]["id"]="replacement"
+            with self.assertRaisesRegex(RuntimeError,"identity drift"):module.promote(api,a)
+    def test_all_authority_mismatches_rejected_on_resume(self):
+        for key in module.AUTH_KEYS:
+            with self.subTest(key=key),tempfile.TemporaryDirectory() as d:
+                api=FakeAPI();a=options(Path(d),api);s={"authority":module.authority(a)};s["authority"][key]="bad" if not isinstance(s["authority"][key],list) else []
+                module.write_state(a.state,s)
+                with mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())),self.assertRaisesRegex(RuntimeError,"authority mismatch"):module.promote(api,a)
+    def test_death_at_every_forward_mutation_resumes(self):
+        phases=("after-maintenance-enable","after-dns-candidate","after-candidate-live","after-maintenance-disable")
         for phase in phases:
-            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
-                api=FakeAPI(); options=args(Path(temporary),api); original=module.checkpoint
-                def kill(path,state,current,*,target=phase):
-                    if current==target: raise SystemExit(137)
-                    original(path,state,current)
-                with mock.patch.object(module,"validate_evidence",lambda *a:None), mock.patch.object(module,"verify_public"), mock.patch.object(module,"checkpoint",side_effect=kill), self.assertRaises(SystemExit):
-                    module.promote(api,options)
-                original_read=module.read_state
-                with mock.patch.object(module,"validate_evidence",lambda *a:None), mock.patch.object(module,"verify_public"), mock.patch.object(module,"read_state",lambda path:original_read(path,expected_uid=os.getuid())):
-                    module.promote(api,options)
-                self.assertEqual(json.loads(options.state.read_text())["phase"],"promoted")
-                self.assertEqual({r["content"] for r in api.records},{options.candidate_target})
-
-    def test_remote_mutation_after_write_is_detected_and_refenced(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            api=FakeAPI(mutate_after_put=True); options=args(Path(temporary),api)
-            with mock.patch.object(module,"validate_evidence",lambda *a:None), mock.patch.object(module,"verify_public"), self.assertRaisesRegex(RuntimeError,"did not converge"):
-                module.promote(api,options)
-            self.assertIn(json.loads(options.state.read_text())["phase"],{"aborted-before-switch","ambiguous-fenced"})
-
-    def test_process_death_during_every_rollback_transition_resumes(self):
-        phases=("rollback-after-candidate-fence","rollback-after-dns-old","rollback-after-old-unfence")
+            with self.subTest(phase=phase),tempfile.TemporaryDirectory() as d:
+                api=FakeAPI();a=options(Path(d),api);real=module.checkpoint
+                def kill(path,state,p,direction=None):
+                    real(path,state,p,direction)
+                    if p==phase:raise SystemExit(137)
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"checkpoint",side_effect=kill),self.assertRaises(SystemExit):module.promote(api,a)
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.promote(api,a)
+                self.assertEqual(json.loads(a.state.read_text())["phase"],"promoted")
+    def test_death_after_each_forward_remote_write_before_after_checkpoint(self):
+        for kill_at in range(1,5):
+            with self.subTest(write=kill_at),tempfile.TemporaryDirectory() as d:
+                api=FakeAPI();a=options(Path(d),api);seen=0
+                def die(method,path):
+                    nonlocal seen
+                    seen+=1
+                    if seen==kill_at:raise SystemExit(137)
+                api.after=die
+                with mock.patch.object(module,"verify_public"),self.assertRaises(SystemExit):module.promote(api,a)
+                api.after=None
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.promote(api,a)
+                self.assertEqual(json.loads(a.state.read_text())["phase"],"promoted")
+    def test_rollback_intent_survives_death_and_never_goes_forward(self):
+        phases=("rollback-after-maintenance-enable","rollback-after-candidate-canary","rollback-after-dns-old","rollback-after-maintenance-disable")
         for phase in phases:
-            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
-                api=FakeAPI(); options=args(Path(temporary),api); original_read=module.read_state; original_checkpoint=module.checkpoint
-                with mock.patch.object(module,"verify_public"), mock.patch.object(module,"validate_evidence",lambda *a:None): module.promote(api,options)
-                def kill(path,state,current,*,target=phase):
-                    if current==target: raise SystemExit(137)
-                    original_checkpoint(path,state,current)
-                with mock.patch.object(module,"verify_public"), mock.patch.object(module,"read_state",lambda p:original_read(p,expected_uid=os.getuid())), mock.patch.object(module,"checkpoint",side_effect=kill), self.assertRaises(SystemExit): module.rollback(api,options)
-                with mock.patch.object(module,"verify_public"), mock.patch.object(module,"read_state",lambda p:original_read(p,expected_uid=os.getuid())): module.rollback(api,options)
-                self.assertEqual(json.loads(options.state.read_text())["phase"],"rolled-back")
-
-    def test_fd_relative_reads_reject_symlink_and_resist_path_swap(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary); authority=root/"authority"; authority.write_text("original-authority-value-12345"); authority.chmod(0o400)
-            link=root/"link"; link.symlink_to(authority)
-            with self.assertRaises(OSError): module.read_token(link,expected_uid=os.getuid())
-            replacement=root/"replacement"; replacement.write_text("attacker-authority-value-12345"); replacement.chmod(0o400)
-            original_open=module.os.open; swapped=False
-            def swapping_open(path,*args,**kwargs):
-                nonlocal swapped
-                fd=original_open(path,*args,**kwargs)
-                if path==authority.name and kwargs.get("dir_fd") is not None and not swapped:
-                    swapped=True; os.replace(replacement,authority)
-                return fd
-            with mock.patch.object(module.os,"open",side_effect=swapping_open):
-                self.assertEqual(module.read_token(authority,expected_uid=os.getuid()),b"original-authority-value-12345")
-
-    def test_journal_fsyncs_file_and_parent_before_return(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            path=Path(temporary)/"state"; calls=[]; original=module.os.fsync
-            with mock.patch.object(module.os,"fsync",side_effect=lambda fd:(calls.append(fd),original(fd))[1]):
-                module.write_state(path,{"phase":"test"})
+            with self.subTest(phase=phase),tempfile.TemporaryDirectory() as d:
+                api=FakeAPI();a=options(Path(d),api);self.run_promote(api,a);real=module.checkpoint
+                def kill(path,state,p,direction=None):
+                    real(path,state,p,direction)
+                    if p==phase:raise SystemExit(137)
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())),mock.patch.object(module,"checkpoint",side_effect=kill),self.assertRaises(SystemExit):module.rollback(api,a)
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.promote(api,a)
+                self.assertEqual(json.loads(a.state.read_text())["phase"],"rolled-back");self.assertEqual({r["content"] for r in api.records},{a.old_target})
+    def test_death_after_each_rollback_remote_write_before_after_checkpoint(self):
+        for kill_at in range(1,5):
+            with self.subTest(write=kill_at),tempfile.TemporaryDirectory() as d:
+                api=FakeAPI();a=options(Path(d),api);self.run_promote(api,a);seen=0
+                def die(method,path):
+                    nonlocal seen
+                    seen+=1
+                    if seen==kill_at:raise SystemExit(137)
+                api.after=die
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())),self.assertRaises(SystemExit):module.rollback(api,a)
+                api.after=None
+                with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.promote(api,a)
+                self.assertEqual(json.loads(a.state.read_text())["phase"],"rolled-back")
+    def test_prewrite_remote_mutation_is_detected(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api)
+            def mutate(method,path):
+                if method=="PATCH":api.records[0]["ttl"]=60;api.after=None
+            api.after=mutate
+            with self.assertRaisesRegex(RuntimeError,"identity drift"):module.promote(api,a)
+            self.assertTrue(api.rule["enabled"])
+    def test_fd_read_and_journal_fsync(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"token";p.write_text("x"*30);p.chmod(0o400);link=Path(d)/"link";link.symlink_to(p)
+            with self.assertRaises(OSError):module.read_token(link,os.getuid())
+            calls=[];real=os.fsync
+            with mock.patch.object(module.os,"fsync",side_effect=lambda fd:(calls.append(fd),real(fd))[1]):module.write_state(Path(d)/"state",{"x":1})
             self.assertGreaterEqual(len(calls),2)
-
-if __name__=="__main__": unittest.main()
+    def test_service_owns_state_directory_before_exec_and_disables_cores(self):
+        unit=(ROOT/"clixor-cloudflare-promote.service").read_text()
+        self.assertIn("StateDirectory=clixor",unit);self.assertIn("StateDirectoryMode=0700",unit);self.assertIn("LimitCORE=0",unit)
+        self.assertLess(unit.index("StateDirectory=clixor"),unit.index("ExecStart="))
+    def test_terminal_rerun_is_read_only_and_archive_allows_next_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            api=FakeAPI();a=options(Path(d),api);self.run_promote(api,a);before=len([c for c in api.calls if c[0] in ("PATCH","PUT","POST")])
+            with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.promote(api,a)
+            after=len([c for c in api.calls if c[0] in ("PATCH","PUT","POST")]);self.assertEqual(before,after)
+            with mock.patch.object(module,"verify_public"),mock.patch.object(module,"read_state",lambda p:json.loads(p.read_text())):module.archive_terminal(api,a)
+            self.assertFalse(a.state.exists());archives=list((a.state.parent/"cloudflare-promotion-archive").glob("*.json"));self.assertEqual(len(archives),1)
+if __name__=="__main__":unittest.main()

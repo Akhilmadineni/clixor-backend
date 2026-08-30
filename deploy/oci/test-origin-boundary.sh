@@ -15,7 +15,7 @@ import os, socket, sys
 os.umask(0o007)
 s = socket.socket(socket.AF_UNIX)
 s.bind(sys.argv[1]); s.listen(4)
-for _ in range(1):
+for _ in range(2):
     c, _ = s.accept(); c.sendall(b"connector-only\n"); c.close()
 PY
 server_pid=$!
@@ -27,13 +27,20 @@ import socket, sys
 s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(64).decode().strip())
 PY
 )" = "connector-only" ]
-wait "${server_pid}"
 
 if setpriv --reuid=65531 --regid=65531 --clear-groups \
   python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' \
   "${root}/origin/gateway.sock" 2>/dev/null; then
   echo "non-connector identity reached the origin" >&2; exit 1
 fi
+# The denial above is meaningful only while the same server is still listening.
+kill -0 "${server_pid}"
+[ "$(setpriv --reuid=65530 --regid=65530 --groups=987 python3 - "${root}/origin/gateway.sock" <<'PY'
+import socket, sys
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(64).decode().strip())
+PY
+)" = "connector-only" ]
+wait "${server_pid}"
 if setpriv --reuid=65530 --regid=65530 --groups=987 \
   rm -f -- "${root}/origin/gateway.sock" 2>/dev/null; then
   echo "connector group could replace the gateway socket" >&2; exit 1
