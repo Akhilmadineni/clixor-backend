@@ -270,6 +270,26 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn('[ "${actual_sha}" = "${source_sha}" ]', wrapper)
         self.assertIn("status --porcelain --untracked-files=all", wrapper)
 
+        compose = (self.oci_root / "compose.yaml").read_text(encoding="utf-8")
+        dependency_images = re.findall(r"^\s+image:\s+([^\s]+)", compose, re.MULTILINE)
+        self.assertTrue(dependency_images)
+        for image in dependency_images:
+            if image.startswith("clixor-api:"):
+                continue
+            with self.subTest(image=image):
+                self.assertRegex(image, r"^[^@]+@sha256:[0-9a-f]{64}$")
+
+        ci_workflow = (
+            repository_root / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        ci_service_images = re.findall(
+            r"^\s{8}image:\s+([^\s]+)", ci_workflow, re.MULTILINE
+        )
+        self.assertTrue(ci_service_images)
+        for image in ci_service_images:
+            with self.subTest(ci_image=image):
+                self.assertRegex(image, r"^[^@]+@sha256:[0-9a-f]{64}$")
+
         terraform_root = self.oci_root / "terraform"
         package_script = (terraform_root / "package-stack.sh").read_text(
             encoding="utf-8"
@@ -439,7 +459,10 @@ class ReleaseHardeningTests(unittest.TestCase):
 
     def test_restore_drill_is_ephemeral_and_never_mounts_production_data(self) -> None:
         restore = (self.oci_root / "restore-drill.sh").read_text(encoding="utf-8")
-        self.assertIn("postgres_image=postgres:17.5-alpine", restore)
+        self.assertIn(
+            "postgres_image=postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa",
+            restore,
+        )
         self.assertIn("--pull=never", restore)
         self.assertIn("--network none", restore)
         self.assertNotIn("--publish", restore)

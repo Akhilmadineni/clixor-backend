@@ -25,7 +25,7 @@ backup_root=/srv/clixor/backups
 repo_root=/srv/clixor/repo
 helper=/usr/local/libexec/clixor/backup_manifest.py
 lock_root=/run/clixor-backup
-postgres_image=postgres:17.5-alpine
+postgres_image=postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
 
 case "${bucket}" in
   ''|*[!A-Za-z0-9._-]*) fail "OCI_BACKUP_BUCKET contains unsupported characters" ;;

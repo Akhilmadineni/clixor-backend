@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
         env:
           POSTGRES_DB: clustr_test
           POSTGRES_USER: clustr
@@ -31,7 +31,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:8-alpine
+        image: redis:8.0.3-alpine@sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c
         ports:
           - 6379:6379
         options: >-

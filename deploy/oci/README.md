@@ -135,15 +135,11 @@ The exact SHA argument is the deployment boundary. Deploying `main` does not
 silently include features that exist only on another branch.
 
 All third-party GitHub Actions used by CI and deployment are pinned to immutable
-40-character commits. Container base images, CI service images, and OCI runtime
-dependency images still use version tags because their current multi-platform
-manifest digests were not independently verified in this change. An exact
-source SHA does not make those upstream tags immutable, and `deploy.sh --pull`
-can observe a republished tag. Before the public production gate, resolve each
-tag through its official registry, verify that the manifest list contains the
-required `linux/arm64` image (and `linux/amd64` where CI builds it), then review
-and pin the manifest-list digest. Keep dependency upgrades separate from
-application-only releases.
+40-character commits. Container base images, CI service images, the isolated
+restore image, and every OCI runtime dependency image are pinned to reviewed
+multi-platform manifest-list digests verified to include `linux/arm64` and
+`linux/amd64`. Keep digest upgrades separate from application-only releases and
+repeat the architecture and provenance review before changing any pin.
 
 ### GitHub Actions production runner
 
@@ -422,7 +418,7 @@ The drill lists the private bucket through the instance principal, selects the
 newest fresh dump with a matching checksum object, downloads both to a unique
 mode-0700 workspace under `/srv/clixor/restore-drills`, and validates the strict
 one-line SHA-256 manifest. It starts the already-installed
-`postgres:17.5-alpine` image with `--network none`, no published port, an
+digest-pinned `postgres:17.5-alpine` image with `--network none`, no published port, an
 ephemeral random credential, a separate temporary data directory, read-only
 root filesystem, dropped capabilities, and CPU/memory/PID limits. It then runs
 `pg_restore --exit-on-error`, requires the exact checked-out migration set,

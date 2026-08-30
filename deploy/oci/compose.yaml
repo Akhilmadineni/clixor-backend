@@ -13,7 +13,7 @@ x-service-security: &service-security
 
 services:
   postgres:
-    image: postgres:17.5-alpine
+    image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     container_name: clixor-oci-postgres
     command:
       - postgres
@@ -62,7 +62,7 @@ services:
     <<: *service-security
 
   redis:
-    image: redis:8.0.3-alpine
+    image: redis:8.0.3-alpine@sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c
     container_name: clixor-oci-redis
     user: "999:1000"
     env_file:
@@ -87,7 +87,7 @@ services:
     <<: *service-security
 
   nats:
-    image: nats:2.11.6-alpine
+    image: nats:2.11.6-alpine@sha256:7dec3f8f1ff181975dbdfc0d903d2a9724659648294dbc2ebb2fa3a294d573a6
     container_name: clixor-oci-nats
     user: "1000:1000"
     env_file:
@@ -117,7 +117,7 @@ services:
     <<: *service-security
 
   dependency-tls:
-    image: haproxy:3.2-alpine
+    image: haproxy:3.2-alpine@sha256:d9b40affba6af8411bc661e8743877b3d40b1dc5c4b88b26bf1ef00214f2cd71
     container_name: clixor-oci-dependency-tls
     depends_on:
       postgres:
@@ -239,7 +239,7 @@ services:
     <<: *service-security
 
   api-gateway:
-    image: nginx:1.29-alpine
+    image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     container_name: clixor-oci-api-gateway
     user: "101:101"
     depends_on:
@@ -268,7 +268,7 @@ services:
     <<: *service-security
 
   postgres-backup:
-    image: postgres:17.5-alpine
+    image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     container_name: clixor-oci-postgres-backup
     user: "0:0"
     env_file:
@@ -295,7 +295,7 @@ services:
 
   prometheus:
     profiles: ["observability"]
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     container_name: clixor-oci-prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -317,7 +317,7 @@ services:
 
   grafana:
     profiles: ["observability"]
-    image: grafana/grafana:12.1.0
+    image: grafana/grafana:12.1.0@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f
     container_name: clixor-oci-grafana
     env_file:
       - /srv/clixor/secrets/grafana.env
