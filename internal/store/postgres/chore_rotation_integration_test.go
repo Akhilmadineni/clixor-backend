@@ -129,8 +129,26 @@ func TestPostgresRotateChoreConcurrentReplayAndRollback(t *testing.T) {
 	if _, err := persistence.RotateChore(ctx, missing); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("delete-between-read=%v", err)
 	}
+	memberReplay := p
+	memberReplay.OperationID = uuid.New()
+	memberReplay.ActorID = member.ID
+	memberReplay.ExpectedChoreVersion = 2
+	memberReplay.FeedPayload = json.RawMessage(`{"id":"` + memberReplay.OperationID.String() + `","groupId":"` + c.ID.String() + `","type":"note","relatedId":"` + choreID.String() + `"}`)
+	memberReplayHash := sha256.Sum256(append(append([]byte(nil), memberReplay.ChorePayload...), memberReplay.FeedPayload...))
+	memberReplay.RequestHash = memberReplayHash[:]
+	if result, err := persistence.RotateChore(ctx, memberReplay); err != nil || result.Chore.Version != 3 {
+		t.Fatalf("member rotation=%+v err=%v", result, err)
+	}
 	if err := persistence.RemoveConversationMember(ctx, c.ID, owner.ID, member.ID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := persistence.RotateChore(ctx, memberReplay); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("removed member replay=%v", err)
+	}
+	otherActor := memberReplay
+	otherActor.ActorID = owner.ID
+	if _, err := persistence.RotateChore(ctx, otherActor); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("other actor operation reuse=%v", err)
 	}
 	removed := p
 	removed.OperationID = uuid.New()
@@ -143,5 +161,133 @@ func TestPostgresRotateChoreConcurrentReplayAndRollback(t *testing.T) {
 	}
 	if _, err := persistence.RotateChore(ctx, p); err != nil {
 		t.Fatalf("lost-response replay after ACL change=%v", err)
+	}
+}
+
+func TestPostgresRotateChoreRechecksMembershipAfterConversationAuthorityLock(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: uuid.NewString() + "@rotation-race.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: uuid.NewString() + "@rotation-race.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: owner.ID, MemberIDs: []uuid.UUID{member.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choreID, operationID := uuid.New(), uuid.New()
+	original := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` + conversation.ID.String() + `","assignedTo":"` + owner.ID.String() + `","rotateOrder":["` + owner.ID.String() + `","` + member.ID.String() + `"]}`)
+	chore, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "chore", ID: choreID,
+		Payload: original, CreatedBy: owner.ID,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposed := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` + conversation.ID.String() + `","assignedTo":"` + member.ID.String() + `","rotateOrder":["` + owner.ID.String() + `","` + member.ID.String() + `"]}`)
+	feed := json.RawMessage(`{"id":"` + operationID.String() + `","groupId":"` + conversation.ID.String() + `","type":"note","relatedId":"` + choreID.String() + `"}`)
+	digest := sha256.Sum256(append(append([]byte(nil), proposed...), feed...))
+	command := store.RotateChoreParams{
+		OperationID: operationID, ConversationID: conversation.ID, ChoreID: choreID,
+		ActorID: member.ID, ExpectedChoreVersion: chore.Version,
+		ChorePayload: proposed, FeedPayload: feed, RequestHash: digest[:],
+	}
+
+	var baselineOutbox int
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbox_events WHERE aggregate_id=$1`, conversation.ID,
+	).Scan(&baselineOutbox); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the membership authority while making the removal visible only to
+	// its transaction. The old ordering observed the still-committed membership
+	// first, then waited here and incorrectly mutated after the removal commit.
+	removal, err := persistence.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removal.Rollback(ctx)
+	var lockedConversation uuid.UUID
+	if err := removal.QueryRow(ctx,
+		`SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, conversation.ID,
+	).Scan(&lockedConversation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := removal.Exec(ctx,
+		`DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
+		conversation.ID, member.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, rotateErr := persistence.RotateChore(ctx, command)
+		done <- rotateErr
+	}()
+	<-started
+	select {
+	case rotateErr := <-done:
+		t.Fatalf("rotation escaped conversation authority before removal commit: %v", rotateErr)
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := removal.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rotateErr := <-done:
+		if !errors.Is(rotateErr, domain.ErrForbidden) {
+			t.Fatalf("rotation after committed removal=%v", rotateErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("rotation did not resume after removal committed")
+	}
+
+	var finalVersion int64
+	var feedCount, operationCount, finalOutbox int
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT version FROM entities WHERE conversation_id=$1 AND kind='chore' AND id=$2`,
+		conversation.ID, choreID,
+	).Scan(&finalVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT count(*) FROM entities WHERE conversation_id=$1 AND kind='feed_item' AND id=$2`,
+		conversation.ID, operationID,
+	).Scan(&feedCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT count(*) FROM chore_rotation_operations WHERE operation_id=$1`, operationID,
+	).Scan(&operationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT count(*) FROM outbox_events WHERE aggregate_id=$1`, conversation.ID,
+	).Scan(&finalOutbox); err != nil {
+		t.Fatal(err)
+	}
+	if finalVersion != chore.Version || feedCount != 0 || operationCount != 0 || finalOutbox != baselineOutbox {
+		t.Fatalf("removed actor mutated state: version=%d feed=%d operation=%d outbox=%d baseline_outbox=%d",
+			finalVersion, feedCount, operationCount, finalOutbox, baselineOutbox)
 	}
 }

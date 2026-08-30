@@ -1727,6 +1727,18 @@ func (s *Store) RotateChore(ctx context.Context, p store.RotateChoreParams) (sto
 		return store.RotateChoreResult{}, err
 	}
 	defer tx.Rollback(ctx)
+	// The conversation row is the membership authority. Take its update lock
+	// before observing membership or a replay result so a concurrent removal
+	// has one unambiguous serialization point: a removal that owns the lock
+	// first commits before this membership recheck, while a command that owns it
+	// first remains authorized through its complete atomic commit.
+	var metadata json.RawMessage
+	if err := tx.QueryRow(ctx, `SELECT metadata FROM conversations WHERE id=$1 FOR UPDATE`, p.ConversationID).Scan(&metadata); err != nil {
+		return store.RotateChoreResult{}, mapError(err)
+	}
+	if err := s.requireMember(ctx, tx, p.ConversationID, p.ActorID); err != nil {
+		return store.RotateChoreResult{}, err
+	}
 	// Serialize both the first execution and concurrent replays before looking
 	// up the durable result. The lock key is scoped to this database.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, p.OperationID); err != nil {
@@ -1753,13 +1765,6 @@ func (s *Store) RotateChore(ctx context.Context, p store.RotateChoreParams) (sto
 	}
 	if p.Validate() != nil {
 		return store.RotateChoreResult{}, domain.ErrInvalid
-	}
-	if err := s.requireMember(ctx, tx, p.ConversationID, p.ActorID); err != nil {
-		return store.RotateChoreResult{}, err
-	}
-	var metadata json.RawMessage
-	if err := tx.QueryRow(ctx, `SELECT metadata FROM conversations WHERE id=$1 FOR SHARE`, p.ConversationID).Scan(&metadata); err != nil {
-		return store.RotateChoreResult{}, mapError(err)
 	}
 	var chore domain.Entity
 	err = tx.QueryRow(ctx, `SELECT conversation_id,kind,id,version,payload,created_by,created_at,updated_at,deleted_at FROM entities WHERE conversation_id=$1 AND kind='chore' AND id=$2 AND deleted_at IS NULL FOR UPDATE`, p.ConversationID, p.ChoreID).

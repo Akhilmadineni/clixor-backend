@@ -66,8 +66,26 @@ func TestRotateChoreIsAtomicAuthoritativeAndReplaySafe(t *testing.T) {
 	if _, err := persistence.RotateChore(ctx, bad); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("operation body reuse=%v", err)
 	}
+	memberReplay := p
+	memberReplay.OperationID = uuid.New()
+	memberReplay.ActorID = member.ID
+	memberReplay.ExpectedChoreVersion = chore.Version + 1
+	memberReplay.FeedPayload = json.RawMessage(`{"id":"` + memberReplay.OperationID.String() + `","groupId":"` + conversation.ID.String() + `","relatedId":"` + choreID.String() + `","type":"note"}`)
+	memberHash := sha256.Sum256(append(append([]byte(nil), memberReplay.ChorePayload...), memberReplay.FeedPayload...))
+	memberReplay.RequestHash = memberHash[:]
+	if result, err := persistence.RotateChore(ctx, memberReplay); err != nil || result.Chore.Version != 3 {
+		t.Fatalf("member rotation=%+v err=%v", result, err)
+	}
 	if err := persistence.RemoveConversationMember(ctx, conversation.ID, owner.ID, member.ID); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := persistence.RotateChore(ctx, memberReplay); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("removed member replay=%v", err)
+	}
+	otherActor := memberReplay
+	otherActor.ActorID = owner.ID
+	if _, err := persistence.RotateChore(ctx, otherActor); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("other actor operation reuse=%v", err)
 	}
 	if _, err := persistence.RotateChore(ctx, p); err != nil {
 		t.Fatalf("durable replay after membership change: %v", err)

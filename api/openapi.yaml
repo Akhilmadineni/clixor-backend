@@ -767,6 +767,7 @@ paths:
                   operation_id: {type: string, format: uuid}
                   chore: {type: object, additionalProperties: true}
                   feed_item: {type: object, additionalProperties: true}
+        "400": {description: Invalid operation ID, version, chore binding, feed binding, or participant payload}
         "403": {description: Actor is not an active conversation member}
         "404": {description: Chore is absent or tombstoned}
         "409": {description: Stale version or operation binding mismatch}

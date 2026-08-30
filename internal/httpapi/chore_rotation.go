@@ -3,6 +3,7 @@ package httpapi
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
@@ -25,7 +26,7 @@ func (s *Server) rotateChore(w http.ResponseWriter, r *http.Request) {
 	}
 	choreID, err := uuid.Parse(chi.URLParam(r, "choreID"))
 	if err != nil {
-		writeDomainError(w, domain.ErrInvalid)
+		writeRotateChoreError(w, domain.ErrInvalid)
 		return
 	}
 	var req rotateChoreRequest
@@ -33,17 +34,29 @@ func (s *Server) rotateChore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.OperationID == uuid.Nil || req.ExpectedChoreVersion < 1 || !rotationPayloadBindings(req.Chore, req.FeedItem, conversationID, choreID, req.OperationID) {
-		writeDomainError(w, domain.ErrInvalid)
+		writeRotateChoreError(w, domain.ErrInvalid)
 		return
 	}
 	canonical, _ := json.Marshal(req)
 	digest := sha256.Sum256(canonical)
 	result, err := s.store.RotateChore(r.Context(), store.RotateChoreParams{OperationID: req.OperationID, ConversationID: conversationID, ChoreID: choreID, ActorID: id.UserID, ExpectedChoreVersion: req.ExpectedChoreVersion, ChorePayload: req.Chore, FeedPayload: req.FeedItem, RequestHash: digest[:]})
 	if err != nil {
-		writeDomainError(w, err)
+		writeRotateChoreError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// Chore rotation was finalized as an additive client contract with HTTP 400
+// for malformed or semantically invalid commands. Keep this mapping local so
+// legacy endpoints that intentionally expose the API's historical 422 behavior
+// are not changed.
+func writeRotateChoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrInvalid) {
+		writeError(w, http.StatusBadRequest, "invalid_input", "One or more fields are invalid.")
+		return
+	}
+	writeDomainError(w, err)
 }
 
 func rotationPayloadBindings(chore, feed json.RawMessage, conversationID, choreID, operationID uuid.UUID) bool {

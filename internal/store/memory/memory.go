@@ -1906,6 +1906,11 @@ func (s *Store) RotateChore(_ context.Context, p store.RotateChoreParams) (store
 	if p.OperationID == uuid.Nil {
 		return store.RotateChoreResult{}, domain.ErrInvalid
 	}
+	// Idempotency never bypasses the current ACL. The process-wide mutex is the
+	// memory store's conversation authority, matching the PostgreSQL lock order.
+	if _, ok := s.members[p.ConversationID][p.ActorID]; !ok {
+		return store.RotateChoreResult{}, domain.ErrForbidden
+	}
 	if prior, ok := s.choreRotations[p.OperationID]; ok {
 		if prior.ConversationID != p.ConversationID || prior.ActorID != p.ActorID ||
 			prior.ChoreID != p.ChoreID || !bytes.Equal(prior.RequestHash, p.RequestHash) {
@@ -1915,9 +1920,6 @@ func (s *Store) RotateChore(_ context.Context, p store.RotateChoreParams) (store
 	}
 	if p.Validate() != nil {
 		return store.RotateChoreResult{}, domain.ErrInvalid
-	}
-	if _, ok := s.members[p.ConversationID][p.ActorID]; !ok {
-		return store.RotateChoreResult{}, domain.ErrForbidden
 	}
 	key := entityKey(p.ConversationID, "chore", p.ChoreID)
 	chore, ok := s.entities[key]
