@@ -13,6 +13,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestPostgresMembershipPathsRejectBackendUUIDReservedAsAnotherLocalID(t *testing.T) {
@@ -162,4 +163,146 @@ func TestPostgresMembershipPathsRejectBackendUUIDReservedAsAnotherLocalID(t *tes
 		}
 		assertRejectedAndUnambiguous(t, f)
 	})
+}
+
+func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHistory(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+
+	joining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: owner.ID,
+		Metadata: json.RawMessage(`{"members":[{"id":"` + joining.ID.String() +
+			`","backendUserId":"` + owner.ID.String() + `"}]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalLocal := uuid.New()
+	if _, err := persistence.pool.Exec(ctx, `
+		INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)
+		VALUES($1,$2,$3)`, conversation.ID, historical.ID, historicalLocal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.pool.Exec(ctx, `
+		INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
+		VALUES($1,$2,$3)`, conversation.ID, historical.ID, historicalLocal); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := func(t *testing.T) string {
+		t.Helper()
+		var mappings, tombstones string
+		if err := persistence.pool.QueryRow(ctx, `
+			SELECT COALESCE(string_agg(user_id::text||':'||local_id::text,',' ORDER BY user_id),'')
+			FROM conversation_member_local_ids WHERE conversation_id=$1`, conversation.ID,
+		).Scan(&mappings); err != nil {
+			t.Fatal(err)
+		}
+		if err := persistence.pool.QueryRow(ctx, `
+			SELECT COALESCE(string_agg(user_id::text||':'||local_id::text,',' ORDER BY user_id),'')
+			FROM conversation_member_tombstones WHERE conversation_id=$1`, conversation.ID,
+		).Scan(&tombstones); err != nil {
+			t.Fatal(err)
+		}
+		return mappings + "|" + tombstones
+	}
+	historyBefore := snapshot(t)
+
+	// This is the lock acquired by migration 000018 before its first validation.
+	// A write from a previous binary uses ROW EXCLUSIVE and must remain blocked.
+	migrationTx, err := persistence.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrationTx.Rollback(ctx)
+	if _, err := migrationTx.Exec(ctx, `
+		LOCK TABLE conversation_members, conversation_member_local_ids
+		IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	writerResult := make(chan error, 1)
+	go func() {
+		_, writeErr := persistence.pool.Exec(ctx, `
+			INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
+			VALUES($1,$2,'member',now())`, conversation.ID, joining.ID)
+		writerResult <- writeErr
+	}()
+	select {
+	case writeErr := <-writerResult:
+		t.Fatalf("old writer bypassed migration lock: %v", writeErr)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: writer is fenced until the migration transaction commits.
+	}
+	if err := migrationTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := <-writerResult
+	var pgErr *pgconn.PgError
+	if !errors.As(writeErr, &pgErr) || pgErr.ConstraintName != "conversation_member_backend_local_disjoint" {
+		t.Fatalf("writer resumed without namespace enforcement: %v", writeErr)
+	}
+	var admitted bool
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2)`,
+		conversation.ID, joining.ID).Scan(&admitted); err != nil || admitted {
+		t.Fatalf("rejected writer mutated membership: admitted=%t err=%v", admitted, err)
+	}
+	if got := snapshot(t); got != historyBefore {
+		t.Fatalf("rejected writer changed history:\nbefore %s\nafter  %s", historyBefore, got)
+	}
+
+	// A trigger failure aborts its transaction completely; rollback must retain
+	// the exact historical mapping and tombstone bytes.
+	failingTx, err := persistence.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, failure := failingTx.Exec(ctx, `
+		UPDATE conversation_member_local_ids SET local_id=$3
+		WHERE conversation_id=$1 AND user_id=$2`, conversation.ID, historical.ID, uuid.New())
+	if failure == nil {
+		t.Fatal("immutable historical mapping update unexpectedly succeeded")
+	}
+	if err := failingTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot(t); got != historyBefore {
+		t.Fatalf("failed transaction changed history:\nbefore %s\nafter  %s", historyBefore, got)
+	}
+
+	// The migration runner must skip the already-recorded version without
+	// recreating triggers or rewriting any historical identity.
+	if err := Migrate(ctx, persistence.pool); err != nil {
+		t.Fatalf("idempotent migration rerun: %v", err)
+	}
+	if got := snapshot(t); got != historyBefore {
+		t.Fatalf("migration rerun changed history:\nbefore %s\nafter  %s", historyBefore, got)
+	}
 }

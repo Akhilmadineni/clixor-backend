@@ -2,6 +2,15 @@
 -- backend/local UUID namespace. Refuse to guess if an older deployment already
 -- persisted contradictory history: silently remapping it would reinterpret
 -- existing expenses and settlements.
+--
+-- Deployments run migrations while the previous API replicas are still
+-- serving. Take both writer-conflicting locks before the first validation and
+-- retain them until this migration transaction commits. An old replica must
+-- therefore either commit before validation or resume only after the triggers
+-- below are visible; no write can slip between validation and enforcement.
+LOCK TABLE conversation_members, conversation_member_local_ids
+    IN SHARE ROW EXCLUSIVE MODE;
+
 DO $$
 BEGIN
     IF EXISTS (
