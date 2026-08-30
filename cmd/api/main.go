@@ -13,6 +13,7 @@ import (
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
+	"github.com/Akhilmadineni/clixor-backend/internal/chores"
 	"github.com/Akhilmadineni/clixor-backend/internal/config"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	"github.com/Akhilmadineni/clixor-backend/internal/httpapi"
@@ -306,6 +307,9 @@ func main() {
 		).Run(ctx)
 		go media.RunPendingCleanup(
 			ctx, persistence, cfg.Media.CleanupInterval, cfg.Media.CleanupBatchSize, logger,
+		)
+		go chores.RunRotationCleanup(
+			ctx, persistence, cfg.ChoreRotation.CleanupInterval, cfg.ChoreRotation.CleanupBatchSize, logger,
 		)
 	}
 	if mailCipher != nil {

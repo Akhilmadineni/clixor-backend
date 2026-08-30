@@ -256,6 +256,7 @@ type Store interface {
 	ListEntities(context.Context, uuid.UUID, uuid.UUID, string, time.Time, int) ([]domain.Entity, error)
 	DeleteEntity(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, *int64) (domain.Entity, error)
 	RotateChore(context.Context, RotateChoreParams) (RotateChoreResult, error)
+	PruneChoreRotationOperations(context.Context, time.Time, int) (int, error)
 
 	CreateMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
 	CreateProfileMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)

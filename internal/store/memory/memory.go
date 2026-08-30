@@ -93,6 +93,7 @@ type memoryChoreRotation struct {
 	ConversationID, ActorID, ChoreID uuid.UUID
 	RequestHash                      []byte
 	Result                           store.RotateChoreResult
+	ExpiresAt                        time.Time
 }
 
 func (*Store) Close()                     {}
@@ -1959,8 +1960,46 @@ func (s *Store) RotateChore(_ context.Context, p store.RotateChoreParams) (store
 		payload, _ := json.Marshal(entity)
 		s.appendOutbox("entity.updated", p.ConversationID, payload)
 	}
-	s.choreRotations[p.OperationID] = memoryChoreRotation{p.ConversationID, p.ActorID, p.ChoreID, append([]byte(nil), p.RequestHash...), cloneChoreRotationResult(result)}
+	s.choreRotations[p.OperationID] = memoryChoreRotation{
+		ConversationID: p.ConversationID, ActorID: p.ActorID, ChoreID: p.ChoreID,
+		RequestHash: append([]byte(nil), p.RequestHash...), Result: cloneChoreRotationResult(result),
+		ExpiresAt: now.Add(90 * 24 * time.Hour),
+	}
 	return cloneChoreRotationResult(result), nil
+}
+
+func (s *Store) PruneChoreRotationOperations(_ context.Context, cutoff time.Time, batchSize int) (int, error) {
+	if batchSize < 1 {
+		return 0, domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now := time.Now().UTC(); cutoff.After(now) {
+		cutoff = now
+	}
+	type expiredOperation struct {
+		id uuid.UUID
+		at time.Time
+	}
+	expired := make([]expiredOperation, 0)
+	for id, operation := range s.choreRotations {
+		if !operation.ExpiresAt.After(cutoff) {
+			expired = append(expired, expiredOperation{id: id, at: operation.ExpiresAt})
+		}
+	}
+	sort.Slice(expired, func(i, j int) bool {
+		if expired[i].at.Equal(expired[j].at) {
+			return expired[i].id.String() < expired[j].id.String()
+		}
+		return expired[i].at.Before(expired[j].at)
+	})
+	if len(expired) > batchSize {
+		expired = expired[:batchSize]
+	}
+	for _, operation := range expired {
+		delete(s.choreRotations, operation.id)
+	}
+	return len(expired), nil
 }
 
 func cloneChoreRotationResult(result store.RotateChoreResult) store.RotateChoreResult {

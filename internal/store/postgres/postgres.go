@@ -1820,6 +1820,38 @@ func (s *Store) RotateChore(ctx context.Context, p store.RotateChoreParams) (sto
 	return store.RotateChoreResult{OperationID: p.OperationID, Chore: chore, FeedItem: feed}, nil
 }
 
+func (s *Store) PruneChoreRotationOperations(ctx context.Context, cutoff time.Time, batchSize int) (int, error) {
+	if batchSize < 1 {
+		return 0, domain.ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	// Retention maintenance must never turn a slow delete into an unbounded API
+	// outage. This timeout is transaction-local and cannot leak to pooled sessions.
+	if _, err = tx.Exec(ctx, `SELECT set_config('statement_timeout','5s',true)`); err != nil {
+		return 0, err
+	}
+	tag, err := tx.Exec(ctx, `
+		WITH expired AS (
+			SELECT operation_id FROM chore_rotation_operations
+			WHERE expires_at <= LEAST($1,now())
+			ORDER BY expires_at,operation_id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM chore_rotation_operations operations
+		USING expired WHERE operations.operation_id=expired.operation_id`, cutoff, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 func (s *Store) CreateMedia(ctx context.Context, media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
 	if err := limits.Validate(); err != nil {
 		return domain.MediaObject{}, err

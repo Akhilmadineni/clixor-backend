@@ -141,3 +141,35 @@ func TestRotateChoreFeedConflictRollsBackChore(t *testing.T) {
 		t.Fatalf("chore mutated on failure: %+v", items)
 	}
 }
+
+func TestPruneChoreRotationOperationsRejectsInvalidBatchAndIsIdempotent(t *testing.T) {
+	persistence := New()
+	ctx := context.Background()
+	if _, err := persistence.PruneChoreRotationOperations(ctx, time.Now(), 0); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("invalid batch=%v", err)
+	}
+	owner, _ := persistence.CreateUser(ctx, store.CreateUserParams{Email: uuid.NewString() + "@prune.test"})
+	c, _ := persistence.CreateConversation(ctx, store.CreateConversationParams{Kind: "group", CreatedBy: owner.ID})
+	choreID, operationID := uuid.New(), uuid.New()
+	payload := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` + c.ID.String() + `","assignedTo":"` + owner.ID.String() + `"}`)
+	chore, _ := persistence.PutEntity(ctx, domain.Entity{ConversationID: c.ID, Kind: "chore", ID: choreID, CreatedBy: owner.ID, Payload: payload}, nil)
+	feed := json.RawMessage(`{"id":"` + operationID.String() + `","groupId":"` + c.ID.String() + `","relatedId":"` + choreID.String() + `","type":"note"}`)
+	digest := sha256.Sum256(feed)
+	if _, err := persistence.RotateChore(ctx, store.RotateChoreParams{OperationID: operationID, ConversationID: c.ID, ChoreID: choreID, ActorID: owner.ID, ExpectedChoreVersion: chore.Version, ChorePayload: payload, FeedPayload: feed, RequestHash: digest[:]}); err != nil {
+		t.Fatal(err)
+	}
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, time.Now().Add(89*24*time.Hour), 10); err != nil || deleted != 0 {
+		t.Fatalf("unexpired prune deleted=%d err=%v", deleted, err)
+	}
+	persistence.mu.Lock()
+	operation := persistence.choreRotations[operationID]
+	operation.ExpiresAt = time.Now().Add(-time.Hour)
+	persistence.choreRotations[operationID] = operation
+	persistence.mu.Unlock()
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, time.Now(), 10); err != nil || deleted != 1 {
+		t.Fatalf("expired prune deleted=%d err=%v", deleted, err)
+	}
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, time.Now(), 10); err != nil || deleted != 0 {
+		t.Fatalf("idempotent prune deleted=%d err=%v", deleted, err)
+	}
+}

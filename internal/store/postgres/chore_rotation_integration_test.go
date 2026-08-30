@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -290,4 +291,223 @@ func TestPostgresRotateChoreRechecksMembershipAfterConversationAuthorityLock(t *
 		t.Fatalf("removed actor mutated state: version=%d feed=%d operation=%d outbox=%d baseline_outbox=%d",
 			finalVersion, feedCount, operationCount, finalOutbox, baselineOutbox)
 	}
+}
+
+func TestPostgresPruneChoreRotationOperationsIsBoundedAndReplaySafe(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: uuid.NewString() + "@rotation-prune.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := persistence.CreateConversation(ctx, store.CreateConversationParams{Kind: "group", CreatedBy: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	choreID := uuid.New()
+	original := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` + c.ID.String() + `","assignedTo":"` + owner.ID.String() + `"}`)
+	chore, err := persistence.PutEntity(ctx, domain.Entity{ConversationID: c.ID, Kind: "chore", ID: choreID, Payload: original, CreatedBy: owner.ID}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operations := make([]uuid.UUID, 0, 4)
+	var retainedCommand store.RotateChoreParams
+	for i := 0; i < 4; i++ {
+		op := uuid.New()
+		feed := json.RawMessage(`{"id":"` + op.String() + `","groupId":"` + c.ID.String() + `","relatedId":"` + choreID.String() + `","type":"note"}`)
+		hash := sha256.Sum256(append(append([]byte(nil), original...), feed...))
+		command := store.RotateChoreParams{OperationID: op, ConversationID: c.ID, ChoreID: choreID, ActorID: owner.ID, ExpectedChoreVersion: chore.Version, ChorePayload: original, FeedPayload: feed, RequestHash: hash[:]}
+		result, rotateErr := persistence.RotateChore(ctx, command)
+		if rotateErr != nil {
+			t.Fatal(rotateErr)
+		}
+		chore = result.Chore
+		operations = append(operations, op)
+		retainedCommand = command
+	}
+	cutoff := time.Now().UTC()
+	if _, err := persistence.pool.Exec(ctx, `UPDATE chore_rotation_operations SET expires_at=$2 WHERE operation_id=ANY($1)`, operations[:3], cutoff.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.pool.Exec(ctx, `UPDATE chore_rotation_operations SET expires_at=$2 WHERE operation_id=$1`, operations[3], cutoff.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	replayDone := make(chan error, 1)
+	go func() {
+		_, replayErr := persistence.RotateChore(ctx, retainedCommand)
+		replayDone <- replayErr
+	}()
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, cutoff, 1); err != nil || deleted != 1 {
+		t.Fatalf("concurrent prune deleted=%d err=%v", deleted, err)
+	}
+	if replayErr := <-replayDone; replayErr != nil {
+		t.Fatalf("unexpired concurrent replay=%v", replayErr)
+	}
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, cutoff, 2); err != nil || deleted != 2 {
+		t.Fatalf("second bounded prune deleted=%d err=%v", deleted, err)
+	}
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, cutoff, 2); err != nil || deleted != 0 {
+		t.Fatalf("idempotent prune deleted=%d err=%v", deleted, err)
+	}
+	if deleted, err := persistence.PruneChoreRotationOperations(ctx, cutoff.Add(24*time.Hour), 2); err != nil || deleted != 0 {
+		t.Fatalf("future caller cutoff deleted=%d err=%v", deleted, err)
+	}
+	var surviving int
+	if err := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM chore_rotation_operations WHERE operation_id=$1`, operations[3]).Scan(&surviving); err != nil || surviving != 1 {
+		t.Fatalf("unexpired operation count=%d err=%v", surviving, err)
+	}
+}
+
+func TestPostgresRotateChoreSerializesWithDeleteEntityBothWinners(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+
+	setup := func(t *testing.T) (domain.User, domain.Conversation, domain.Entity, store.RotateChoreParams) {
+		owner, createErr := persistence.CreateUser(ctx, store.CreateUserParams{Email: uuid.NewString() + "@rotation-delete.test"})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		conversation, createErr := persistence.CreateConversation(ctx, store.CreateConversationParams{Kind: "group", CreatedBy: owner.ID})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		choreID, operationID := uuid.New(), uuid.New()
+		payload := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` + conversation.ID.String() + `","assignedTo":"` + owner.ID.String() + `"}`)
+		chore, createErr := persistence.PutEntity(ctx, domain.Entity{ConversationID: conversation.ID, Kind: "chore", ID: choreID, CreatedBy: owner.ID, Payload: payload}, nil)
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		feed := json.RawMessage(`{"id":"` + operationID.String() + `","groupId":"` + conversation.ID.String() + `","relatedId":"` + choreID.String() + `","type":"note"}`)
+		digest := sha256.Sum256(append(append([]byte(nil), payload...), feed...))
+		return owner, conversation, chore, store.RotateChoreParams{OperationID: operationID, ConversationID: conversation.ID, ChoreID: choreID, ActorID: owner.ID, ExpectedChoreVersion: chore.Version, ChorePayload: payload, FeedPayload: feed, RequestHash: digest[:]}
+	}
+	waitFor := func(t *testing.T, query string, args ...any) {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var ready bool
+			if queryErr := persistence.pool.QueryRow(ctx, query, args...).Scan(&ready); queryErr == nil && ready {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("timed out waiting for deterministic database lock barrier")
+	}
+
+	t.Run("delete wins", func(t *testing.T) {
+		owner, conversation, chore, command := setup(t)
+		barrier, beginErr := persistence.pool.Begin(ctx)
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		defer barrier.Rollback(ctx)
+		if _, beginErr = barrier.Exec(ctx, `SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, conversation.ID); beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		rotateDone := make(chan error, 1)
+		go func() {
+			_, rotateErr := persistence.RotateChore(ctx, command)
+			rotateDone <- rotateErr
+		}()
+		waitFor(t, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT metadata FROM conversations%')`)
+		if _, deleteErr := persistence.DeleteEntity(ctx, conversation.ID, owner.ID, "chore", chore.ID, &chore.Version); deleteErr != nil {
+			t.Fatal(deleteErr)
+		}
+		if commitErr := barrier.Commit(ctx); commitErr != nil {
+			t.Fatal(commitErr)
+		}
+		if rotateErr := <-rotateDone; !errors.Is(rotateErr, domain.ErrNotFound) {
+			t.Fatalf("rotation after delete=%v", rotateErr)
+		}
+		var feedCount, operationCount, updatedOutbox int
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM entities WHERE conversation_id=$1 AND kind='feed_item' AND id=$2`, conversation.ID, command.OperationID).Scan(&feedCount); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM chore_rotation_operations WHERE operation_id=$1`, command.OperationID).Scan(&operationCount); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE aggregate_id=$1 AND topic='entity.updated'`, conversation.ID).Scan(&updatedOutbox); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if feedCount != 0 || operationCount != 0 || updatedOutbox != 1 {
+			t.Fatalf("partial rotation feed=%d operation=%d updated_outbox=%d", feedCount, operationCount, updatedOutbox)
+		}
+	})
+
+	t.Run("rotation wins", func(t *testing.T) {
+		owner, conversation, chore, command := setup(t)
+		lockKey := int64(734198265)
+		name := "rotation_barrier_" + fmt.Sprintf("%x", command.OperationID[:4])
+		function := name + "_fn"
+		functionDDL := fmt.Sprintf(`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='%s'::uuid AND NEW.payload IS DISTINCT FROM OLD.payload THEN PERFORM pg_advisory_xact_lock(%d); END IF; RETURN NEW; END $$`, function, chore.ID, lockKey)
+		if _, ddlErr := persistence.pool.Exec(ctx, functionDDL); ddlErr != nil {
+			t.Fatal(ddlErr)
+		}
+		defer persistence.pool.Exec(context.Background(), fmt.Sprintf(`DROP FUNCTION IF EXISTS %s()`, function))
+		triggerDDL := fmt.Sprintf(`CREATE TRIGGER %s BEFORE UPDATE ON entities FOR EACH ROW EXECUTE FUNCTION %s()`, name, function)
+		if _, ddlErr := persistence.pool.Exec(ctx, triggerDDL); ddlErr != nil {
+			t.Fatal(ddlErr)
+		}
+		defer persistence.pool.Exec(context.Background(), fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON entities`, name))
+		locker, acquireErr := persistence.pool.Acquire(ctx)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		defer locker.Release()
+		if _, acquireErr = locker.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey); acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		defer locker.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockKey)
+		rotateDone := make(chan error, 1)
+		go func() {
+			_, rotateErr := persistence.RotateChore(ctx, command)
+			rotateDone <- rotateErr
+		}()
+		waitFor(t, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE 'UPDATE entities SET version=version+1,payload=%')`)
+		deleteDone := make(chan error, 1)
+		go func() {
+			_, deleteErr := persistence.DeleteEntity(ctx, conversation.ID, owner.ID, "chore", chore.ID, &chore.Version)
+			deleteDone <- deleteErr
+		}()
+		waitFor(t, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%SELECT version FROM entities%')`)
+		if _, releaseErr := locker.Exec(ctx, `SELECT pg_advisory_unlock($1)`, lockKey); releaseErr != nil {
+			t.Fatal(releaseErr)
+		}
+		if rotateErr := <-rotateDone; rotateErr != nil {
+			t.Fatal(rotateErr)
+		}
+		if deleteErr := <-deleteDone; !errors.Is(deleteErr, domain.ErrConflict) {
+			t.Fatalf("delete after rotation=%v", deleteErr)
+		}
+		var feedCount, operationCount, rotationOutbox int
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM entities WHERE conversation_id=$1 AND kind='feed_item' AND id=$2`, conversation.ID, command.OperationID).Scan(&feedCount); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM chore_rotation_operations WHERE operation_id=$1`, command.OperationID).Scan(&operationCount); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if queryErr := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE aggregate_id=$1 AND topic='entity.updated'`, conversation.ID).Scan(&rotationOutbox); queryErr != nil {
+			t.Fatal(queryErr)
+		}
+		if feedCount != 1 || operationCount != 1 || rotationOutbox != 3 {
+			t.Fatalf("feed=%d operation=%d updated_outbox=%d", feedCount, operationCount, rotationOutbox)
+		}
+	})
 }

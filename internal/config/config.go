@@ -46,6 +46,12 @@ type Config struct {
 	APNS              APNSConfig
 	APNSSandbox       APNSConfig
 	PushDelivery      PushDeliveryConfig
+	ChoreRotation     ChoreRotationConfig
+}
+
+type ChoreRotationConfig struct {
+	CleanupInterval  time.Duration
+	CleanupBatchSize int
 }
 
 type S3Config struct {
@@ -200,6 +206,14 @@ func Load() (Config, error) {
 	refreshTTL, err := time.ParseDuration(env("CLUSTER_REFRESH_TTL", "720h"))
 	if err != nil {
 		return Config{}, fmt.Errorf("CLUSTER_REFRESH_TTL: %w", err)
+	}
+	choreRotationCleanupInterval, err := envDuration("CLUSTER_CHORE_ROTATION_CLEANUP_INTERVAL", "1h")
+	if err != nil {
+		return Config{}, err
+	}
+	choreRotationCleanupBatchSize, err := envInt("CLUSTER_CHORE_ROTATION_CLEANUP_BATCH_SIZE", 500)
+	if err != nil {
+		return Config{}, err
 	}
 	otpChallengeTTL, err := envDuration("CLUSTER_OTP_CHALLENGE_TTL", "10m")
 	if err != nil {
@@ -389,7 +403,10 @@ func Load() (Config, error) {
 		AccessTTL:         accessTTL,
 		RefreshTTL:        refreshTTL,
 		AutoMigrate:       envBool("CLUSTER_AUTO_MIGRATE", true),
-		MediaProvider:     env("CLUSTER_MEDIA_PROVIDER", "s3"),
+		ChoreRotation: ChoreRotationConfig{
+			CleanupInterval: choreRotationCleanupInterval, CleanupBatchSize: choreRotationCleanupBatchSize,
+		},
+		MediaProvider: env("CLUSTER_MEDIA_PROVIDER", "s3"),
 		S3: S3Config{
 			Endpoint:       env("CLUSTER_S3_ENDPOINT", "127.0.0.1:9000"),
 			PublicEndpoint: os.Getenv("CLUSTER_S3_PUBLIC_ENDPOINT"),
@@ -549,6 +566,12 @@ func (cfg Config) Validate() error {
 	}
 	if err := cfg.validateMedia(); err != nil {
 		return err
+	}
+	if cfg.ChoreRotation.CleanupInterval < 5*time.Minute || cfg.ChoreRotation.CleanupInterval > 24*time.Hour {
+		return errors.New("CLUSTER_CHORE_ROTATION_CLEANUP_INTERVAL must be between 5m and 24h")
+	}
+	if cfg.ChoreRotation.CleanupBatchSize < 1 || cfg.ChoreRotation.CleanupBatchSize > 1000 {
+		return errors.New("CLUSTER_CHORE_ROTATION_CLEANUP_BATCH_SIZE must be between 1 and 1000")
 	}
 	if cfg.Environment == "production" && strings.TrimSpace(cfg.AppleClientID) == "" {
 		return errors.New("production CLUSTER_APPLE_CLIENT_ID is required")

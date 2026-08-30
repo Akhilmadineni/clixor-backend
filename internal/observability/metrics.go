@@ -47,6 +47,17 @@ var (
 		Help: "Expired media reservations and cleanup failures.",
 	}, []string{"result"})
 
+	ChoreRotationCleanup = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_total",
+		Help: "Expired chore-rotation replay records pruned and cleanup failures.",
+	}, []string{"result"})
+
+	ChoreRotationCleanupDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_duration_seconds",
+		Help:    "Duration of one bounded chore-rotation cleanup batch.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
+	})
+
 	PushFailures = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "clustr", Subsystem: "push", Name: "failures_total",
 		Help: "Push notification delivery failures.",
