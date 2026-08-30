@@ -882,18 +882,35 @@ def _nft_exact_cut(document: Mapping[str, Any] | None, table: str) -> bool:
     return table_seen and set(chains) == {"input", "output"}
 
 
-def _nft_table_exists(runner: CommandRunner, table: str) -> bool | None:
+def _known_nft_cut_states(runner: CommandRunner) -> Mapping[str, str] | None:
+    """Return an authoritative state for both controller-owned cut identities."""
+
     ruleset = _nft_json(runner, "list", "ruleset")
     if ruleset is None or not isinstance(ruleset.get("nftables"), list):
         return None
-    found = False
+    known = {EMERGENCY_NFT_TABLE, EMERGENCY_NFT_CANDIDATE}
+    present: set[str] = set()
     for item in ruleset["nftables"]:
         if not isinstance(item, dict):
             return None
-        value = item.get("table")
-        if isinstance(value, dict) and value.get("family") == "inet" and value.get("name") == table:
-            found = True
-    return found
+        table = item.get("table")
+        if not isinstance(table, dict):
+            continue
+        if table.get("family") != "inet" or not isinstance(table.get("name"), str):
+            continue
+        name = str(table["name"])
+        if name in known:
+            if name in present:
+                return None
+            present.add(name)
+    states: dict[str, str] = {}
+    for table in known:
+        if table not in present:
+            states[table] = "absent"
+            continue
+        document = _nft_json(runner, "list", "table", "inet", table)
+        states[table] = "exact" if _nft_exact_cut(document, table) else "unknown"
+    return states
 
 
 def _run_nft_transaction(runner: CommandRunner, content: bytes) -> bool:
@@ -917,39 +934,35 @@ def _run_nft_transaction(runner: CommandRunner, content: bytes) -> bool:
 
 
 def _activate_emergency_network_cut(runner: CommandRunner) -> bool:
-    """Transactionally replace only after a candidate kernel cut is proven."""
+    """Install or recover either exact controller-owned fail-closed identity."""
 
-    current = _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE)
-    if _nft_exact_cut(current, EMERGENCY_NFT_TABLE):
+    states = _known_nft_cut_states(runner)
+    if states is None:
+        return False
+    if "exact" in states.values():
+        # Either name is a complete kernel cut.  In particular, a crash after
+        # candidate installation is already a safe, idempotent terminal state.
         return True
-    runner.run(
-        [NFT_BINARY, "delete", "table", "inet", EMERGENCY_NFT_CANDIDATE],
-        check=False,
-    )
-    candidate = (
-        f"add table inet {EMERGENCY_NFT_CANDIDATE}\n"
-        f"add chain inet {EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
-        f"add chain inet {EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n"
-    ).encode("ascii")
-    if not _run_nft_transaction(runner, candidate):
-        return False
-    if not _nft_exact_cut(
-        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_CANDIDATE),
+
+    # Prefer creating an absent identity. If both known names contain
+    # unrecognized state, replace one within a single nft transaction; there is
+    # no verified cut to preserve, and nft applies the delete+add atomically.
+    target = next(
+        (table for table in (EMERGENCY_NFT_CANDIDATE, EMERGENCY_NFT_TABLE) if states[table] == "absent"),
         EMERGENCY_NFT_CANDIDATE,
-    ):
-        return False
-    exists = _nft_table_exists(runner, EMERGENCY_NFT_TABLE)
-    if exists is None:
-        return False
-    replacement = ""
-    if exists:
-        replacement += f"delete table inet {EMERGENCY_NFT_TABLE}\n"
-    replacement += f"rename table inet {EMERGENCY_NFT_CANDIDATE} {EMERGENCY_NFT_TABLE}\n"
-    if not _run_nft_transaction(runner, replacement.encode("ascii")):
+    )
+    commands = ""
+    if states[target] == "unknown":
+        commands += f"delete table inet {target}\n"
+    commands += (
+        f"add table inet {target}\n"
+        f"add chain inet {target} input {{ type filter hook input priority -300; policy drop; }}\n"
+        f"add chain inet {target} output {{ type filter hook output priority -300; policy drop; }}\n"
+    )
+    if not _run_nft_transaction(runner, commands.encode("ascii")):
         return False
     return _nft_exact_cut(
-        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE),
-        EMERGENCY_NFT_TABLE,
+        _nft_json(runner, "list", "table", "inet", target), target
     )
 
 
@@ -970,23 +983,25 @@ def _kernel_fail_closed(runner: CommandRunner) -> bool:
 
 
 def _clear_emergency_network_cut(runner: CommandRunner) -> None:
-    """Remove only an exact known cut and prove it absent from the ruleset."""
+    """Atomically clear every exact known cut and prove both names absent."""
 
-    exists = _nft_table_exists(runner, EMERGENCY_NFT_TABLE)
-    if exists is None:
+    states = _known_nft_cut_states(runner)
+    if states is None:
         raise ReconcileError("emergency network-cut state is unavailable")
-    if not exists:
-        return
-    if not _nft_exact_cut(
-        _nft_json(runner, "list", "table", "inet", EMERGENCY_NFT_TABLE),
-        EMERGENCY_NFT_TABLE,
-    ):
+    if "unknown" in states.values():
         raise ReconcileError("refusing to clear an unrecognized emergency network cut")
-    removed = runner.run(
-        [NFT_BINARY, "delete", "table", "inet", EMERGENCY_NFT_TABLE],
-        check=False,
-    )
-    if removed.returncode != 0 or _nft_table_exists(runner, EMERGENCY_NFT_TABLE) is not False:
+    exact = [
+        table
+        for table in (EMERGENCY_NFT_TABLE, EMERGENCY_NFT_CANDIDATE)
+        if states[table] == "exact"
+    ]
+    if not exact:
+        return
+    commands = "".join(f"delete table inet {table}\n" for table in exact)
+    if not _run_nft_transaction(runner, commands.encode("ascii")):
+        raise ReconcileError("emergency network cut was not removed")
+    final = _known_nft_cut_states(runner)
+    if final is None or any(state != "absent" for state in final.values()):
         raise ReconcileError("emergency network cut was not removed")
 
 

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ SPEC.loader.exec_module(RECONCILER)
 
 SOURCE_SHA = "0123456789abcdef0123456789abcdef01234567"
 IMAGE_ID = "sha256:" + "a" * 64
+D2F5_SOURCE_SHA = "d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c"
 TEMP_ROOT = "/private/tmp" if Path("/private/tmp").is_dir() else None
 
 
@@ -80,21 +82,84 @@ class GitArchiveRunner(FakeRunner):
         )
 
 
-class NftTransactionRunner(FakeRunner):
-    def __init__(self, outputs=None, transaction_results=()):
+class StatefulNftRunner(FakeRunner):
+    """Small nft state model that rejects unsupported grammar transactionally."""
+
+    def __init__(self, tables=None, transaction_results=(), outputs=None):
         super().__init__(outputs)
+        self.tables = json.loads(json.dumps(tables or {}))
         self.transaction_results = list(transaction_results)
         self.transactions: list[str] = []
 
+    @staticmethod
+    def exact_table():
+        return {
+            "input": {"type": "filter", "hook": "input", "prio": -300, "policy": "drop"},
+            "output": {"type": "filter", "hook": "output", "prio": -300, "policy": "drop"},
+        }
+
+    def _table_document(self, name):
+        if name not in self.tables:
+            return None
+        objects = [{"table": {"family": "inet", "name": name}}]
+        for chain_name, values in self.tables[name].items():
+            objects.append({"chain": {"family": "inet", "table": name, "name": chain_name, **values}})
+        return json.dumps({"nftables": objects}).encode()
+
+    def _ruleset_document(self):
+        return json.dumps({"nftables": [
+            {"table": {"family": "inet", "name": name}}
+            for name in sorted(self.tables)
+        ]}).encode()
+
+    def _apply(self, content):
+        state = json.loads(json.dumps(self.tables))
+        add_table = re.compile(r"add table inet ([a-z0-9_]+)$")
+        delete_table = re.compile(r"delete table inet ([a-z0-9_]+)$")
+        add_chain = re.compile(
+            r"add chain inet ([a-z0-9_]+) (input|output) \{ type filter hook (input|output) priority -300; policy drop; \}$"
+        )
+        for line in content.splitlines():
+            if not line or "rename" in line:
+                raise AssertionError(f"unsupported nft grammar: {line!r}")
+            if match := add_table.fullmatch(line):
+                if match.group(1) in state:
+                    raise AssertionError("duplicate nft table")
+                state[match.group(1)] = {}
+                continue
+            if match := delete_table.fullmatch(line):
+                if match.group(1) not in state:
+                    raise AssertionError("delete of absent nft table")
+                del state[match.group(1)]
+                continue
+            if match := add_chain.fullmatch(line):
+                table, name, hook = match.groups()
+                if table not in state or name in state[table] or name != hook:
+                    raise AssertionError("invalid nft chain transition")
+                state[table][name] = {
+                    "type": "filter", "hook": hook, "prio": -300, "policy": "drop",
+                }
+                continue
+            raise AssertionError(f"unsupported nft grammar: {line!r}")
+        self.tables = state
+
     def run(self, arguments, *, check=True, capture=False, environment=None):
-        if tuple(arguments[:2]) == (RECONCILER.NFT_BINARY, "-f"):
-            self.calls.append(tuple(arguments))
-            self.transactions.append(Path(arguments[2]).read_text(encoding="ascii"))
-            returncode = self.transaction_results.pop(0)
-            result = subprocess.CompletedProcess(list(arguments), returncode, b"", b"")
-            if check and returncode:
-                raise RECONCILER.ReconcileError("fake nft transaction failed")
-            return result
+        key = tuple(arguments)
+        if key[:3] == (RECONCILER.NFT_BINARY, "-j", "list"):
+            self.calls.append(key)
+            if key[3:] == ("ruleset",):
+                return subprocess.CompletedProcess(list(arguments), 0, self._ruleset_document(), b"")
+            if key[3:5] == ("table", "inet") and len(key) == 6:
+                document = self._table_document(key[5])
+                return subprocess.CompletedProcess(list(arguments), 0 if document else 1, document or b"", b"")
+        if key[:2] == (RECONCILER.NFT_BINARY, "-f"):
+            self.calls.append(key)
+            content = Path(key[2]).read_text(encoding="ascii")
+            self.transactions.append(content)
+            returncode = self.transaction_results.pop(0) if self.transaction_results else 0
+            if returncode == 0:
+                self._apply(content)
+            return subprocess.CompletedProcess(list(arguments), returncode, b"", b"")
         return super().run(arguments, check=check, capture=capture, environment=environment)
 
 
@@ -476,61 +541,34 @@ class HostToolSelectionTests(unittest.TestCase):
 
 class LegacyBaselineTests(unittest.TestCase):
     def _git_object_store(self, fixture: RuntimeFixture) -> tuple[Path, str, bytes]:
-        work = fixture.root / "legacy-git-work"
-        shutil.copytree(fixture.source, work)
-        # Real 9e41-style application history predates both boot helpers.  The
-        # transition must source them from the separately pinned controller.
-        for name in ("hydrate-vault-secrets.py", "prepare-runtime-secrets.sh"):
-            (work / "deploy" / "oci" / name).unlink()
-        original_go_mod = (work / "go.mod").read_bytes()
-        subprocess.run(
-            ["/usr/bin/git", "init", "--initial-branch=main", str(work)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
-            [
-                "/usr/bin/git",
-                "-C",
-                str(work),
-                "-c",
-                "user.name=Clixor Test",
-                "-c",
-                "user.email=clixor-test@example.invalid",
-                "add",
-                ".",
-            ],
-            check=True,
-        )
-        subprocess.run(
-            [
-                "/usr/bin/git",
-                "-C",
-                str(work),
-                "-c",
-                "user.name=Clixor Test",
-                "-c",
-                "user.email=clixor-test@example.invalid",
-                "commit",
-                "-m",
-                "legacy fixture",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        repository = SCRIPT_ROOT.parent.parent
+        # Exercise the actual live legacy application object, not a newly
+        # synthesized tree that happens to omit modern boot helpers.
         source_sha = subprocess.run(
-            ["/usr/bin/git", "-C", str(work), "rev-parse", "HEAD"],
-            check=True,
-            stdout=subprocess.PIPE,
+            ["/usr/bin/git", "-C", str(repository), "rev-parse", D2F5_SOURCE_SHA],
+            check=True, stdout=subprocess.PIPE,
         ).stdout.decode("ascii").strip()
+        self.assertEqual(source_sha, D2F5_SOURCE_SHA)
+        original_go_mod = subprocess.run(
+            ["/usr/bin/git", "-C", str(repository), "show", f"{source_sha}:go.mod"],
+            check=True, stdout=subprocess.PIPE,
+        ).stdout
+        for helper in ("hydrate-vault-secrets.py", "prepare-runtime-secrets.sh"):
+            missing = subprocess.run(
+                ["/usr/bin/git", "-C", str(repository), "cat-file", "-e", f"{source_sha}:deploy/oci/{helper}"],
+                check=False, stderr=subprocess.DEVNULL,
+            )
+            self.assertNotEqual(missing.returncode, 0, f"historical d2f5 unexpectedly contains {helper}")
         bare = fixture.root / "legacy-source.git"
         subprocess.run(
-            ["/usr/bin/git", "clone", "--bare", str(work), str(bare)],
+            ["/usr/bin/git", "clone", "--bare", "--no-local", str(repository), str(bare)],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["/usr/bin/git", f"--git-dir={bare}", "cat-file", "-e", f"{source_sha}^{{commit}}"],
+            check=True,
         )
         bare.chmod(0o700)
         return bare, source_sha, original_go_mod
@@ -1523,27 +1561,15 @@ class FailClosedStopTests(unittest.TestCase):
         outputs[("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")] = failure
         outputs[("/usr/bin/docker", "info", "--format", "{{json .LiveRestoreEnabled}}")] = failure
 
-        def cut(table: str) -> bytes:
-            return json.dumps({"nftables": [
-                {"table": {"family": "inet", "name": table}},
-                {"chain": {"family": "inet", "table": table, "name": "input", "type": "filter", "hook": "input", "prio": -300, "policy": "drop"}},
-                {"chain": {"family": "inet", "table": table, "name": "output", "type": "filter", "hook": "output", "prio": -300, "policy": "drop"}},
-            ]}).encode()
-
-        current_list = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", RECONCILER.EMERGENCY_NFT_TABLE)
         candidate_list = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", RECONCILER.EMERGENCY_NFT_CANDIDATE)
-        outputs[current_list] = [(1, b""), (0, cut(RECONCILER.EMERGENCY_NFT_TABLE))]
-        outputs[candidate_list] = (0, cut(RECONCILER.EMERGENCY_NFT_CANDIDATE))
-        outputs[(RECONCILER.NFT_BINARY, "-j", "list", "ruleset")] = (0, b'{"nftables": []}')
-        runner = FakeRunner(outputs)
+        runner = StatefulNftRunner(outputs=outputs)
         with tempfile.TemporaryDirectory(prefix="no-cgroups-", dir=TEMP_ROOT) as temporary, mock.patch.object(
             RECONCILER, "CGROUP_SYSTEM_SLICE", Path(temporary)
         ):
             with self.assertRaisesRegex(RECONCILER.ReconcileError, "shutdown"):
                 RECONCILER._stop_ingress_and_containers(runner)
-        self.assertGreaterEqual(len([call for call in runner.calls if call[:2] == (RECONCILER.NFT_BINARY, "-f")]), 2)
+        self.assertEqual(len([call for call in runner.calls if call[:2] == (RECONCILER.NFT_BINARY, "-f")]), 1)
         self.assertIn(candidate_list, runner.calls)
-        self.assertIn(current_list, runner.calls)
 
     def test_unauthoritative_docker_inventory_and_live_restore_force_isolation(self) -> None:
         inventory_call = ("/usr/bin/docker", "container", "ls", "--all", "--no-trunc", "--format", "{{json .}}")
@@ -1595,41 +1621,120 @@ class EmergencyNetworkCutTests(unittest.TestCase):
         self.assertFalse(RECONCILER._nft_exact_cut(extra, table))
 
     def test_existing_exact_cut_is_idempotent(self) -> None:
-        table = RECONCILER.EMERGENCY_NFT_TABLE
-        call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
-        runner = NftTransactionRunner({call: (0, self._cut(table))})
-        self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
-        self.assertEqual(runner.transactions, [])
+        for table in (RECONCILER.EMERGENCY_NFT_TABLE, RECONCILER.EMERGENCY_NFT_CANDIDATE):
+            with self.subTest(table=table):
+                runner = StatefulNftRunner({table: StatefulNftRunner.exact_table()})
+                self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
+                self.assertEqual(runner.transactions, [])
 
-    def test_failed_replacement_keeps_verified_candidate_and_old_cut(self) -> None:
-        table = RECONCILER.EMERGENCY_NFT_TABLE
+    def test_activation_is_atomic_and_retry_safe_at_every_boundary(self) -> None:
         candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
-        current_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
-        candidate_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", candidate)
-        ruleset_call = (RECONCILER.NFT_BINARY, "-j", "list", "ruleset")
-        malformed = self._cut(table, policy="accept")
-        ruleset = json.dumps({"nftables": [{"table": {"family": "inet", "name": table}}]}).encode()
-        runner = NftTransactionRunner(
-            {current_call: (0, malformed), candidate_call: (0, self._cut(candidate)), ruleset_call: (0, ruleset)},
-            transaction_results=(0, 1),
-        )
-        self.assertFalse(RECONCILER._activate_emergency_network_cut(runner))
-        self.assertEqual(len(runner.transactions), 2)
-        self.assertNotIn(f"delete table inet {table}", runner.transactions[0])
-        self.assertIn(f"delete table inet {table}\nrename table", runner.transactions[1])
+        failed = StatefulNftRunner(transaction_results=(1,))
+        self.assertFalse(RECONCILER._activate_emergency_network_cut(failed))
+        self.assertEqual(failed.tables, {})
+        self.assertNotIn("rename", "".join(failed.transactions))
+
+        installed = StatefulNftRunner()
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(installed))
+        self.assertEqual(installed.tables, {candidate: StatefulNftRunner.exact_table()})
+        # Crash after the transaction but before userspace verification: retry
+        # recognizes the exact candidate as the continuous kernel authority.
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(installed))
+        self.assertEqual(len(installed.transactions), 1)
+
+    def test_unknown_primary_is_never_deleted_when_candidate_can_be_added(self) -> None:
+        primary = RECONCILER.EMERGENCY_NFT_TABLE
+        candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        malformed = {"input": {"type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}
+        runner = StatefulNftRunner({primary: malformed})
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
+        self.assertEqual(runner.tables[primary], malformed)
+        self.assertEqual(runner.tables[candidate], StatefulNftRunner.exact_table())
+        self.assertNotIn(f"delete table inet {primary}", runner.transactions[0])
+
+    def test_both_unknown_replacement_is_one_atomic_supported_transaction(self) -> None:
+        primary = RECONCILER.EMERGENCY_NFT_TABLE
+        candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        malformed = {"input": {"type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}
+        failed = StatefulNftRunner({primary: malformed, candidate: malformed}, (1,))
+        self.assertFalse(RECONCILER._activate_emergency_network_cut(failed))
+        self.assertEqual(failed.tables, {primary: malformed, candidate: malformed})
+        runner = StatefulNftRunner({primary: malformed, candidate: malformed})
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
+        self.assertEqual(runner.tables[primary], malformed)
+        self.assertEqual(runner.tables[candidate], StatefulNftRunner.exact_table())
+        self.assertIn(f"delete table inet {candidate}\nadd table inet {candidate}", runner.transactions[0])
+        self.assertNotIn("rename", runner.transactions[0])
 
     def test_clear_refuses_unknown_cut_and_is_retry_idempotent(self) -> None:
         table = RECONCILER.EMERGENCY_NFT_TABLE
-        ruleset_call = (RECONCILER.NFT_BINARY, "-j", "list", "ruleset")
-        list_call = (RECONCILER.NFT_BINARY, "-j", "list", "table", "inet", table)
-        present = json.dumps({"nftables": [{"table": {"family": "inet", "name": table}}]}).encode()
-        runner = FakeRunner({ruleset_call: (0, present), list_call: (0, self._cut(table, prio=0))})
+        malformed = {"input": {"type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}
+        runner = StatefulNftRunner({table: malformed})
         with self.assertRaisesRegex(RECONCILER.ReconcileError, "unrecognized"):
             RECONCILER._clear_emergency_network_cut(runner)
-        self.assertNotIn((RECONCILER.NFT_BINARY, "delete", "table", "inet", table), runner.calls)
-        absent = FakeRunner({ruleset_call: (0, b'{"nftables": []}')})
+        self.assertEqual(runner.tables, {table: malformed})
+        absent = StatefulNftRunner()
         RECONCILER._clear_emergency_network_cut(absent)
         RECONCILER._clear_emergency_network_cut(absent)
+
+    def test_clear_both_exact_cuts_is_atomic_failure_safe_and_idempotent(self) -> None:
+        primary = RECONCILER.EMERGENCY_NFT_TABLE
+        candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        both = {primary: StatefulNftRunner.exact_table(), candidate: StatefulNftRunner.exact_table()}
+        failed = StatefulNftRunner(both, (1,))
+        with self.assertRaisesRegex(RECONCILER.ReconcileError, "not removed"):
+            RECONCILER._clear_emergency_network_cut(failed)
+        self.assertEqual(failed.tables, both)
+        runner = StatefulNftRunner(both)
+        RECONCILER._clear_emergency_network_cut(runner)
+        self.assertEqual(runner.tables, {})
+        self.assertIn(f"delete table inet {primary}", runner.transactions[0])
+        self.assertIn(f"delete table inet {candidate}", runner.transactions[0])
+        RECONCILER._clear_emergency_network_cut(runner)
+        self.assertEqual(len(runner.transactions), 1)
+
+    def test_candidate_only_crash_state_can_recover_then_reopen_after_readiness(self) -> None:
+        candidate = RECONCILER.EMERGENCY_NFT_CANDIDATE
+        runner = StatefulNftRunner({candidate: StatefulNftRunner.exact_table()})
+        self.assertTrue(RECONCILER._activate_emergency_network_cut(runner))
+        self.assertEqual(runner.transactions, [])
+        RECONCILER._clear_emergency_network_cut(runner)
+        self.assertEqual(runner.tables, {})
+        self.assertEqual(runner.transactions, [f"delete table inet {candidate}\n"])
+
+    def test_target_ubuntu_nft_accepts_every_transaction_grammar(self) -> None:
+        nft = Path(RECONCILER.NFT_BINARY)
+        if not nft.is_file() or shutil.which("unshare") is None or shutil.which("sudo") is None:
+            self.skipTest("target nft/unshare/sudo integration tools are unavailable")
+        version = subprocess.run([str(nft), "--version"], check=True, stdout=subprocess.PIPE, text=True).stdout
+        match = re.search(r"v(\d+)\.(\d+)\.(\d+)", version)
+        self.assertIsNotNone(match)
+        self.assertGreaterEqual(tuple(map(int, match.groups())), (1, 0, 9))
+        transactions = (
+            f"add table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n",
+            f"add table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} input {{ type filter hook input priority -300; policy drop; }}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} output {{ type filter hook output priority -300; policy drop; }}\n"
+            f"delete table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n",
+            f"add table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} input {{ type filter hook input priority -300; policy drop; }}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_TABLE} output {{ type filter hook output priority -300; policy drop; }}\n"
+            f"add table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} input {{ type filter hook input priority -300; policy drop; }}\n"
+            f"add chain inet {RECONCILER.EMERGENCY_NFT_CANDIDATE} output {{ type filter hook output priority -300; policy drop; }}\n"
+            f"delete table inet {RECONCILER.EMERGENCY_NFT_TABLE}\n"
+            f"delete table inet {RECONCILER.EMERGENCY_NFT_CANDIDATE}\n",
+        )
+        for content in transactions:
+            with tempfile.NamedTemporaryFile("w", encoding="ascii") as source:
+                source.write(content)
+                source.flush()
+                subprocess.run(
+                    ["sudo", "-n", "unshare", "--net", str(nft), "--check", "--file", source.name],
+                    check=True,
+                )
 
 
 class PreMigrationDurabilityTests(unittest.TestCase):

@@ -464,7 +464,14 @@ and does not perform a duplicate Vault fetch. It then restores the selected
 release's complete checksummed runtime bundle,
 force-recreates its exact image/Compose selection, restores the release-selected
 cloudflared executable, verifies both replicas plus exact local revision
-readiness, and only then writes `/run/clixor/runtime-ready`. Cloudflared and the
+readiness, clears every exact controller-owned nft cut in one transaction,
+rechecks the host route while the ready marker and Cloudflare remain closed,
+and only then writes `/run/clixor/runtime-ready`. The two recognized nft table
+identities are `clixor_fail_closed` and `clixor_fail_closed_candidate`; either
+exact input-and-output DROP table is a complete crash-safe cut. Recovery never
+renames nft tables, never deletes the sole verified cut while installing one,
+and accepts a candidate-only state left after power loss. Unknown lookalike
+tables are never cleared automatically. Cloudflared and the
 backup/restore/health services are ordered after that reconciler and require the
 ready marker. A verified first boot with no cloudflared unit is handled
 idempotently; any active or unverifiable ingress state still fails closed. The
