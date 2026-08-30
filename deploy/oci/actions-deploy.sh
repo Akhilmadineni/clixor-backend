@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 umask 077
+ulimit -c 0
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 HOME=/root
 LC_ALL=C
@@ -63,19 +64,24 @@ for numeric_value in "${source_run_id}" "${deploy_run_id}" "${deploy_run_attempt
   esac
 done
 
-api_env=/srv/clixor/secrets/api.env
+api_env=/run/clixor/secrets/active/api.env
 [ -f "${api_env}" ] && [ ! -L "${api_env}" ] || \
   fail "production API configuration is missing or unsafe"
-[ "$(stat -c %u "${api_env}")" -eq 0 ] || \
-  fail "production API configuration is not root-owned"
-[ "$(stat -c %a "${api_env}")" = "600" ] || \
-  fail "production API configuration must have mode 0600"
+[ "$(stat -c '%u:%g:%a' "${api_env}")" = "0:65532:440" ] || \
+  fail "production API configuration has unsafe ownership or mode"
 grep -qx 'CLUSTER_ENV=production' "${api_env}" || \
   fail "Actions deploys require CLUSTER_ENV=production"
 grep -qx 'CLUSTER_VERIFICATION_PROVIDER=telnyx' "${api_env}" || \
   fail "Actions deploys require the Telnyx verification provider"
 grep -qx 'CLUSTER_MAIL_PROVIDER=smtp' "${api_env}" || \
   fail "Actions deploys require durable SMTP password-reset delivery"
+
+[ -f /etc/clixor/secret-mode ] && [ ! -L /etc/clixor/secret-mode ] || \
+  fail "production secret mode is unavailable"
+[ "$(stat -c '%u:%g:%a' /etc/clixor/secret-mode)" = "0:0:600" ] || \
+  fail "production secret mode has unsafe ownership or mode"
+[ "$(sed -n '1p' /etc/clixor/secret-mode)" = "vault" ] || \
+  fail "production Actions require OCI Vault secret mode"
 
 approval_audience="clixor-oci-production:${source_sha}:${source_run_id}:${deploy_run_id}:${deploy_run_attempt}"
 trusted_env /usr/bin/python3 "${approval_helper}" \
@@ -144,6 +150,6 @@ trusted_env /usr/bin/tar --extract --file="${source_archive}" --directory="${app
 [ -f "${approved_source}/deploy/oci/deploy.sh" ] || \
   fail "approved archive has no OCI deployment entrypoint"
 
-trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true \
+trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true \
   /bin/sh "${approved_source}/deploy/oci/deploy.sh" \
   "${approved_source}" "${source_sha}" "${deploy_run_id}-${deploy_run_attempt}"

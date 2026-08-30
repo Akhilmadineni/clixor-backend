@@ -24,7 +24,8 @@ ingress and reaches that bridge from the host.
 - `/srv/clixor/backups` is only local staging. A root-owned timer copies verified
   dumps to the private, versioned Object Storage backup bucket; that still does
   not make the single-VM database highly available.
-- Secrets live only in root-owned, per-service environment files outside the
+- Production secrets live in OCI Vault and are materialized only into a
+  root-owned, atomically selected generation on `/run` tmpfs outside the
   repository. PostgreSQL, Redis, NATS, backup, Grafana, migration, and the API
   each receive only their allowlisted configuration; only the API receives JWT,
   OTP/Telnyx, APNs, SMTP, reset-HMAC, and mail-queue keys. Never
@@ -63,10 +64,12 @@ sudo sh deploy/oci/bootstrap.sh
 The script verifies ARM64, 2 OCPUs, and approximately 12 GB RAM; installs Docker,
 its Compose plugin, and OCI CLI 3.91.0 through a checksum-pinned official installer; creates the
 data/runtime tree; resolves Object Storage namespace/region through the instance
-principal and OCI metadata; generates an internal CA; and creates
-root-owned scoped files under `/srv/clixor/secrets` with random local
-credentials. `runtime.env` is retained only as a non-consumed migration
-checkpoint for unknown legacy entries.
+principal and OCI metadata; generates an internal CA; and creates root-owned
+scoped files under `/srv/clixor/secrets` with random local staging credentials.
+It selects those files through
+`/run/clixor/secrets/active -> /srv/clixor/secrets`. `runtime.env` is retained
+only as a non-consumed migration checkpoint for unknown legacy entries. Staging
+bootstrap is not a production-secret source.
 
 On an existing VM, bootstrap performs a one-time safe upgrade from the former
 all-service `runtime.env`: it rejects symbolic links and duplicate assignments,
@@ -76,7 +79,7 @@ from the legacy file only after every new file is ready. Rerunning it is
 idempotent. During this Compose boundary only, application rollback uses the new
 scoped model with the prior API image so provider credentials are not re-exposed
 to data containers. Existing data, backup, and Grafana containers whose immutable
-Docker configuration still contains legacy `CLUSTER_*` values are force-replaced
+Docker configuration still contains secret-valued environment entries are force-replaced
 once (a stopped Grafana container is removed); persistent data volumes are not
 deleted.
 
@@ -108,7 +111,95 @@ start.
 Do not copy an `*.env.example` file over a generated secret file. The examples
 contain placeholders and are references, not secret generators.
 
-## 3. Deploy an immutable source revision
+## 3. Hydrate production secrets from OCI Vault
+
+Terraform creates the Vault, encryption key, instance dynamic group, and
+`read secret-bundles` policy, but intentionally creates no secret objects or
+values. Create these seven secrets outside Terraform:
+
+- `api_env`, `postgres_env`, `redis_env`, `nats_env`, and `grafana_env`, whose
+  plaintext contents follow the matching checked-in examples;
+- `apns_production_p8`, containing the complete PKCS#8 Apple private-key file;
+  and
+- `cloudflare_token`, containing only the remotely managed tunnel token.
+
+`backup.env`, `migrate.env`, and `metrics.token` are derived by the hydrator;
+do not create independent Vault copies that could drift. Add
+`apns_sandbox_p8` only when `api_env` sets
+`CLUSTER_APNS_SANDBOX_PRIVATE_KEY_FILE=/run/secrets/apns/AuthKey-sandbox.p8`.
+
+Use OCI Console's Vault secret-content upload from a protected operator
+workstation, or another audited input mechanism that does not put plaintext in
+shell arguments or history. Never add `oci_vault_secret`, secret-content
+variables, generated passwords, or provider credentials to Terraform: those
+persist in state. Do not put secret payloads in Git, GitHub Actions, cloud-init,
+Resource Manager variables, the OCID mapping, or command lines.
+
+After creating the secrets, copy only their nonsecret OCIDs into the mapping:
+
+```sh
+sudo install -d -o root -g root -m 0700 /etc/clixor
+sudo install -o root -g root -m 0600 \
+  deploy/oci/vault-secrets.map.example /etc/clixor/vault-secrets.map
+sudoedit /etc/clixor/vault-secrets.map
+printf 'vault\n' > /tmp/clixor-secret-mode
+sudo install -o root -g root -m 0600 \
+  /tmp/clixor-secret-mode /etc/clixor/secret-mode
+rm /tmp/clixor-secret-mode
+```
+
+Replace every example OCID; placeholders are rejected. Each artifact must use a
+different `ocid1.vaultsecret...` identifier. The mapping accepts no values,
+shell syntax, unknown names, duplicate names, duplicate OCIDs, symbolic links,
+or group/world access.
+
+Run bootstrap once more from the reviewed checkout. It installs the boot-time
+unit and fixed-path hydrator, verifies that `/run/clixor/secrets` is backed by
+`tmpfs`, hydrates it, and makes Docker require successful preparation on every
+boot:
+
+```sh
+sudo sh deploy/oci/bootstrap.sh
+sudo readlink /run/clixor/secrets/active
+```
+
+It authenticates only as the VM instance principal, requests the `CURRENT`
+bundle for every mapped OCID, enforces canonical base64 and bounded content,
+validates exact per-service key allowlists, checks cross-service dependency
+credentials, parses APNs private keys with OpenSSL, and validates the Cloudflare
+token. It stages every artifact under mode-0700 tmpfs storage and emits no secret
+output. Only after every fetch and validation succeeds does one atomic symlink
+swap select the complete generation. Identical reruns keep the current
+generation. Fetch, validation, or pointer-swap failure leaves the previous
+generation selected for the current boot. Vault remains the externally
+recoverable source across reboot; Docker and cloudflared fail closed if boot-time
+hydration cannot reconstruct a complete generation.
+
+Compose mounts the tmpfs files and stores only nonsecret file paths in container
+metadata. API and migration binaries parse their mounted file before loading
+configuration; PostgreSQL uses `POSTGRES_PASSWORD_FILE`, Redis uses an ACL file,
+NATS and Grafana use generated config files, backup uses `PGPASSFILE`, and
+cloudflared uses a systemd credential. No secret-valued `env_file` is used.
+Loaded API values are still present in process memory/environment while running,
+so host root, the Docker daemon, and code execution inside that container remain
+trusted boundaries; tmpfs is an at-rest and metadata hardening boundary, not
+protection from root compromise.
+
+The production Actions entrypoint repeats hydration while holding the deployment
+lock before any container, file, backup, or migration mutation. Production
+deployment refuses `secret-mode=staging`, persistent staging files, a non-tmpfs
+target, or a missing/unsafe hydration marker. A manual staging deploy may use the
+explicit `/run/.../active -> /srv/clixor/secrets` fallback and locally generated
+credentials.
+
+An upgraded host may still contain the former persistent production files under
+`/srv/clixor/secrets` for a deliberately bounded rollback window. After the new
+path-only release, reboot hydration, backup restore drill, and provider canaries
+all pass, inventory and securely remove those legacy values in a separately
+reviewed maintenance operation. Never automate that cleanup as part of hydration
+or deployment, and never remove the externally recoverable Vault versions.
+
+## 4. Deploy an immutable source revision
 
 From the source checkout:
 
@@ -197,8 +288,11 @@ It never executes a file from the runner-writable checkout and invokes the
 verifier, Git transport, archive tools, and deployment under an explicit empty
 environment rather than inheriting runner-controlled process settings. No OCI,
 GitHub, or application credential belongs in GitHub Actions.
+Every production run first fetches and validates all mapped Vault `CURRENT`
+bundles through the instance principal while holding the root-owned deployment
+lock and before any deployment mutation.
 The root-owned entrypoint additionally refuses automated deployment unless the
-scoped API configuration is mode `0600`, root-owned, and explicitly enables
+hydrated scoped API configuration is mode `0600`, root-owned, and explicitly enables
 production, Telnyx verification, and durable SMTP reset delivery. Manual staging
 deployments remain available for provider canaries before this gate is enabled.
 
@@ -274,7 +368,7 @@ sudo ./svc.sh status
 
 Keep the runner repository-scoped and dedicated to production. Do not add the
 custom production label to the retired NAS runner or any shared runner. Leave the
-OCI runner offline until all scoped files under `/srv/clixor/secrets`, native OCI media,
+OCI runner offline until the Vault-selected files under `/run/clixor/secrets/active`, native OCI media,
 backups, and the Cloudflare tunnel have passed their manual release gates. If the
 repository owner/name or workflow path changes, update and reinstall both
 root-owned verification files before enabling it.
@@ -295,7 +389,7 @@ Treat code execution inside an API container as equivalent to the narrowly scope
 instance-principal media permissions and keep its dynamic-group policy bucket
 specific.
 
-## 4. Move Cloudflare ingress
+## 5. Move Cloudflare ingress
 
 Install cloudflared **2025.4.0 or newer** from Cloudflare's signed package
 repository; `--token-file` is unavailable in older releases and the installer
@@ -306,13 +400,10 @@ hostname routes on that tunnel:
 - `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
 - `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
 
-Download the tunnel token into a temporary protected file without printing it or
-putting it in shell history, then install it and the hardened connector unit:
+After selecting the production Vault generation, install the hardened connector
+unit. It loads the token from the same atomic `active` generation:
 
 ```sh
-sudo install -d -o root -g root -m 0700 /etc/cloudflared
-sudo install -o root -g root -m 0600 /secure/input/clixor-cloudflare-token \
-  /etc/cloudflared/token
 sudo sh deploy/oci/install-cloudflared-service.sh \
   "$PWD/deploy/oci/cloudflared.service"
 sudo systemctl status --no-pager cloudflared.service
@@ -345,10 +436,13 @@ jitter, dead-lettering, and bounded retention. For OCI Email Delivery in
 Phoenix, use authenticated implicit TLS at
 `smtp.email.us-phoenix-1.oci.oraclecloud.com:465`, or mandatory STARTTLS at port
 587. Configure the SMTP credential, approved `no-reply@mail.atlanteanz.com` sender,
-distinct reset HMAC, and padded-base64 32-byte queue key only in
-`/srv/clixor/secrets/api.env`. Keep `CLUSTER_MAIL_PROVIDER=disabled` until SPF,
-DKIM, DMARC, suppression handling, and real-mailbox reset/change canaries pass;
-the reset endpoints then return 503 instead of offering an unsafe shortcut.
+distinct reset HMAC, and padded-base64 32-byte queue key only in the `api_env`
+Vault bundle. Keep the application in explicit staging mode with
+`CLUSTER_MAIL_PROVIDER=disabled` until SPF, DKIM, DMARC, suppression handling,
+and real-mailbox reset/change canaries pass; reset endpoints then return 503
+instead of offering an unsafe shortcut. The production Vault allowlist requires
+`CLUSTER_MAIL_PROVIDER=smtp`, so a production promotion fails closed until those
+mail gates and credentials are complete.
 
 The queue currently has one encryption key, not a keyring. Never hot-rotate
 `CLUSTER_MAIL_QUEUE_ENCRYPTION_KEY`: old queued ciphertext would become
@@ -390,26 +484,12 @@ migration 12 adds encrypted durable mail delivery, migration 13 enforces unique
 APNs token ownership, and migration 14 closes write-PAR replay during
 publication.
 
-## 5. Provider credentials and production promotion
+## 6. Provider credentials and production promotion
 
 Keep the first deployment in staging while authentication, group, media,
-WebSocket, and account-deletion tests run. To add APNs, install the private key
-without displaying it:
-
-```sh
-sudo install -o root -g 65532 -m 0440 /secure/input/AuthKey.p8 \
-  /srv/clixor/secrets/apns/AuthKey.p8
-sudo sh deploy/oci/bootstrap.sh
-```
-
-UID/GID 65532 is the distroless API identity. Bootstrap keeps the APNs directory
-traversable only by root and that identity and fixes every `.p8` key to
-`root:65532` mode `0440`.
-
-Use `sudoedit /srv/clixor/secrets/api.env` to add the Telnyx, Apple, and mail
-values described in `api.env.example`. The database/cache/bus/backup/Grafana
-examples are separate and must stay separate. Use distinct random secrets. Before setting
-`CLUSTER_ENV=production`, complete all of these:
+WebSocket, and account-deletion tests run. Populate the Vault bundles described
+above with distinct production values, promote their intended versions to
+`CURRENT`, hydrate them, and then complete all of these:
 
 - Telnyx sender registration, API/signing credentials, allowed country prefixes,
   and a real-device OTP test;
@@ -425,7 +505,20 @@ After changing runtime configuration, deploy a new immutable revision. Placehold
 values are rejected by the deploy script, and the application's existing production
 validation remains authoritative.
 
-## 6. Backups
+Rotate coordinated bundles during a maintenance window, promote every intended
+version to `CURRENT`, then run the hydrator/deploy once. A PostgreSQL password is
+not rotated by changing `POSTGRES_PASSWORD_FILE` on an initialized database:
+change the database role password in the same controlled operation or the API
+will be locked out. Redis/NATS credential changes recreate their containers;
+APNs and API-provider changes require both API replicas to restart; a Cloudflare
+token change requires a connector restart after the new tunnel token is proven.
+JWT rotation invalidates sessions. The mail-queue key has the stricter drain
+procedure above. Any inconsistent dependency URL/credential bundle, pending mail
+during queue-key rotation, unverified Cloudflare token, or failed real-device
+canary is a rotation stop condition. Previous Vault versions are the reviewed
+rollback source; never copy decrypted tmpfs files back to persistent storage.
+
+## 7. Backups
 
 The default stack performs a six-hourly custom-format PostgreSQL dump with a
 SHA-256 checksum and seven-day local retention. OCI Object Storage is already the
@@ -515,7 +608,7 @@ retention lock: review and test a time-bound rule separately because an OCI
 retention-rule lock is irreversible. Media retention and deletion recovery are
 separate from the PostgreSQL backup policy.
 
-## 7. Optional observability
+## 8. Optional observability
 
 Prometheus and Grafana are excluded from the default 2-OCPU workload. Enable them
 only after observing headroom:

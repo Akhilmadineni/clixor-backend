@@ -30,6 +30,16 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if configPath := os.Getenv("CLUSTER_CONFIG_FILE"); configPath != "" {
+		if configPath != "/run/secrets/api.env" {
+			logger.Error("invalid configuration", "error", "unsupported runtime configuration path")
+			os.Exit(1)
+		}
+		if err := config.LoadAPIEnvironmentFile(configPath); err != nil {
+			logger.Error("invalid configuration", "error", err)
+			os.Exit(1)
+		}
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)

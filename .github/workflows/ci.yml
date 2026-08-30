@@ -99,15 +99,21 @@ jobs:
       - name: Validate the OCI Resource Manager stack
         run: terraform validate -no-color
       - name: Check OCI deployment entrypoints
-        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../test_secret_split.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh
+        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../prepare-runtime-secrets.sh ../test_secret_split.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh
       - name: Test least-privilege secret split and Compose exposure
         run: sh ../test_secret_split.sh
+      - name: Test OCI Vault hydration and atomic rotation
+        run: python3 -m unittest -v ../test_vault_hydration.py
       - name: Validate scoped OCI Compose YAML
         run: |
           sudo install -d -m 0700 /srv/clixor/secrets
           for name in api postgres redis nats grafana backup migrate; do
             sudo install -m 0600 "../${name}.env.example" "/srv/clixor/secrets/${name}.env"
           done
+          sudo install -d -m 0750 -o 0 -g 65532 /srv/clixor/secrets/apns
+          sudo install -m 0440 -o 0 -g 65534 /dev/null /srv/clixor/secrets/metrics.token
+          sudo install -d -m 0700 /run/clixor/secrets
+          sudo ln -s /srv/clixor/secrets /run/clixor/secrets/active
           CLIXOR_IMAGE_TAG=ci docker compose --file ../compose.yaml config --quiet
       - name: Test OCI backup health gate
         run: sh ../test-backup.sh

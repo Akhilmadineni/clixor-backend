@@ -1,26 +1,30 @@
 #!/bin/sh
 set -eu
 umask 077
+ulimit -c 0
 
 project_root=/srv/clixor
 stable_root="${project_root}/repo"
 release_root="${project_root}/releases"
 runtime_env="${project_root}/secrets/runtime.env"
-api_env="${project_root}/secrets/api.env"
-postgres_env="${project_root}/secrets/postgres.env"
-redis_env="${project_root}/secrets/redis.env"
-nats_env="${project_root}/secrets/nats.env"
-grafana_env="${project_root}/secrets/grafana.env"
-backup_env="${project_root}/secrets/backup.env"
-migrate_env="${project_root}/secrets/migrate.env"
+runtime_secret_root=/run/clixor/secrets
+active_secret_root="${runtime_secret_root}/active"
+api_env="${active_secret_root}/api.env"
+postgres_env="${active_secret_root}/postgres.env"
+redis_env="${active_secret_root}/redis.env"
+nats_env="${active_secret_root}/nats.env"
+grafana_env="${active_secret_root}/grafana.env"
+backup_env="${active_secret_root}/backup.env"
+migrate_env="${active_secret_root}/migrate.env"
 lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
 pki_desired="${project_root}/runtime/dependency-pki.desired"
 pki_applied="${project_root}/runtime/dependency-pki.applied"
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
-public_api_readiness_url=https://clustr-api.atlanteanz.com/health/ready
-public_association_url=https://clixor.atlanteanz.com/.well-known/apple-app-site-association
+public_api_readiness_url=${CLIXOR_PUBLIC_API_READINESS_URL:-https://clustr-api.atlanteanz.com/health/ready}
+public_association_url=${CLIXOR_PUBLIC_ASSOCIATION_URL:-https://clixor.atlanteanz.com/.well-known/apple-app-site-association}
 public_smoke_mode=${CLIXOR_REQUIRE_PUBLIC_SMOKE:-auto}
+vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -38,16 +42,29 @@ case "${public_smoke_mode}" in
   auto|true|false) ;;
   *) fail "CLIXOR_REQUIRE_PUBLIC_SMOKE must be auto, true, or false" ;;
 esac
+case "${vault_hydration_mode}" in
+  true|false) ;;
+  *) fail "CLIXOR_REQUIRE_VAULT_HYDRATION must be true or false" ;;
+esac
+case "${public_api_readiness_url}" in
+  https://*) ;;
+  *) fail "public API readiness URL must use HTTPS" ;;
+esac
+case "${public_association_url}" in
+  https://*) ;;
+  *) fail "public association URL must use HTTPS" ;;
+esac
 public_smoke_required=false
 [ "${public_smoke_mode}" = "true" ] && public_smoke_required=true
 
 verify_public_ingress() {
   log "verifying public Cloudflare ingress before release finalization"
   curl --fail --silent --show-error --retry 12 --retry-all-errors \
-    --retry-delay 5 --max-time 10 "${public_api_readiness_url}" >/dev/null
+    --retry-delay 5 --max-time 10 "${public_api_readiness_url}" >/dev/null || \
+    return 1
   curl --fail --silent --show-error --retry 6 --retry-all-errors \
     --retry-delay 5 --max-time 10 --header 'Cache-Control: no-cache' \
-    "${public_association_url}" >/dev/null
+    "${public_association_url}" >/dev/null || return 1
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
@@ -65,7 +82,9 @@ case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
 
-for command_name in cmp curl docker find flock install python3 rsync sha256sum systemctl touch; do
+for command_name in \
+  cmp curl docker find findmnt flock install python3 rsync sha256sum systemctl touch
+do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
@@ -73,6 +92,24 @@ docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
+
+if [ -s "${compose_file}" ] && \
+  ! grep -Eq '(/srv/clixor/secrets/(active/)?api.env|/run/clixor/secrets/active/api.env)' \
+    "${compose_file}"; then
+  fail "path-only secret migration requires a reviewed manual maintenance release"
+fi
+
+vault_generation_changed=false
+cloudflare_secret_changed=false
+cloudflare_secret_activated=false
+vault_postgres_secret_changed=false
+vault_postgres_secret_activated=false
+vault_redis_secret_changed=false
+vault_redis_secret_activated=false
+vault_nats_secret_changed=false
+vault_nats_secret_activated=false
+previous_vault_target=
+current_vault_target=
 
 # Detect containers created by the retired all-secrets Compose model without
 # printing their environments. Docker stores container configuration immutably,
@@ -92,7 +129,7 @@ for container_name in \
 do
   if docker inspect "${container_name}" \
     --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
-    grep -q '^CLUSTER_'; then
+    grep -Eq '^(CLUSTER_|POSTGRES_PASSWORD=|REDIS_PASSWORD=|NATS_AUTH_TOKEN=|GF_SECURITY_ADMIN_PASSWORD=)'; then
     case "${container_name}" in
       clixor-oci-postgres|clixor-oci-redis|clixor-oci-nats)
         legacy_dependency_scope=true
@@ -103,7 +140,6 @@ do
     esac
   fi
 done
-
 release_tag="oci-$(printf '%s' "${source_sha}" | cut -c1-12)-${run_id}"
 release_dir="${release_root}/${release_tag}"
 previous_compose="${release_dir}/previous-compose.yaml"
@@ -145,14 +181,25 @@ else
 
   cp "${compose_file}" "${previous_compose}"
   [ -s "${previous_compose}" ] || fail "captured previous Compose model is empty"
-  if grep -q '/srv/clixor/secrets/api.env' "${previous_compose}"; then
+  if grep -Eq '(/srv/clixor/secrets/(active/)?api.env|/run/clixor/secrets/active/api.env|CLUSTER_CONFIG_FILE:[[:space:]]*/run/secrets/api.env)' \
+    "${previous_compose}"; then
     previous_compose_uses_scoped=true
   fi
-
   log "capturing a pre-change PostgreSQL snapshot"
-  docker exec clixor-oci-postgres sh -ec \
-    'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --no-owner --no-privileges --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
-    > "${pre_migration_dump}.partial"
+  if docker inspect clixor-oci-postgres \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
+    grep -q '^POSTGRES_PASSWORD='; then
+    # One-time transition from the retired env-secret container model.
+    docker exec clixor-oci-postgres sh -ec \
+      'PGPASSWORD="$POSTGRES_PASSWORD" pg_dump --format=custom --no-owner --no-privileges --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+      > "${pre_migration_dump}.partial"
+  else
+    # Current containers mount their credential from tmpfs; Docker metadata
+    # contains only the path and nonsecret database identity.
+    docker exec clixor-oci-postgres sh -ec \
+      'PGPASSFILE=/run/secrets/postgres.pgpass pg_dump --host=postgres.clixor.internal --format=custom --no-owner --no-privileges --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"' \
+      > "${pre_migration_dump}.partial"
+  fi
   [ -s "${pre_migration_dump}.partial" ] || fail "pre-change PostgreSQL snapshot is empty"
   docker exec -i clixor-oci-postgres pg_restore --list \
     < "${pre_migration_dump}.partial" >/dev/null || \
@@ -220,6 +267,42 @@ else
 fi
 
 rollback_needed=0
+restore_previous_vault_target() {
+  [ "${vault_generation_changed}" = "true" ] || return 0
+  if [ -n "${current_vault_target}" ]; then
+    [ -L "${runtime_secret_root}/active" ] && \
+      [ "$(readlink -- "${runtime_secret_root}/active")" = "${current_vault_target}" ] || \
+      return 1
+  else
+    [ ! -e "${runtime_secret_root}/active" ] && \
+      [ ! -L "${runtime_secret_root}/active" ] || return 1
+  fi
+  case "${previous_vault_target}" in
+    '')
+      rm -f -- "${runtime_secret_root}/active" || return 1
+      vault_generation_changed=false
+      return 0
+      ;;
+    /srv/clixor/secrets)
+      [ -d "${previous_vault_target}" ] && [ ! -L "${previous_vault_target}" ] || \
+        return 1
+      ;;
+    vault-generations/gen-[0-9]*-[0-9a-f]*)
+      [ -d "${runtime_secret_root}/${previous_vault_target}" ] && \
+        [ ! -L "${runtime_secret_root}/${previous_vault_target}" ] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  temporary_vault_link="${runtime_secret_root}/.active.rollback.$$"
+  rm -f -- "${temporary_vault_link}"
+  ln -s "${previous_vault_target}" "${temporary_vault_link}" || return 1
+  if ! mv -Tf -- "${temporary_vault_link}" "${runtime_secret_root}/active"; then
+    rm -f -- "${temporary_vault_link}"
+    return 1
+  fi
+  vault_generation_changed=false
+}
+
 scoped_runtime_ready() {
   [ -f "${runtime_env}" ] && [ ! -L "${runtime_env}" ] || return 1
   for scoped_env in \
@@ -233,9 +316,81 @@ scoped_runtime_ready() {
     "${runtime_env}"
 }
 
+retire_persistent_staging_secrets() {
+  for persistent_name in \
+    api.env postgres.env redis.env nats.env grafana.env backup.env migrate.env \
+    metrics.token postgres.password postgres.pgpass redis.password redis.acl \
+    nats.conf grafana.ini cloudflare-token
+  do
+    persistent_path="${project_root}/secrets/${persistent_name}"
+    if [ -e "${persistent_path}" ] || [ -L "${persistent_path}" ]; then
+      [ -f "${persistent_path}" ] && [ ! -L "${persistent_path}" ] || return 1
+      rm -f -- "${persistent_path}" || return 1
+    fi
+  done
+  for persistent_apns_key in "${project_root}/secrets/apns"/*.p8; do
+    [ -e "${persistent_apns_key}" ] || continue
+    [ -f "${persistent_apns_key}" ] && [ ! -L "${persistent_apns_key}" ] || \
+      return 1
+    rm -f -- "${persistent_apns_key}" || return 1
+  done
+  legacy_cloudflare_token=/etc/cloudflared/token
+  if [ -e "${legacy_cloudflare_token}" ] || [ -L "${legacy_cloudflare_token}" ]; then
+    [ -f "${legacy_cloudflare_token}" ] && \
+      [ ! -L "${legacy_cloudflare_token}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${legacy_cloudflare_token}")" = "0:0:600" ] || \
+      return 1
+    rm -f -- "${legacy_cloudflare_token}" || return 1
+  fi
+  for residual_secret_dir in \
+    "${project_root}/secrets"/.split-runtime.* \
+    "${project_root}/secrets"/.staging-runtime-*
+  do
+    [ -e "${residual_secret_dir}" ] || continue
+    [ -d "${residual_secret_dir}" ] && [ ! -L "${residual_secret_dir}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${residual_secret_dir}")" = "0:0:700" ] || \
+      return 1
+    case "${residual_secret_dir}" in
+      "${project_root}/secrets"/.split-runtime.*|\
+      "${project_root}/secrets"/.staging-runtime-*) ;;
+      *) return 1 ;;
+    esac
+    rm -rf -- "${residual_secret_dir}" || return 1
+  done
+}
+
 rollback() {
   status=$?
   trap - 0
+  secret_rollback_failed=0
+  cloudflare_rollback_failed=0
+  if [ "${status}" -ne 0 ] && [ "${vault_generation_changed}" = "true" ]; then
+    set +e
+    if restore_previous_vault_target; then
+      log "restored the previous runtime-secret generation after deployment failure"
+      if [ "${cloudflare_secret_activated}" = "true" ]; then
+        if [ -n "${previous_vault_target}" ]; then
+          if systemctl restart cloudflared.service && \
+            systemctl is-active --quiet cloudflared.service; then
+            log "restored cloudflared with the previous credential"
+          else
+            log "ERROR: cloudflared did not recover with the previous credential" >&2
+            cloudflare_rollback_failed=1
+          fi
+        else
+          if systemctl stop cloudflared.service; then
+            log "stopped cloudflared because no prior credential existed"
+          else
+            log "ERROR: cloudflared did not stop after first-deploy failure" >&2
+            cloudflare_rollback_failed=1
+          fi
+        fi
+      fi
+    else
+      log "ERROR: could not restore the previous runtime-secret generation" >&2
+      secret_rollback_failed=1
+    fi
+  fi
   if [ "${status}" -ne 0 ] && [ "${rollback_needed}" -eq 1 ]; then
     set +e
     if [ "${first_deploy}" = "false" ]; then
@@ -293,6 +448,52 @@ rollback() {
         log "ERROR: rollback Compose reconciliation failed" >&2
         rollback_failed=1
       fi
+      rollback_secret_services=
+      rollback_secret_containers=
+      [ "${vault_postgres_secret_activated}" = "true" ] && {
+        rollback_secret_services="${rollback_secret_services} postgres"
+        rollback_secret_containers="${rollback_secret_containers} clixor-oci-postgres"
+      }
+      [ "${vault_redis_secret_activated}" = "true" ] && {
+        rollback_secret_services="${rollback_secret_services} redis"
+        rollback_secret_containers="${rollback_secret_containers} clixor-oci-redis"
+      }
+      [ "${vault_nats_secret_activated}" = "true" ] && {
+        rollback_secret_services="${rollback_secret_services} nats"
+        rollback_secret_containers="${rollback_secret_containers} clixor-oci-nats"
+      }
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ -n "${rollback_secret_services}" ]; then
+        if ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
+          --file "${compose_file}" up -d --no-build --no-deps --force-recreate \
+          ${rollback_secret_services}; then
+          log "ERROR: rollback secret consumers did not restart" >&2
+          rollback_failed=1
+        fi
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ -n "${rollback_secret_containers}" ]; then
+        for rollback_dependency in ${rollback_secret_containers}
+        do
+          rollback_dependency_attempt=1
+          while :; do
+            rollback_dependency_health="$(docker inspect "${rollback_dependency}" \
+              --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+              2>/dev/null || true)"
+            [ "${rollback_dependency_health}" = "healthy" ] && break
+            case "${rollback_dependency_health}" in
+              exited|dead) break ;;
+            esac
+            [ "${rollback_dependency_attempt}" -lt 60 ] || break
+            rollback_dependency_attempt=$((rollback_dependency_attempt + 1))
+            sleep 2
+          done
+          if [ "${rollback_dependency_health}" != "healthy" ]; then
+            log "ERROR: ${rollback_dependency} did not recover with the previous secrets" >&2
+            rollback_failed=1
+          fi
+        done
+      fi
       if [ "${rollback_failed}" -eq 0 ] && \
         ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
           --file "${compose_file}" up -d --no-build --no-deps --force-recreate \
@@ -342,7 +543,21 @@ rollback() {
           rollback_ready=true
         fi
       fi
-      if [ "${rollback_failed}" -eq 0 ] && [ "${rollback_ready}" = "true" ]; then
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${rollback_ready}" = "true" ] && \
+        [ "${cloudflare_secret_activated}" = "true" ] && \
+        [ -n "${previous_vault_target}" ]; then
+        if verify_public_ingress; then
+          cloudflare_rollback_failed=0
+        else
+          log "ERROR: public ingress did not recover after connector rollback" >&2
+          cloudflare_rollback_failed=1
+        fi
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${secret_rollback_failed}" -eq 0 ] && \
+        [ "${cloudflare_rollback_failed}" -eq 0 ] && \
+        [ "${rollback_ready}" = "true" ]; then
         log "application rollback completed; database migrations were not reversed"
       else
         log "ERROR: application rollback did not restore and verify the prior release" >&2
@@ -363,6 +578,57 @@ trap rollback 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Hydrate only after the exit trap is armed. From this point onward, every
+# failure restores the exact previously selected generation before attempting
+# an application rollback. The pre-change database snapshot above deliberately
+# uses the still-running containers' prior mounted credentials.
+if [ "${vault_hydration_mode}" = "true" ]; then
+  [ -x /usr/bin/python3 ] || fail "Python 3 is required for OCI Vault hydration"
+  previous_vault_target="$(readlink -- "${runtime_secret_root}/active" 2>/dev/null || true)"
+  hydration_status=0
+  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" || \
+    hydration_status=$?
+  current_vault_target="$(readlink -- "${runtime_secret_root}/active" 2>/dev/null || true)"
+  if [ "${previous_vault_target}" != "${current_vault_target}" ]; then
+    vault_generation_changed=true
+  fi
+  if [ "${hydration_status}" -eq 0 ] && \
+    [ "${vault_generation_changed}" = "true" ]; then
+    previous_secret_generation_root=
+    case "${previous_vault_target}" in
+      /srv/clixor/secrets)
+        previous_secret_generation_root="${previous_vault_target}"
+        ;;
+      vault-generations/gen-[0-9]*-[0-9a-f]*)
+        previous_secret_generation_root="${runtime_secret_root}/${previous_vault_target}"
+        ;;
+    esac
+    current_secret_generation_root="${runtime_secret_root}/${current_vault_target}"
+    for secret_consumer in \
+      postgres:postgres.password redis:redis.acl nats:nats.conf \
+      cloudflare:cloudflare-token
+    do
+      consumer_name=${secret_consumer%%:*}
+      consumer_file=${secret_consumer#*:}
+      consumer_changed=false
+      if [ -z "${previous_secret_generation_root}" ] || \
+        [ ! -f "${previous_secret_generation_root}/${consumer_file}" ] || \
+        [ -L "${previous_secret_generation_root}/${consumer_file}" ] || \
+        ! cmp -s "${previous_secret_generation_root}/${consumer_file}" \
+          "${current_secret_generation_root}/${consumer_file}"; then
+        consumer_changed=true
+      fi
+      case "${consumer_name}:${consumer_changed}" in
+        postgres:true) vault_postgres_secret_changed=true ;;
+        redis:true) vault_redis_secret_changed=true ;;
+        nats:true) vault_nats_secret_changed=true ;;
+        cloudflare:true) cloudflare_secret_changed=true ;;
+      esac
+    done
+  fi
+  [ "${hydration_status}" -eq 0 ] || fail "OCI Vault hydration failed before deployment"
+fi
+
 log "building ARM64 release ${new_image}"
 docker buildx build --load \
   --pull \
@@ -381,13 +647,47 @@ rollback_needed=1
 
 # Idempotently refresh permissions, certificates and checked-in runtime config.
 # Package installation belongs to the explicit first bootstrap, not every deploy.
-CLIXOR_SKIP_PACKAGES=true sh "${source_root}/deploy/oci/bootstrap.sh"
+CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true \
+  sh "${source_root}/deploy/oci/bootstrap.sh"
 for scoped_env in \
   "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
   "${grafana_env}" "${backup_env}" "${migrate_env}"
 do
   [ -s "${scoped_env}" ] || fail "scoped configuration is missing"
 done
+if [ "${vault_hydration_mode}" = "true" ]; then
+  [ -L "${runtime_secret_root}/active" ] && \
+    [ "$(readlink -- "${runtime_secret_root}/active")" = "${current_vault_target}" ] || \
+    fail "the active Vault generation changed during deployment"
+  grep -qx 'CLUSTER_ENV=production' "${api_env}" || \
+    fail "Vault-backed deployments require CLUSTER_ENV=production"
+  grep -qx 'CLUSTER_VERIFICATION_PROVIDER=telnyx' "${api_env}" || \
+    fail "Vault-backed deployments require the Telnyx verification provider"
+  grep -qx 'CLUSTER_MAIL_PROVIDER=smtp' "${api_env}" || \
+    fail "Vault-backed deployments require durable SMTP password-reset delivery"
+fi
+if grep -q '^CLUSTER_ENV=production$' "${api_env}"; then
+  [ -f /etc/clixor/secret-mode ] && [ ! -L /etc/clixor/secret-mode ] && \
+    [ "$(stat -c '%u:%g:%a' /etc/clixor/secret-mode)" = "0:0:600" ] && \
+    [ "$(sed -n '1p' /etc/clixor/secret-mode)" = "vault" ] || \
+    fail "production requires root-owned OCI Vault secret mode"
+  [ "$(findmnt --noheadings --output FSTYPE --target "${runtime_secret_root}" | tr -d '[:space:]')" = "tmpfs" ] || \
+    fail "production runtime secrets are not on tmpfs"
+  active_target="$(readlink -- "${runtime_secret_root}/active")"
+  case "${active_target}" in
+    vault-generations/gen-[0-9]*-[0-9a-f]*) ;;
+    *) fail "production requires an atomically selected OCI Vault generation" ;;
+  esac
+  marker="${runtime_secret_root}/${active_target}/.vault-hydrated"
+  [ -f "${marker}" ] && [ ! -L "${marker}" ] || \
+    fail "production Vault hydration marker is missing"
+  [ "$(stat -c '%u:%g:%a' "${marker}")" = "0:0:400" ] || \
+    fail "production Vault hydration marker has unsafe ownership or mode"
+  grep -q '^schema=1$' "${marker}" || fail "production Vault hydration marker is invalid"
+  if grep -Eq '^[[:space:]]*[^#[:space:]]' "${runtime_env}"; then
+    fail "production requires an empty legacy runtime.env marker"
+  fi
+fi
 if grep -Eiq 'REPLACE_(WITH|ME)|replace-with' \
   "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
   "${grafana_env}" "${backup_env}" "${migrate_env}"; then
@@ -435,6 +735,15 @@ rsync -a --delete \
   "${source_root}/" "${stable_root}/"
 
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" config --quiet
+if [ "${vault_postgres_secret_changed}" = "true" ] && \
+  [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
+  log "verifying hydrated PostgreSQL credentials before replacing dependencies"
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    run --rm --no-deps --entrypoint psql postgres-backup \
+    --host postgres.clixor.internal --username clixor --dbname clixor \
+    --command 'SELECT 1' >/dev/null || \
+    fail "Vault PostgreSQL credential does not match the initialized database"
+fi
 for dependency_service in ${pki_restart_services}; do
   case "${dependency_service}" in
     postgres|nats|dependency-tls) ;;
@@ -444,14 +753,28 @@ done
 
 for dependency_service in postgres redis nats; do
   recreate_dependency=false
+  vault_dependency_secret_changed=false
   if [ "${legacy_dependency_scope}" = "true" ]; then
     recreate_dependency=true
   fi
+  case "${dependency_service}" in
+    postgres) vault_dependency_secret_changed=${vault_postgres_secret_changed} ;;
+    redis) vault_dependency_secret_changed=${vault_redis_secret_changed} ;;
+    nats) vault_dependency_secret_changed=${vault_nats_secret_changed} ;;
+  esac
+  [ "${vault_dependency_secret_changed}" = "true" ] && recreate_dependency=true
   case " ${pki_restart_services} " in
     *" ${dependency_service} "*) recreate_dependency=true ;;
   esac
   if [ "${recreate_dependency}" = "true" ]; then
     log "recreating ${dependency_service} for scoped secrets or its new TLS leaf"
+    if [ "${vault_dependency_secret_changed}" = "true" ]; then
+      case "${dependency_service}" in
+        postgres) vault_postgres_secret_activated=true ;;
+        redis) vault_redis_secret_activated=true ;;
+        nats) vault_nats_secret_activated=true ;;
+      esac
+    fi
     CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
       up -d --no-build --no-deps --force-recreate "${dependency_service}"
   else
@@ -554,6 +877,13 @@ for replica in api-a api-b; do
     "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the gateway"
 done
 log "both API replicas completed native OCI media-provider startup and readiness"
+if [ "${cloudflare_secret_changed}" = "true" ]; then
+  log "restarting cloudflared to activate the rotated tmpfs credential"
+  cloudflare_secret_activated=true
+  systemctl restart cloudflared.service
+  systemctl is-active --quiet cloudflared.service || \
+    fail "cloudflared did not become active with the rotated credential"
+fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress
 else
@@ -608,4 +938,23 @@ mv -Tf "${release_dir}/current-link.pending" "${release_root}/current"
 [ "$(readlink "${release_root}/current")" = "${release_dir}" ] || \
   fail "current release pointer did not update atomically"
 rollback_needed=0
+vault_generation_changed=false
+
+# Retire durable staging copies only after the release is committed and its
+# rollback trap is disarmed. A staging-to-Vault cutover deliberately retains
+# the prior files for one full release; the next successful Vault-to-Vault
+# release removes them after proving both the application and connector.
+retire_staging_copies=false
+if [ "${first_deploy}" = "true" ]; then
+  retire_staging_copies=true
+else
+  case "${previous_vault_target}" in
+    vault-generations/gen-[0-9]*-[0-9a-f]*) retire_staging_copies=true ;;
+  esac
+fi
+if grep -qx 'CLUSTER_ENV=production' "${api_env}" && \
+  [ "${retire_staging_copies}" = "true" ]; then
+  retire_persistent_staging_secrets || \
+    fail "release is live but persistent staging credential retirement failed"
+fi
 log "deployed ${new_image}; API readiness passed"

@@ -17,7 +17,7 @@ while true; do
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   partial="${backup_root}/.clixor-${timestamp}.dump.partial"
   destination="${backup_root}/clixor-${timestamp}.dump"
-  PGPASSWORD="${POSTGRES_PASSWORD}" pg_dump \
+  pg_dump \
     --username "${POSTGRES_USER}" \
     --dbname "${POSTGRES_DB}" \
     --format custom \

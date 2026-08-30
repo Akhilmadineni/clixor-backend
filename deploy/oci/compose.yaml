@@ -10,6 +10,10 @@ x-service-security: &service-security
   security_opt:
     - no-new-privileges:true
   logging: *local-logging
+  ulimits:
+    core:
+      soft: 0
+      hard: 0
 
 services:
   postgres:
@@ -39,8 +43,10 @@ services:
       - wal_compression=on
       - -c
       - checkpoint_timeout=15min
-    env_file:
-      - /srv/clixor/secrets/postgres.env
+    environment:
+      POSTGRES_DB: clixor
+      POSTGRES_USER: clixor
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres.password
     networks:
       clixor_data:
       clixor_service:
@@ -48,6 +54,8 @@ services:
           - postgres.clixor.internal
     volumes:
       - /srv/clixor/data/postgres:/var/lib/postgresql/data
+      - /run/clixor/secrets/active/postgres.password:/run/secrets/postgres.password:ro
+      - /run/clixor/secrets/active/postgres.pgpass:/run/secrets/postgres.pgpass:ro
       - /srv/clixor/runtime/postgres-tls/current/server.crt:/run/postgres-tls/server.crt:ro
       - /srv/clixor/runtime/postgres-tls/current/server.key:/run/postgres-tls/server.key:ro
     healthcheck:
@@ -65,17 +73,26 @@ services:
     image: redis:8.0.3-alpine@sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c
     container_name: clixor-oci-redis
     user: "999:1000"
-    env_file:
-      - /srv/clixor/secrets/redis.env
-    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}" --maxmemory 512mb --maxmemory-policy noeviction
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --aclfile
+      - /run/secrets/redis.acl
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
     networks:
       - clixor_data
     volumes:
       - /srv/clixor/data/redis:/data
+      - /run/clixor/secrets/active/redis.password:/run/secrets/redis.password:ro
+      - /run/clixor/secrets/active/redis.acl:/run/secrets/redis.acl:ro
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping 2>/dev/null | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$(cat /run/secrets/redis.password) redis-cli ping 2>/dev/null | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -90,11 +107,9 @@ services:
     image: nats:2.11.6-alpine@sha256:7dec3f8f1ff181975dbdfc0d903d2a9724659648294dbc2ebb2fa3a294d573a6
     container_name: clixor-oci-nats
     user: "1000:1000"
-    env_file:
-      - /srv/clixor/secrets/nats.env
-    entrypoint: ["/bin/sh", "-ec"]
     command:
-      - exec nats-server --jetstream --store_dir=/data --http_port=8222 --auth "$${NATS_AUTH_TOKEN}" --tls --tlscert=/run/nats-tls/server.crt --tlskey=/run/nats-tls/server.key
+      - --config
+      - /run/secrets/nats.conf
     networks:
       clixor_data:
       clixor_service:
@@ -102,6 +117,7 @@ services:
           - nats.clixor.internal
     volumes:
       - /srv/clixor/data/nats:/data
+      - /run/clixor/secrets/active/nats.conf:/run/secrets/nats.conf:ro
       - /srv/clixor/runtime/nats-tls/current/server.crt:/run/nats-tls/server.crt:ro
       - /srv/clixor/runtime/nats-tls/current/server.key:/run/nats-tls/server.key:ro
     healthcheck:
@@ -154,8 +170,8 @@ services:
     image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
     pull_policy: never
     entrypoint: ["/clustr-migrate"]
-    env_file:
-      - /srv/clixor/secrets/migrate.env
+    environment:
+      CLUSTER_CONFIG_FILE: /run/secrets/migrate.env
     depends_on:
       dependency-tls:
         condition: service_healthy
@@ -168,15 +184,15 @@ services:
       - ALL
     volumes:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /run/clixor/secrets/active/migrate.env:/run/secrets/migrate.env:ro
     <<: *service-security
 
   api-a:
     image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
     pull_policy: never
     container_name: clixor-oci-api-a
-    env_file:
-      - /srv/clixor/secrets/api.env
     environment:
+      CLUSTER_CONFIG_FILE: /run/secrets/api.env
       CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
     depends_on:
       dependency-tls:
@@ -201,16 +217,16 @@ services:
     stop_grace_period: 30s
     volumes:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
-      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
+      - /run/clixor/secrets/active/api.env:/run/secrets/api.env:ro
+      - /run/clixor/secrets/active/apns:/run/secrets/apns:ro
     <<: *service-security
 
   api-b:
     image: clixor-api:${CLIXOR_IMAGE_TAG:?set CLIXOR_IMAGE_TAG to an immutable OCI release tag}
     pull_policy: never
     container_name: clixor-oci-api-b
-    env_file:
-      - /srv/clixor/secrets/api.env
     environment:
+      CLUSTER_CONFIG_FILE: /run/secrets/api.env
       CLUSTER_TRUSTED_PROXY_CIDRS: 172.30.254.2/32
     depends_on:
       dependency-tls:
@@ -235,7 +251,8 @@ services:
     stop_grace_period: 30s
     volumes:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
-      - /srv/clixor/secrets/apns:/run/secrets/apns:ro
+      - /run/clixor/secrets/active/api.env:/run/secrets/api.env:ro
+      - /run/clixor/secrets/active/apns:/run/secrets/apns:ro
     <<: *service-security
 
   api-gateway:
@@ -271,8 +288,10 @@ services:
     image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
     container_name: clixor-oci-postgres-backup
     user: "0:0"
-    env_file:
-      - /srv/clixor/secrets/backup.env
+    environment:
+      POSTGRES_DB: clixor
+      POSTGRES_USER: clixor
+      PGPASSFILE: /run/secrets/postgres.pgpass
     entrypoint: ["/bin/sh", "/opt/clixor/backup.sh"]
     depends_on:
       postgres:
@@ -282,6 +301,7 @@ services:
     volumes:
       - /srv/clixor/runtime/postgres-backup/backup.sh:/opt/clixor/backup.sh:ro
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
+      - /run/clixor/secrets/active/postgres.pgpass:/run/secrets/postgres.pgpass:ro
       - /srv/clixor/backups:/backups
     restart: unless-stopped
     read_only: true
@@ -305,7 +325,7 @@ services:
       - clixor_service
     volumes:
       - /srv/clixor/runtime/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - /srv/clixor/runtime/prometheus/metrics.token:/run/secrets/metrics.token:ro
+      - /run/clixor/secrets/active/metrics.token:/run/secrets/metrics.token:ro
       - /srv/clixor/data/prometheus:/prometheus
     restart: unless-stopped
     read_only: true
@@ -319,12 +339,9 @@ services:
     profiles: ["observability"]
     image: grafana/grafana:12.1.0@sha256:6ac590e7cabc2fbe8d7b8fc1ce9c9f0582177b334e0df9c927ebd9670469440f
     container_name: clixor-oci-grafana
-    env_file:
-      - /srv/clixor/secrets/grafana.env
+    user: "472:472"
     environment:
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_SERVER_ROOT_URL: http://127.0.0.1:13000
+      GF_PATHS_CONFIG: /run/secrets/grafana.ini
     depends_on:
       - prometheus
     ports:
@@ -333,6 +350,7 @@ services:
       - clixor_service
     volumes:
       - /srv/clixor/data/grafana:/var/lib/grafana
+      - /run/clixor/secrets/active/grafana.ini:/run/secrets/grafana.ini:ro
       - /srv/clixor/runtime/grafana/datasource.yml:/etc/grafana/provisioning/datasources/clixor.yml:ro
     restart: unless-stopped
     mem_limit: 512m

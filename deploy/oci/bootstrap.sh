@@ -1,6 +1,15 @@
 #!/bin/sh
 set -eu
 umask 077
+ulimit -c 0
+
+case "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" in
+  true|false) ;;
+  *)
+    echo "CLIXOR_SKIP_SECRET_PREPARATION must be true or false." >&2
+    exit 1
+    ;;
+esac
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run this script as root so host packages and runtime permissions can be enforced." >&2
@@ -125,7 +134,6 @@ secret_root="${project_root}/secrets"
 pki_root="${secret_root}/pki"
 apns_root="${secret_root}/apns"
 runtime_env="${secret_root}/runtime.env"
-api_env="${secret_root}/api.env"
 runtime_root="${project_root}/runtime"
 backup_tool_root=/usr/local/libexec/clixor
 systemd_unit_root=/etc/systemd/system
@@ -136,6 +144,26 @@ install -d -m 0750 "${project_root}" "${project_root}/repo" \
 install -d -m 0700 -o 0 -g 0 "${project_root}/restore-drills"
 install -d -m 0755 -o 0 -g 0 "${backup_tool_root}" "${backup_config_root}"
 install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
+secret_mode=/etc/clixor/secret-mode
+if [ ! -e "${secret_mode}" ] && [ ! -L "${secret_mode}" ]; then
+  temporary_mode="/etc/clixor/.secret-mode.$$"
+  printf 'staging\n' > "${temporary_mode}"
+  chmod 0600 "${temporary_mode}"
+  chown 0:0 "${temporary_mode}"
+  mv -Tf -- "${temporary_mode}" "${secret_mode}"
+fi
+[ -f "${secret_mode}" ] && [ ! -L "${secret_mode}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${secret_mode}")" = "0:0:600" ] || {
+  echo "${secret_mode} has unsafe type, ownership, or mode." >&2
+  exit 1
+}
+case "$(sed -n '1p' "${secret_mode}")" in
+  staging|vault) ;;
+  *)
+    echo "${secret_mode} must contain exactly staging or vault." >&2
+    exit 1
+    ;;
+esac
 # The API image is distroless nonroot (UID/GID 65532). The mount root must be
 # traversable and each installed key readable by that identity, but not by other
 # host users.
@@ -158,7 +186,11 @@ python3 "${script_root}/dependency_pki.py" ensure \
   --pki-root "${pki_root}" \
   --runtime-root "${runtime_root}"
 
-if [ ! -f "${runtime_env}" ]; then
+if [ ! -f "${runtime_env}" ] && [ "$(sed -n '1p' "${secret_mode}")" = "vault" ]; then
+  printf '# Production values are hydrated from OCI Vault into /run only.\n' > \
+    "${runtime_env}"
+  chmod 0600 "${runtime_env}"
+elif [ ! -f "${runtime_env}" ]; then
   oci_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get --query data --raw-output)"
   oci_region="$(curl --fail --silent --show-error \
     --connect-timeout 5 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
@@ -248,14 +280,75 @@ fi
 # The helper publishes files atomically, is idempotent, and never evaluates or
 # prints their values. runtime.env remains only as a non-consumed migration
 # checkpoint for unknown legacy entries.
-sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
+if [ "$(sed -n '1p' "${secret_mode}")" = "staging" ]; then
+  sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
+fi
 
+install -m 0755 -o 0 -g 0 "${script_root}/hydrate-vault-secrets.py" \
+  /usr/local/libexec/clixor/hydrate-vault-secrets.py
+install -m 0755 -o 0 -g 0 "${script_root}/prepare-staging-secrets.py" \
+  /usr/local/libexec/clixor/prepare-staging-secrets.py
+install -m 0755 -o 0 -g 0 "${script_root}/prepare-runtime-secrets.sh" \
+  /usr/local/libexec/clixor/prepare-runtime-secrets.sh
+install -d -m 0755 -o 0 -g 0 /etc/systemd/system/docker.service.d
+install -m 0644 -o 0 -g 0 "${script_root}/clixor-runtime-secrets.service" \
+  /etc/systemd/system/clixor-runtime-secrets.service
+install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
+  /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
+if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
+  if [ "$(sed -n '1p' "${secret_mode}")" = "staging" ]; then
+    /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
+  fi
+  sh /usr/local/libexec/clixor/prepare-runtime-secrets.sh
+fi
+systemctl daemon-reload
+systemctl enable clixor-runtime-secrets.service
+
+runtime_secret_root=/run/clixor/secrets
+active_link="${runtime_secret_root}/active"
+[ -L "${active_link}" ] || {
+  echo "${active_link} must be a symbolic link." >&2
+  exit 1
+}
+active_target="$(readlink -- "${active_link}")"
+case "${active_target}" in
+  /srv/clixor/secrets) ;;
+  vault-generations/gen-[0-9]*-[0-9a-f]*)
+    [ -d "${runtime_secret_root}/${active_target}" ] && \
+      [ ! -L "${runtime_secret_root}/${active_target}" ] || {
+      echo "${active_link} selects an unavailable Vault generation." >&2
+      exit 1
+    }
+    ;;
+  *)
+    echo "${active_link} selects an unsupported secret location." >&2
+    exit 1
+    ;;
+esac
+
+active_secret_root="${runtime_secret_root}/active"
+api_env="${active_secret_root}/api.env"
+active_apns_root="${active_secret_root}/apns"
+metrics_secret="${active_secret_root}/metrics.token"
 metrics_token="$(sed -n 's/^CLUSTER_METRICS_TOKEN=//p' "${api_env}" | tail -n 1)"
 [ -n "${metrics_token}" ] || {
   echo "CLUSTER_METRICS_TOKEN is missing from ${api_env}." >&2
   exit 1
 }
-printf '%s' "${metrics_token}" > "${runtime_root}/prometheus/metrics.token"
+if [ "${active_target}" = "/srv/clixor/secrets" ]; then
+  printf '%s' "${metrics_token}" > "${secret_root}/metrics.token"
+  chown 0:65534 "${secret_root}/metrics.token"
+  chmod 0440 "${secret_root}/metrics.token"
+else
+  [ -s "${metrics_secret}" ] && [ ! -L "${metrics_secret}" ] || {
+    echo "Hydrated metrics token is missing." >&2
+    exit 1
+  }
+  [ "$(stat -c '%u:%g:%a' "${metrics_secret}")" = "0:65534:440" ] || {
+    echo "Hydrated metrics token has unsafe ownership or mode." >&2
+    exit 1
+  }
+fi
 
 install -m 0400 -o 99 -g 99 "${script_root}/haproxy.cfg" \
   "${runtime_root}/dependency-tls/haproxy.cfg"
@@ -294,15 +387,22 @@ if [ ! -f "${backup_config}" ]; then
 fi
 install -m 0400 -o 65534 -g 65534 "${script_root}/prometheus.yml" \
   "${runtime_root}/prometheus/prometheus.yml"
-chown 65534:65534 "${runtime_root}/prometheus/metrics.token"
-chmod 0400 "${runtime_root}/prometheus/metrics.token"
 install -m 0400 -o 472 -g 472 "${script_root}/grafana-datasource.yml" \
   "${runtime_root}/grafana/datasource.yml"
 
-for apns_key in "${apns_root}"/*.p8; do
+for apns_key in "${active_apns_root}"/*.p8; do
   [ -f "${apns_key}" ] || continue
-  chown 0:65532 "${apns_key}"
-  chmod 0440 "${apns_key}"
+  [ ! -L "${apns_key}" ] || {
+    echo "APNs key must not be a symbolic link: ${apns_key}" >&2
+    exit 1
+  }
+  if [ "${active_target}" = "/srv/clixor/secrets" ]; then
+    chown 0:65532 "${apns_key}"
+    chmod 0440 "${apns_key}"
+  elif [ "$(stat -c '%u:%g:%a' "${apns_key}")" != "0:65532:440" ]; then
+    echo "Hydrated APNs key has unsafe ownership or mode." >&2
+    exit 1
+  fi
 done
 
 # Only establish mount-root ownership. Recursively walking a live database
@@ -313,20 +413,48 @@ chown 1000:1000 "${project_root}/data/nats"
 chown 65534:65534 "${project_root}/data/prometheus"
 chown 472:472 "${project_root}/data/grafana"
 chmod 0600 "${runtime_env}"
-for scoped_env in api postgres redis nats grafana backup migrate; do
-  chmod 0600 "${secret_root}/${scoped_env}.env"
+chmod 0750 "${active_apns_root}"
+
+for file_spec in \
+  'api.env:0:65532:440' \
+  'migrate.env:0:65532:440' \
+  'postgres.password:0:70:440' \
+  'postgres.pgpass:0:0:400' \
+  'redis.password:0:1000:440' \
+  'redis.acl:0:1000:440' \
+  'nats.conf:0:1000:440' \
+  'grafana.ini:0:472:440' \
+  'metrics.token:0:65534:440'
+do
+  file_name=${file_spec%%:*}
+  expected_metadata=${file_spec#*:}
+  file_path="${active_secret_root}/${file_name}"
+  [ -f "${file_path}" ] && [ ! -L "${file_path}" ] || {
+    echo "Runtime secret file is unsafe: ${file_name}" >&2
+    exit 1
+  }
+  [ "$(stat -c '%u:%g:%a' "${file_path}")" = "${expected_metadata}" ] || {
+    echo "Runtime secret file has unsafe ownership or mode: ${file_name}" >&2
+    exit 1
+  }
 done
-chmod 0750 "${apns_root}"
 
 for required_path in \
   "${runtime_env}" \
   "${api_env}" \
-  "${secret_root}/postgres.env" \
-  "${secret_root}/redis.env" \
-  "${secret_root}/nats.env" \
-  "${secret_root}/grafana.env" \
-  "${secret_root}/backup.env" \
-  "${secret_root}/migrate.env" \
+  "${active_secret_root}/postgres.env" \
+  "${active_secret_root}/redis.env" \
+  "${active_secret_root}/nats.env" \
+  "${active_secret_root}/grafana.env" \
+  "${active_secret_root}/backup.env" \
+  "${active_secret_root}/migrate.env" \
+  "${active_secret_root}/postgres.password" \
+  "${active_secret_root}/postgres.pgpass" \
+  "${active_secret_root}/redis.password" \
+  "${active_secret_root}/redis.acl" \
+  "${active_secret_root}/nats.conf" \
+  "${active_secret_root}/grafana.ini" \
+  "${metrics_secret}" \
   "${pki_root}/ca.crt" \
   "${runtime_root}/dependency-pki.desired" \
   "${runtime_root}/dependency-tls/current/server.pem" \
@@ -354,5 +482,7 @@ else
     >/dev/null 2>&1 || true
 fi
 
-echo "Clixor OCI ARM64 directories, staging secrets, and internal PKI are ready."
-echo "Telnyx and APNs remain disabled until production credentials are installed."
+echo "Clixor OCI ARM64 directories, runtime secrets, and internal PKI are ready."
+if [ "$(sed -n '1p' /etc/clixor/secret-mode)" = "staging" ]; then
+  echo "Telnyx and APNs remain disabled until production Vault credentials are installed."
+fi

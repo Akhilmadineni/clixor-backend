@@ -78,32 +78,53 @@ sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${test_root}"
 after="$(cksum "${test_root}"/*.env | sort)"
 [ "${before}" = "${after}" ] || fail "secret split is not idempotent"
 
-# Assert each parsed Compose service sees exactly its scoped env file. No
-# checked-in service may fall back to the legacy all-secrets runtime.env.
+# Assert Compose receives only tmpfs file paths, never secret-valued env_file
+# content. No checked-in service may consume the persistent staging root.
 compose_map="$(awk '
   /^  [A-Za-z0-9_-]+:$/ { service=$1; sub(/:$/, "", service) }
-  /\/srv\/clixor\/secrets\/[A-Za-z0-9_-]+\.env$/ {
-    path=$0; sub(/^.*\/secrets\//, "", path)
+  /\/run\/clixor\/secrets\/active\/[A-Za-z0-9._-]+/ {
+    path=$0; sub(/^.*\/active\//, "", path); sub(/:.*/, "", path)
     print service "=" path
   }
 ' "${script_root}/compose.yaml" | sort)"
 expected_map='api-a=api.env
+api-a=apns
 api-b=api.env
-grafana=grafana.env
+api-b=apns
+grafana=grafana.ini
 migrate=migrate.env
-nats=nats.env
-postgres-backup=backup.env
-postgres=postgres.env
-redis=redis.env'
+nats=nats.conf
+postgres-backup=postgres.pgpass
+postgres=postgres.password
+postgres=postgres.pgpass
+prometheus=metrics.token
+redis=redis.acl
+redis=redis.password'
 [ "${compose_map}" = "${expected_map}" ] || fail "Compose env exposure map is not allowlisted"
-grep -q '/srv/clixor/secrets/runtime.env' "${script_root}/compose.yaml" && \
+grep -q '^[[:space:]]*env_file:' "${script_root}/compose.yaml" && \
+  fail "Compose persists secret values in container environment metadata"
+grep -q '/srv/clixor/secrets/active' "${script_root}/compose.yaml" && \
+  fail "Compose consumes persistent active secrets instead of tmpfs"
+grep -q '/run/clixor/secrets/active/runtime.env' "${script_root}/compose.yaml" && \
   fail "Compose still consumes legacy runtime.env"
-grep -q "grep -q '^CLUSTER_'" "${script_root}/deploy.sh" || \
-  fail "deploy does not detect immutable containers with legacy API secrets"
+grep -Fq "grep -Eq '^(CLUSTER_|POSTGRES_PASSWORD=|REDIS_PASSWORD=|NATS_AUTH_TOKEN=|GF_SECURITY_ADMIN_PASSWORD=)'" \
+  "${script_root}/deploy.sh" || \
+  fail "deploy does not detect immutable containers with legacy secrets"
 grep -q '\[ "${legacy_dependency_scope}" = "true" \]' "${script_root}/deploy.sh" || \
   fail "deploy does not route legacy containers through forced reconciliation"
 grep -q -- '--force-recreate "${dependency_service}"' "${script_root}/deploy.sh" || \
   fail "deploy does not replace legacy data containers"
+grep -Fq 'trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true' \
+  "${script_root}/actions-deploy.sh" || \
+  fail "production Actions do not require Vault hydration"
+grep -q 'runtime secrets must be materialized on tmpfs' "${script_root}/hydrate-vault-secrets.py" || \
+  fail "Vault hydration does not fail closed outside tmpfs"
+grep -q '^Requires=clixor-runtime-secrets.service$' "${script_root}/docker-runtime-secrets.conf" || \
+  fail "Docker is not ordered after boot-time secret hydration"
+grep -q '^RuntimeDirectory=clixor$' "${script_root}/clixor-runtime-secrets.service" || \
+  fail "boot-time hydration does not create its tmpfs runtime parent"
+grep -q 'LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token' \
+  "${script_root}/cloudflared.service" || fail "cloudflared does not use the tmpfs generation"
 
 duplicate_root="${test_root}/duplicate"
 mkdir "${duplicate_root}"

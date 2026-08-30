@@ -173,14 +173,18 @@ configuration: Terraform would retain them in state. In particular, the locked
 OCI provider exposes the generated SMTP password as a computed, state-bearing
 attribute, so SMTP credential resources are forbidden. A `sensitive` marker, if
 added by a future provider, would only redact CLI display and would not remove a
-value from state. The stack creates an empty Vault and key,
-but deliberately does not create secret values or a hydration service. The
-bundled host bootstrap generates a root-only **staging** runtime file. Before a
-production promotion, add an audited flow that writes secret values to Vault and
-hydrates them through the instance principal into a root-owned tmpfs runtime
-path. Until that flow exists, production secret materialization is an explicit
-release blocker. Required values include the database, Redis, NATS, JWT,
-metrics, Telnyx, APNs, Cloudflare Tunnel, and backup-encryption credentials.
+value from state. The stack creates an empty Vault and key, but deliberately
+does not create secret objects or values. The host deployment package provides
+the audited boundary: an operator creates the values outside Terraform, installs
+only their nonsecret secret OCIDs in a root-only mapping, and the VM instance
+principal fetches `CURRENT` bundles into a complete root-owned `/run` tmpfs
+generation. Docker and cloudflared are ordered after the boot-time hydration unit
+and fail closed when the mapping, Vault, content, ownership, mode, allowlist, or
+tmpfs checks fail. See `../README.md` for the exact artifact/import/rotation
+procedure. Terraform, Resource Manager state, cloud-init, GitHub, and command
+arguments never receive secret content. Required values include the database,
+Redis, NATS, JWT, metrics, Telnyx, APNs, Cloudflare Tunnel, and backup-encryption
+credentials.
 
 Application media uses the compute instance principal with the native OCI
 Object Storage API, so the stack creates no S3 customer secret key. Configure

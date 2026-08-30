@@ -13,6 +13,16 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if configPath := os.Getenv("CLUSTER_CONFIG_FILE"); configPath != "" {
+		if configPath != "/run/secrets/migrate.env" {
+			logger.Error("invalid_configuration", "error", "unsupported runtime configuration path")
+			os.Exit(1)
+		}
+		if err := config.LoadMigrationEnvironmentFile(configPath); err != nil {
+			logger.Error("invalid_configuration", "error", err)
+			os.Exit(1)
+		}
+	}
 	cfg, err := config.LoadMigration()
 	if err != nil {
 		logger.Error("invalid_configuration", "error", err)

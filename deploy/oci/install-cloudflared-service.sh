@@ -2,7 +2,8 @@
 set -eu
 umask 077
 
-token_file=/etc/cloudflared/token
+token_file=/run/clixor/secrets/active/cloudflare-token
+legacy_token_file=/etc/cloudflared/token
 unit_source=${1:-}
 minimum_cloudflared_version=2025.4.0
 
@@ -24,7 +25,18 @@ cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
   "${cloudflared_version}" ge "${minimum_cloudflared_version}" || \
   fail "cloudflared ${minimum_cloudflared_version} or newer is required for --token-file (found ${cloudflared_version})"
 
+if [ ! -e "${token_file}" ] && [ -f "${legacy_token_file}" ] && \
+  [ ! -L "${legacy_token_file}" ]; then
+  [ "$(stat -c '%u:%g:%a' "${legacy_token_file}")" = "0:0:600" ] || \
+    fail "legacy tunnel token has unsafe ownership or mode"
+  [ "$(readlink -- /run/clixor/secrets/active)" = "/srv/clixor/secrets" ] || \
+    fail "refusing to copy a legacy token into a Vault-selected generation"
+  install -m 0600 -o 0 -g 0 "${legacy_token_file}" \
+    /srv/clixor/secrets/cloudflare-token
+fi
 [ -s "${token_file}" ] || fail "install the tunnel token at ${token_file} first"
+[ -f "${token_file}" ] && [ ! -L "${token_file}" ] || \
+  fail "${token_file} must resolve to a regular file"
 
 token_owner="$(stat -c '%u:%g' "${token_file}")"
 token_mode="$(stat -c '%a' "${token_file}")"

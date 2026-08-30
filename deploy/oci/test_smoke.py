@@ -189,7 +189,9 @@ class ReleaseHardeningTests(unittest.TestCase):
         script = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
         snapshot = script.index('log "capturing a pre-change PostgreSQL snapshot"')
         rollback_arm = script.index("\nrollback_needed=1\n")
-        bootstrap = script.index('CLIXOR_SKIP_PACKAGES=true sh')
+        bootstrap = script.index(
+            "CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true"
+        )
         sync = script.index('log "syncing the approved revision')
         dependency_reconcile = script.index(
             'if [ "${legacy_dependency_scope}" = "true" ]'
@@ -201,7 +203,12 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(rollback_arm, sync)
         self.assertLess(rollback_arm, dependency_reconcile)
         self.assertLess(rollback_arm, migration)
-        self.assertEqual(script.count("CLIXOR_SKIP_PACKAGES=true sh"), 1)
+        self.assertEqual(
+            script.count(
+                "CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true"
+            ),
+            1,
+        )
         self.assertIn('printf \'first-deploy\\n\'', script)
         self.assertIn("database files and forward migrations were not restored", script)
         self.assertIn("pg_restore --list", script)
@@ -219,6 +226,41 @@ class ReleaseHardeningTests(unittest.TestCase):
         release_complete = script.rindex("rollback_needed=0")
         self.assertLess(release_pointer, release_complete)
 
+    def test_vault_rotation_is_transactional_for_every_secret_consumer(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        exit_trap = deploy.index("trap rollback 0")
+        hydrate = deploy.index(
+            'hydration_status=0\n  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py"'
+        )
+        bootstrap_call = deploy.index(
+            "CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true"
+        )
+        self.assertLess(exit_trap, hydrate)
+        self.assertLess(hydrate, bootstrap_call)
+        self.assertIn('hydration_status=$?', deploy)
+        self.assertIn(
+            'current_vault_target="$(readlink -- "${runtime_secret_root}/active" 2>/dev/null || true)"',
+            deploy,
+        )
+        self.assertIn("CLIXOR_SKIP_SECRET_PREPARATION", bootstrap)
+        self.assertIn(
+            "Vault-backed deployments require CLUSTER_ENV=production", deploy
+        )
+        self.assertIn(
+            "Vault-backed deployments require the Telnyx verification provider",
+            deploy,
+        )
+        self.assertIn(
+            "Vault-backed deployments require durable SMTP password-reset delivery",
+            deploy,
+        )
+        for consumer in ("postgres", "redis", "nats"):
+            self.assertIn(f"vault_{consumer}_secret_activated=true", deploy)
+        self.assertIn("rollback secret consumers did not restart", deploy)
+        self.assertIn("systemctl restart cloudflared.service", deploy)
+        self.assertIn("restored cloudflared with the previous credential", deploy)
+
     def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
         installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
             encoding="utf-8"
@@ -233,7 +275,10 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertNotIn("--protocol quic", unit)
         self.assertIn("protocol: auto", local_config)
         self.assertNotIn("protocol: quic", local_config)
-        self.assertIn("LoadCredential=cloudflare-token:/etc/cloudflared/token", unit)
+        self.assertIn(
+            "LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token",
+            unit,
+        )
 
     def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
         raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")
