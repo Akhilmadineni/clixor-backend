@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
@@ -29,22 +30,25 @@ import (
 )
 
 type Server struct {
-	store             store.Store
-	tokens            *auth.TokenManager
-	bus               events.Bus
-	limiter           ratelimit.Limiter
-	media             media.Service
-	mailQueue         clustrmail.QueueSealer
-	verifier          verification.Service
-	apple             appleauth.Verifier
-	presence          presence.Service
-	logger            *slog.Logger
-	dummyHash         string
-	metricsToken      string
-	trustedProxyCIDRs []netip.Prefix
-	passwordReset     PasswordResetPolicy
-	mediaPolicy       MediaPolicy
-	mediaVerifySlots  chan struct{}
+	store                  store.Store
+	tokens                 *auth.TokenManager
+	bus                    events.Bus
+	limiter                ratelimit.Limiter
+	media                  media.Service
+	mailQueue              clustrmail.QueueSealer
+	verifier               verification.Service
+	apple                  appleauth.Verifier
+	presence               presence.Service
+	logger                 *slog.Logger
+	dummyHash              string
+	metricsToken           string
+	trustedProxyCIDRs      []netip.Prefix
+	passwordReset          PasswordResetPolicy
+	mediaPolicy            MediaPolicy
+	mediaVerifySlots       chan struct{}
+	sessionRevocations     *sessionRevocationCache
+	sessionRevocationsOnce sync.Once
+	realtimeSessionRecheck time.Duration
 }
 
 // buildRevision is replaced with the exact reviewed Git object ID in release
@@ -93,6 +97,10 @@ func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter r
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
 		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset, mediaPolicy: mediaPolicy,
 		mediaVerifySlots: make(chan struct{}, mediaPolicy.VerificationConcurrency),
+		sessionRevocations: newSessionRevocationCache(
+			sessionRevocationCacheCapacity, sessionRevocationCacheRetention, time.Now,
+		),
+		realtimeSessionRecheck: realtimeDurableSessionRecheckInterval,
 	}
 }
 
@@ -119,6 +127,8 @@ func (s *Server) Router() http.Handler {
 
 	router.Route("/v1", func(router chi.Router) {
 		router.Post("/webhooks/telnyx/messaging", s.telnyxMessagingWebhook)
+		router.With(s.rateLimit("account-deletion-execute", 10, time.Hour, true)).
+			Post("/account-deletions/{requestID}/execute", s.executeAccountDeletionIntent)
 		router.Route("/auth", func(router chi.Router) {
 			router.Use(s.rateLimit("auth", 20, 5*time.Minute, true))
 			router.Post("/register", s.register)
@@ -139,6 +149,8 @@ func (s *Server) Router() http.Handler {
 			router.Post("/auth/logout", s.logout)
 			router.Get("/me", s.me)
 			router.Delete("/me", s.deleteAccount)
+			router.With(s.rateLimitIdentity("account-deletion-intent", 10, 24*time.Hour)).
+				Put("/me/deletion-intents/{requestID}", s.putAccountDeletionIntent)
 			router.With(s.rateLimitIdentity("age-assurance-read", 240, 24*time.Hour)).
 				Get("/me/age-assurance", s.getAgeAssurance)
 			router.With(s.rateLimitIdentity("age-assurance-write", 10, 24*time.Hour)).
@@ -183,6 +195,7 @@ func (s *Server) Router() http.Handler {
 					router.Get("/entities/{kind}", s.listEntities)
 					router.Put("/entities/{kind}/{entityID}", s.putEntity)
 					router.Delete("/entities/{kind}/{entityID}", s.deleteEntity)
+					router.Post("/chores/{choreID}/rotate", s.rotateChore)
 				})
 			})
 			router.With(s.rateLimitIdentity("conversation-invite-preview", 120, time.Minute)).

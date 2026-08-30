@@ -56,12 +56,8 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// Device IDs are account-bound cryptographic identities. A new account must
 	// never inherit an installation ID that may belong to a previously signed-in
 	// account on the same phone.
-	device, err := s.registerDevice(r, user.ID, uuid.Nil, request.DeviceName, request.Platform)
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	tokens, err := s.tokens.Issue(r.Context(), user.ID, device.ID)
+	device := newAuthDevice(user.ID, uuid.Nil, request.DeviceName, request.Platform)
+	user, device, tokens, err := s.tokens.IssueWithDevice(r.Context(), user.ID, nil, device)
 	if err != nil {
 		writeDomainError(w, err)
 		return
@@ -94,13 +90,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "The email or password is incorrect.")
 		return
 	}
-	device, err := s.registerDevice(r, user.ID, request.DeviceID, request.DeviceName, request.Platform)
+	device := newAuthDevice(user.ID, request.DeviceID, request.DeviceName, request.Platform)
+	user, device, tokens, err := s.tokens.IssueWithDevice(
+		r.Context(), user.ID, &user.PasswordHash, device,
+	)
 	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	tokens, err := s.tokens.Issue(r.Context(), user.ID, device.ID)
-	if err != nil {
+		if errors.Is(err, domain.ErrUnauthenticated) || errors.Is(err, domain.ErrNotFound) {
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "The email or password is incorrect.")
+			return
+		}
 		writeDomainError(w, err)
 		return
 	}
@@ -124,6 +122,15 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFrom(r.Context())
+	// Fence first. Closing a socket when a later database mutation fails is a
+	// safe false positive; returning success while another replica can still send
+	// is not.
+	ticket, err := s.publishSessionRevocation(r.Context(), id.UserID, &id.SessionID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+		return
+	}
+	defer releaseSessionFence(ticket)
 	if err := s.store.RevokeSession(r.Context(), id.SessionID, id.UserID); err != nil &&
 		!errors.Is(err, domain.ErrNotFound) {
 		writeDomainError(w, err)
@@ -149,6 +156,12 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFrom(r.Context())
+	ticket, err := s.publishSessionRevocation(r.Context(), id.UserID, nil)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+		return
+	}
+	defer releaseSessionFence(ticket)
 	if err := s.store.DeleteAccount(r.Context(), id.UserID); err != nil {
 		writeDomainError(w, err)
 		return
@@ -368,7 +381,7 @@ func validPushToken(token string) bool {
 	return err == nil
 }
 
-func (s *Server) registerDevice(r *http.Request, userID, deviceID uuid.UUID, name, platform string) (domain.Device, error) {
+func newAuthDevice(userID, deviceID uuid.UUID, name, platform string) domain.Device {
 	if deviceID == uuid.Nil {
 		deviceID = uuid.New()
 	}
@@ -378,10 +391,10 @@ func (s *Server) registerDevice(r *http.Request, userID, deviceID uuid.UUID, nam
 	if platform == "" {
 		platform = "ios"
 	}
-	return s.store.UpsertDevice(r.Context(), domain.Device{
+	return domain.Device{
 		ID: deviceID, UserID: userID, Name: name, Platform: platform,
 		CreatedAt: time.Now().UTC(),
-	})
+	}
 }
 
 func validEmail(value string) bool {

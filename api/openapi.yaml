@@ -230,6 +230,36 @@ paths:
               schema: {$ref: "#/components/schemas/AgeAssurance"}
         "422": {description: Invalid or inconsistent age evidence}
         "429": {description: Underage-to-adult recheck cooldown is active}
+  /me/deletion-intents/{request_id}:
+    put:
+      operationId: putAccountDeletionIntent
+      description: Durably registers a recovery capability before account deletion. Only a SHA-256 verifier is stored.
+      parameters:
+        - {$ref: "#/components/parameters/RequestID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountDeletionCapability"}
+      responses:
+        "204": {description: Intent registered or identical live-account intent already exists}
+        "409": {description: Request ID is already bound to another account or capability}
+  /account-deletions/{request_id}/execute:
+    post:
+      security: []
+      operationId: executeAccountDeletionIntent
+      description: Executes or reconciles account deletion using the previously registered recovery capability.
+      parameters:
+        - {$ref: "#/components/parameters/RequestID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountDeletionCapability"}
+      responses:
+        "204": {description: Account deletion completed or was already completed}
+        "404": {description: Capability is invalid or missing}
+        "429": {description: Too many capability attempts}
   /me/avatar:
     post:
       operationId: createProfileMediaUpload
@@ -325,6 +355,58 @@ paths:
                   items: {$ref: "#/components/schemas/PreKey"}
       responses:
         "204": {description: Prekeys stored}
+  /users/lookup:
+    post:
+      operationId: lookupUsers
+      description: Exact contact/username discovery. Responses never expose email or private profile fields; an exact phone match only echoes a phone number already supplied in this request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              anyOf:
+                - required: [phones]
+                  properties:
+                    phones: {minItems: 1}
+                - required: [usernames]
+                  properties:
+                    usernames: {minItems: 1}
+              properties:
+                phones:
+                  type: array
+                  maxItems: 1024
+                  items: {type: string, pattern: "^\\+[1-9][0-9]{7,14}$"}
+                usernames:
+                  type: array
+                  maxItems: 1024
+                  items: {type: string, maxLength: 31}
+      responses:
+        "200":
+          description: Discovery-safe user page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/PublicUser"}}}}
+  /users/search:
+    get:
+      operationId: searchUsersByUsername
+      description: Prefix search over usernames. Email and phone are never returned.
+      parameters:
+        - {name: q, in: query, required: true, schema: {type: string, minLength: 1}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 50, default: 20}}
+      responses:
+        "200":
+          description: Discovery-safe user page
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/PublicUser"}}}}
   /users/{user_id}/prekeys:claim:
     post:
       operationId: claimPrekeys
@@ -377,13 +459,61 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Conversation"}
+  /conversations/{conversation_id}:
+    get:
+      operationId: getConversation
+      description: Returns 404 both when the conversation does not exist and when the caller is not a member, preventing identifier enumeration.
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "200":
+          description: Conversation visible to the authenticated member
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Conversation"}
+        "404": {description: Conversation absent or not visible to this caller}
+    patch:
+      operationId: updateConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                title: {type: string, maxLength: 200}
+                avatar_url: {type: string, maxLength: 2048}
+                metadata: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Updated conversation; registered member metadata is rebuilt from the authoritative ACL/public identity view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Conversation"}
+    delete:
+      operationId: deleteConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "204": {description: Conversation deleted}
   /conversations/{conversation_id}/members:
     get:
       operationId: listConversationMembers
       parameters:
         - {$ref: "#/components/parameters/ConversationID"}
       responses:
-        "200": {description: Current conversation membership}
+        "200":
+          description: Authoritative relational membership with public identity fields only
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Page"}
+                  - {type: object, properties: {items: {type: array, items: {$ref: "#/components/schemas/ConversationMember"}}}}
     post:
       operationId: addConversationMember
       parameters:
@@ -605,6 +735,42 @@ paths:
         - {$ref: "#/components/parameters/ExpectedVersion"}
       responses:
         "204": {description: Tombstone created}
+  /conversations/{conversation_id}/chores/{chore_id}/rotate:
+    post:
+      operationId: rotateChore
+      description: Atomically updates one live chore and creates its activity feed item. Identical operation replays return the durable original result for at least 90 days.
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {name: chore_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [operation_id, expected_chore_version, chore, feed_item]
+              properties:
+                operation_id: {type: string, format: uuid}
+                expected_chore_version: {type: integer, format: int64, minimum: 1}
+                chore: {type: object, additionalProperties: true}
+                feed_item: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Authoritative chore and feed entities, including on an identical replay
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operation_id, chore, feed_item]
+                properties:
+                  operation_id: {type: string, format: uuid}
+                  chore: {type: object, additionalProperties: true}
+                  feed_item: {type: object, additionalProperties: true}
+        "400": {description: Invalid operation ID, version, chore binding, feed binding, or participant payload}
+        "403": {description: Actor is not an active conversation member}
+        "404": {description: Chore is absent or tombstoned}
+        "409": {description: Stale version or operation binding mismatch}
   /conversations/{conversation_id}/media:
     post:
       operationId: createMediaUpload
@@ -672,6 +838,7 @@ components:
     InviteID: {name: invite_id, in: path, required: true, schema: {type: string, format: uuid}}
     DeviceID: {name: device_id, in: path, required: true, schema: {type: string, format: uuid}}
     UserID: {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
+    RequestID: {name: request_id, in: path, required: true, schema: {type: string, format: uuid}}
     EntityKind:
       name: kind
       in: path
@@ -686,6 +853,15 @@ components:
       description: Current version for optimistic concurrency, or 0 when creating
       schema: {type: integer, format: int64, minimum: 0}
   schemas:
+    AccountDeletionCapability:
+      type: object
+      additionalProperties: false
+      required: [recovery_token]
+      properties:
+        recovery_token:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+          description: Unpadded base64url encoding of exactly 32 random bytes.
     ConversationMediaUploadRequest:
       type: object
       additionalProperties: false
@@ -779,6 +955,27 @@ components:
         display_name: {type: string}
         avatar_url: {type: string, format: uri}
         profile: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    PublicUser:
+      type: object
+      additionalProperties: false
+      required: [id, created_at, updated_at]
+      description: Discovery-safe identity. Email is never present. Phone is present only as an exact echo for a number supplied to /users/lookup.
+      properties:
+        id: {type: string, format: uuid}
+        phone: {type: string, description: Exact matched input phone; omitted for username lookup/search}
+        display_name: {type: string}
+        avatar_url: {type: string}
+        profile:
+          type: object
+          additionalProperties: false
+          properties:
+            display_name: {type: string}
+            avatar_color: {type: string}
+            username: {type: string}
+            bio: {type: string}
+            profile_image_url: {type: string}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
     ProfilePatch:
@@ -875,6 +1072,22 @@ components:
         last_seq: {type: integer, format: int64}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    ConversationMember:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, user_id, role, joined_at]
+      description: Relational ACL membership enriched only with public profile fields. Email and phone are never returned.
+      properties:
+        conversation_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        role: {type: string, enum: [owner, admin, member]}
+        joined_at: {type: string, format: date-time}
+        muted_until: {type: string, format: date-time}
+        display_name: {type: string}
+        username: {type: string}
+        avatar_url: {type: string}
+        avatar_color: {type: string}
+        bio: {type: string}
     ConversationInvite:
       type: object
       additionalProperties: false

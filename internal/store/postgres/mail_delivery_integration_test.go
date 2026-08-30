@@ -158,8 +158,30 @@ func TestPostgresPasswordChangedMailCascadesWithResetChallenge(t *testing.T) {
 	).Scan(&consumedAt); err != nil || consumedAt != nil {
 		t.Fatalf("challenge consumed after failed mail transaction: consumed=%v err=%v", consumedAt, err)
 	}
+	barrierErr := errors.New("missing replica acknowledgement")
+	if _, err := persistence.ConsumePasswordResetChallengeWithMailAndFence(
+		ctx, challenge.ID, challenge.CodeHash, "must-not-commit", 5,
+		func(string) (domain.MailDelivery, error) {
+			return postgresTestMailDelivery(uuid.New(), challenge.ID, domain.MailDeliveryPasswordChanged), nil
+		},
+		func(got uuid.UUID) error {
+			if got != user.ID {
+				t.Fatalf("barrier user=%s want %s", got, user.ID)
+			}
+			return barrierErr
+		},
+	); !errors.Is(err, barrierErr) {
+		t.Fatalf("barrier failure returned %v", err)
+	}
+	unchanged, err = persistence.UserByID(ctx, user.ID)
+	if err != nil || unchanged.PasswordHash != "old-hash" {
+		t.Fatalf("barrier failure changed password: %+v err=%v", unchanged, err)
+	}
+	if err := persistence.pool.QueryRow(ctx, `SELECT consumed_at FROM password_reset_challenges WHERE id=$1`, challenge.ID).Scan(&consumedAt); err != nil || consumedAt != nil {
+		t.Fatalf("barrier failure consumed challenge: consumed=%v err=%v", consumedAt, err)
+	}
 	changedID := uuid.New()
-	if _, err := persistence.ConsumePasswordResetChallengeWithMail(
+	completion, err := persistence.ConsumePasswordResetChallengeWithMail(
 		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
 		func(email string) (domain.MailDelivery, error) {
 			if email != user.Email {
@@ -169,8 +191,12 @@ func TestPostgresPasswordChangedMailCascadesWithResetChallenge(t *testing.T) {
 				changedID, challenge.ID, domain.MailDeliveryPasswordChanged,
 			), nil
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if completion.UserID != user.ID || completion.Email != user.Email {
+		t.Fatalf("reset completion identity=%+v, want user=%s email=%q", completion, user.ID, user.Email)
 	}
 	var changedCount int
 	if err := persistence.pool.QueryRow(ctx, `

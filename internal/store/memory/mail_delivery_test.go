@@ -159,9 +159,28 @@ func TestPasswordMutationAndChangedMailAreAtomic(t *testing.T) {
 	if persistence.passwordResets[challenge.ID].ConsumedAt != nil {
 		t.Fatal("challenge consumed without password-changed mail")
 	}
+	barrierErr := errors.New("missing replica acknowledgement")
+	if _, err := persistence.ConsumePasswordResetChallengeWithMailAndFence(
+		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
+		func(string) (domain.MailDelivery, error) {
+			return testMailDelivery(uuid.New(), challenge.ID, domain.MailDeliveryPasswordChanged), nil
+		},
+		func(got uuid.UUID) error {
+			if got != user.ID {
+				t.Fatalf("barrier user=%s want %s", got, user.ID)
+			}
+			return barrierErr
+		},
+	); !errors.Is(err, barrierErr) {
+		t.Fatalf("barrier failure returned %v", err)
+	}
+	unchanged, err = persistence.UserByID(ctx, user.ID)
+	if err != nil || unchanged.PasswordHash != "old-hash" || persistence.passwordResets[challenge.ID].ConsumedAt != nil {
+		t.Fatalf("barrier failure mutated reset state: user=%+v challenge=%+v err=%v", unchanged, persistence.passwordResets[challenge.ID], err)
+	}
 
 	changedDelivery := uuid.New()
-	if _, err := persistence.ConsumePasswordResetChallengeWithMail(
+	completion, err := persistence.ConsumePasswordResetChallengeWithMail(
 		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
 		func(email string) (domain.MailDelivery, error) {
 			if email != user.Email {
@@ -169,8 +188,12 @@ func TestPasswordMutationAndChangedMailAreAtomic(t *testing.T) {
 			}
 			return testMailDelivery(changedDelivery, challenge.ID, domain.MailDeliveryPasswordChanged), nil
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if completion.UserID != user.ID || completion.Email != user.Email {
+		t.Fatalf("reset completion identity=%+v, want user=%s email=%q", completion, user.ID, user.Email)
 	}
 	changed, err := persistence.UserByID(ctx, user.ID)
 	if err != nil || changed.PasswordHash != "new-hash" {

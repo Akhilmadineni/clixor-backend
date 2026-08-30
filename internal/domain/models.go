@@ -82,6 +82,22 @@ type PasswordResetChallenge struct {
 	CreatedAt  time.Time
 }
 
+const (
+	AccountDeletionPending   = "pending"
+	AccountDeletionCompleted = "completed"
+)
+
+// AccountDeletionIntent stores only a capability verifier and lifecycle state;
+// it deliberately carries no email, phone, display name, or raw token.
+type AccountDeletionIntent struct {
+	RequestID   uuid.UUID
+	UserID      uuid.UUID
+	TokenHash   []byte
+	State       string
+	CreatedAt   time.Time
+	CompletedAt *time.Time
+}
+
 type OneTimePreKey struct {
 	ID        int64      `json:"-"`
 	DeviceID  uuid.UUID  `json:"-"`
@@ -115,6 +131,26 @@ type ConversationMember struct {
 	Role           string     `json:"role"`
 	JoinedAt       time.Time  `json:"joined_at"`
 	MutedUntil     *time.Time `json:"muted_until,omitempty"`
+	DisplayName    string     `json:"display_name,omitempty"`
+	Username       string     `json:"username,omitempty"`
+	AvatarURL      string     `json:"avatar_url,omitempty"`
+	AvatarColor    string     `json:"avatar_color,omitempty"`
+	Bio            string     `json:"bio,omitempty"`
+}
+
+// PublicUser is the deliberately narrow directory representation returned by
+// contact and username discovery. It never contains an email address, password
+// data, or private profile fields. MatchedPhone is populated only by exact
+// phone lookup so legacy clients can correlate a response with a number they
+// already submitted; username lookup and search always omit it.
+type PublicUser struct {
+	ID           uuid.UUID       `json:"id"`
+	MatchedPhone string          `json:"phone,omitempty"`
+	DisplayName  string          `json:"display_name,omitempty"`
+	AvatarURL    string          `json:"avatar_url,omitempty"`
+	Profile      json.RawMessage `json:"profile,omitempty"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
 }
 
 type ConversationMemberAdded struct {

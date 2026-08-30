@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,12 +28,15 @@ type Store struct {
 	externalUsers             map[string]uuid.UUID
 	ageAssurances             map[uuid.UUID]domain.AgeAssurance
 	passwordResets            map[uuid.UUID]domain.PasswordResetChallenge
+	accountDeletionIntents    map[uuid.UUID]domain.AccountDeletionIntent
 	mailDeliveries            map[uuid.UUID]domain.MailDelivery
 	devices                   map[uuid.UUID]domain.Device
 	preKeys                   map[uuid.UUID][]domain.OneTimePreKey
 	sessions                  map[uuid.UUID]domain.Session
 	conversations             map[uuid.UUID]domain.Conversation
 	members                   map[uuid.UUID]map[uuid.UUID]domain.ConversationMember
+	memberLocalIDs            map[uuid.UUID]map[uuid.UUID]uuid.UUID
+	memberTombstones          map[uuid.UUID]map[uuid.UUID]store.ConversationMemberTombstone
 	invites                   map[uuid.UUID]map[string]uuid.UUID
 	inviteLinks               map[string]domain.ConversationInvite
 	inviteLinkKeys            map[uuid.UUID]string
@@ -40,6 +44,7 @@ type Store struct {
 	clientMessages            map[string]domain.Message
 	receipts                  map[string]domain.Receipt
 	entities                  map[string]domain.Entity
+	choreRotations            map[uuid.UUID]memoryChoreRotation
 	media                     map[uuid.UUID]domain.MediaObject
 	mediaUploadCapabilities   map[uuid.UUID]string
 	outbox                    []domain.OutboxEvent
@@ -58,12 +63,15 @@ func New() *Store {
 		externalUsers:             make(map[string]uuid.UUID),
 		ageAssurances:             make(map[uuid.UUID]domain.AgeAssurance),
 		passwordResets:            make(map[uuid.UUID]domain.PasswordResetChallenge),
+		accountDeletionIntents:    make(map[uuid.UUID]domain.AccountDeletionIntent),
 		mailDeliveries:            make(map[uuid.UUID]domain.MailDelivery),
 		devices:                   make(map[uuid.UUID]domain.Device),
 		preKeys:                   make(map[uuid.UUID][]domain.OneTimePreKey),
 		sessions:                  make(map[uuid.UUID]domain.Session),
 		conversations:             make(map[uuid.UUID]domain.Conversation),
 		members:                   make(map[uuid.UUID]map[uuid.UUID]domain.ConversationMember),
+		memberLocalIDs:            make(map[uuid.UUID]map[uuid.UUID]uuid.UUID),
+		memberTombstones:          make(map[uuid.UUID]map[uuid.UUID]store.ConversationMemberTombstone),
 		invites:                   make(map[uuid.UUID]map[string]uuid.UUID),
 		inviteLinks:               make(map[string]domain.ConversationInvite),
 		inviteLinkKeys:            make(map[uuid.UUID]string),
@@ -71,6 +79,7 @@ func New() *Store {
 		clientMessages:            make(map[string]domain.Message),
 		receipts:                  make(map[string]domain.Receipt),
 		entities:                  make(map[string]domain.Entity),
+		choreRotations:            make(map[uuid.UUID]memoryChoreRotation),
 		media:                     make(map[uuid.UUID]domain.MediaObject),
 		mediaUploadCapabilities:   make(map[uuid.UUID]string),
 		nextOutboxID:              1,
@@ -78,6 +87,13 @@ func New() *Store {
 		pushDeliveryByEventDevice: make(map[string]int64),
 		nextPushDeliveryID:        1,
 	}
+}
+
+type memoryChoreRotation struct {
+	ConversationID, ActorID, ChoreID uuid.UUID
+	RequestHash                      []byte
+	Result                           store.RotateChoreResult
+	ExpiresAt                        time.Time
 }
 
 func (*Store) Close()                     {}
@@ -240,7 +256,7 @@ func (s *Store) UserByExternalIdentity(ctx context.Context, provider, subject st
 func (s *Store) LinkExternalIdentity(_ context.Context, provider, subject string, userID uuid.UUID, _ string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.users[userID]; !ok {
+	if user, ok := s.users[userID]; !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.ErrNotFound
 	}
 	key := provider + ":" + subject
@@ -356,7 +372,67 @@ func (s *Store) UpdateUserPhone(_ context.Context, id uuid.UUID, phone string) (
 func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.deleteAccountLocked(userID)
+}
 
+func (s *Store) PutAccountDeletionIntent(_ context.Context, intent domain.AccountDeletionIntent) error {
+	if intent.RequestID == uuid.Nil || intent.UserID == uuid.Nil || len(intent.TokenHash) != 32 {
+		return domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, live := s.users[intent.UserID]
+	if !live || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
+	if existing, found := s.accountDeletionIntents[intent.RequestID]; found {
+		if existing.UserID != intent.UserID || subtle.ConstantTimeCompare(existing.TokenHash, intent.TokenHash) != 1 {
+			return domain.ErrConflict
+		}
+		return nil
+	}
+	intent.TokenHash = append([]byte(nil), intent.TokenHash...)
+	intent.State = domain.AccountDeletionPending
+	intent.CreatedAt = time.Now().UTC()
+	s.accountDeletionIntents[intent.RequestID] = intent
+	return nil
+}
+
+func (s *Store) ExecuteAccountDeletionIntent(
+	_ context.Context,
+	requestID uuid.UUID,
+	tokenHash []byte,
+	fence store.AccountDeletionFence,
+) error {
+	if requestID == uuid.Nil || len(tokenHash) != 32 || fence == nil {
+		return domain.ErrNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	intent, found := s.accountDeletionIntents[requestID]
+	if !found || subtle.ConstantTimeCompare(intent.TokenHash, tokenHash) != 1 {
+		return domain.ErrNotFound
+	}
+	if intent.State == domain.AccountDeletionCompleted {
+		return nil
+	}
+	if intent.State != domain.AccountDeletionPending {
+		return domain.ErrNotFound
+	}
+	if err := fence(intent.UserID); err != nil {
+		return err
+	}
+	if err := s.deleteAccountLocked(intent.UserID); err != nil && !errors.Is(err, domain.ErrNotFound) {
+		return err
+	}
+	now := time.Now().UTC()
+	intent.State = domain.AccountDeletionCompleted
+	intent.CompletedAt = &now
+	s.accountDeletionIntents[requestID] = intent
+	return nil
+}
+
+func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	user, ok := s.users[userID]
 	if !ok || string(user.Profile) == `{"deleted":true}` {
 		return domain.ErrNotFound
@@ -379,6 +455,8 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			deletedConversations[conversationID] = struct{}{}
 			delete(s.conversations, conversationID)
 			delete(s.members, conversationID)
+			delete(s.memberLocalIDs, conversationID)
+			delete(s.memberTombstones, conversationID)
 			delete(s.invites, conversationID)
 			delete(s.messages, conversationID)
 			continue
@@ -398,7 +476,18 @@ func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
 			successor.Role = "owner"
 			members[successor.UserID] = successor
 		}
+		if s.memberTombstones[conversationID] == nil {
+			s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+		}
+		localID := s.memberLocalIDs[conversationID][userID]
+		if localID == uuid.Nil {
+			localID = userID
+		}
+		s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
+			UserID: userID, LocalID: localID,
+		}
 		delete(members, userID)
+		s.projectConversationMembersLocked(conversationID)
 		delete(s.receipts, conversationID.String()+":"+userID.String())
 
 		for key, entity := range s.entities {
@@ -566,6 +655,10 @@ func containsAny(payload []byte, needles [][]byte) bool {
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	user, live := s.users[device.UserID]
+	if !live || string(user.Profile) == `{"deleted":true}` {
+		return domain.Device{}, domain.ErrNotFound
+	}
 	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
 	if device.ID == uuid.Nil {
 		device.ID = uuid.New()
@@ -696,15 +789,75 @@ func (s *Store) ClaimPreKeys(_ context.Context, targetUserID uuid.UUID) ([]domai
 func (s *Store) CreateSession(_ context.Context, session domain.Session) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	user, live := s.users[session.UserID]
+	device, deviceExists := s.devices[session.DeviceID]
+	if !live || string(user.Profile) == `{"deleted":true}` || !deviceExists || device.UserID != session.UserID {
+		return domain.ErrUnauthenticated
+	}
 	s.sessions[session.ID] = session
 	return nil
+}
+
+func (s *Store) IssueSession(
+	_ context.Context,
+	p store.SessionIssueParams,
+) (domain.User, domain.Device, error) {
+	if p.UserID == uuid.Nil || p.Device.ID == uuid.Nil || p.Device.UserID != p.UserID ||
+		p.Session.ID == uuid.Nil || p.Session.UserID != p.UserID ||
+		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
+		return domain.User{}, domain.Device{}, domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[p.UserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
+	}
+	if p.RequirePasswordHashMatch && subtle.ConstantTimeCompare(
+		[]byte(user.PasswordHash), []byte(p.ExpectedPasswordHash),
+	) != 1 {
+		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
+	}
+	device := p.Device
+	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
+	if existing, exists := s.devices[device.ID]; exists && existing.UserID != device.UserID {
+		return domain.User{}, domain.Device{}, domain.ErrConflict
+	} else if exists {
+		if device.PushToken == "" {
+			device.PushToken = existing.PushToken
+		}
+		if device.IdentityKey == "" {
+			device.IdentityKey = existing.IdentityKey
+		}
+		if len(device.SignedPreKey) == 0 {
+			device.SignedPreKey = cloneJSON(existing.SignedPreKey)
+		}
+		device.CreatedAt = existing.CreatedAt
+	}
+	if device.CreatedAt.IsZero() {
+		device.CreatedAt = time.Now().UTC()
+	}
+	device.LastSeenAt = time.Now().UTC()
+	if device.PushToken != "" {
+		for id, existing := range s.devices {
+			if id != device.ID && strings.EqualFold(existing.PushToken, device.PushToken) {
+				existing.PushToken = ""
+				s.devices[id] = existing
+			}
+		}
+	}
+	s.devices[device.ID] = device
+	s.sessions[p.Session.ID] = p.Session
+	return user, device, nil
 }
 
 func (s *Store) RotateSession(_ context.Context, id uuid.UUID, oldHash, newHash []byte, expiresAt time.Time) (domain.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
-	if !ok || session.RevokedAt != nil || session.ExpiresAt.Before(time.Now()) {
+	user, live := s.users[session.UserID]
+	if !ok || !live || string(user.Profile) == `{"deleted":true}` ||
+		session.RevokedAt != nil || session.ExpiresAt.Before(time.Now()) {
 		return domain.Session{}, domain.ErrUnauthenticated
 	}
 	if !equalTokenHash(session.RefreshTokenHash, oldHash) {
@@ -747,7 +900,8 @@ func (s *Store) SessionActive(_ context.Context, id, userID, deviceID uuid.UUID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	session, ok := s.sessions[id]
-	if !ok {
+	user, live := s.users[userID]
+	if !ok || !live || string(user.Profile) == `{"deleted":true}` {
 		return false, nil
 	}
 	return session.UserID == userID && session.DeviceID == deviceID &&
@@ -776,6 +930,13 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 		}
 	}
 	now := time.Now().UTC()
+	memberIDs := append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...)
+	for _, id := range uniqueUUIDs(memberIDs) {
+		user, exists := s.users[id]
+		if !exists || string(user.Profile) == `{"deleted":true}` {
+			return domain.Conversation{}, domain.ErrNotFound
+		}
+	}
 	conversationID := p.ID
 	if conversationID == uuid.Nil {
 		conversationID = uuid.New()
@@ -792,8 +953,16 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 	}
 	s.conversations[conversation.ID] = conversation
 	s.members[conversation.ID] = make(map[uuid.UUID]domain.ConversationMember)
+	s.memberLocalIDs[conversation.ID] = make(map[uuid.UUID]uuid.UUID)
+	s.memberTombstones[conversation.ID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
 	s.invites[conversation.ID] = make(map[string]uuid.UUID)
-	memberIDs := append([]uuid.UUID{p.CreatedBy}, p.MemberIDs...)
+	rollbackConversation := func() {
+		delete(s.conversations, conversation.ID)
+		delete(s.members, conversation.ID)
+		delete(s.memberLocalIDs, conversation.ID)
+		delete(s.memberTombstones, conversation.ID)
+		delete(s.invites, conversation.ID)
+	}
 	for _, id := range uniqueUUIDs(memberIDs) {
 		role := "member"
 		if id == p.CreatedBy {
@@ -801,6 +970,29 @@ func (s *Store) CreateConversation(_ context.Context, p store.CreateConversation
 		}
 		s.members[conversation.ID][id] = domain.ConversationMember{
 			ConversationID: conversation.ID, UserID: id, Role: role, JoinedAt: now,
+		}
+	}
+	if conversation.Kind == "group" {
+		members := s.conversationMembersLocked(conversation.ID)
+		localIDs, err := s.ensureConversationMemberLocalIDsLocked(conversation.ID, conversation.Metadata, members)
+		if err != nil {
+			rollbackConversation()
+			return domain.Conversation{}, err
+		}
+		conversation.Metadata, err = store.ProjectConversationMembersWithLocalIDs(
+			conversation.Metadata, members, localIDs,
+			s.conversationMemberTombstonesLocked(conversation.ID)...,
+		)
+		if err != nil {
+			rollbackConversation()
+			return domain.Conversation{}, err
+		}
+		s.conversations[conversation.ID] = conversation
+	} else {
+		members := s.conversationMembersLocked(conversation.ID)
+		if _, err := s.ensureConversationMemberLocalIDsLocked(conversation.ID, conversation.Metadata, members); err != nil {
+			rollbackConversation()
+			return domain.Conversation{}, err
 		}
 	}
 	for _, phone := range p.InvitePhones {
@@ -830,6 +1022,20 @@ func (s *Store) UpdateConversation(_ context.Context, conversationID, actorID uu
 	}
 	if p.Metadata != nil {
 		conversation.Metadata = cloneJSON(*p.Metadata)
+	}
+	if conversation.Kind == "group" {
+		members := s.conversationMembersLocked(conversationID)
+		localIDs, err := s.ensureConversationMemberLocalIDsLocked(conversationID, conversation.Metadata, members)
+		if err != nil {
+			return domain.Conversation{}, err
+		}
+		conversation.Metadata, err = store.ProjectConversationMembersWithLocalIDs(
+			conversation.Metadata, members, localIDs,
+			s.conversationMemberTombstonesLocked(conversationID)...,
+		)
+		if err != nil {
+			return domain.Conversation{}, err
+		}
 	}
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
@@ -867,6 +1073,8 @@ func (s *Store) DeleteConversation(_ context.Context, conversationID, actorID uu
 	s.outbox = filtered
 	delete(s.conversations, conversationID)
 	delete(s.members, conversationID)
+	delete(s.memberLocalIDs, conversationID)
+	delete(s.memberTombstones, conversationID)
 	delete(s.invites, conversationID)
 	for tokenKey, invite := range s.inviteLinks {
 		if invite.ConversationID == conversationID {
@@ -893,7 +1101,8 @@ func (s *Store) Conversation(_ context.Context, id, userID uuid.UUID) (domain.Co
 		return domain.Conversation{}, domain.ErrNotFound
 	}
 	if _, ok := s.members[id][userID]; !ok {
-		return domain.Conversation{}, domain.ErrForbidden
+		// Do not reveal whether a high-entropy conversation identifier exists.
+		return domain.Conversation{}, domain.ErrNotFound
 	}
 	return conversation, nil
 }
@@ -924,11 +1133,177 @@ func (s *Store) ListConversationMembers(_ context.Context, conversationID, actor
 	if _, ok := members[actorID]; !ok {
 		return nil, domain.ErrForbidden
 	}
+	return s.conversationMembersLocked(conversationID), nil
+}
+
+func (s *Store) conversationMembersLocked(conversationID uuid.UUID) []domain.ConversationMember {
+	members := s.members[conversationID]
 	result := make([]domain.ConversationMember, 0, len(members))
 	for _, member := range members {
+		if user, ok := s.users[member.UserID]; ok {
+			member = store.ConversationMemberWithPublicIdentity(member, user)
+		}
 		result = append(result, member)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].JoinedAt.Equal(result[j].JoinedAt) {
+			return result[i].UserID.String() < result[j].UserID.String()
+		}
+		return result[i].JoinedAt.Before(result[j].JoinedAt)
+	})
+	return result
+}
+
+func (s *Store) projectConversationMembersLocked(conversationID uuid.UUID) error {
+	conversation, ok := s.conversations[conversationID]
+	if !ok || conversation.Kind != "group" {
+		return nil
+	}
+	localIDs, err := s.ensureConversationMemberLocalIDsLocked(
+		conversationID, conversation.Metadata, s.conversationMembersLocked(conversationID),
+	)
+	if err != nil {
+		return err
+	}
+	conversation.Metadata, err = store.ProjectConversationMembersWithLocalIDs(
+		conversation.Metadata, s.conversationMembersLocked(conversationID),
+		localIDs,
+		s.conversationMemberTombstonesLocked(conversationID)...,
+	)
+	if err != nil {
+		return err
+	}
+	s.conversations[conversationID] = conversation
+	return nil
+}
+
+func (s *Store) planConversationMemberLocalIDsLocked(
+	conversationID uuid.UUID,
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+) ([]store.ConversationMemberLocalID, error) {
+	existing := make([]store.ConversationMemberLocalID, 0, len(s.memberLocalIDs[conversationID]))
+	for userID, localID := range s.memberLocalIDs[conversationID] {
+		existing = append(existing, store.ConversationMemberLocalID{UserID: userID, LocalID: localID})
+	}
+	derived := store.DeriveConversationMemberLocalIDs(metadata, members, existing)
+	all := append([]store.ConversationMemberLocalID(nil), existing...)
+	existingUsers := make(map[uuid.UUID]struct{}, len(existing))
+	for _, mapping := range existing {
+		existingUsers[mapping.UserID] = struct{}{}
+	}
+	for _, mapping := range derived {
+		if _, immutable := existingUsers[mapping.UserID]; !immutable {
+			all = append(all, mapping)
+		}
+	}
+	if err := store.ValidateConversationMemberLocalIDNamespace(members, all); err != nil {
+		return nil, err
+	}
+	allByUser := make(map[uuid.UUID]uuid.UUID, len(all))
+	for _, mapping := range all {
+		allByUser[mapping.UserID] = mapping.LocalID
+	}
+	result := make([]store.ConversationMemberLocalID, 0, len(members))
+	for _, member := range members {
+		localID, exists := allByUser[member.UserID]
+		if !exists {
+			return nil, domain.ErrConflict
+		}
+		result = append(result, store.ConversationMemberLocalID{
+			UserID: member.UserID, LocalID: localID,
+		})
+	}
 	return result, nil
+}
+
+func (s *Store) commitConversationMemberLocalIDsLocked(
+	conversationID uuid.UUID,
+	mappings []store.ConversationMemberLocalID,
+) {
+	if s.memberLocalIDs[conversationID] == nil {
+		s.memberLocalIDs[conversationID] = make(map[uuid.UUID]uuid.UUID)
+	}
+	for _, mapping := range mappings {
+		if _, immutable := s.memberLocalIDs[conversationID][mapping.UserID]; !immutable {
+			s.memberLocalIDs[conversationID][mapping.UserID] = mapping.LocalID
+		}
+	}
+}
+
+func (s *Store) ensureConversationMemberLocalIDsLocked(
+	conversationID uuid.UUID,
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+) ([]store.ConversationMemberLocalID, error) {
+	planned, err := s.planConversationMemberLocalIDsLocked(conversationID, metadata, members)
+	if err != nil {
+		return nil, err
+	}
+	s.commitConversationMemberLocalIDsLocked(conversationID, planned)
+	return planned, nil
+}
+
+func (s *Store) conversationMemberTombstonesLocked(conversationID uuid.UUID) []store.ConversationMemberTombstone {
+	byUser := s.memberTombstones[conversationID]
+	result := make([]store.ConversationMemberTombstone, 0, len(byUser))
+	for _, tombstone := range byUser {
+		result = append(result, tombstone)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].UserID.String() < result[j].UserID.String() })
+	return result
+}
+
+func (s *Store) prospectiveConversationMembersLocked(
+	conversationID uuid.UUID,
+	candidate domain.ConversationMember,
+) []domain.ConversationMember {
+	members := s.conversationMembersLocked(conversationID)
+	if user, ok := s.users[candidate.UserID]; ok {
+		candidate = store.ConversationMemberWithPublicIdentity(candidate, user)
+	}
+	replaced := false
+	for index := range members {
+		if members[index].UserID == candidate.UserID {
+			members[index] = candidate
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		members = append(members, candidate)
+	}
+	sort.SliceStable(members, func(i, j int) bool {
+		if members[i].JoinedAt.Equal(members[j].JoinedAt) {
+			return members[i].UserID.String() < members[j].UserID.String()
+		}
+		return members[i].JoinedAt.Before(members[j].JoinedAt)
+	})
+	return members
+}
+
+func (s *Store) planConversationMembershipProjectionLocked(
+	conversationID uuid.UUID,
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+	joiningUserID uuid.UUID,
+) ([]store.ConversationMemberLocalID, json.RawMessage, error) {
+	planned, err := s.planConversationMemberLocalIDsLocked(conversationID, metadata, members)
+	if err != nil {
+		return nil, nil, err
+	}
+	tombstones := s.conversationMemberTombstonesLocked(conversationID)
+	filtered := tombstones[:0]
+	for _, tombstone := range tombstones {
+		if tombstone.UserID != joiningUserID {
+			filtered = append(filtered, tombstone)
+		}
+	}
+	projected, err := store.ProjectConversationMembersWithLocalIDs(metadata, members, planned, filtered...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return planned, projected, nil
 }
 
 func (s *Store) ConversationMemberIDs(_ context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -965,6 +1340,12 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	if s.conversations[conversationID].Kind != "group" {
 		return domain.ErrInvalid
 	}
+	if role != "member" && role != "admin" {
+		return domain.ErrInvalid
+	}
+	if user, exists := s.users[userID]; !exists || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
 	if actor := members[actorID]; actor.Role != "owner" && actor.Role != "admin" {
 		return domain.ErrForbidden
 	}
@@ -975,10 +1356,25 @@ func (s *Store) AddConversationMember(_ context.Context, conversationID, actorID
 	if !targetExists && len(members) >= 1024 {
 		return domain.ErrInvalid
 	}
-	members[userID] = domain.ConversationMember{
-		ConversationID: conversationID, UserID: userID, Role: role, JoinedAt: time.Now().UTC(),
+	joinedAt := time.Now().UTC()
+	if targetExists {
+		joinedAt = target.JoinedAt
 	}
+	candidate := domain.ConversationMember{
+		ConversationID: conversationID, UserID: userID, Role: role, JoinedAt: joinedAt,
+	}
+	prospective := s.prospectiveConversationMembersLocked(conversationID, candidate)
+	planned, projected, err := s.planConversationMembershipProjectionLocked(
+		conversationID, s.conversations[conversationID].Metadata, prospective, userID,
+	)
+	if err != nil {
+		return err
+	}
+	members[userID] = candidate
+	delete(s.memberTombstones[conversationID], userID)
+	s.commitConversationMemberLocalIDsLocked(conversationID, planned)
 	conversation := s.conversations[conversationID]
+	conversation.Metadata = projected
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
 	if !targetExists {
@@ -1009,18 +1405,71 @@ func (s *Store) CreateConversationInvites(_ context.Context, conversationID, act
 func (s *Store) ClaimConversationInvites(_ context.Context, userID uuid.UUID, phone string) ([]uuid.UUID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var claimed []uuid.UUID
+	if user, exists := s.users[userID]; !exists || string(user.Profile) == `{"deleted":true}` {
+		return nil, domain.ErrNotFound
+	}
+	type claimPlan struct {
+		conversationID uuid.UUID
+		candidate      domain.ConversationMember
+		joined         bool
+		localIDs       []store.ConversationMemberLocalID
+		metadata       json.RawMessage
+	}
+	var conversationIDs []uuid.UUID
 	for conversationID, phones := range s.invites {
-		if _, ok := phones[phone]; !ok {
-			continue
+		if _, ok := phones[phone]; ok {
+			conversationIDs = append(conversationIDs, conversationID)
 		}
-		delete(phones, phone)
-		if _, exists := s.members[conversationID][userID]; !exists {
-			s.members[conversationID][userID] = domain.ConversationMember{
-				ConversationID: conversationID, UserID: userID, Role: "member", JoinedAt: time.Now().UTC(),
+	}
+	sort.Slice(conversationIDs, func(i, j int) bool { return conversationIDs[i].String() < conversationIDs[j].String() })
+	now := time.Now().UTC()
+	plans := make([]claimPlan, 0, len(conversationIDs))
+	for _, conversationID := range conversationIDs {
+		conversation, exists := s.conversations[conversationID]
+		if !exists {
+			return nil, domain.ErrNotFound
+		}
+		if conversation.Kind != "group" {
+			return nil, domain.ErrInvalid
+		}
+		candidate, alreadyMember := s.members[conversationID][userID]
+		if !alreadyMember {
+			if len(s.members[conversationID]) >= 1024 {
+				return nil, domain.ErrInvalid
+			}
+			candidate = domain.ConversationMember{
+				ConversationID: conversationID, UserID: userID, Role: "member", JoinedAt: now,
 			}
 		}
-		claimed = append(claimed, conversationID)
+		prospective := s.prospectiveConversationMembersLocked(conversationID, candidate)
+		localIDs, metadata, err := s.planConversationMembershipProjectionLocked(
+			conversationID, conversation.Metadata, prospective, userID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, claimPlan{
+			conversationID: conversationID, candidate: candidate, joined: !alreadyMember,
+			localIDs: localIDs, metadata: metadata,
+		})
+	}
+	claimed := make([]uuid.UUID, 0, len(plans))
+	for _, plan := range plans {
+		delete(s.invites[plan.conversationID], phone)
+		if plan.joined {
+			s.members[plan.conversationID][userID] = plan.candidate
+			payload, _ := json.Marshal(domain.ConversationMemberAdded{
+				ConversationID: plan.conversationID, ActorID: userID, UserID: userID,
+			})
+			s.appendOutbox("conversation.member_added", plan.conversationID, payload)
+		}
+		delete(s.memberTombstones[plan.conversationID], userID)
+		s.commitConversationMemberLocalIDsLocked(plan.conversationID, plan.localIDs)
+		conversation := s.conversations[plan.conversationID]
+		conversation.Metadata = plan.metadata
+		conversation.UpdatedAt = now
+		s.conversations[plan.conversationID] = conversation
+		claimed = append(claimed, plan.conversationID)
 	}
 	return claimed, nil
 }
@@ -1066,14 +1515,16 @@ func (s *Store) ConversationInvitePreview(_ context.Context, tokenHash []byte, u
 	if !ok {
 		return domain.ConversationInvitePreview{}, domain.ErrNotFound
 	}
-	if err := conversationInviteActiveError(invite, time.Now()); err != nil {
-		return domain.ConversationInvitePreview{}, err
-	}
 	conversation, ok := s.conversations[invite.ConversationID]
 	if !ok {
 		return domain.ConversationInvitePreview{}, domain.ErrNotFound
 	}
 	_, alreadyMember := s.members[invite.ConversationID][userID]
+	if !alreadyMember {
+		if err := conversationInviteActiveError(invite, time.Now()); err != nil {
+			return domain.ConversationInvitePreview{}, err
+		}
+	}
 	return domain.ConversationInvitePreview{
 		InviteID: invite.ID, Kind: conversation.Kind, Title: conversation.Title,
 		AvatarURL: conversation.AvatarURL, ExpiresAt: invite.ExpiresAt,
@@ -1084,25 +1535,45 @@ func (s *Store) ConversationInvitePreview(_ context.Context, tokenHash []byte, u
 func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, userID uuid.UUID) (domain.ConversationInviteAcceptance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if user, exists := s.users[userID]; !exists || string(user.Profile) == `{"deleted":true}` {
+		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
+	}
 	tokenKey := string(tokenHash)
 	invite, ok := s.inviteLinks[tokenKey]
 	if !ok {
 		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
 	}
 	now := time.Now().UTC()
-	if invite.RevokedAt != nil {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
-	}
-	if !invite.ExpiresAt.After(now) {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
-	}
 	conversation, ok := s.conversations[invite.ConversationID]
 	if !ok {
 		return domain.ConversationInviteAcceptance{}, domain.ErrNotFound
 	}
 	members := s.members[invite.ConversationID]
 	if _, alreadyMember := members[userID]; alreadyMember {
+		activeMembers := s.conversationMembersLocked(conversation.ID)
+		localIDs, err := s.ensureConversationMemberLocalIDsLocked(conversation.ID, conversation.Metadata, activeMembers)
+		if err != nil {
+			return domain.ConversationInviteAcceptance{}, err
+		}
+		projected, err := store.ProjectConversationMembersWithLocalIDs(
+			conversation.Metadata, activeMembers, localIDs,
+			s.conversationMemberTombstonesLocked(conversation.ID)...,
+		)
+		if err != nil {
+			return domain.ConversationInviteAcceptance{}, err
+		}
+		if !store.JSONValuesEqual(projected, conversation.Metadata) {
+			conversation.Metadata = projected
+			conversation.UpdatedAt = now
+			s.conversations[conversation.ID] = conversation
+		}
 		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
+	}
+	if invite.RevokedAt != nil {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
 	}
 	if invite.Uses >= invite.MaxUses {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExhausted
@@ -1110,11 +1581,22 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 	if conversation.Kind != "group" || len(members) >= 1024 {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInvalid
 	}
-	members[userID] = domain.ConversationMember{
+	candidate := domain.ConversationMember{
 		ConversationID: conversation.ID, UserID: userID, Role: "member", JoinedAt: now,
 	}
+	prospective := s.prospectiveConversationMembersLocked(conversation.ID, candidate)
+	planned, projected, err := s.planConversationMembershipProjectionLocked(
+		conversation.ID, conversation.Metadata, prospective, userID,
+	)
+	if err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
+	members[userID] = candidate
+	delete(s.memberTombstones[conversation.ID], userID)
+	s.commitConversationMemberLocalIDsLocked(conversation.ID, planned)
 	invite.Uses++
 	s.inviteLinks[tokenKey] = invite
+	conversation.Metadata = projected
 	conversation.UpdatedAt = now
 	s.conversations[conversation.ID] = conversation
 	payload, _ := json.Marshal(domain.ConversationMemberAdded{
@@ -1181,10 +1663,21 @@ func (s *Store) RemoveConversationMember(_ context.Context, conversationID, acto
 	if actorID != userID && actor.Role != "owner" && actor.Role != "admin" {
 		return domain.ErrForbidden
 	}
-	delete(members, userID)
 	conversation := s.conversations[conversationID]
+	localID := s.memberLocalIDs[conversationID][userID]
+	if localID == uuid.Nil {
+		localID = userID
+	}
+	delete(members, userID)
+	if s.memberTombstones[conversationID] == nil {
+		s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+	}
+	s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
+		UserID: userID, LocalID: localID,
+	}
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	s.projectConversationMembersLocked(conversationID)
 	return nil
 }
 
@@ -1327,6 +1820,20 @@ func (s *Store) PutEntity(_ context.Context, entity domain.Entity, expectedVersi
 	if _, ok := s.members[entity.ConversationID][entity.CreatedBy]; !ok {
 		return domain.Entity{}, domain.ErrForbidden
 	}
+	conversation, ok := s.conversations[entity.ConversationID]
+	if !ok {
+		return domain.Entity{}, domain.ErrNotFound
+	}
+	activeMembers := s.conversationMembersLocked(entity.ConversationID)
+	localIDs, err := s.ensureConversationMemberLocalIDsLocked(entity.ConversationID, conversation.Metadata, activeMembers)
+	if err != nil {
+		return domain.Entity{}, err
+	}
+	if err := store.ValidateEntityParticipants(
+		entity.Kind, entity.Payload, conversation.Metadata, activeMembers, localIDs...,
+	); err != nil {
+		return domain.Entity{}, err
+	}
 	key := entityKey(entity.ConversationID, entity.Kind, entity.ID)
 	now := time.Now().UTC()
 	existing, exists := s.entities[key]
@@ -1392,6 +1899,113 @@ func (s *Store) DeleteEntity(_ context.Context, conversationID, actorID uuid.UUI
 	payload, _ := json.Marshal(entity)
 	s.appendOutbox("entity.deleted", conversationID, payload)
 	return entity, nil
+}
+
+func (s *Store) RotateChore(_ context.Context, p store.RotateChoreParams) (store.RotateChoreResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.OperationID == uuid.Nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	// Idempotency never bypasses the current ACL. The process-wide mutex is the
+	// memory store's conversation authority, matching the PostgreSQL lock order.
+	if _, ok := s.members[p.ConversationID][p.ActorID]; !ok {
+		return store.RotateChoreResult{}, domain.ErrForbidden
+	}
+	if prior, ok := s.choreRotations[p.OperationID]; ok {
+		if prior.ConversationID != p.ConversationID || prior.ActorID != p.ActorID ||
+			prior.ChoreID != p.ChoreID || !bytes.Equal(prior.RequestHash, p.RequestHash) {
+			return store.RotateChoreResult{}, domain.ErrConflict
+		}
+		return cloneChoreRotationResult(prior.Result), nil
+	}
+	if p.Validate() != nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	key := entityKey(p.ConversationID, "chore", p.ChoreID)
+	chore, ok := s.entities[key]
+	if !ok || chore.DeletedAt != nil {
+		return store.RotateChoreResult{}, domain.ErrNotFound
+	}
+	if chore.Version != p.ExpectedChoreVersion {
+		return store.RotateChoreResult{}, domain.ErrConflict
+	}
+	conversation, ok := s.conversations[p.ConversationID]
+	if !ok {
+		return store.RotateChoreResult{}, domain.ErrNotFound
+	}
+	members := s.conversationMembersLocked(p.ConversationID)
+	localIDs, err := s.ensureConversationMemberLocalIDsLocked(p.ConversationID, conversation.Metadata, members)
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err := store.ValidateEntityParticipants("chore", p.ChorePayload, conversation.Metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err := store.ValidateEntityParticipants("feed_item", p.FeedPayload, conversation.Metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	now := time.Now().UTC()
+	chore.Payload, chore.Version, chore.UpdatedAt = cloneJSON(p.ChorePayload), chore.Version+1, now
+	feed := domain.Entity{ConversationID: p.ConversationID, Kind: "feed_item", ID: p.OperationID, Version: 1,
+		Payload: cloneJSON(p.FeedPayload), CreatedBy: p.ActorID, CreatedAt: now, UpdatedAt: now}
+	if _, exists := s.entities[entityKey(p.ConversationID, "feed_item", p.OperationID)]; exists {
+		return store.RotateChoreResult{}, domain.ErrConflict
+	}
+	result := store.RotateChoreResult{OperationID: p.OperationID, Chore: chore, FeedItem: feed}
+	// All validation precedes this atomic critical-section commit.
+	s.entities[key] = chore
+	s.entities[entityKey(p.ConversationID, "feed_item", p.OperationID)] = feed
+	for _, entity := range []domain.Entity{chore, feed} {
+		payload, _ := json.Marshal(entity)
+		s.appendOutbox("entity.updated", p.ConversationID, payload)
+	}
+	s.choreRotations[p.OperationID] = memoryChoreRotation{
+		ConversationID: p.ConversationID, ActorID: p.ActorID, ChoreID: p.ChoreID,
+		RequestHash: append([]byte(nil), p.RequestHash...), Result: cloneChoreRotationResult(result),
+		ExpiresAt: now.Add(90 * 24 * time.Hour),
+	}
+	return cloneChoreRotationResult(result), nil
+}
+
+func (s *Store) PruneChoreRotationOperations(_ context.Context, cutoff time.Time, batchSize int) (int, error) {
+	if batchSize < 1 {
+		return 0, domain.ErrInvalid
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now := time.Now().UTC(); cutoff.After(now) {
+		cutoff = now
+	}
+	type expiredOperation struct {
+		id uuid.UUID
+		at time.Time
+	}
+	expired := make([]expiredOperation, 0)
+	for id, operation := range s.choreRotations {
+		if !operation.ExpiresAt.After(cutoff) {
+			expired = append(expired, expiredOperation{id: id, at: operation.ExpiresAt})
+		}
+	}
+	sort.Slice(expired, func(i, j int) bool {
+		if expired[i].at.Equal(expired[j].at) {
+			return expired[i].id.String() < expired[j].id.String()
+		}
+		return expired[i].at.Before(expired[j].at)
+	})
+	if len(expired) > batchSize {
+		expired = expired[:batchSize]
+	}
+	for _, operation := range expired {
+		delete(s.choreRotations, operation.id)
+	}
+	return len(expired), nil
+}
+
+func cloneChoreRotationResult(result store.RotateChoreResult) store.RotateChoreResult {
+	result.Chore.Payload = cloneJSON(result.Chore.Payload)
+	result.FeedItem.Payload = cloneJSON(result.FeedItem.Payload)
+	return result
 }
 
 func (s *Store) CreateMedia(_ context.Context, media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {

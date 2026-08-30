@@ -27,6 +27,25 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrUnauthenticated)
 		return
 	}
+	guard := s.realtimeRevocations().Register(id)
+	defer s.realtimeRevocations().Unregister(guard)
+	owner, err := s.bus.RegisterSessionOwner(r.Context(), id.UserID, id.SessionID, func(sessionID *uuid.UUID) {
+		s.realtimeRevocations().Revoke(id.UserID, sessionID)
+	})
+	if err != nil {
+		guard.Revoke()
+		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Realtime delivery is unavailable.")
+		return
+	}
+	defer owner.Close()
+	guard.SetLeaseValidator(owner.Valid)
+	// This durable check occurs after owner registration. A revocation racing
+	// registration therefore either fences us through the barrier or is observed
+	// here before the socket can send any application data.
+	if !s.realtimeSessionActive(r.Context(), id, guard) {
+		writeDomainError(w, domain.ErrUnauthenticated)
+		return
+	}
 	connection, err := websocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -45,6 +64,7 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 	defer subscription.Close()
 
 	connection.SetReadLimit(16 << 10)
+	_ = connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_ = connection.SetReadDeadline(time.Now().Add(70 * time.Second))
 	connection.SetPongHandler(func(string) error {
 		return connection.SetReadDeadline(time.Now().Add(70 * time.Second))
@@ -53,9 +73,12 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 	hello, _ := json.Marshal(map[string]any{
 		"user_id": id.UserID, "device_id": id.DeviceID, "heartbeat_seconds": 25,
 	})
-	if err := connection.WriteJSON(domain.RealtimeEvent{
-		ID: uuid.NewString(), Type: "session.ready", Payload: hello, OccurredAt: time.Now().UTC(),
-	}); err != nil {
+	wrote, err := guard.WhileActive(func() error {
+		return connection.WriteJSON(domain.RealtimeEvent{
+			ID: uuid.NewString(), Type: "session.ready", Payload: hello, OccurredAt: time.Now().UTC(),
+		})
+	})
+	if err != nil || !wrote {
 		return
 	}
 
@@ -64,6 +87,9 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 		defer close(readDone)
 		var lastTypingEvent time.Time
 		for {
+			if guard.IsRevoked() {
+				return
+			}
 			var frame struct {
 				Type           string     `json:"type"`
 				ConversationID *uuid.UUID `json:"conversation_id,omitempty"`
@@ -73,54 +99,128 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if frame.Type == "ping" {
-				_ = connection.WriteControl(websocket.PongMessage, nil, time.Now().Add(5*time.Second))
+				_, _ = guard.WhileActive(func() error {
+					return connection.WriteControl(websocket.PongMessage, nil, time.Now().Add(5*time.Second))
+				})
 			} else if frame.Type == "typing" && frame.ConversationID != nil {
-				if time.Since(lastTypingEvent) < 300*time.Millisecond {
+				now := time.Now()
+				if !typingFrameDue(now, &lastTypingEvent) {
 					continue
 				}
-				lastTypingEvent = time.Now()
-				members, err := s.store.ListConversationMembers(r.Context(), *frame.ConversationID, id.UserID)
-				if err != nil {
-					continue
+				// The cheap per-connection gate precedes the durable lookup, bounding
+				// an authenticated typing flood to at most one query per interval.
+				if !s.realtimeSessionActive(r.Context(), id, guard) {
+					return
 				}
-				recipients := make([]uuid.UUID, 0, len(members))
-				for _, member := range members {
-					if member.UserID != id.UserID {
-						recipients = append(recipients, member.UserID)
+				published, _ := guard.WhileActive(func() error {
+					actionContext, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+					defer cancel()
+					members, memberErr := s.store.ListConversationMembers(
+						actionContext, *frame.ConversationID, id.UserID,
+					)
+					if memberErr != nil {
+						return nil
 					}
+					recipients := make([]uuid.UUID, 0, len(members))
+					for _, member := range members {
+						if member.UserID != id.UserID {
+							recipients = append(recipients, member.UserID)
+						}
+					}
+					payload, _ := json.Marshal(map[string]any{
+						"user_id": id.UserID, "device_id": id.DeviceID, "active": frame.Active,
+					})
+					return s.bus.Publish(actionContext, recipients, domain.RealtimeEvent{
+						ID: uuid.NewString(), Type: "typing.changed", ConversationID: frame.ConversationID,
+						Payload: payload, OccurredAt: time.Now().UTC(),
+					})
+				})
+				if !published {
+					return
 				}
-				payload, _ := json.Marshal(map[string]any{
-					"user_id": id.UserID, "device_id": id.DeviceID, "active": frame.Active,
-				})
-				_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-					ID: uuid.NewString(), Type: "typing.changed", ConversationID: frame.ConversationID,
-					Payload: payload, OccurredAt: time.Now().UTC(),
-				})
 			}
 		}
 	}()
 
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
+	recheckInterval := s.realtimeSessionRecheck
+	if recheckInterval <= 0 {
+		recheckInterval = realtimeDurableSessionRecheckInterval
+	}
+	sessionTicker := time.NewTicker(recheckInterval)
+	defer sessionTicker.Stop()
+	heartbeatTicker := time.NewTicker(25 * time.Second)
+	defer heartbeatTicker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-guard.Revoked():
+			s.closeRealtimeSession(connection)
+			return
 		case <-readDone:
 			return
-		case <-ticker.C:
+		case <-sessionTicker.C:
+			// This fail-closed durable fallback bounds a dropped cross-process
+			// revocation signal to five seconds without a query per fanout event.
+			if !s.realtimeSessionActive(r.Context(), id, guard) {
+				s.closeRealtimeSession(connection)
+				return
+			}
+		case <-heartbeatTicker.C:
 			_ = s.presence.Heartbeat(r.Context(), id.UserID, id.DeviceID)
-			if err := connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+			wrote, err := guard.WhileActive(func() error {
+				return connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+			})
+			if err != nil || !wrote {
 				return
 			}
 		case event, open := <-subscription.Events():
 			if !open {
 				return
 			}
+			if event.Type == sessionRevokedEventType {
+				s.applySessionRevocation(id.UserID, event.Payload)
+				continue
+			}
 			_ = connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := connection.WriteJSON(event); err != nil {
+			wrote, err := guard.WhileActive(func() error { return connection.WriteJSON(event) })
+			if err != nil || !wrote {
 				return
 			}
 		}
 	}
+}
+
+func typingFrameDue(now time.Time, last *time.Time) bool {
+	if !last.IsZero() && now.Sub(*last) < 300*time.Millisecond {
+		return false
+	}
+	*last = now
+	return true
+}
+
+func (s *Server) realtimeSessionActive(
+	ctx context.Context,
+	id identity,
+	guard *realtimeSessionGuard,
+) bool {
+	active, err := s.store.SessionActive(ctx, id.SessionID, id.UserID, id.DeviceID)
+	if err != nil {
+		s.logger.Error("realtime_session_check_failed", "error", err)
+		guard.Revoke()
+		return false
+	}
+	if !active {
+		s.realtimeRevocations().Revoke(id.UserID, &id.SessionID)
+		return false
+	}
+	return !guard.IsRevoked()
+}
+
+func (s *Server) closeRealtimeSession(connection *websocket.Conn) {
+	_ = connection.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "session revoked"),
+		time.Now().Add(5*time.Second),
+	)
 }

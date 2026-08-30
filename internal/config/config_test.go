@@ -293,6 +293,21 @@ func TestPushDeliveryPolicyIsBounded(t *testing.T) {
 	}
 }
 
+func TestChoreRotationCleanupPolicyIsBounded(t *testing.T) {
+	for _, mutate := range []func(*Config){
+		func(cfg *Config) { cfg.ChoreRotation.CleanupInterval = time.Minute },
+		func(cfg *Config) { cfg.ChoreRotation.CleanupInterval = 25 * time.Hour },
+		func(cfg *Config) { cfg.ChoreRotation.CleanupBatchSize = 0 },
+		func(cfg *Config) { cfg.ChoreRotation.CleanupBatchSize = 1001 },
+	} {
+		cfg := validProductionConfig()
+		mutate(&cfg)
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("unsafe chore rotation cleanup policy was accepted")
+		}
+	}
+}
+
 func TestMediaLimitsRejectUnsafeCapacityAndCleanupSettings(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -385,6 +400,7 @@ func validProductionConfig() Config {
 		AccessTTL:        15 * time.Minute,
 		RefreshTTL:       30 * 24 * time.Hour,
 		AutoMigrate:      false,
+		ChoreRotation:    ChoreRotationConfig{CleanupInterval: time.Hour, CleanupBatchSize: 500},
 		MediaProvider:    "s3",
 		S3: S3Config{
 			Endpoint: "s3.internal", PublicEndpoint: "media.clustr.app",

@@ -80,8 +80,10 @@ func (s *Store) ConversationInvitePreview(ctx context.Context, tokenHash []byte,
 	if err != nil {
 		return domain.ConversationInvitePreview{}, mapError(err)
 	}
-	if err := postgresConversationInviteActiveError(invite, time.Now()); err != nil {
-		return domain.ConversationInvitePreview{}, err
+	if !preview.AlreadyMember {
+		if err := postgresConversationInviteActiveError(invite, time.Now()); err != nil {
+			return domain.ConversationInvitePreview{}, err
+		}
 	}
 	preview.InviteID = invite.ID
 	preview.ExpiresAt = invite.ExpiresAt
@@ -130,12 +132,6 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		return domain.ConversationInviteAcceptance{}, mapError(err)
 	}
 	now := time.Now().UTC()
-	if invite.RevokedAt != nil {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
-	}
-	if !invite.ExpiresAt.After(now) {
-		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
-	}
 	var alreadyMember bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(SELECT 1 FROM conversation_members WHERE conversation_id=$1 AND user_id=$2)`,
@@ -143,10 +139,32 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		return domain.ConversationInviteAcceptance{}, err
 	}
 	if alreadyMember {
+		projected, projectionErr := projectConversationMetadata(
+			ctx, tx, conversation.ID, conversation.Metadata,
+		)
+		if projectionErr != nil {
+			return domain.ConversationInviteAcceptance{}, projectionErr
+		}
+		if !store.JSONValuesEqual(projected, conversation.Metadata) {
+			conversation.Metadata = projected
+			err = tx.QueryRow(ctx, `
+				UPDATE conversations SET metadata=$2,updated_at=$3 WHERE id=$1
+				RETURNING updated_at`, conversation.ID, conversation.Metadata, now,
+			).Scan(&conversation.UpdatedAt)
+			if err != nil {
+				return domain.ConversationInviteAcceptance{}, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.ConversationInviteAcceptance{}, err
 		}
 		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
+	}
+	if invite.RevokedAt != nil {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteRevoked
+	}
+	if !invite.ExpiresAt.After(now) {
+		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExpired
 	}
 	if invite.Uses >= invite.MaxUses {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInviteExhausted
@@ -163,19 +181,31 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 	if memberCount >= 1024 {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInvalid
 	}
+	if err := validateConversationMemberAdmission(ctx, tx, invite.ConversationID, userID); err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
 		VALUES($1,$2,'member',$3)`, invite.ConversationID, userID, now); err != nil {
 		return domain.ConversationInviteAcceptance{}, mapError(err)
 	}
+	if _, err := tx.Exec(ctx, `DELETE FROM conversation_member_tombstones WHERE conversation_id=$1 AND user_id=$2`, invite.ConversationID, userID); err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversation_invite_links SET uses=uses+1 WHERE id=$1`, invite.ID); err != nil {
 		return domain.ConversationInviteAcceptance{}, err
 	}
+	conversation.Metadata, err = projectConversationMetadata(
+		ctx, tx, conversation.ID, conversation.Metadata,
+	)
+	if err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
 	err = tx.QueryRow(ctx, `
-		UPDATE conversations SET updated_at=$2 WHERE id=$1
+		UPDATE conversations SET metadata=$2,updated_at=$3 WHERE id=$1
 		RETURNING id,kind,title,avatar_url,metadata,created_by,last_seq,created_at,updated_at`,
-		conversation.ID, now,
+		conversation.ID, conversation.Metadata, now,
 	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
 		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
 		&conversation.CreatedAt, &conversation.UpdatedAt)

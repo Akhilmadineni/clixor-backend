@@ -149,7 +149,7 @@ func TestMessagingLifecycleAndIsolation(t *testing.T) {
 		t.Fatalf("bob did not receive conversation: %+v", listed.Items)
 	}
 	eve.client.do(t, http.MethodGet, "/v1/conversations/"+conversation.ID.String(),
-		nil, http.StatusForbidden, nil)
+		nil, http.StatusNotFound, nil)
 
 	body := map[string]any{
 		"client_message_id": uuid.NewString(),
@@ -331,7 +331,7 @@ func TestGroupMemberCanLeaveThroughSelfCompatibilityRoute(t *testing.T) {
 		"/v1/conversations/"+group.ID.String()+"/members/me",
 		nil, http.StatusNoContent, nil)
 	member.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(),
-		nil, http.StatusForbidden, nil)
+		nil, http.StatusNotFound, nil)
 
 	var members domain.Page[domain.ConversationMember]
 	owner.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String()+"/members",
@@ -383,7 +383,7 @@ func TestGroupMembershipInvariantsAndOwnershipTransfer(t *testing.T) {
 		"/v1/conversations/"+group.ID.String()+"/members/"+alice.user.ID.String(),
 		nil, http.StatusNoContent, nil)
 	alice.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(),
-		nil, http.StatusForbidden, nil)
+		nil, http.StatusNotFound, nil)
 }
 
 func TestRefreshTokenRotation(t *testing.T) {

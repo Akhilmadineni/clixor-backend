@@ -16,6 +16,18 @@ type CreateUserParams struct {
 	PasswordHash string
 }
 
+// SessionIssueParams binds device registration and refresh-session creation to
+// one live-account serialization point. Password login additionally supplies
+// the exact hash that was verified outside the store; a reset that changes the
+// hash before this transaction acquires the user lock makes issuance fail.
+type SessionIssueParams struct {
+	UserID                   uuid.UUID
+	ExpectedPasswordHash     string
+	RequirePasswordHashMatch bool
+	Device                   domain.Device
+	Session                  domain.Session
+}
+
 type CreateConversationParams struct {
 	ID           uuid.UUID
 	Kind         string
@@ -126,6 +138,57 @@ func (l MediaReservationLimits) Validate() error {
 // perform network I/O.
 type MailDeliveryBuilder func(string) (domain.MailDelivery, error)
 
+// PasswordResetCompletion returns the authoritative account identity from the
+// same transaction that changed the password and revoked its sessions. The
+// caller can therefore fence local realtime sockets without a second lookup
+// that could fail after the password mutation has committed.
+type PasswordResetCompletion struct {
+	UserID uuid.UUID
+	Email  string
+}
+
+type PasswordResetFence func(uuid.UUID) error
+type AccountDeletionFence func(uuid.UUID) error
+
+// RotateChoreParams is a single, replayable business command. RequestHash is
+// the SHA-256 digest of the canonical command body and binds an operation ID to
+// exactly one actor and mutation for its entire retention window.
+type RotateChoreParams struct {
+	OperationID, ConversationID, ChoreID, ActorID uuid.UUID
+	ExpectedChoreVersion                          int64
+	ChorePayload, FeedPayload                     json.RawMessage
+	RequestHash                                   []byte
+}
+
+type RotateChoreResult struct {
+	OperationID uuid.UUID     `json:"operation_id"`
+	Chore       domain.Entity `json:"chore"`
+	FeedItem    domain.Entity `json:"feed_item"`
+}
+
+func (p RotateChoreParams) Validate() error {
+	if p.OperationID == uuid.Nil || p.ConversationID == uuid.Nil || p.ChoreID == uuid.Nil ||
+		p.ActorID == uuid.Nil || p.ExpectedChoreVersion < 1 || len(p.RequestHash) != 32 {
+		return domain.ErrInvalid
+	}
+	var chore struct {
+		ID      uuid.UUID `json:"id"`
+		GroupID uuid.UUID `json:"groupId"`
+	}
+	var feed struct {
+		ID        uuid.UUID  `json:"id"`
+		GroupID   uuid.UUID  `json:"groupId"`
+		RelatedID *uuid.UUID `json:"relatedId"`
+		Type      string     `json:"type"`
+	}
+	if json.Unmarshal(p.ChorePayload, &chore) != nil || json.Unmarshal(p.FeedPayload, &feed) != nil ||
+		chore.ID != p.ChoreID || chore.GroupID != p.ConversationID || feed.ID != p.OperationID ||
+		feed.GroupID != p.ConversationID || feed.RelatedID == nil || *feed.RelatedID != p.ChoreID || feed.Type != "note" {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -144,11 +207,14 @@ type Store interface {
 	AgeAssurance(context.Context, uuid.UUID) (domain.AgeAssurance, error)
 	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
+	PutAccountDeletionIntent(context.Context, domain.AccountDeletionIntent) error
+	ExecuteAccountDeletionIntent(context.Context, uuid.UUID, []byte, AccountDeletionFence) error
 	CreatePasswordResetChallenge(context.Context, domain.PasswordResetChallenge) error
 	CreatePasswordResetChallengeWithMail(context.Context, domain.PasswordResetChallenge, MailDeliveryBuilder) error
 	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
 	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
-	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (string, error)
+	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (PasswordResetCompletion, error)
+	ConsumePasswordResetChallengeWithMailAndFence(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder, PasswordResetFence) (PasswordResetCompletion, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)
@@ -158,6 +224,7 @@ type Store interface {
 	ClaimPreKeys(context.Context, uuid.UUID) ([]domain.PreKeyBundle, error)
 
 	CreateSession(context.Context, domain.Session) error
+	IssueSession(context.Context, SessionIssueParams) (domain.User, domain.Device, error)
 	RotateSession(context.Context, uuid.UUID, []byte, []byte, time.Time) (domain.Session, error)
 	RevokeSession(context.Context, uuid.UUID, uuid.UUID) error
 	SessionActive(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)
@@ -188,6 +255,8 @@ type Store interface {
 	PutEntity(context.Context, domain.Entity, *int64) (domain.Entity, error)
 	ListEntities(context.Context, uuid.UUID, uuid.UUID, string, time.Time, int) ([]domain.Entity, error)
 	DeleteEntity(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, *int64) (domain.Entity, error)
+	RotateChore(context.Context, RotateChoreParams) (RotateChoreResult, error)
+	PruneChoreRotationOperations(context.Context, time.Time, int) (int, error)
 
 	CreateMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
 	CreateProfileMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)

@@ -518,6 +518,24 @@ Ship those contract changes only in a later release after every old replica has
 drained. The post-migration old-release readiness check catches gross
 incompatibility but does not replace migration review.
 
+Migration 18 has a bounded write-fence budget: relation-lock acquisition fails
+after 5 seconds and every validation/backfill/DDL statement fails after 30
+seconds. Before deploying it, query the production primary for
+`count(*)` on `conversation_members`, `conversation_member_local_ids`, and
+`conversation_member_tombstones`, and review `pg_stat_activity` for non-idle
+transactions with an old `xact_start` that touch user/conversation membership.
+Record those counts with the release evidence. Run the exact migration against
+a recently restored, production-sized backup in CI or the release load gate;
+every statement must finish within 30 seconds. This repository makes no
+untested cardinality claim and operators must not raise or remove these limits
+to force a release through.
+
+If either timeout fires, the migration transaction, backfill, functions, and
+triggers roll back together and the prior API remains authoritative. Cancel or
+drain the identified long transaction, or schedule a maintenance window after
+the restored-backup load gate passes, then retry the normal deployment. Do not
+manually mark migration 18 applied and do not partially replay its SQL.
+
 The first digest-pinned and per-service-PKI rollout intentionally recreates
 PostgreSQL, Redis, NATS, and HAProxy once. Schedule that transition in a
 maintenance window because the single-node A1 topology has no redundant

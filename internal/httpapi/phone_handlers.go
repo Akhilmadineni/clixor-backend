@@ -87,17 +87,13 @@ func (s *Server) verifyPhone(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	device, err := s.registerDevice(r, user.ID, request.DeviceID, request.DeviceName, request.Platform)
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
 	if _, err := s.store.ClaimConversationInvites(r.Context(), user.ID, request.Phone); err != nil {
 		s.logger.Error("claim_phone_invites", "error", err, "user_id", user.ID)
 		writeError(w, http.StatusInternalServerError, "invite_claim_failed", "The account was verified, but its pending invitations could not be claimed.")
 		return
 	}
-	tokens, err := s.tokens.Issue(r.Context(), user.ID, device.ID)
+	device := newAuthDevice(user.ID, request.DeviceID, request.DeviceName, request.Platform)
+	user, device, tokens, err := s.tokens.IssueWithDevice(r.Context(), user.ID, nil, device)
 	if err != nil {
 		writeDomainError(w, err)
 		return

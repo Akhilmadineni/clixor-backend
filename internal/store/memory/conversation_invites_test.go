@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -72,9 +73,29 @@ func TestConversationInviteLifecycleAndAuthorization(t *testing.T) {
 	if err != nil || !accepted.Joined || accepted.Conversation.ID != conversation.ID {
 		t.Fatalf("first acceptance failed: accepted=%+v err=%v", accepted, err)
 	}
+	if !bytes.Contains(accepted.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("invite acceptance did not project new ACL member: %s", accepted.Conversation.Metadata)
+	}
+	// Simulate metadata written by a legacy node after the relational membership
+	// was committed. Retrying the same invite must heal the projection without
+	// consuming another use.
+	persistence.mu.Lock()
+	stale := persistence.conversations[conversation.ID]
+	stale.Metadata = []byte(`{"members":[]}`)
+	persistence.conversations[conversation.ID] = stale
+	persistence.mu.Unlock()
 	retried, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
 	if err != nil || retried.Joined {
 		t.Fatalf("idempotent acceptance failed: accepted=%+v err=%v", retried, err)
+	}
+	if !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("idempotent acceptance did not heal the ACL projection: %s", retried.Conversation.Metadata)
+	}
+	persistence.mu.RLock()
+	persistedMetadata := append([]byte(nil), persistence.conversations[conversation.ID].Metadata...)
+	persistence.mu.RUnlock()
+	if !bytes.Contains(persistedMetadata, []byte(firstJoiner.String())) {
+		t.Fatalf("healed invite projection was not persisted: %s", persistedMetadata)
 	}
 	if uses := persistence.inviteLinks[string(tokenHash[:])].Uses; uses != 1 {
 		t.Fatalf("idempotent acceptance consumed %d uses, want 1", uses)
@@ -95,8 +116,17 @@ func TestConversationInviteLifecycleAndAuthorization(t *testing.T) {
 	if err := persistence.RevokeConversationInvite(ctx, conversation.ID, admin, invite.ID); err != nil {
 		t.Fatalf("idempotent revoke failed: %v", err)
 	}
-	if _, err := persistence.ConversationInvitePreview(ctx, tokenHash[:], firstJoiner); !errors.Is(err, domain.ErrInviteRevoked) {
-		t.Fatalf("revoked preview returned %v, want revoked", err)
+	if preview, err := persistence.ConversationInvitePreview(ctx, tokenHash[:], firstJoiner); err != nil || !preview.AlreadyMember {
+		t.Fatalf("revoked member preview returned preview=%+v err=%v, want already-member success", preview, err)
+	}
+	persistence.mu.Lock()
+	stale = persistence.conversations[conversation.ID]
+	stale.Metadata = []byte(`{"members":[]}`)
+	persistence.conversations[conversation.ID] = stale
+	persistence.mu.Unlock()
+	retried, err = persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
+	if err != nil || retried.Joined || !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("revoked idempotent retry did not heal: accepted=%+v err=%v", retried, err)
 	}
 }
 

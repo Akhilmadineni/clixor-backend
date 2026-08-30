@@ -79,12 +79,41 @@ func TestPostgresSecureConversationInviteLifecycle(t *testing.T) {
 	if err != nil || !accepted.Joined {
 		t.Fatalf("first acceptance failed: accepted=%+v err=%v", accepted, err)
 	}
+	if !bytes.Contains(accepted.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("invite acceptance did not project new ACL member: %s", accepted.Conversation.Metadata)
+	}
+	if _, err := persistence.pool.Exec(ctx, `
+		UPDATE conversations SET metadata='{"members":[]}'::jsonb WHERE id=$1`, conversation.ID); err != nil {
+		t.Fatal(err)
+	}
 	retried, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
 	if err != nil || retried.Joined {
 		t.Fatalf("idempotent acceptance failed: accepted=%+v err=%v", retried, err)
 	}
+	if !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("idempotent acceptance did not heal the ACL projection: %s", retried.Conversation.Metadata)
+	}
+	var persistedMetadata []byte
+	if err := persistence.pool.QueryRow(ctx,
+		`SELECT metadata FROM conversations WHERE id=$1`, conversation.ID,
+	).Scan(&persistedMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(persistedMetadata, []byte(firstJoiner.String())) {
+		t.Fatalf("healed invite projection was not persisted: %s", persistedMetadata)
+	}
 	if _, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], secondJoiner); !errors.Is(err, domain.ErrInviteExhausted) {
 		t.Fatalf("max-use acceptance returned %v, want exhausted", err)
+	}
+	if err := persistence.RevokeConversationInvite(ctx, conversation.ID, owner, invite.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.pool.Exec(ctx, `UPDATE conversations SET metadata='{"members":[]}'::jsonb WHERE id=$1`, conversation.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err = persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
+	if err != nil || retried.Joined || !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("revoked idempotent retry did not heal: accepted=%+v err=%v", retried, err)
 	}
 
 	expiredHash := sha256.Sum256([]byte("expired-postgres-token"))

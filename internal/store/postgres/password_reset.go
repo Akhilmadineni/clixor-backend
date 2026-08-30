@@ -101,7 +101,8 @@ func (s *Store) ConsumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 ) (string, error) {
-	return s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, nil)
+	completion, err := s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, nil, nil)
+	return completion.Email, err
 }
 
 func (s *Store) ConsumePasswordResetChallengeWithMail(
@@ -111,13 +112,23 @@ func (s *Store) ConsumePasswordResetChallengeWithMail(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
-) (string, error) {
+) (store.PasswordResetCompletion, error) {
 	if buildMail == nil {
-		return "", domain.ErrInvalid
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
 	}
 	return s.consumePasswordResetChallenge(
-		ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail,
+		ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail, nil,
 	)
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMailAndFence(
+	ctx context.Context, id uuid.UUID, codeHash []byte, newPasswordHash string,
+	maxAttempts int, buildMail store.MailDeliveryBuilder, fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
+	if buildMail == nil || fence == nil {
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(ctx, id, codeHash, newPasswordHash, maxAttempts, buildMail, fence)
 }
 
 func (s *Store) consumePasswordResetChallenge(
@@ -127,7 +138,8 @@ func (s *Store) consumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
-) (string, error) {
+	fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
 	// Read only the owner needed to choose the per-user lock. Do not lock the
 	// challenge first: account deletion locks users before its cleanup trigger
 	// deletes reset rows, and the opposite order can deadlock.
@@ -135,21 +147,21 @@ func (s *Store) consumePasswordResetChallenge(
 	if err := s.pool.QueryRow(ctx, `
 		SELECT user_id FROM password_reset_challenges WHERE id=$1`, id,
 	).Scan(&userID); errors.Is(err, pgx.ErrNoRows) {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	} else if err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	defer tx.Rollback(ctx)
 	email, err := lockPasswordResetUser(ctx, tx, userID)
 	if errors.Is(err, domain.ErrNotFound) {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	if err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 
 	var expectedHash []byte
@@ -163,36 +175,41 @@ func (s *Store) consumePasswordResetChallenge(
 		FOR UPDATE`, id, userID,
 	).Scan(&expectedHash, &attempts, &expiresAt, &consumedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	if err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	now := time.Now().UTC()
 	if consumedAt != nil || !expiresAt.After(now) || attempts >= maxAttempts {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	if len(expectedHash) != len(codeHash) ||
 		subtle.ConstantTimeCompare(expectedHash, codeHash) != 1 {
 		if _, err := tx.Exec(ctx, `
 			UPDATE password_reset_challenges SET attempts=attempts+1 WHERE id=$1`, id); err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	var delivery *domain.MailDelivery
 	if buildMail != nil {
 		built, err := buildMail(email)
 		if err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
 		if err := validateMailDelivery(built, domain.MailDeliveryPasswordChanged, id); err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
 		delivery = &built
+	}
+	if fence != nil {
+		if err := fence(userID); err != nil {
+			return store.PasswordResetCompletion{}, err
+		}
 	}
 	// Once a reset code is consumed, any still-pending copy of that code must
 	// never leave the queue. A concurrently leased worker will lose its lease
@@ -204,32 +221,36 @@ func (s *Store) consumePasswordResetChallenge(
 				canceled_at=now(),updated_at=now(),last_error_class='challenge_consumed'
 			WHERE password_reset_challenge_id=$1
 			  AND purpose='password_reset' AND status='pending'`, id); err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE users SET password_hash=$2,updated_at=$3 WHERE id=$1`,
 		userID, newPasswordHash, now); err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE sessions SET revoked_at=$2
 		WHERE user_id=$1 AND revoked_at IS NULL`, userID, now); err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE devices SET push_token='' WHERE user_id=$1`, userID); err != nil {
+		return store.PasswordResetCompletion{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE password_reset_challenges SET consumed_at=$2
 		WHERE user_id=$1 AND consumed_at IS NULL`, userID, now); err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
 	if delivery != nil {
 		if err := insertMailDelivery(ctx, tx, *delivery); err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", err
+		return store.PasswordResetCompletion{}, err
 	}
-	return email, nil
+	return store.PasswordResetCompletion{UserID: userID, Email: email}, nil
 }
 
 // lockPasswordResetUser defines the lock order shared by reset start and

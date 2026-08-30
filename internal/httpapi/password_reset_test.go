@@ -24,6 +24,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/store/memory"
 	"github.com/Akhilmadineni/clixor-backend/internal/verification"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 type resetMailRecorder struct {
@@ -92,6 +93,19 @@ func TestPasswordResetRequiresEmailedCodeAndRevokesSessions(t *testing.T) {
 		"email": "reset@example.com", "password": "original-password-123",
 		"display_name": "Reset User", "device_name": "Test iPhone", "platform": "ios",
 	}, http.StatusCreated, &registered)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime"
+	socket, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Authorization": []string{"Bearer " + registered.Tokens.AccessToken},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	_ = socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var hello domain.RealtimeEvent
+	if err := socket.ReadJSON(&hello); err != nil || hello.Type != "session.ready" {
+		t.Fatalf("missing reset-test realtime hello: event=%+v err=%v", hello, err)
+	}
 
 	var started passwordResetStartResponse
 	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
@@ -119,6 +133,10 @@ func TestPasswordResetRequiresEmailedCodeAndRevokesSessions(t *testing.T) {
 		"challenge_id": started.ChallengeID, "code": code,
 		"new_password": "replacement-password-456",
 	}, http.StatusNoContent, nil)
+	var postResetEvent domain.RealtimeEvent
+	if err := socket.ReadJSON(&postResetEvent); err == nil {
+		t.Fatalf("password-reset revoked socket received an event: %+v", postResetEvent)
+	}
 
 	client.token = registered.Tokens.AccessToken
 	client.do(t, http.MethodGet, "/v1/me", nil, http.StatusUnauthorized, nil)

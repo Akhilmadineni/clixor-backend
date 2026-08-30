@@ -160,7 +160,22 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
-	var users []domain.User
+	users := make([]domain.PublicUser, 0)
+	seen := make(map[uuid.UUID]int)
+	appendUser := func(user domain.User, includePhone bool) {
+		public := store.PublicUserFromUser(user, includePhone)
+		if index, duplicate := seen[user.ID]; duplicate {
+			// If one request matched both a submitted phone and a username,
+			// preserve the exact-phone correlation without exposing any other
+			// account identifier.
+			if includePhone {
+				users[index].MatchedPhone = public.MatchedPhone
+			}
+			return
+		}
+		seen[user.ID] = len(users)
+		users = append(users, public)
+	}
 	if len(request.Phones) > 0 {
 		phones, ok := normalizePhones(request.Phones)
 		if !ok || len(phones) > 1024 {
@@ -172,7 +187,9 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 			writeDomainError(w, err)
 			return
 		}
-		users = append(users, phoneUsers...)
+		for _, user := range phoneUsers {
+			appendUser(user, true)
+		}
 	}
 	if len(request.Usernames) > 0 {
 		if len(request.Usernames) > 1024 {
@@ -184,9 +201,11 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 			writeDomainError(w, err)
 			return
 		}
-		users = append(users, usernameUsers...)
+		for _, user := range usernameUsers {
+			appendUser(user, false)
+		}
 	}
-	writeJSON(w, http.StatusOK, domain.Page[domain.User]{Items: users})
+	writeJSON(w, http.StatusOK, domain.Page[domain.PublicUser]{Items: users})
 }
 
 func (s *Server) searchUsers(w http.ResponseWriter, r *http.Request) {
@@ -206,7 +225,11 @@ func (s *Server) searchUsers(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, domain.Page[domain.User]{Items: users})
+	public := make([]domain.PublicUser, 0, len(users))
+	for _, user := range users {
+		public = append(public, store.PublicUserFromUser(user, false))
+	}
+	writeJSON(w, http.StatusOK, domain.Page[domain.PublicUser]{Items: public})
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
