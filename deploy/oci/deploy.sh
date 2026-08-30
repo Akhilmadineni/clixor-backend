@@ -20,11 +20,16 @@ lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
 pki_desired="${project_root}/runtime/dependency-pki.desired"
 pki_applied="${project_root}/runtime/dependency-pki.applied"
+backup_tool_root=/usr/local/libexec/clixor
+systemd_unit_root=/etc/systemd/system
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
 public_api_readiness_url=${CLIXOR_PUBLIC_API_READINESS_URL:-https://clustr-api.atlanteanz.com/health/ready}
 public_association_url=${CLIXOR_PUBLIC_ASSOCIATION_URL:-https://clixor.atlanteanz.com/.well-known/apple-app-site-association}
 public_smoke_mode=${CLIXOR_REQUIRE_PUBLIC_SMOKE:-auto}
 vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
+minimum_data_headroom_kb=8388608
+minimum_docker_headroom_kb=6291456
+retained_audit_releases=3
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -67,10 +72,338 @@ verify_public_ingress() {
     "${public_association_url}" >/dev/null || return 1
 }
 
+require_unsigned_integer() {
+  case "$2" in
+    ''|*[!0-9]*) fail "$1 is not an unsigned integer" ;;
+  esac
+}
+
+preflight_disk_capacity() {
+  postgres_size_kb="$(du -sk "${project_root}/data/postgres" | awk 'NR == 1 {print $1}')"
+  data_available_kb="$(df -Pk "${project_root}" | awk 'NR == 2 {print $4}')"
+  require_unsigned_integer "PostgreSQL data size" "${postgres_size_kb}"
+  require_unsigned_integer "Clixor data-volume free space" "${data_available_kb}"
+  # Reserve three times the live database footprint for the pre-migration dump,
+  # fresh local dump, and isolated restore workspace, plus a fixed 8 GiB floor.
+  data_required_kb=$((minimum_data_headroom_kb + postgres_size_kb * 3))
+
+  docker_root="$(docker info --format '{{.DockerRootDir}}')"
+  case "${docker_root}" in
+    /*) ;;
+    *) fail "Docker reported an unsafe data-root path" ;;
+  esac
+  [ -d "${docker_root}" ] || fail "Docker data-root is missing: ${docker_root}"
+  docker_available_kb="$(df -Pk "${docker_root}" | awk 'NR == 2 {print $4}')"
+  require_unsigned_integer "Docker filesystem free space" "${docker_available_kb}"
+  data_device="$(stat -c %d "${project_root}")"
+  docker_device="$(stat -c %d "${docker_root}")"
+  require_unsigned_integer "Clixor data-volume device" "${data_device}"
+  require_unsigned_integer "Docker filesystem device" "${docker_device}"
+  if [ "${data_device}" = "${docker_device}" ]; then
+    combined_required_kb=$((data_required_kb + minimum_docker_headroom_kb))
+    [ "${data_available_kb}" -ge "${combined_required_kb}" ] || \
+      fail "insufficient shared data/Docker capacity: ${data_available_kb} KiB free, ${combined_required_kb} KiB required"
+  else
+    [ "${data_available_kb}" -ge "${data_required_kb}" ] || \
+      fail "insufficient /srv/clixor capacity: ${data_available_kb} KiB free, ${data_required_kb} KiB required"
+    [ "${docker_available_kb}" -ge "${minimum_docker_headroom_kb}" ] || \
+      fail "insufficient Docker capacity: ${docker_available_kb} KiB free, ${minimum_docker_headroom_kb} KiB required"
+  fi
+  log "capacity preflight passed for snapshots, restore workspace, and image build"
+}
+
+stage_host_tooling() {
+  install -d -m 0700 -o 0 -g 0 \
+    "${host_tool_stage}/bin" "${host_tool_stage}/systemd"
+  install -m 0500 -o 0 -g 0 \
+    "${source_root}/deploy/oci/release_retention.py" \
+    "${release_dir}/release_retention.py"
+  (
+    cd "${release_dir}"
+    sha256sum release_retention.py > release_retention.py.sha256.partial
+    sha256sum --check release_retention.py.sha256.partial >/dev/null
+    mv release_retention.py.sha256.partial release_retention.py.sha256
+  )
+  : > "${host_tool_stage}/SHA256SUMS.partial"
+  for tool_name in \
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
+  do
+    install -m 0500 -o 0 -g 0 \
+      "${source_root}/deploy/oci/${tool_name}" \
+      "${host_tool_stage}/bin/${tool_name}"
+    (
+      cd "${host_tool_stage}"
+      sha256sum "bin/${tool_name}"
+    ) >> "${host_tool_stage}/SHA256SUMS.partial"
+  done
+  for unit_name in \
+    clixor-offsite-backup.service \
+    clixor-offsite-backup.timer \
+    clixor-backup-health.service \
+    clixor-backup-health.timer \
+    clixor-restore-drill.service \
+    clixor-restore-drill.timer
+  do
+    install -m 0644 -o 0 -g 0 \
+      "${source_root}/deploy/oci/${unit_name}" \
+      "${host_tool_stage}/systemd/${unit_name}"
+    (
+      cd "${host_tool_stage}"
+      sha256sum "systemd/${unit_name}"
+    ) >> "${host_tool_stage}/SHA256SUMS.partial"
+  done
+  chmod 0600 "${host_tool_stage}/SHA256SUMS.partial"
+  mv "${host_tool_stage}/SHA256SUMS.partial" \
+    "${host_tool_stage}/SHA256SUMS"
+  (
+    cd "${host_tool_stage}"
+    sha256sum --check SHA256SUMS >/dev/null
+  ) || fail "staged host backup tooling failed checksum verification"
+  printf 'staged\n' > "${release_dir}/host-tools-state"
+}
+
+capture_host_tooling() {
+  install -d -m 0700 -o 0 -g 0 \
+    "${previous_host_tool_root}/bin" "${previous_host_tool_root}/systemd"
+  : > "${previous_host_tool_root}/file-state"
+  for tool_name in \
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
+  do
+    active_path="${backup_tool_root}/${tool_name}"
+    if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
+      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] || \
+        fail "active host tool is not a regular file: ${active_path}"
+      install -m 0500 -o 0 -g 0 "${active_path}" \
+        "${previous_host_tool_root}/bin/${tool_name}"
+      printf 'bin/%s=present\n' "${tool_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    else
+      printf 'bin/%s=absent\n' "${tool_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    fi
+  done
+  for unit_name in \
+    clixor-offsite-backup.service \
+    clixor-offsite-backup.timer \
+    clixor-backup-health.service \
+    clixor-backup-health.timer \
+    clixor-restore-drill.service \
+    clixor-restore-drill.timer
+  do
+    active_path="${systemd_unit_root}/${unit_name}"
+    if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
+      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] || \
+        fail "active systemd unit is not a regular file: ${active_path}"
+      install -m 0644 -o 0 -g 0 "${active_path}" \
+        "${previous_host_tool_root}/systemd/${unit_name}"
+      printf 'systemd/%s=present\n' "${unit_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    else
+      printf 'systemd/%s=absent\n' "${unit_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    fi
+  done
+  : > "${previous_host_tool_root}/timer-state"
+  for timer_name in \
+    clixor-offsite-backup.timer \
+    clixor-restore-drill.timer \
+    clixor-backup-health.timer
+  do
+    timer_enabled=false
+    timer_active=false
+    systemctl is-enabled --quiet "${timer_name}" >/dev/null 2>&1 && \
+      timer_enabled=true
+    systemctl is-active --quiet "${timer_name}" >/dev/null 2>&1 && \
+      timer_active=true
+    printf '%s %s %s\n' \
+      "${timer_name}" "${timer_enabled}" "${timer_active}" >> \
+      "${previous_host_tool_root}/timer-state"
+  done
+  chmod 0600 \
+    "${previous_host_tool_root}/file-state" \
+    "${previous_host_tool_root}/timer-state"
+}
+
+publish_host_file() {
+  source_path=$1
+  target_path=$2
+  file_mode=$3
+  pending_path="${target_path}.pending.${release_tag}"
+  rm -f -- "${pending_path}"
+  install -m "${file_mode}" -o 0 -g 0 "${source_path}" "${pending_path}"
+  mv -Tf "${pending_path}" "${target_path}"
+}
+
+activate_host_tooling() {
+  host_tools_activated=true
+  log "activating release-versioned backup tooling after backup and restore gates"
+  for tool_name in \
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
+  do
+    publish_host_file \
+      "${host_tool_stage}/bin/${tool_name}" \
+      "${backup_tool_root}/${tool_name}" 0500
+  done
+  for unit_name in \
+    clixor-offsite-backup.service \
+    clixor-offsite-backup.timer \
+    clixor-backup-health.service \
+    clixor-backup-health.timer \
+    clixor-restore-drill.service \
+    clixor-restore-drill.timer
+  do
+    publish_host_file \
+      "${host_tool_stage}/systemd/${unit_name}" \
+      "${systemd_unit_root}/${unit_name}" 0644
+  done
+  systemctl daemon-reload
+}
+
+restore_host_tooling() {
+  restore_status=0
+  log "restoring the previously active host backup tooling"
+  for tool_name in \
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
+  do
+    target_path="${backup_tool_root}/${tool_name}"
+    if grep -qx "bin/${tool_name}=present" \
+      "${previous_host_tool_root}/file-state"; then
+      publish_host_file \
+        "${previous_host_tool_root}/bin/${tool_name}" "${target_path}" 0500 || \
+        restore_status=1
+    else
+      rm -f -- "${target_path}" || restore_status=1
+    fi
+  done
+  for unit_name in \
+    clixor-offsite-backup.service \
+    clixor-offsite-backup.timer \
+    clixor-backup-health.service \
+    clixor-backup-health.timer \
+    clixor-restore-drill.service \
+    clixor-restore-drill.timer
+  do
+    target_path="${systemd_unit_root}/${unit_name}"
+    if grep -qx "systemd/${unit_name}=present" \
+      "${previous_host_tool_root}/file-state"; then
+      publish_host_file \
+        "${previous_host_tool_root}/systemd/${unit_name}" \
+        "${target_path}" 0644 || restore_status=1
+    else
+      rm -f -- "${target_path}" || restore_status=1
+    fi
+  done
+  systemctl daemon-reload || restore_status=1
+  while read -r timer_name timer_enabled timer_active; do
+    case "${timer_name}" in
+      clixor-offsite-backup.timer|clixor-restore-drill.timer|clixor-backup-health.timer) ;;
+      *) restore_status=1; continue ;;
+    esac
+    if [ "${timer_enabled}" = "true" ]; then
+      systemctl enable "${timer_name}" >/dev/null 2>&1 || restore_status=1
+    else
+      systemctl disable "${timer_name}" >/dev/null 2>&1 || restore_status=1
+    fi
+    if [ "${timer_active}" = "true" ]; then
+      systemctl start "${timer_name}" || restore_status=1
+    else
+      systemctl stop "${timer_name}" || restore_status=1
+    fi
+  done < "${previous_host_tool_root}/timer-state"
+  printf 'rolled-back\n' > "${release_dir}/host-tools-state" || restore_status=1
+  return "${restore_status}"
+}
+
+ensure_gateway_for_probe() {
+  if [ "$(docker inspect clixor-oci-api-gateway \
+    --format '{{.State.Running}}' 2>/dev/null || true)" != "true" ]; then
+    log "starting the internal gateway so the first API replica can be probed"
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+      up -d --no-build --no-deps api-gateway
+  fi
+}
+
+wait_replica_ready() {
+  replica=$1
+  container_name="clixor-oci-${replica}"
+  attempt=1
+  while :; do
+    container_state="$(docker inspect "${container_name}" \
+      --format '{{.State.Status}}' 2>/dev/null || true)"
+    if [ "${container_state}" = "running" ] && \
+      docker exec clixor-oci-api-gateway wget --quiet --output-document=/dev/null \
+        "http://${replica}:8080/health/ready"; then
+      break
+    fi
+    case "${container_state}" in
+      exited|dead) fail "${replica} stopped while waiting for readiness" ;;
+    esac
+    [ "${attempt}" -lt 60 ] || \
+      fail "${replica} did not become ready within 120 seconds"
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  log "${replica} is ready before the next replica is replaced"
+}
+
+prune_release_history() {
+  [ -s "${project_root}/backups/OFFSITE_LAST_SUCCESS" ] && \
+    [ -n "$(find "${project_root}/backups/OFFSITE_LAST_SUCCESS" \
+      -newer "${backup_gate_start}" -print 2>/dev/null)" ] || return 1
+  current_boundary="$(readlink "${release_root}/current")"
+  [ "${current_boundary}" = "${release_dir}" ] || return 1
+  previous_boundary="$(sed -n '1p' "${release_dir}/previous-release")"
+  image_inventory="$(mktemp "${project_root}/runtime/image-retention.XXXXXXXX")"
+  retention_status=0
+  if ! python3 "${release_dir}/release_retention.py" \
+    --release-root "${release_root}" \
+    --current-release "${current_boundary}" \
+    --previous-release "${previous_boundary}" \
+    --offsite-marker "${project_root}/backups/OFFSITE_LAST_SUCCESS" \
+    --gate-start "${backup_gate_start}" \
+    --keep-extra "${retained_audit_releases}"; then
+    rm -f -- "${image_inventory}"
+    return 1
+  fi
+
+  current_image="$(docker inspect clixor-oci-api-a \
+    --format '{{.Config.Image}}' 2>/dev/null || true)"
+  previous_boundary_image="$(sed -n '1p' "${release_dir}/previous-image")"
+  [ "${current_image}" = "${new_image}" ] || {
+    rm -f -- "${image_inventory}"
+    return 1
+  }
+  case "${previous_boundary_image}" in
+    none|clixor-api:*) ;;
+    *)
+      rm -f -- "${image_inventory}"
+      return 1
+      ;;
+  esac
+  docker image ls --format '{{.Repository}}:{{.Tag}}' \
+    --filter 'reference=clixor-api:*' > "${image_inventory}" || retention_status=1
+  while read -r image_ref; do
+    case "${image_ref}" in
+      clixor-api:oci-*) ;;
+      *) continue ;;
+    esac
+    if [ "${image_ref}" = "${current_image}" ] || \
+      [ "${image_ref}" = "${previous_boundary_image}" ]; then
+      continue
+    fi
+    log "retiring unneeded API image ${image_ref}"
+    docker image rm "${image_ref}" >/dev/null 2>&1 || retention_status=1
+  done < "${image_inventory}"
+  rm -f -- "${image_inventory}" || retention_status=1
+  return "${retention_status}"
+}
+
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 [ -n "${source_root}" ] || fail "source workspace argument is required"
 [ -f "${source_root}/go.mod" ] || fail "source workspace does not contain go.mod"
 [ -f "${source_root}/deploy/oci/compose.yaml" ] || fail "source workspace does not contain the OCI Compose model"
+[ -f "${source_root}/deploy/oci/release_retention.py" ] || \
+  fail "source workspace does not contain the release retention helper"
 grep -q '^module github.com/Akhilmadineni/clixor-backend$' "${source_root}/go.mod" || \
   fail "unexpected Go module"
 
@@ -83,7 +416,8 @@ case "${run_id}" in
 esac
 
 for command_name in \
-  cmp curl docker find findmnt flock install python3 rsync sha256sum systemctl touch
+  awk cmp curl df docker du find findmnt flock grep install mktemp mv python3 \
+  readlink rm rsync sed sha256sum sort stat systemctl touch tr
 do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
@@ -92,6 +426,7 @@ docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
+preflight_disk_capacity
 
 if [ -s "${compose_file}" ] && \
   ! grep -Eq '(/srv/clixor/secrets/(active/)?api.env|/run/clixor/secrets/active/api.env)' \
@@ -146,6 +481,8 @@ previous_compose="${release_dir}/previous-compose.yaml"
 rollback_compose="${previous_compose}"
 scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
 previous_runtime_root="${release_dir}/previous-runtime"
+host_tool_stage="${release_dir}/host-tools"
+previous_host_tool_root="${release_dir}/previous-host-tools"
 pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
@@ -153,6 +490,8 @@ mkdir -p "${stable_root}" "${release_root}" "${project_root}/runtime"
 [ ! -e "${release_dir}" ] || fail "release directory already exists: ${release_dir}"
 mkdir "${release_dir}"
 chmod 0700 "${release_dir}"
+stage_host_tooling
+capture_host_tooling
 
 previous_image="$(docker inspect clixor-oci-api-a --format '{{.Config.Image}}' 2>/dev/null || true)"
 previous_postgres_id="$(docker inspect clixor-oci-postgres --format '{{.Id}}' 2>/dev/null || true)"
@@ -267,6 +606,7 @@ else
 fi
 
 rollback_needed=0
+host_tools_activated=false
 restore_previous_vault_target() {
   [ "${vault_generation_changed}" = "true" ] || return 0
   if [ -n "${current_vault_target}" ]; then
@@ -393,6 +733,12 @@ rollback() {
   fi
   if [ "${status}" -ne 0 ] && [ "${rollback_needed}" -eq 1 ]; then
     set +e
+    if [ "${host_tools_activated}" = "true" ]; then
+      if ! restore_host_tooling; then
+        log "ERROR: rollback could not restore the prior host backup tooling" >&2
+      fi
+      host_tools_activated=false
+    fi
     if [ "${first_deploy}" = "false" ]; then
       log "deployment failed; attempting application rollback to ${previous_image}"
       selected_rollback_compose="${rollback_compose}"
@@ -648,6 +994,7 @@ rollback_needed=1
 # Idempotently refresh permissions, certificates and checked-in runtime config.
 # Package installation belongs to the explicit first bootstrap, not every deploy.
 CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true \
+  CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true \
   sh "${source_root}/deploy/oci/bootstrap.sh"
 for scoped_env in \
   "${api_env}" "${postgres_env}" "${redis_env}" "${nats_env}" \
@@ -832,17 +1179,35 @@ log "applying transactional forward migrations"
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
   --profile migration run --rm migrate
 
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
-  api-a api-b
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
-  --remove-orphans
+# Every migration in a rolling release must be expand-compatible with the prior
+# binary. Keep one previously ready replica serving while the other is replaced,
+# and prove the replacement ready through the gateway before proceeding. A
+# destructive or newly restrictive schema change requires a later contract
+# release after all old binaries have drained.
+if [ "${first_deploy}" = "false" ]; then
+  curl --fail --silent --show-error --max-time 5 \
+    "${gateway_readiness_url}" >/dev/null || \
+    fail "the previous release is not ready after forward migration"
+fi
+log "replacing api-a while api-b remains available"
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  up -d --no-build --no-deps api-a
+ensure_gateway_for_probe
+wait_replica_ready api-a
+
+log "replacing api-b only after api-a passed readiness"
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  up -d --no-build --no-deps api-b
+wait_replica_ready api-b
 
 # Nginx, Prometheus, and Grafana read their bind-mounted configuration only at
 # process start. Preserve the operator's observability run/stop state while
 # guaranteeing that every running consumer uses this exact release's files.
-log "recreating api-gateway to apply the reviewed ingress configuration"
+log "reconciling the gateway after both API replicas are ready"
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-  up -d --no-build --no-deps --force-recreate api-gateway
+  up -d --no-build --no-deps --remove-orphans api-gateway
+docker exec clixor-oci-api-gateway nginx -t
+docker exec clixor-oci-api-gateway nginx -s reload
 if [ "${prometheus_was_running}" = "true" ]; then
   log "recreating running Prometheus to apply the reviewed scrape configuration"
   CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
@@ -926,8 +1291,13 @@ systemctl start clixor-restore-drill.service
   [ -n "$(find "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" \
     -newer "${backup_gate_start}" -print 2>/dev/null)" ] || \
   fail "the isolated restore drill did not produce a fresh success marker"
-systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
+activate_host_tooling
+systemctl enable --now \
+  clixor-offsite-backup.timer \
+  clixor-restore-drill.timer \
+  clixor-backup-health.timer
 systemctl start clixor-backup-health.service
+printf 'activated\n' > "${release_dir}/host-tools-state"
 
 python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
   --desired "${release_dir}/dependency-pki.desired" \
@@ -958,3 +1328,6 @@ if grep -qx 'CLUSTER_ENV=production' "${api_env}" && \
     fail "release is live but persistent staging credential retirement failed"
 fi
 log "deployed ${new_image}; API readiness passed"
+if ! prune_release_history; then
+  log "WARNING: bounded post-release retention did not complete; capacity preflight remains authoritative"
+fi

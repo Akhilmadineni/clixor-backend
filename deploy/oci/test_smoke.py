@@ -209,6 +209,9 @@ class ReleaseHardeningTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertEqual(
+            script.count("CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true"), 1
+        )
         self.assertIn('printf \'first-deploy\\n\'', script)
         self.assertIn("database files and forward migrations were not restored", script)
         self.assertIn("pg_restore --list", script)
@@ -257,9 +260,28 @@ class ReleaseHardeningTests(unittest.TestCase):
         )
         for consumer in ("postgres", "redis", "nats"):
             self.assertIn(f"vault_{consumer}_secret_activated=true", deploy)
+        self.assertIn("cloudflare_secret_activated=true", deploy)
         self.assertIn("rollback secret consumers did not restart", deploy)
         self.assertIn("systemctl restart cloudflared.service", deploy)
         self.assertIn("restored cloudflared with the previous credential", deploy)
+
+        release_pointer = deploy.index(
+            'mv -Tf "${release_dir}/current-link.pending"'
+        )
+        rollback_disarm = deploy.rindex("rollback_needed=0")
+        vault_disarm = deploy.index(
+            "vault_generation_changed=false", rollback_disarm
+        )
+        staging_cleanup = deploy.rindex(
+            "retire_persistent_staging_secrets ||"
+        )
+        self.assertLess(release_pointer, rollback_disarm)
+        self.assertLess(rollback_disarm, vault_disarm)
+        self.assertLess(vault_disarm, staging_cleanup)
+        self.assertIn(
+            'vault-generations/gen-[0-9]*-[0-9a-f]*) retire_staging_copies=true',
+            deploy,
+        )
 
     def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
         installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
@@ -582,10 +604,12 @@ class ReleaseHardeningTests(unittest.TestCase):
             'backup_gate_start="${release_dir}/post-migration-backup-gate-start"'
         )
         restart_backup = deploy.index("--force-recreate postgres-backup")
-        newer_proof = deploy.index('-newer "${backup_gate_start}"')
         offsite_gate = deploy.index("systemctl start clixor-offsite-backup.service")
+        newer_proof = deploy.index(
+            '-newer "${backup_gate_start}"', restart_backup
+        )
         health_enable = deploy.index(
-            "systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer"
+            "systemctl enable --now \\\n  clixor-offsite-backup.timer"
         )
         release_complete = deploy.rindex("rollback_needed=0")
         self.assertLess(fresh_gate, restart_backup)
@@ -607,12 +631,14 @@ class ReleaseHardeningTests(unittest.TestCase):
 
     def test_runtime_config_consumers_reload_and_public_smoke_is_transactional(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
-        for service in ("dependency-tls", "api-gateway", "postgres-backup"):
+        for service in ("dependency-tls", "postgres-backup"):
             with self.subTest(service=service):
                 self.assertRegex(
                     deploy,
                     rf"--force-recreate\s+{re.escape(service)}",
                 )
+        self.assertIn("docker exec clixor-oci-api-gateway nginx -t", deploy)
+        self.assertIn("docker exec clixor-oci-api-gateway nginx -s reload", deploy)
         self.assertIn("prometheus_was_running", deploy)
         self.assertIn("grafana_was_running", deploy)
         self.assertIn('previous_runtime_root="${release_dir}/previous-runtime"', deploy)
@@ -637,6 +663,109 @@ class ReleaseHardeningTests(unittest.TestCase):
         wrapper = (self.oci_root / "actions-deploy.sh").read_text(encoding="utf-8")
         self.assertIn("CLIXOR_REQUIRE_PUBLIC_SMOKE=true", wrapper)
         self.assertNotIn("Verify public OCI ingress", workflow)
+
+    def test_host_backup_tooling_activation_is_release_transactional(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+
+        self.assertIn("CLIXOR_DEFER_HOST_TOOL_ACTIVATION", bootstrap)
+        self.assertIn(
+            "CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true", deploy
+        )
+        self.assertIn('host_tool_stage="${release_dir}/host-tools"', deploy)
+        self.assertIn(
+            'previous_host_tool_root="${release_dir}/previous-host-tools"',
+            deploy,
+        )
+        self.assertIn("sha256sum --check SHA256SUMS", deploy)
+        self.assertIn('host_tools_activated=true', deploy)
+        self.assertIn("restore_host_tooling", deploy)
+        self.assertIn('systemctl is-enabled --quiet "${timer_name}"', deploy)
+        self.assertIn('systemctl is-active --quiet "${timer_name}"', deploy)
+
+        stage_call = deploy.index("\nstage_host_tooling\n")
+        capture_call = deploy.index("\ncapture_host_tooling\n")
+        bootstrap_call = deploy.index("CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true")
+        restore_gate = deploy.index("systemctl start clixor-restore-drill.service")
+        activate_call = deploy.rindex("\nactivate_host_tooling\n")
+        health_gate = deploy.index("systemctl start clixor-backup-health.service")
+        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        self.assertLess(stage_call, capture_call)
+        self.assertLess(capture_call, bootstrap_call)
+        self.assertLess(restore_gate, activate_call)
+        self.assertLess(activate_call, health_gate)
+        self.assertLess(health_gate, release_pointer)
+
+        rollback_start = deploy.index("rollback() {")
+        rollback_restore = deploy.index(
+            'if [ "${host_tools_activated}" = "true" ]; then', rollback_start
+        )
+        application_restore = deploy.index(
+            "deployment failed; attempting application rollback", rollback_start
+        )
+        self.assertLess(rollback_restore, application_restore)
+
+    def test_capacity_retention_and_rollback_boundaries_are_conservative(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        retention = (self.oci_root / "release_retention.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("minimum_data_headroom_kb=8388608", deploy)
+        self.assertIn("minimum_docker_headroom_kb=6291456", deploy)
+        self.assertIn("postgres_size_kb * 3", deploy)
+        self.assertIn('if [ "${data_device}" = "${docker_device}" ]; then', deploy)
+        self.assertIn("data_required_kb + minimum_docker_headroom_kb", deploy)
+        preflight_call = deploy.index("\npreflight_disk_capacity\n")
+        release_create = deploy.index('mkdir "${release_dir}"')
+        snapshot = deploy.index("capturing a pre-change PostgreSQL snapshot")
+        image_build = deploy.index("building ARM64 release")
+        self.assertLess(preflight_call, release_create)
+        self.assertLess(preflight_call, snapshot)
+        self.assertLess(preflight_call, image_build)
+
+        self.assertIn("release_retention.py", deploy)
+        self.assertIn("protected = {current}", retention)
+        self.assertIn("protected.add(previous)", retention)
+        self.assertIn("if candidate in protected", retention)
+        self.assertIn("marker.stat().st_mtime_ns <= gate.stat().st_mtime_ns", retention)
+        self.assertIn('"${image_ref}" = "${current_image}"', deploy)
+        self.assertIn('"${image_ref}" = "${previous_boundary_image}"', deploy)
+        self.assertNotIn("docker system prune", deploy)
+        self.assertNotIn("docker image rm --force", deploy)
+        offsite_proof = deploy.index(
+            'find "${project_root}/backups/OFFSITE_LAST_SUCCESS"'
+        )
+        disarm = deploy.rindex("rollback_needed=0")
+        retention_call = deploy.rindex("\nif ! prune_release_history; then")
+        self.assertLess(offsite_proof, disarm)
+        self.assertLess(disarm, retention_call)
+
+    def test_api_replicas_roll_sequentially_before_gateway_reload(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        nginx = (self.oci_root / "api-gateway-nginx.conf").read_text(
+            encoding="utf-8"
+        )
+        migration = deploy.index("applying transactional forward migrations")
+        api_a = deploy.index("replacing api-a while api-b remains available")
+        wait_a = deploy.index("wait_replica_ready api-a")
+        api_b = deploy.index("replacing api-b only after api-a passed readiness")
+        wait_b = deploy.index("wait_replica_ready api-b")
+        gateway = deploy.index("reconciling the gateway after both API replicas are ready")
+        validate = deploy.index("docker exec clixor-oci-api-gateway nginx -t")
+        reload_gateway = deploy.index("docker exec clixor-oci-api-gateway nginx -s reload")
+        self.assertLess(migration, api_a)
+        self.assertLess(api_a, wait_a)
+        self.assertLess(wait_a, api_b)
+        self.assertLess(api_b, wait_b)
+        self.assertLess(wait_b, gateway)
+        self.assertLess(gateway, validate)
+        self.assertLess(validate, reload_gateway)
+        self.assertNotRegex(deploy, r"up -d --no-build\s+api-a api-b")
+        self.assertIn("previous release is not ready after forward migration", deploy)
+        self.assertIn("expand-compatible", deploy)
+        self.assertIn("resolver 127.0.0.11", nginx)
+        self.assertIn("server api-a:8080 resolve", nginx)
+        self.assertIn("server api-b:8080 resolve", nginx)
 
 
 class BackupManifestTests(unittest.TestCase):

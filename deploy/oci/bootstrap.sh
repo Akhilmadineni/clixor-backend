@@ -16,6 +16,15 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+defer_host_tool_activation=${CLIXOR_DEFER_HOST_TOOL_ACTIVATION:-false}
+case "${defer_host_tool_activation}" in
+  true|false) ;;
+  *)
+    echo "CLIXOR_DEFER_HOST_TOOL_ACTIVATION must be true or false." >&2
+    exit 1
+    ;;
+esac
+
 architecture="$(uname -m)"
 case "${architecture}" in
   aarch64|arm64) ;;
@@ -356,25 +365,27 @@ install -m 0400 -o 101 -g 101 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
   "${runtime_root}/postgres-backup/backup.sh"
-install -m 0500 -o 0 -g 0 "${script_root}/offsite-backup.sh" \
-  "${backup_tool_root}/offsite-backup.sh"
-install -m 0500 -o 0 -g 0 "${script_root}/backup-health.sh" \
-  "${backup_tool_root}/backup-health.sh"
-install -m 0500 -o 0 -g 0 "${script_root}/restore-drill.sh" \
-  "${backup_tool_root}/restore-drill.sh"
-install -m 0500 -o 0 -g 0 "${script_root}/backup_manifest.py" \
-  "${backup_tool_root}/backup_manifest.py"
-for unit_name in \
-  clixor-offsite-backup.service \
-  clixor-offsite-backup.timer \
-  clixor-backup-health.service \
-  clixor-backup-health.timer \
-  clixor-restore-drill.service \
-  clixor-restore-drill.timer
-do
-  install -m 0644 -o 0 -g 0 "${script_root}/${unit_name}" \
-    "${systemd_unit_root}/${unit_name}"
-done
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  install -m 0500 -o 0 -g 0 "${script_root}/offsite-backup.sh" \
+    "${backup_tool_root}/offsite-backup.sh"
+  install -m 0500 -o 0 -g 0 "${script_root}/backup-health.sh" \
+    "${backup_tool_root}/backup-health.sh"
+  install -m 0500 -o 0 -g 0 "${script_root}/restore-drill.sh" \
+    "${backup_tool_root}/restore-drill.sh"
+  install -m 0500 -o 0 -g 0 "${script_root}/backup_manifest.py" \
+    "${backup_tool_root}/backup_manifest.py"
+  for unit_name in \
+    clixor-offsite-backup.service \
+    clixor-offsite-backup.timer \
+    clixor-backup-health.service \
+    clixor-backup-health.timer \
+    clixor-restore-drill.service \
+    clixor-restore-drill.timer
+  do
+    install -m 0644 -o 0 -g 0 "${script_root}/${unit_name}" \
+      "${systemd_unit_root}/${unit_name}"
+  done
+fi
 if [ ! -f "${backup_config}" ]; then
   backup_config_partial="$(mktemp "${backup_config_root}/offsite-backup.env.XXXXXXXX")"
   {
@@ -471,15 +482,17 @@ do
   }
 done
 
-systemctl daemon-reload
-systemctl enable --now clixor-offsite-backup.timer
-if [ -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]; then
-  systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
-else
-  # deploy.sh performs the first offsite restore drill as a release gate. Never
-  # report backup health or schedule later drills before that gate has passed.
-  systemctl disable --now clixor-restore-drill.timer clixor-backup-health.timer \
-    >/dev/null 2>&1 || true
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  systemctl daemon-reload
+  systemctl enable --now clixor-offsite-backup.timer
+  if [ -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]; then
+    systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
+  else
+    # deploy.sh performs the first offsite restore drill as a release gate. Never
+    # report backup health or schedule later drills before that gate has passed.
+    systemctl disable --now clixor-restore-drill.timer clixor-backup-health.timer \
+      >/dev/null 2>&1 || true
+  fi
 fi
 
 echo "Clixor OCI ARM64 directories, runtime secrets, and internal PKI are ready."

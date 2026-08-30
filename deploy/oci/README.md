@@ -209,51 +209,83 @@ sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-20260830T120000Z
 ```
 
 Use a new non-secret run identifier for every attempt. Release directories are
-append-only audit records, so the script refuses to overwrite an earlier run.
+immutable while retained, so the script refuses to overwrite an earlier run.
+After a newly verified offsite backup and successful deployment, bounded
+retention removes only non-boundary history as described below.
 
 The deploy script:
 
 1. takes an exclusive host lock;
-2. for an upgrade, captures the previous Compose model, API image, release
+2. requires at least 8 GiB plus three times the live PostgreSQL footprint free
+   on `/srv/clixor`, and at least 6 GiB free on Docker's filesystem, before
+   creating a release or snapshot; when both paths share one filesystem, the
+   requirements are added rather than counted twice;
+3. stages and checksums that release's host backup/restore/health programs and
+   systemd units, and captures the active versions plus timer state;
+4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
    --list` and SHA-256 verification before changing the active runtime; a clean
    first deployment records an explicit first-deploy marker;
-3. builds and verifies an ARM64 API image tagged with the source revision;
-4. arms application rollback before refreshing runtime configuration,
+5. builds and verifies an ARM64 API image tagged with the source revision;
+6. arms application rollback before refreshing runtime configuration,
    synchronizing source, or reconciling containers;
-5. refreshes the independent dependency TLS leaves, synchronizes that exact
+7. refreshes the independent dependency TLS leaves, synchronizes that exact
    source to `/srv/clixor/repo`, and restarts dependencies that need a new image,
    scoped secret boundary, or certificate; the small HAProxy TLS edge is always
    replaced because it reads its bind-mounted configuration only at startup;
-6. runs the one-shot migration command;
-7. starts both API replicas and the internal gateway;
-8. force-replaces the gateway and every running observability configuration
-   consumer, then requires gateway and per-replica readiness;
-9. for production, verifies both public Cloudflare hostnames while rollback is
+8. runs the one-shot migration command, verifies the previous release still
+   passes readiness on the expanded schema, then replaces `api-a` and `api-b`
+   one at a time, requiring direct readiness before replacing the next replica;
+9. reconciles the gateway only after both replicas are ready, validates its
+   reviewed configuration, and performs a graceful Nginx reload when recreation
+   is unnecessary; running observability consumers are replaced separately;
+10. for production, verifies both public Cloudflare hostnames while rollback is
    still armed;
-10. creates and uploads a fresh post-migration backup, restores it into an
-    isolated PostgreSQL container, and runs integrity checks; and
-11. records the dependency PKI state and atomically advances the current-release
-    pointer before disarming rollback.
+11. creates and uploads a fresh post-migration backup, restores it into an
+    isolated PostgreSQL container, and runs integrity checks;
+12. only after those gates, atomically publishes each staged host-tool and unit
+    file, reloads systemd, enables the verified timers, and runs backup health;
+13. records the dependency PKI state and atomically advances the current-release
+    pointer before disarming rollback; and
+14. after the fresh offsite marker and successful release are durable, retains
+    the current and immediate previous rollback boundaries plus three small audit
+    releases, deletes pre-migration dumps from non-boundary audit releases, and
+    removes unused Clixor API image tags except the current and previous images.
 
-A failed upgrade, when a previous release exists, restores its Compose model,
-API image, and captured startup configuration, then force-replaces those
-configuration consumers. A failed first deployment stops the incomplete stack without
-deleting its bind-mounted data and removes only the copied active Compose marker
-so a clean retry is possible. Database migrations are forward-only: neither
-path automatically runs `pg_restore`, reverses migrations, or deletes database
-files. The pre-change dump is an operator recovery artifact, not an automatic
-rollback mechanism.
+A failed upgrade, when a previous release exists, first restores the captured
+host programs, systemd units, and timer state if activation began, then restores
+its Compose model, API image, and captured startup configuration. A failed first
+deployment performs the same host-tool restoration and stops the incomplete
+stack without deleting its bind-mounted data. Database migrations are
+forward-only: neither path automatically runs `pg_restore`, reverses migrations,
+or deletes database files. The pre-change dump is an operator recovery artifact,
+not an automatic rollback mechanism.
+
+Rolling availability requires expand/contract database changes. A release may
+add nullable columns, tables, indexes, and behavior understood by both the old
+and new binaries. It must not remove or reinterpret a field, or add a constraint
+the previous binary can violate, while that binary can still serve traffic.
+Ship those contract changes only in a later release after every old replica has
+drained. The post-migration old-release readiness check catches gross
+incompatibility but does not replace migration review.
 
 The first digest-pinned and per-service-PKI rollout intentionally recreates
 PostgreSQL, Redis, NATS, and HAProxy once. Schedule that transition in a
 maintenance window because the single-node A1 topology has no redundant
 database/cache/event-bus instance. Nginx, HAProxy, the backup worker, Prometheus,
 and Grafana read ordinary bind-mounted files rather than Docker Config objects.
-Each deployment therefore force-replaces the always-running gateway/TLS
-edge/backup worker and any observability process that was already running. This
-guarantees that a security or routing edit is active rather than merely present
-on the host. Stopped optional observability services remain stopped.
+Each deployment therefore force-replaces HAProxy and the backup worker. Nginx is
+reconciled after both APIs pass readiness, validates the new file, and reloads
+gracefully unless an immutable container setting or image change requires
+Compose to replace it. Any observability process that was already running is
+replaced; stopped optional observability services remain stopped.
+
+Capacity failure is intentionally fail-closed before a dump or image build. The
+successful-release retention pass never deletes the current release, its direct
+previous rollback boundary, either boundary's pre-migration dump, or either API
+image. It runs only after the deployment's new offsite success marker. If an
+older installation already exhausted the volume before this policy can run,
+stop and perform a reviewed manual cleanup; do not weaken the preflight.
 
 Check local state:
 
@@ -524,9 +556,16 @@ The default stack performs a six-hourly custom-format PostgreSQL dump with a
 SHA-256 checksum and seven-day local retention. OCI Object Storage is already the
 primary media store and is not copied into the VM backup directory.
 
-Bootstrap installs root-owned backup programs in `/usr/local/libexec/clixor`, a
-mode-0600 non-secret bucket/prefix file at `/etc/clixor/offsite-backup.env`, and
-three hardened timer pairs:
+The initial operator bootstrap installs root-owned backup programs in
+`/usr/local/libexec/clixor`, a mode-0600 non-secret bucket/prefix file at
+`/etc/clixor/offsite-backup.env`, and three hardened timer pairs. During a
+deployment, bootstrap explicitly defers changes to those host programs and
+units. `deploy.sh` instead stores a checksum-verified version under that
+release's mode-0700 directory, captures the installed files and timer state, and
+keeps the old programs active for the offsite and restore gates. It publishes
+the staged files only after both gates pass. Any later release failure restores
+the captured files, reloads systemd, and restores the exact enabled/active timer
+state before application rollback proceeds.
 
 Once created, that file is the durable backup target. Later bootstraps preserve
 it and fail on conflicting transient `CLIXOR_OCI_BACKUP_BUCKET` or
