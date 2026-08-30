@@ -115,7 +115,9 @@ resource "oci_core_network_security_group_security_rule" "outbound" {
 }
 
 resource "oci_bastion_bastion" "clixor" {
-  bastion_type                 = "standard"
+  # OCI canonicalizes this enum to uppercase. Match the API representation so
+  # every later plan does not propose replacing the Bastion and its dependents.
+  bastion_type                 = "STANDARD"
   compartment_id               = local.deployment_compartment_id
   target_subnet_id             = oci_core_subnet.private.id
   client_cidr_block_allow_list = [var.admin_cidr]
