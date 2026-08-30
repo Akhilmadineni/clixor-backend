@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+[ "$(id -u)" -eq 0 ] || { echo "SKIP: root required"; exit 77; }
+root="$(mktemp -d /tmp/clixor-origin-test.XXXXXX)"
+chmod 0711 "${root}"
+cleanup() { kill "${server_pid:-0}" 2>/dev/null || true; rm -rf -- "${root}"; }
+trap cleanup EXIT HUP INT TERM
+install -d -m 0750 -o 101 -g 987 "${root}/origin"
+
+# Faithful kernel boundary: the gateway owner creates a 0770 Unix socket; only
+# a process carrying connector GID 987 can connect. Other host/runner identities
+# cannot traverse the directory or replace the socket entry.
+setpriv --reuid=101 --regid=987 --clear-groups python3 - "${root}/origin/gateway.sock" <<'PY' &
+import os, socket, sys
+os.umask(0o007)
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1]); s.listen(4)
+for _ in range(1):
+    c, _ = s.accept(); c.sendall(b"connector-only\n"); c.close()
+PY
+server_pid=$!
+for _ in $(seq 1 50); do [ -S "${root}/origin/gateway.sock" ] && break; sleep .05; done
+[ "$(stat -c '%u:%g:%a' "${root}/origin")" = "101:987:750" ]
+[ "$(stat -c '%u:%g:%a' "${root}/origin/gateway.sock")" = "101:987:770" ]
+[ "$(setpriv --reuid=65530 --regid=65530 --groups=987 python3 - "${root}/origin/gateway.sock" <<'PY'
+import socket, sys
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(64).decode().strip())
+PY
+)" = "connector-only" ]
+wait "${server_pid}"
+
+if setpriv --reuid=65531 --regid=65531 --clear-groups \
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' \
+  "${root}/origin/gateway.sock" 2>/dev/null; then
+  echo "non-connector identity reached the origin" >&2; exit 1
+fi
+if setpriv --reuid=65530 --regid=65530 --groups=987 \
+  rm -f -- "${root}/origin/gateway.sock" 2>/dev/null; then
+  echo "connector group could replace the gateway socket" >&2; exit 1
+fi
+
+# The checked-in TCP server is health-only and cannot pass a forged identity.
+python3 - "$(dirname "$0")/api-gateway-nginx.conf" <<'PY'
+import pathlib, sys
+raw=pathlib.Path(sys.argv[1]).read_text()
+_, health=raw.split("  server {", 2)[1:]
+assert "listen 8080;" in health
+assert 'proxy_set_header CF-Connecting-IP "";' in health
+assert "location / { return 404; }" in health
+PY
+echo "origin-boundary=passed"

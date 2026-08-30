@@ -241,7 +241,7 @@ install -m 0644 -o 0 -g 0 "${script_root}/clixor-origin.conf" \
   /etc/tmpfiles.d/clixor-origin.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/clixor-origin.conf
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
-  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "0:987:750" ] || {
+  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "101:987:750" ] || {
   echo "Connector origin tmpfs boundary is unsafe." >&2
   exit 1
 }

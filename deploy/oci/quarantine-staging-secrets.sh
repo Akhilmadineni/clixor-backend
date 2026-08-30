@@ -35,11 +35,11 @@ marker_value() {
 audit() {
   audit_result=$1
   audit_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  printf '%s action=quarantine result=%s ticket=%s boot_id=%s release=%s release_cohort=%s mapping_sha256=%s cohort_sha256=%s approval_sha256=%s item_count=%s\n' \
+  printf '%s action=quarantine result=%s ticket=%s boot_id=%s release=%s release_cohort=%s mapping_sha256=%s cohort_sha256=%s approval_sha256=%s connector_token_revoked_at=%s item_count=%s\n' \
     "${audit_time}" "${audit_result}" "${change_ticket}" \
     "${approved_boot_id}" "${approved_release}" "${release_cohort:-unverified}" \
     "${approved_mapping_sha256}" "${approved_cohort_sha256}" \
-    "${approval_sha256}" "${item_count}" \
+    "${approval_sha256}" "${retired_cloudflare_token_revoked_at}" "${item_count}" \
     >> "${audit_log}"
 }
 
@@ -64,7 +64,7 @@ flock -n 9 || fail "another staging-secret maintenance operation is running"
 [ "$(stat -c '%u:%g:%a' "${approval_file}")" = "0:0:600" ] || \
   fail "approval must be root-owned with mode 0600"
 awk -F= '
-  !/^(schema|change_ticket|approved_mapping_sha256|approved_cohort_sha256|pre_reboot_boot_id|approved_boot_id|approved_release|provider_canaries|provider_canaries_passed_at)=/ { exit 1 }
+  !/^(schema|change_ticket|approved_mapping_sha256|approved_cohort_sha256|pre_reboot_boot_id|approved_boot_id|approved_release|provider_canaries|provider_canaries_passed_at|retired_cloudflare_token_revoked_at)=/ { exit 1 }
   { if (seen[$1]++) exit 1 }
   END {
     if (seen["schema"] != 1 || seen["change_ticket"] != 1 ||
@@ -73,7 +73,8 @@ awk -F= '
         seen["pre_reboot_boot_id"] != 1 ||
         seen["approved_boot_id"] != 1 || seen["approved_release"] != 1 ||
         seen["provider_canaries"] != 1 ||
-        seen["provider_canaries_passed_at"] != 1) exit 1
+        seen["provider_canaries_passed_at"] != 1 ||
+        seen["retired_cloudflare_token_revoked_at"] != 1) exit 1
   }
 ' "${approval_file}" || fail "approval has unknown, missing, or duplicate fields"
 
@@ -86,9 +87,10 @@ approved_boot_id="$(approval_value approved_boot_id)"
 approved_release="$(approval_value approved_release)"
 provider_canaries="$(approval_value provider_canaries)"
 provider_canaries_passed_at="$(approval_value provider_canaries_passed_at)"
+retired_cloudflare_token_revoked_at="$(approval_value retired_cloudflare_token_revoked_at)"
 approval_sha256="$(sha256sum "${approval_file}" | awk '{print $1}')"
 
-[ "${approval_schema}" = "2" ] || fail "approval schema must be 2"
+[ "${approval_schema}" = "3" ] || fail "approval schema must be 3"
 case "${change_ticket}" in
   ''|*[!A-Za-z0-9._-]*) fail "approval change ticket is invalid" ;;
 esac
@@ -252,9 +254,13 @@ current_boot_id="$(sed -n '1p' /proc/sys/kernel/random/boot_id)"
 boot_epoch="$(date --date="$(uptime -s)" '+%s')"
 canary_epoch="$(date --date="${provider_canaries_passed_at}" '+%s')"
 now_epoch="$(date -u '+%s')"
+revoked_epoch="$(date --date="${retired_cloudflare_token_revoked_at}" '+%s')"
 [ "${canary_epoch}" -ge "${boot_epoch}" ] && \
   [ "${canary_epoch}" -le "${now_epoch}" ] || \
   fail "provider canaries were not attested during the current boot"
+[ "${revoked_epoch}" -ge "${boot_epoch}" ] && \
+  [ "${revoked_epoch}" -le "${now_epoch}" ] || \
+  fail "retired connector token revocation was not attested during the current boot"
 [ -s "${restore_marker}" ] && [ ! -L "${restore_marker}" ] && \
   [ "$(stat -c '%Y' "${restore_marker}")" -ge "${boot_epoch}" ] || \
   fail "a successful restore drill from the current boot is required"
@@ -272,16 +278,25 @@ curl --fail --silent --show-error --max-time 5 \
 timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 quarantine_id="${timestamp}-${change_ticket}"
 srv_quarantine="${project_root}/quarantine/staging-secrets/${quarantine_id}"
-cloudflare_quarantine="/etc/cloudflared/quarantine/${quarantine_id}"
-[ ! -e "${srv_quarantine}" ] && [ ! -e "${cloudflare_quarantine}" ] || \
+[ ! -e "${srv_quarantine}" ] || \
   fail "quarantine destination already exists"
+
+# A connector token is bearer authority, not forensic material. The operator
+# must revoke it in Cloudflare and remove both retired persistent copies before
+# this release can complete. Only the change-ticket approval/audit survives.
+for retired_connector_token in \
+  "${secret_root}/cloudflare-token" /etc/cloudflared/token
+do
+  [ ! -e "${retired_connector_token}" ] && [ ! -L "${retired_connector_token}" ] || \
+    fail "revoke and remove the retired Cloudflare connector token before retirement"
+done
 
 inventory="$(mktemp "${project_root}/runtime/staging-secret-inventory.XXXXXXXX")"
 : > "${inventory}"
 for persistent_name in \
   api.env postgres.env redis.env nats.env grafana.env backup.env migrate.env \
   metrics.token postgres.password postgres.pgpass redis.password redis.acl \
-  nats.conf grafana.ini cloudflare-token
+  nats.conf grafana.ini
 do
   persistent_path="${secret_root}/${persistent_name}"
   [ -e "${persistent_path}" ] || continue
@@ -315,20 +330,11 @@ do
   residual_name=${residual_secret_dir##*/}
   printf 'srv-dir|%s|%s\n' "${residual_secret_dir}" "${residual_name}" >> "${inventory}"
 done
-legacy_cloudflare_token=/etc/cloudflared/token
-if [ -e "${legacy_cloudflare_token}" ] || [ -L "${legacy_cloudflare_token}" ]; then
-  [ -f "${legacy_cloudflare_token}" ] && \
-    [ ! -L "${legacy_cloudflare_token}" ] && \
-    [ "$(stat -c '%u:%g:%a' "${legacy_cloudflare_token}")" = "0:0:600" ] || \
-    fail "legacy Cloudflare token is unsafe"
-  printf 'cloudflare-file|%s|token\n' "${legacy_cloudflare_token}" >> "${inventory}"
-fi
-
 item_count="$(awk 'END {print NR + 0}' "${inventory}")"
 [ "${item_count}" -gt 0 ] || fail "no persistent staging secrets require quarantine"
 install -d -m 0700 -o 0 -g 0 \
   "${srv_quarantine}" "${srv_quarantine}/apns" \
-  "${srv_quarantine}/residual" "${cloudflare_quarantine}"
+  "${srv_quarantine}/residual"
 install -m 0600 -o 0 -g 0 "${approval_file}" \
   "${srv_quarantine}/maintenance.approval"
 sha256sum "${srv_quarantine}/maintenance.approval" > \
@@ -339,7 +345,6 @@ while IFS='|' read -r item_type source_path item_name; do
     srv-file) destination="${srv_quarantine}/${item_name}" ;;
     srv-apns) destination="${srv_quarantine}/apns/${item_name}" ;;
     srv-dir) destination="${srv_quarantine}/residual/${item_name}" ;;
-    cloudflare-file) destination="${cloudflare_quarantine}/${item_name}" ;;
     *) fail "internal inventory contains an unknown item type" ;;
   esac
   [ ! -e "${destination}" ] && [ ! -L "${destination}" ] || \

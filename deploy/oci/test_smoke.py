@@ -296,7 +296,8 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("pre-retirement-boot-id", quarantine)
         self.assertIn("approved_mapping_sha256", quarantine)
         self.assertIn("approved_cohort_sha256", quarantine)
-        self.assertIn('[ "${approval_schema}" = "2" ]', quarantine)
+        self.assertIn('[ "${approval_schema}" = "3" ]', quarantine)
+        self.assertIn("retired_cloudflare_token_revoked_at", quarantine)
         self.assertIn('release_secret_mode="${current_release}/secret-mode"', quarantine)
         self.assertIn('approved_mapping="${current_release}/vault-secrets.map"', quarantine)
         self.assertIn(

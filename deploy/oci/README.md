@@ -12,7 +12,7 @@ connector-authenticated Unix-socket origin boundary: the public API is not
 reachable on a host TCP port and only the systemd cloudflared identity belongs
 to `clixor-origin`. The TCP listener serves exact health paths, clears
 `CF-Connecting-IP`, and returns 404 for every application route.
-Systemd tmpfiles creates the root-owned boundary before Docker at cold boot;
+Systemd tmpfiles creates the UID-101-owned, connector-group boundary before Docker at cold boot;
 Compose has `create_host_path: false`, so a missing boundary stops the gateway
 instead of silently replacing it with daemon-default permissions.
 
@@ -23,25 +23,35 @@ production stage. The gate runs readiness/association checks and the disposable
 `smoke.py` lifecycle: account creation/deletion, WebSocket upgrade and reconnect,
 E2EE message delivery, OCI PAR upload/download, authorization, and verified media
 cleanup. Root-owned `canary-public-smoke.txt` binds that evidence to the exact
-release SHA. Before any production route edit, run:
+release SHA. Before any production route edit, record the exact configuration
+digests and run the protected state machine. Give its separate control token
+only Tunnel Configuration Edit and DNS Edit for this account/zone; materialize
+it as root-owned mode 0400 tmpfs and pass it as a systemd credential, never as
+environment, argv, shell history, logs, or the connector token:
 
 ```
-python3 deploy/oci/validate-canary-promotion.py \
-  --evidence /srv/clixor/releases/current/canary-public-smoke.txt \
-  --revision "$(cat /srv/clixor/releases/current/source-sha)"
+systemd-run --unit=clixor-cloudflare-promotion --wait --pipe --collect \
+  -p LoadCredential=cloudflare-control-token:/run/operator/cloudflare-control-token \
+  python3 /srv/clixor/repo/deploy/oci/cloudflare-promote.py promote \
+  --account ACCOUNT_ID --zone ZONE_ID \
+  --old-tunnel OLD_TUNNEL_ID --candidate-tunnel OCI_TUNNEL_ID \
+  --old-target OLD_TUNNEL_ID.cfargotunnel.com \
+  --candidate-target OCI_TUNNEL_ID.cfargotunnel.com \
+  --old-config-sha REVIEWED_SHA256 --candidate-config-sha REVIEWED_SHA256 \
+  --old-revision OLD_RELEASE_SHA --revision NEW_RELEASE_SHA \
+  --evidence /srv/clixor/releases/current/canary-public-smoke.txt
 ```
 
-Promotion is a control-plane ownership transfer, never another deploy. Freeze
-writes and drain the old connector first. Confirm it has zero active tunnel
-connections, then make one reviewed Cloudflare transaction that removes the
-production hostname from the old tunnel and assigns it to the already-healthy
-OCI tunnel. Do not temporarily configure the hostname on both tunnels and do
-not use load balancing between them. Verify the exact revision publicly before
-unfreezing writes. Rollback is the inverse while writes remain frozen: remove
-the OCI ownership, restore the old single owner, verify it, then unfreeze. If
-the control-plane update or verification is ambiguous, keep writes frozen and
-both connectors' production route disabled. Canary cleanup/removal happens only
-after production verification evidence is retained.
+Promotion is a control-plane ownership transfer, never another deploy. The
+state machine CAS-checks both tunnel configurations and both proxied CNAMEs,
+fences writes with `http_status:503` on both tunnels, and changes both records
+with Cloudflare's transactional DNS batch. Edge KV propagation is not atomic,
+so the fence stays until both hostnames repeatedly return the exact API/AASA
+revision. Mixed observations retain the fence and journal for operator action.
+Automatic rollback occurs only if both records still select the exact candidate;
+manual rollback uses `cloudflare-promote.py rollback` with the same identifiers,
+revision, and state. Never configure live production routes on two tunnels or
+load balance them. Remove canary only after retaining production evidence.
 
 The remotely managed canary route must point to
 `unix:/run/clixor-origin/gateway.sock`; the checked-in example is the reviewed
@@ -356,7 +366,7 @@ After those checks pass, create
 exactly these non-secret fields, be owned by `root:root`, and have mode `0600`:
 
 ```text
-schema=2
+schema=3
 change_ticket=CHANGE-1234
 approved_mapping_sha256=<64 lowercase hex characters>
 approved_cohort_sha256=<64 lowercase hex characters from the schema-2 marker>
@@ -365,11 +375,15 @@ approved_boot_id=<current boot ID>
 approved_release=/srv/clixor/releases/oci-<approved release tag>
 provider_canaries=apns,cloudflare,oci-media,smtp,telnyx
 provider_canaries_passed_at=2026-08-30T18:30:00Z
+retired_cloudflare_token_revoked_at=2026-08-30T18:35:00Z
 ```
 
 The canary timestamp must be after the current boot, and the restore success
-marker must also be newer than that boot. Recheck the approval and run the only
-supported retirement entrypoint explicitly:
+marker must also be newer than that boot. Recheck the approval, revoke the
+retired connector token in Cloudflare, and securely remove both
+`/etc/cloudflared/token` and `/srv/clixor/secrets/cloudflare-token`. The script
+fails closed while either persistent bearer credential exists; tokens are never
+retained as evidence. Then run the only supported retirement entrypoint:
 
 ```sh
 sudo chmod 0600 /etc/clixor/staging-secret-retirement.approval
@@ -383,9 +397,8 @@ pointer. It verifies the release-local boot bundle checksum, mode and mapping,
 the approved manifest's calculated cohort digest, and the active schema-2
 marker with that release's own checksummed verifier. It never falls back to
 mutable `/etc/clixor/secret-mode` or `/etc/clixor/vault-secrets.map`. It
-moves `/srv/clixor/secrets` candidates to a unique mode-0700 directory below
-`/srv/clixor/quarantine/staging-secrets` and the legacy connector token to a
-matching directory below `/etc/cloudflared/quarantine`. It appends a non-secret,
+moves non-connector `/srv/clixor/secrets` candidates to a unique mode-0700
+directory below `/srv/clixor/quarantine/staging-secrets`. It appends a non-secret,
 root-only result to `/var/log/clixor/staging-secret-maintenance.log`. It never
 deletes quarantined content and offers no purge mode. Any later secure deletion
 requires a second change ticket, quarantine inventory review, confirmed Vault
@@ -738,8 +751,8 @@ rejects older binaries. Create a new, remotely managed tunnel for this VM; do no
 reuse a NAS connector connected to a different database. Configure these public
 hostname routes on that tunnel:
 
-- `clustr-api.atlanteanz.com` -> `http://172.30.254.2:8080`
-- `clixor.atlanteanz.com` -> `http://172.30.254.2:8080`
+- `clustr-api.atlanteanz.com` -> `unix:/run/clixor-origin/gateway.sock`
+- `clixor.atlanteanz.com` -> `unix:/run/clixor-origin/gateway.sock`
 
 After selecting the production Vault generation, run the normal immutable
 release. `deploy.sh` checksum-stages and systemd-validates the hardened unit,

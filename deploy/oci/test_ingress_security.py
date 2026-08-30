@@ -1,19 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
-import os
-import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location(
-    "promotion", ROOT / "validate-canary-promotion.py"
-)
-assert spec and spec.loader
-promotion = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(promotion)
-
 class IngressBoundaryTests(unittest.TestCase):
     def test_tcp_listener_cannot_proxy_forged_cloudflare_identity(self) -> None:
         nginx = (ROOT / "api-gateway-nginx.conf").read_text(encoding="utf-8")
@@ -29,7 +19,7 @@ class IngressBoundaryTests(unittest.TestCase):
         self.assertIn("umask 007", compose)
         self.assertIn("create_host_path: false", compose)
         self.assertIn("SupplementaryGroups=clixor-origin", unit)
-        self.assertIn("ExecStartPre=+/usr/bin/install -d -m 0750 -o 0 -g 987", unit)
+        self.assertIn("ExecStartPre=+/usr/bin/install -d -m 0750 -o 101 -g 987", unit)
         route = (ROOT / "cloudflared-config.yml.example").read_text(encoding="utf-8")
         self.assertIn("service: unix:/run/clixor-origin/gateway.sock", route)
         self.assertNotIn("172.30.254.2:8080", route)
@@ -41,7 +31,7 @@ class IngressBoundaryTests(unittest.TestCase):
         compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
         self.assertEqual(
             [line for line in tmpfiles.splitlines() if line and not line.startswith("#")],
-            ["d /run/clixor-origin 0750 root clixor-origin -"],
+            ["d /run/clixor-origin 0750 101 clixor-origin -"],
         )
         install_at = bootstrap.index("/etc/tmpfiles.d/clixor-origin.conf")
         create_at = bootstrap.index("systemd-tmpfiles --create", install_at)
@@ -53,8 +43,12 @@ class IngressBoundaryTests(unittest.TestCase):
 
     def test_legacy_persistent_token_fallback_is_absent(self) -> None:
         installer = (ROOT / "install-cloudflared-service.sh").read_text(encoding="utf-8")
+        retirement = (ROOT / "quarantine-staging-secrets.sh").read_text(encoding="utf-8")
         self.assertNotIn("/etc/cloudflared/token", installer)
         self.assertIn("Vault tmpfs generation", installer)
+        self.assertIn("revoke and remove the retired Cloudflare connector token", retirement)
+        self.assertNotIn("cloudflare_quarantine", retirement)
+        self.assertNotIn("cloudflare-file)", retirement)
 
     def test_actions_are_canary_only_and_require_disposable_smoke(self) -> None:
         actions = (ROOT / "actions-deploy.sh").read_text(encoding="utf-8")
@@ -65,36 +59,6 @@ class IngressBoundaryTests(unittest.TestCase):
         self.assertIn('verify_production_not_candidate "${source_sha}"', deploy)
         self.assertIn("candidate connector unexpectedly owns the production hostname", deploy)
         self.assertIn('run_disposable_public_smoke "${source_sha}"', deploy)
-
-class PromotionEvidenceTests(unittest.TestCase):
-    def test_exact_evidence_is_required(self) -> None:
-        revision = "a" * 40
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "evidence"
-            path.write_text(
-                f"revision={revision}\nstage=canary\n"
-                "smoke=passed prefix=clixor-smoke-x checks=99 cleanup=passed\n",
-                encoding="utf-8",
-            )
-            path.chmod(0o400)
-            promotion.validate(path, revision, expected_uid=os.getuid())
-            path.chmod(0o600)
-            with self.assertRaisesRegex(ValueError, "0400"):
-                promotion.validate(path, revision, expected_uid=os.getuid())
-
-    def test_other_revision_or_incomplete_cleanup_is_denied(self) -> None:
-        revision = "b" * 40
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "evidence"
-            path.write_text(
-                f"revision={revision}\nstage=canary\nsmoke=passed cleanup=failed\n",
-                encoding="utf-8",
-            )
-            path.chmod(0o400)
-            with self.assertRaises(ValueError):
-                promotion.validate(path, revision, expected_uid=os.getuid())
-            with self.assertRaises(ValueError):
-                promotion.validate(path, "c" * 40, expected_uid=os.getuid())
 
 if __name__ == "__main__":
     unittest.main()
