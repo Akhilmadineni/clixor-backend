@@ -64,6 +64,26 @@ func TestPushHardeningMigrationIsRollingCompatible(t *testing.T) {
 	}
 }
 
+func TestPushTokenUniquenessMigrationIsCoordinatedAndDeterministic(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000013_push_token_uniqueness.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"LOCK TABLE devices IN ACCESS EXCLUSIVE MODE",
+		"lower(btrim(push_token))",
+		"last_seen_at DESC NULLS LAST",
+		"created_at DESC",
+		"devices_push_token_unique",
+		"WHERE push_token <> ''",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("push-token uniqueness migration is missing %q", required)
+		}
+	}
+}
+
 func TestProfileMediaMigrationCleansExtensionsForLegacyAccountDeletion(t *testing.T) {
 	raw, err := migrationFiles.ReadFile("migrations/000008_profile_media.sql")
 	if err != nil {
