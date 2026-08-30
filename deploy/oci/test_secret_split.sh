@@ -117,6 +117,30 @@ grep -q -- '--force-recreate "${dependency_service}"' "${script_root}/deploy.sh"
 grep -Fq 'trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true' \
   "${script_root}/actions-deploy.sh" || \
   fail "production Actions do not require Vault hydration"
+grep -Fq 'CLIXOR_INITIAL_VAULT_CUTOVER=false' \
+  "${script_root}/actions-deploy.sh" || \
+  fail "production Actions can implicitly perform the initial Vault cutover"
+grep -Fq 'staging-to-Vault promotion requires CLIXOR_INITIAL_VAULT_CUTOVER=true' \
+  "${script_root}/deploy.sh" || \
+  fail "deploy does not require the explicit initial Vault cutover flag"
+grep -Fq 'initial Vault cutover requires an existing boot-approved staging release' \
+  "${script_root}/deploy.sh" || \
+  fail "initial Vault cutover can run without a prior staging rollback boundary"
+grep -Fq -- '--candidate-manifest "${candidate_manifest}"' \
+  "${script_root}/deploy.sh" || \
+  fail "deploy does not record a release candidate Vault manifest"
+grep -Fq -- '--commit-candidate-release "${candidate_manifest}"' \
+  "${script_root}/deploy.sh" || \
+  fail "deploy does not atomically approve the release-local Vault cohort"
+grep -Fq -- '--approved-manifest "${approved_manifest}"' \
+  "${script_root}/prepare-runtime-secrets.sh" || \
+  fail "boot-time hydration does not require the current release manifest"
+grep -Fq 'release history exists but the boot approval pointer is unavailable' \
+  "${script_root}/prepare-runtime-secrets.sh" || \
+  fail "boot can silently downgrade to staging after losing its release pointer"
+grep -Fq 'command.extend(("--version-number", str(version_number)))' \
+  "${script_root}/hydrate-vault-secrets.py" || \
+  fail "approved boot hydration does not pin OCI secret versions"
 grep -q 'runtime secrets must be materialized on tmpfs' "${script_root}/hydrate-vault-secrets.py" || \
   fail "Vault hydration does not fail closed outside tmpfs"
 grep -q '^Requires=clixor-runtime-secrets.service$' "${script_root}/docker-runtime-secrets.conf" || \

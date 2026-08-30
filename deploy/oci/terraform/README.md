@@ -177,14 +177,21 @@ value from state. The stack creates an empty Vault and key, but deliberately
 does not create secret objects or values. The host deployment package provides
 the audited boundary: an operator creates the values outside Terraform, installs
 only their nonsecret secret OCIDs in a root-only mapping, and the VM instance
-principal fetches `CURRENT` bundles into a complete root-owned `/run` tmpfs
-generation. Docker and cloudflared are ordered after the boot-time hydration unit
-and fail closed when the mapping, Vault, content, ownership, mode, allowlist, or
-tmpfs checks fail. See `../README.md` for the exact artifact/import/rotation
-procedure. Terraform, Resource Manager state, cloud-init, GitHub, and command
-arguments never receive secret content. Required values include the database,
-Redis, NATS, JWT, metrics, Telnyx, APNs, Cloudflare Tunnel, and backup-encryption
-credentials.
+principal fetches each `CURRENT` bundle only while selecting a candidate release.
+That single OCI response binds content to its exact secret version. The release
+stores only a root-owned, nonsecret manifest of artifact names, OCIDs, exact
+version numbers, the mapping hash, and cohort digest. The atomic
+`/srv/clixor/releases/current` switch approves the application, mapping snapshot,
+and cohort together. Boot never follows Vault `CURRENT`: it reconstructs the
+approved root-owned `/run` tmpfs generation with exact `--version-number` reads.
+Docker and cloudflared are ordered after the boot-time hydration unit and fail
+closed when the release pointer, manifest, mapping hash, version, Vault content,
+ownership, mode, allowlist, or tmpfs checks fail. See `../README.md` for the exact
+artifact/import/cutover/rotation procedure. Terraform, Resource Manager state,
+cloud-init, GitHub, and command arguments never receive secret content. Required
+values include the database, Redis, NATS, JWT, metrics, Telnyx, APNs, Cloudflare
+Tunnel, and backup-encryption credentials. Keep versions named by retained release
+manifests recoverable in Vault.
 
 Application media uses the compute instance principal with the native OCI
 Object Storage API, so the stack creates no S3 customer secret key. Configure

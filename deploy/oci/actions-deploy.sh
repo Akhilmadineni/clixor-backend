@@ -41,7 +41,8 @@ trusted_env() {
 
 for command_path in \
   /usr/bin/chmod /usr/bin/env /usr/bin/git /usr/bin/install /usr/bin/mktemp \
-  /usr/bin/python3 /usr/bin/rm /usr/bin/stat /usr/bin/tar
+  /usr/bin/python3 /usr/bin/readlink /usr/bin/rm /usr/bin/stat /usr/bin/tar \
+  /usr/bin/tr /usr/bin/wc
 do
   [ -x "${command_path}" ] || fail "required trusted command is unavailable: ${command_path}"
 done
@@ -76,12 +77,33 @@ grep -qx 'CLUSTER_VERIFICATION_PROVIDER=telnyx' "${api_env}" || \
 grep -qx 'CLUSTER_MAIL_PROVIDER=smtp' "${api_env}" || \
   fail "Actions deploys require durable SMTP password-reset delivery"
 
-[ -f /etc/clixor/secret-mode ] && [ ! -L /etc/clixor/secret-mode ] || \
-  fail "production secret mode is unavailable"
-[ "$(stat -c '%u:%g:%a' /etc/clixor/secret-mode)" = "0:0:600" ] || \
-  fail "production secret mode has unsafe ownership or mode"
-[ "$(sed -n '1p' /etc/clixor/secret-mode)" = "vault" ] || \
-  fail "production Actions require OCI Vault secret mode"
+current_release=/srv/clixor/releases/current
+release_secret_mode="${current_release}/secret-mode"
+approved_manifest="${current_release}/vault-approved-cohort.json"
+approved_mapping="${current_release}/vault-secrets.map"
+[ -L "${current_release}" ] || \
+  fail "production release pointer is unavailable"
+current_release_target="$(/usr/bin/readlink -- "${current_release}")"
+case "${current_release_target}" in
+  /srv/clixor/releases/oci-*) ;;
+  *) fail "production release pointer targets an unexpected location" ;;
+esac
+[ "${current_release_target%/*}" = "/srv/clixor/releases" ] && \
+  [ "$(/usr/bin/readlink -f -- "${current_release}")" = "${current_release_target}" ] && \
+  [ -d "${current_release_target}" ] && [ ! -L "${current_release_target}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${current_release_target}")" = "0:0:700" ] || \
+  fail "production release pointer does not select an immediate release child"
+for approved_file in \
+  "${release_secret_mode}" "${approved_manifest}" "${approved_mapping}"
+do
+  [ -f "${approved_file}" ] && [ ! -L "${approved_file}" ] || \
+    fail "production release approval metadata is unavailable"
+  [ "$(stat -c '%u:%g:%a' "${approved_file}")" = "0:0:400" ] || \
+    fail "production release approval metadata has unsafe ownership or mode"
+done
+[ "$(sed -n '1p' "${release_secret_mode}")" = "vault" ] && \
+  [ "$(wc -l < "${release_secret_mode}" | tr -d '[:space:]')" = "1" ] || \
+  fail "production Actions require an approved OCI Vault release cohort"
 
 approval_audience="clixor-oci-production:${source_sha}:${source_run_id}:${deploy_run_id}:${deploy_run_attempt}"
 trusted_env /usr/bin/python3 "${approval_helper}" \
@@ -151,5 +173,6 @@ trusted_env /usr/bin/tar --extract --file="${source_archive}" --directory="${app
   fail "approved archive has no OCI deployment entrypoint"
 
 trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true \
+  CLIXOR_INITIAL_VAULT_CUTOVER=false \
   /bin/sh "${approved_source}/deploy/oci/deploy.sh" \
   "${approved_source}" "${source_sha}" "${deploy_run_id}-${deploy_run_attempt}"

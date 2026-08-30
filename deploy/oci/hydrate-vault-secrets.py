@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Materialize Clixor production secrets from OCI Vault without exposing values."""
+"""Materialize one release-approved Clixor OCI Vault secret cohort."""
 
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ DEFAULT_MAPPING = Path("/etc/clixor/vault-secrets.map")
 DEFAULT_SECRET_ROOT = Path("/run/clixor/secrets")
 DEFAULT_OCI_BINARY = Path("/usr/local/bin/oci")
 DEFAULT_OPENSSL_BINARY = Path("/usr/bin/openssl")
+APPROVED_MANIFEST_NAME = "vault-approved-cohort.json"
+APPROVED_MAPPING_NAME = "vault-secrets.map"
+MANIFEST_SCHEMA = 1
 GENERATION_ROOT_NAME = "vault-generations"
 ACTIVE_NAME = "active"
 MARKER_NAME = ".vault-hydrated"
@@ -33,6 +36,9 @@ MAX_ENV_BYTES = 256 * 1024
 MAX_APNS_BYTES = 16 * 1024
 MAX_TOKEN_BYTES = 8 * 1024
 MAX_ENCODED_BYTES = 384 * 1024
+MAX_OCI_RESPONSE_BYTES = MAX_ENCODED_BYTES + 64 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_OCI_VERSION_NUMBER = (1 << 63) - 1
 
 REQUIRED_MAPPING_NAMES = frozenset(
     {
@@ -57,6 +63,8 @@ TOKEN_RE = re.compile(rb"^[A-Za-z0-9._=-]{40,8192}$")
 OPAQUE_SECRET_RE = re.compile(rb"^[^\x00-\x20\x7f]{32,8192}$")
 SERVICE_SECRET_RE = re.compile(rb"^[A-Za-z0-9._~-]{32,256}$")
 SERVICE_NAME_RE = re.compile(rb"^[A-Za-z0-9._-]{1,64}$")
+SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+RELEASE_COHORT_RE = re.compile(r"^oci-[a-f0-9]{12}-[A-Za-z0-9._-]{1,160}$")
 
 API_ALLOWED_KEYS = frozenset(
     {
@@ -206,7 +214,13 @@ def _validate_no_symlink_components(path: Path) -> None:
             raise HydrationError(f"symbolic links are not allowed in path: {path}")
 
 
-def _validate_mapping_file(path: Path, expected_uid: int, expected_gid: int) -> bytes:
+def _validate_mapping_file(
+    path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    *,
+    expected_mode: int,
+) -> bytes:
     _validate_no_symlink_components(path)
     parent_metadata = _safe_lstat(path.parent)
     if not stat.S_ISDIR(parent_metadata.st_mode):
@@ -221,8 +235,8 @@ def _validate_mapping_file(path: Path, expected_uid: int, expected_gid: int) -> 
         raise HydrationError("mapping must be a regular file")
     if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
         raise HydrationError("mapping has the wrong owner")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise HydrationError("mapping must have mode 0600")
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise HydrationError(f"mapping must have mode {expected_mode:04o}")
     if metadata.st_size <= 0 or metadata.st_size > 64 * 1024:
         raise HydrationError("mapping size is invalid")
     try:
@@ -263,6 +277,301 @@ def _parse_mapping(content: bytes) -> dict[str, str]:
     if missing:
         raise HydrationError(f"mapping is missing required artifact: {missing[0]}")
     return parsed
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise HydrationError(f"JSON object contains a duplicate key: {key}")
+        parsed[key] = value
+    return parsed
+
+
+def _load_strict_json(content: bytes, description: str) -> object:
+    if not content or len(content) > MAX_MANIFEST_BYTES or b"\x00" in content:
+        raise HydrationError(f"{description} size is invalid")
+    try:
+        return json.loads(content.decode("ascii"), object_pairs_hook=_strict_json_object)
+    except HydrationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HydrationError(f"{description} is invalid JSON") from None
+
+
+def _cohort_payload(
+    release_cohort: str,
+    mapping_sha256: str,
+    artifacts: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "release_cohort": release_cohort,
+        "mapping_sha256": mapping_sha256,
+        "artifacts": artifacts,
+    }
+
+
+def _cohort_digest(payload: Mapping[str, object]) -> str:
+    canonical = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _build_manifest(
+    release_cohort: str,
+    mapping_content: bytes,
+    mapping: Mapping[str, str],
+    versions: Mapping[str, int],
+) -> bytes:
+    if RELEASE_COHORT_RE.fullmatch(release_cohort) is None:
+        raise HydrationError("release cohort is invalid")
+    if set(versions) != set(mapping):
+        raise HydrationError("candidate cohort is incomplete")
+    artifacts: list[dict[str, object]] = []
+    for name in sorted(mapping):
+        version_number = versions[name]
+        if (
+            isinstance(version_number, bool)
+            or not isinstance(version_number, int)
+            or version_number < 1
+            or version_number > MAX_OCI_VERSION_NUMBER
+        ):
+            raise HydrationError(f"candidate version is invalid for {name}")
+        artifacts.append(
+            {
+                "name": name,
+                "secret_id": mapping[name],
+                "version_number": version_number,
+            }
+        )
+    payload = _cohort_payload(
+        release_cohort, hashlib.sha256(mapping_content).hexdigest(), artifacts
+    )
+    document = dict(payload)
+    document["cohort_sha256"] = _cohort_digest(payload)
+    return (
+        json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+
+
+def _parse_manifest(
+    content: bytes,
+    mapping_content: bytes,
+    mapping: Mapping[str, str],
+    expected_release_cohort: str,
+) -> tuple[dict[str, int], str]:
+    loaded = _load_strict_json(content, "approved cohort manifest")
+    if not isinstance(loaded, dict):
+        raise HydrationError("approved cohort manifest must be an object")
+    expected_keys = {
+        "schema",
+        "release_cohort",
+        "mapping_sha256",
+        "cohort_sha256",
+        "artifacts",
+    }
+    if set(loaded) != expected_keys:
+        raise HydrationError("approved cohort manifest has unsupported or missing fields")
+    if loaded["schema"] != MANIFEST_SCHEMA or isinstance(loaded["schema"], bool):
+        raise HydrationError("approved cohort manifest schema is invalid")
+    release_cohort = loaded["release_cohort"]
+    if (
+        not isinstance(release_cohort, str)
+        or RELEASE_COHORT_RE.fullmatch(release_cohort) is None
+        or release_cohort != expected_release_cohort
+    ):
+        raise HydrationError("approved cohort is bound to a different release")
+    mapping_sha256 = loaded["mapping_sha256"]
+    if not isinstance(mapping_sha256, str) or SHA256_RE.fullmatch(mapping_sha256) is None:
+        raise HydrationError("approved cohort mapping hash is invalid")
+    if mapping_sha256 != hashlib.sha256(mapping_content).hexdigest():
+        raise HydrationError("approved cohort mapping hash does not match its snapshot")
+    cohort_sha256 = loaded["cohort_sha256"]
+    if not isinstance(cohort_sha256, str) or SHA256_RE.fullmatch(cohort_sha256) is None:
+        raise HydrationError("approved cohort digest is invalid")
+    artifact_records = loaded["artifacts"]
+    if not isinstance(artifact_records, list):
+        raise HydrationError("approved cohort artifacts must be a list")
+    versions: dict[str, int] = {}
+    seen_secret_ids: set[str] = set()
+    normalized_records: list[dict[str, object]] = []
+    previous_name = ""
+    for record in artifact_records:
+        if not isinstance(record, dict) or set(record) != {
+            "name",
+            "secret_id",
+            "version_number",
+        }:
+            raise HydrationError("approved cohort artifact record is invalid")
+        name = record["name"]
+        secret_id = record["secret_id"]
+        version_number = record["version_number"]
+        if not isinstance(name, str) or name not in ALL_MAPPING_NAMES:
+            raise HydrationError("approved cohort contains an unknown artifact")
+        if name in versions or name <= previous_name:
+            raise HydrationError("approved cohort artifacts are duplicated or unsorted")
+        if not isinstance(secret_id, str) or secret_id != mapping.get(name):
+            raise HydrationError(f"approved cohort secret ID does not match mapping: {name}")
+        if secret_id in seen_secret_ids:
+            raise HydrationError("approved cohort reuses a secret ID")
+        if (
+            isinstance(version_number, bool)
+            or not isinstance(version_number, int)
+            or version_number < 1
+            or version_number > MAX_OCI_VERSION_NUMBER
+        ):
+            raise HydrationError(f"approved cohort version is invalid for {name}")
+        versions[name] = version_number
+        seen_secret_ids.add(secret_id)
+        previous_name = name
+        normalized_records.append(
+            {
+                "name": name,
+                "secret_id": secret_id,
+                "version_number": version_number,
+            }
+        )
+    if set(versions) != set(mapping):
+        raise HydrationError("approved cohort is incomplete or mixed with another mapping")
+    payload = _cohort_payload(release_cohort, mapping_sha256, normalized_records)
+    if cohort_sha256 != _cohort_digest(payload):
+        raise HydrationError("approved cohort digest does not match its contents")
+    return versions, cohort_sha256
+
+
+def _validate_release_directory(
+    path: Path, expected_uid: int, expected_gid: int, release_cohort: str
+) -> None:
+    _validate_no_symlink_components(path)
+    metadata = _safe_lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise HydrationError("release cohort directory must be a regular directory")
+    if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError("release cohort directory has the wrong owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise HydrationError("release cohort directory must have mode 0700")
+    if path.name != release_cohort or RELEASE_COHORT_RE.fullmatch(path.name) is None:
+        raise HydrationError("release cohort directory name is invalid")
+
+
+def _resolve_approved_release(
+    manifest_path: Path, expected_uid: int, expected_gid: int
+) -> tuple[Path, str]:
+    if manifest_path.name != APPROVED_MANIFEST_NAME or manifest_path.parent.name != "current":
+        raise HydrationError("approved cohort manifest must be selected through releases/current")
+    release_root = manifest_path.parent.parent
+    root_metadata = _safe_lstat(release_root)
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise HydrationError("release root must be a regular directory")
+    if (root_metadata.st_uid, root_metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError("release root has the wrong owner")
+    if stat.S_IMODE(root_metadata.st_mode) & 0o022:
+        raise HydrationError("release root is writable outside its owner")
+    current_metadata = _safe_lstat(manifest_path.parent)
+    if not stat.S_ISLNK(current_metadata.st_mode):
+        raise HydrationError("current release pointer must be a symbolic link")
+    if (current_metadata.st_uid, current_metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError("current release pointer has the wrong owner")
+    try:
+        current_target = os.readlink(manifest_path.parent)
+        resolved_release = manifest_path.parent.resolve(strict=True)
+    except OSError:
+        raise HydrationError("current release pointer is unavailable") from None
+    if (
+        not os.path.isabs(current_target)
+        or current_target != str(resolved_release)
+        or resolved_release.parent != release_root.resolve()
+    ):
+        raise HydrationError("current release pointer targets an unexpected location")
+    release_cohort = resolved_release.name
+    _validate_release_directory(
+        resolved_release, expected_uid, expected_gid, release_cohort
+    )
+    return resolved_release, release_cohort
+
+
+def _read_release_file(
+    path: Path,
+    expected_uid: int,
+    expected_gid: int,
+    expected_mode: int,
+    description: str,
+    maximum_size: int,
+) -> bytes:
+    metadata = _safe_lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise HydrationError(f"{description} must be a regular file")
+    if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError(f"{description} has the wrong owner")
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise HydrationError(f"{description} must have mode {expected_mode:04o}")
+    if metadata.st_size <= 0 or metadata.st_size > maximum_size:
+        raise HydrationError(f"{description} size is invalid")
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise HydrationError(f"{description} cannot be read") from None
+
+
+def _validate_release_secret_mode(
+    release: Path, expected_uid: int, expected_gid: int, expected: bytes
+) -> None:
+    content = _read_release_file(
+        release / "secret-mode",
+        expected_uid,
+        expected_gid,
+        0o400,
+        "release secret mode",
+        16,
+    )
+    if content != expected + b"\n":
+        raise HydrationError("release secret mode does not match its cohort")
+
+
+def _parse_marker(content: bytes) -> dict[str, str]:
+    if not content or len(content) > 1024 or not content.endswith(b"\n"):
+        raise HydrationError("Vault hydration marker is invalid")
+    try:
+        lines = content.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise HydrationError("Vault hydration marker is invalid") from None
+    parsed: dict[str, str] = {}
+    for line in lines:
+        if line.count("=") != 1:
+            raise HydrationError("Vault hydration marker is invalid")
+        key, value = line.split("=", 1)
+        if key in parsed or not value:
+            raise HydrationError("Vault hydration marker is invalid")
+        parsed[key] = value
+    if set(parsed) != {"schema", "release_cohort", "mapping_sha256", "cohort_sha256"}:
+        raise HydrationError("Vault hydration marker is invalid")
+    if parsed["schema"] != "2":
+        raise HydrationError("Vault hydration marker schema is invalid")
+    if RELEASE_COHORT_RE.fullmatch(parsed["release_cohort"]) is None:
+        raise HydrationError("Vault hydration marker cohort is invalid")
+    for key in ("mapping_sha256", "cohort_sha256"):
+        if SHA256_RE.fullmatch(parsed[key]) is None:
+            raise HydrationError("Vault hydration marker digest is invalid")
+    return parsed
+
+
+def _atomic_publish_release_file(
+    path: Path, content: bytes, mode: int, expected_uid: int, expected_gid: int
+) -> None:
+    if path.exists() or path.is_symlink():
+        raise HydrationError(f"release metadata already exists: {path.name}")
+    temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}"
+    try:
+        _write_file(temporary, content, mode, expected_uid, expected_gid)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _validate_secret_root(path: Path, expected_uid: int, expected_gid: int) -> None:
@@ -332,7 +641,14 @@ def _decode_bundle(encoded: bytes, artifact: str, max_decoded: int) -> bytes:
     return decoded
 
 
-def _fetch_current_bundle(oci_binary: Path, artifact: str, ocid: str, max_decoded: int) -> bytes:
+def _fetch_bundle(
+    oci_binary: Path,
+    artifact: str,
+    ocid: str,
+    max_decoded: int,
+    *,
+    version_number: int | None,
+) -> tuple[bytes, int]:
     environment = {
         "HOME": "/run/clixor",
         "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -348,12 +664,19 @@ def _fetch_current_bundle(oci_binary: Path, artifact: str, ocid: str, max_decode
         "get",
         "--secret-id",
         ocid,
-        "--stage",
-        "CURRENT",
-        "--query",
-        'data."secret-bundle-content".content',
-        "--raw-output",
     ]
+    if version_number is None:
+        command.extend(("--stage", "CURRENT"))
+    else:
+        if (
+            isinstance(version_number, bool)
+            or not isinstance(version_number, int)
+            or version_number < 1
+            or version_number > MAX_OCI_VERSION_NUMBER
+        ):
+            raise HydrationError(f"approved version is invalid for {artifact}")
+        command.extend(("--version-number", str(version_number)))
+    command.extend(("--output", "json"))
     try:
         completed = subprocess.run(
             command,
@@ -368,7 +691,42 @@ def _fetch_current_bundle(oci_binary: Path, artifact: str, ocid: str, max_decode
         raise HydrationError(f"Vault fetch failed for {artifact}") from None
     if completed.returncode != 0:
         raise HydrationError(f"Vault fetch failed for {artifact}")
-    return _decode_bundle(completed.stdout, artifact, max_decoded)
+    if not completed.stdout or len(completed.stdout) > MAX_OCI_RESPONSE_BYTES:
+        raise HydrationError(f"Vault response size is invalid for {artifact}")
+    try:
+        response = json.loads(
+            completed.stdout.decode("utf-8"), object_pairs_hook=_strict_json_object
+        )
+    except HydrationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HydrationError(f"Vault response is invalid for {artifact}") from None
+    if not isinstance(response, dict) or not isinstance(response.get("data"), dict):
+        raise HydrationError(f"Vault response is invalid for {artifact}")
+    data = response["data"]
+    returned_secret_id = data.get("secret-id")
+    returned_version = data.get("version-number")
+    bundle_content = data.get("secret-bundle-content")
+    if returned_secret_id != ocid:
+        raise HydrationError(f"Vault returned a different secret for {artifact}")
+    if (
+        isinstance(returned_version, bool)
+        or not isinstance(returned_version, int)
+        or returned_version < 1
+        or returned_version > MAX_OCI_VERSION_NUMBER
+    ):
+        raise HydrationError(f"Vault returned an invalid version for {artifact}")
+    if version_number is not None and returned_version != version_number:
+        raise HydrationError(f"Vault returned the wrong approved version for {artifact}")
+    if not isinstance(bundle_content, dict) or not isinstance(
+        bundle_content.get("content"), str
+    ):
+        raise HydrationError(f"Vault response has no content for {artifact}")
+    try:
+        encoded = bundle_content["content"].encode("ascii")
+    except UnicodeEncodeError:
+        raise HydrationError(f"Vault bundle encoding is invalid for {artifact}") from None
+    return _decode_bundle(encoded, artifact, max_decoded), returned_version
 
 
 def _parse_env(content: bytes, artifact: str, allowed: frozenset[str], required: frozenset[str]) -> dict[str, bytes]:
@@ -532,6 +890,7 @@ def _write_file(path: Path, content: bytes, mode: int, uid: int, gid: int) -> No
         os.fchmod(descriptor, mode)
         if os.geteuid() == 0:
             os.fchown(descriptor, uid, gid)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
@@ -728,6 +1087,9 @@ def _publish_generation(secret_root: Path, staged: Path) -> Path:
 def hydrate(
     *,
     mapping_path: Path = DEFAULT_MAPPING,
+    candidate_manifest_path: Path | None = None,
+    approved_manifest_path: Path | None = None,
+    release_cohort: str | None = None,
     secret_root: Path = DEFAULT_SECRET_ROOT,
     oci_binary: Path = DEFAULT_OCI_BINARY,
     openssl_binary: Path = DEFAULT_OPENSSL_BINARY,
@@ -737,13 +1099,77 @@ def hydrate(
     require_tmpfs: bool = True,
     require_root: bool = True,
 ) -> bool:
-    """Hydrate one complete generation. Return True only when selection changed."""
+    """Hydrate one candidate or already-approved complete secret generation."""
 
     if require_root and os.geteuid() != 0:
         raise HydrationError("hydration must run as root")
     os.umask(0o077)
-    mapping_content = _validate_mapping_file(mapping_path, expected_uid, expected_gid)
-    mapping = _parse_mapping(mapping_content)
+    candidate_mode = candidate_manifest_path is not None
+    approved_mode = approved_manifest_path is not None
+    if candidate_mode == approved_mode:
+        raise HydrationError("select exactly one candidate or approved cohort mode")
+
+    manifest_content: bytes | None = None
+    manifest_cohort_sha256: str | None = None
+    approved_versions: dict[str, int] | None = None
+    if candidate_mode:
+        if release_cohort is None or RELEASE_COHORT_RE.fullmatch(release_cohort) is None:
+            raise HydrationError("candidate release cohort is invalid")
+        if candidate_manifest_path is None:
+            raise HydrationError("candidate manifest is required")
+        if candidate_manifest_path.name != APPROVED_MANIFEST_NAME:
+            raise HydrationError("candidate manifest has an unexpected name")
+        _validate_release_directory(
+            candidate_manifest_path.parent,
+            expected_uid,
+            expected_gid,
+            release_cohort,
+        )
+        _validate_release_secret_mode(
+            candidate_manifest_path.parent, expected_uid, expected_gid, b"vault"
+        )
+        mapping_content = _validate_mapping_file(
+            mapping_path,
+            expected_uid,
+            expected_gid,
+            expected_mode=0o600,
+        )
+        mapping = _parse_mapping(mapping_content)
+    else:
+        if release_cohort is not None:
+            raise HydrationError("approved hydration cannot override its release cohort")
+        if approved_manifest_path is None:
+            raise HydrationError("approved manifest is required")
+        approved_release, approved_release_cohort = _resolve_approved_release(
+            approved_manifest_path, expected_uid, expected_gid
+        )
+        _validate_release_secret_mode(
+            approved_release, expected_uid, expected_gid, b"vault"
+        )
+        approved_mapping_path = approved_release / APPROVED_MAPPING_NAME
+        mapping_content = _validate_mapping_file(
+            approved_mapping_path,
+            expected_uid,
+            expected_gid,
+            expected_mode=0o400,
+        )
+        mapping = _parse_mapping(mapping_content)
+        manifest_content = _read_release_file(
+            approved_release / APPROVED_MANIFEST_NAME,
+            expected_uid,
+            expected_gid,
+            0o400,
+            "approved cohort manifest",
+            MAX_MANIFEST_BYTES,
+        )
+        approved_versions, manifest_cohort_sha256 = _parse_manifest(
+            manifest_content,
+            mapping_content,
+            mapping,
+            approved_release_cohort,
+        )
+        release_cohort = approved_release_cohort
+
     _validate_secret_root(secret_root, expected_uid, expected_gid)
     if require_tmpfs:
         _validate_tmpfs(secret_root)
@@ -774,13 +1200,22 @@ def hydrate(
     changed = False
     try:
         fetched: dict[str, bytes] = {}
+        fetched_versions: dict[str, int] = {}
         for artifact in sorted(mapping):
             maximum = MAX_ENV_BYTES if artifact.endswith("_env") else (
                 MAX_APNS_BYTES if artifact.endswith("_p8") else MAX_TOKEN_BYTES
             )
-            fetched[artifact] = _fetch_current_bundle(
-                oci_binary, artifact, mapping[artifact], maximum
+            content, returned_version = _fetch_bundle(
+                oci_binary,
+                artifact,
+                mapping[artifact],
+                maximum,
+                version_number=(
+                    None if approved_versions is None else approved_versions[artifact]
+                ),
             )
+            fetched[artifact] = content
+            fetched_versions[artifact] = returned_version
 
         api_values = _parse_env(
             fetched["api_env"], "api_env", API_ALLOWED_KEYS, API_REQUIRED_KEYS
@@ -908,10 +1343,29 @@ def hydrate(
             staged / "cloudflare-token", cloudflare_token, 0o600, expected_uid, expected_gid
         )
 
+        if candidate_mode:
+            if release_cohort is None:
+                raise HydrationError("candidate release cohort is required")
+            manifest_content = _build_manifest(
+                release_cohort, mapping_content, mapping, fetched_versions
+            )
+            _, manifest_cohort_sha256 = _parse_manifest(
+                manifest_content,
+                mapping_content,
+                mapping,
+                release_cohort,
+            )
+        if manifest_content is None or manifest_cohort_sha256 is None or release_cohort is None:
+            raise HydrationError("cohort metadata is incomplete")
         marker = (
-            "schema=1\n"
+            "schema=2\n"
+            + "release_cohort="
+            + release_cohort
+            + "\n"
             + "mapping_sha256="
             + hashlib.sha256(mapping_content).hexdigest()
+            + "\ncohort_sha256="
+            + manifest_cohort_sha256
             + "\n"
         ).encode("ascii")
         _write_file(staged / MARKER_NAME, marker, 0o400, expected_uid, expected_gid)
@@ -940,6 +1394,23 @@ def hydrate(
         )
         _reject_implicit_postgres_credential_rotation(active, staged)
         _reject_implicit_stateful_secret_rotation(active, staged, api_values)
+        if candidate_mode:
+            if candidate_manifest_path is None:
+                raise HydrationError("candidate manifest is required")
+            _atomic_publish_release_file(
+                candidate_manifest_path.parent / APPROVED_MAPPING_NAME,
+                mapping_content,
+                0o400,
+                expected_uid,
+                expected_gid,
+            )
+            _atomic_publish_release_file(
+                candidate_manifest_path,
+                manifest_content,
+                0o400,
+                expected_uid,
+                expected_gid,
+            )
         if _same_generation(active, staged, relative_paths):
             return False
         if len(existing_generations) >= 16:
@@ -958,13 +1429,207 @@ def hydrate(
             shutil.rmtree(staged)
 
 
+def verify_candidate_selection(
+    *,
+    candidate_manifest_path: Path,
+    release_cohort: str,
+    secret_root: Path = DEFAULT_SECRET_ROOT,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    """Verify that one candidate manifest selects the active complete cohort."""
+
+    if candidate_manifest_path.name != APPROVED_MANIFEST_NAME:
+        raise HydrationError("candidate manifest has an unexpected name")
+    _validate_release_directory(
+        candidate_manifest_path.parent,
+        expected_uid,
+        expected_gid,
+        release_cohort,
+    )
+    _validate_release_secret_mode(
+        candidate_manifest_path.parent, expected_uid, expected_gid, b"vault"
+    )
+    mapping_content = _validate_mapping_file(
+        candidate_manifest_path.parent / APPROVED_MAPPING_NAME,
+        expected_uid,
+        expected_gid,
+        expected_mode=0o400,
+    )
+    mapping = _parse_mapping(mapping_content)
+    manifest_content = _read_release_file(
+        candidate_manifest_path,
+        expected_uid,
+        expected_gid,
+        0o400,
+        "candidate cohort manifest",
+        MAX_MANIFEST_BYTES,
+    )
+    _, cohort_sha256 = _parse_manifest(
+        manifest_content, mapping_content, mapping, release_cohort
+    )
+    active = _validate_active_target(secret_root, expected_uid, expected_gid)
+    if active is None:
+        raise HydrationError("candidate cohort is not selected")
+    marker_content = _read_release_file(
+        active / MARKER_NAME,
+        expected_uid,
+        expected_gid,
+        0o400,
+        "Vault hydration marker",
+        1024,
+    )
+    marker = _parse_marker(marker_content)
+    if marker["release_cohort"] != release_cohort:
+        raise HydrationError("active Vault generation belongs to another release")
+    if marker["mapping_sha256"] != hashlib.sha256(mapping_content).hexdigest():
+        raise HydrationError("active Vault generation uses another mapping")
+    if marker["cohort_sha256"] != cohort_sha256:
+        raise HydrationError("active Vault generation uses another cohort")
+
+
+def _fsync_regular_file(path: Path, expected_uid: int, expected_gid: int) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise HydrationError(f"release metadata cannot be opened: {path.name}") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HydrationError(f"release metadata is not regular: {path.name}")
+        if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
+            raise HydrationError(f"release metadata has the wrong owner: {path.name}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def commit_candidate_release(
+    *,
+    candidate_manifest_path: Path,
+    release_cohort: str,
+    secret_root: Path = DEFAULT_SECRET_ROOT,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    """Durably make one complete selected candidate boot-authoritative."""
+
+    release = candidate_manifest_path.parent
+    release_root = release.parent
+    _validate_release_directory(release, expected_uid, expected_gid, release_cohort)
+    root_metadata = _safe_lstat(release_root)
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise HydrationError("release root must be a regular directory")
+    if (root_metadata.st_uid, root_metadata.st_gid) != (expected_uid, expected_gid):
+        raise HydrationError("release root has the wrong owner")
+    if stat.S_IMODE(root_metadata.st_mode) & 0o022:
+        raise HydrationError("release root is writable outside its owner")
+    verify_candidate_selection(
+        candidate_manifest_path=candidate_manifest_path,
+        release_cohort=release_cohort,
+        secret_root=secret_root,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    for metadata_name in (
+        "secret-mode",
+        APPROVED_MAPPING_NAME,
+        APPROVED_MANIFEST_NAME,
+    ):
+        _fsync_regular_file(release / metadata_name, expected_uid, expected_gid)
+    _fsync_directory(release)
+
+    current = release_root / "current"
+    if current.exists() or current.is_symlink():
+        current_metadata = _safe_lstat(current)
+        if not stat.S_ISLNK(current_metadata.st_mode):
+            raise HydrationError("current release pointer must be a symbolic link")
+        if (current_metadata.st_uid, current_metadata.st_gid) != (
+            expected_uid,
+            expected_gid,
+        ):
+            raise HydrationError("current release pointer has the wrong owner")
+    temporary = release_root / f".current.{secrets.token_hex(8)}"
+    try:
+        os.symlink(str(release), temporary)
+        os.replace(temporary, current)
+        _fsync_directory(release_root)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        selected = os.readlink(current)
+    except OSError:
+        raise HydrationError("current release pointer is unavailable after commit") from None
+    if selected != str(release):
+        raise HydrationError("current release pointer did not select the candidate")
+
+
 def main(argv: list[str]) -> int:
-    if argv:
-        print("OCI Vault hydration accepts no command-line arguments.", file=sys.stderr)
+    candidate_manifest_path: Path | None = None
+    approved_manifest_path: Path | None = None
+    release_cohort: str | None = None
+    verify_only = False
+    commit_release = False
+    if len(argv) == 2 and argv[0] == "--approved-manifest":
+        approved_manifest_path = Path(argv[1])
+    elif (
+        len(argv) == 4
+        and argv[0] == "--candidate-manifest"
+        and argv[2] == "--release-cohort"
+    ):
+        candidate_manifest_path = Path(argv[1])
+        release_cohort = argv[3]
+    elif (
+        len(argv) == 4
+        and argv[0] == "--verify-candidate-manifest"
+        and argv[2] == "--release-cohort"
+    ):
+        candidate_manifest_path = Path(argv[1])
+        release_cohort = argv[3]
+        verify_only = True
+    elif (
+        len(argv) == 4
+        and argv[0] == "--commit-candidate-release"
+        and argv[2] == "--release-cohort"
+    ):
+        candidate_manifest_path = Path(argv[1])
+        release_cohort = argv[3]
+        commit_release = True
+    else:
+        print(
+            "OCI Vault hydration requires an approved manifest or candidate release cohort.",
+            file=sys.stderr,
+        )
+        return 2
+    selected_path = candidate_manifest_path or approved_manifest_path
+    if selected_path is None or not selected_path.is_absolute():
+        print("OCI Vault manifest path must be absolute.", file=sys.stderr)
         return 2
     try:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        hydrate()
+        if commit_release:
+            if candidate_manifest_path is None or release_cohort is None:
+                raise HydrationError("candidate commit arguments are incomplete")
+            commit_candidate_release(
+                candidate_manifest_path=candidate_manifest_path,
+                release_cohort=release_cohort,
+            )
+        elif verify_only:
+            if candidate_manifest_path is None or release_cohort is None:
+                raise HydrationError("candidate verification arguments are incomplete")
+            verify_candidate_selection(
+                candidate_manifest_path=candidate_manifest_path,
+                release_cohort=release_cohort,
+            )
+        else:
+            hydrate(
+                candidate_manifest_path=candidate_manifest_path,
+                approved_manifest_path=approved_manifest_path,
+                release_cohort=release_cohort,
+            )
     except (HydrationError, OSError, ValueError) as exc:
         print(f"OCI Vault hydration failed: {exc}", file=sys.stderr)
         return 1

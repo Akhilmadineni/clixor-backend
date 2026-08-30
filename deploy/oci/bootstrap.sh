@@ -166,6 +166,10 @@ fi
   echo "${secret_mode} has unsafe type, ownership, or mode." >&2
   exit 1
 }
+[ "$(wc -l < "${secret_mode}" | tr -d '[:space:]')" = "1" ] || {
+  echo "${secret_mode} must contain exactly one line." >&2
+  exit 1
+}
 case "$(sed -n '1p' "${secret_mode}")" in
   staging|vault) ;;
   *)
@@ -173,6 +177,44 @@ case "$(sed -n '1p' "${secret_mode}")" in
     exit 1
     ;;
 esac
+selected_secret_mode="$(sed -n '1p' "${secret_mode}")"
+release_secret_mode="${project_root}/releases/current/secret-mode"
+if [ -e "${release_secret_mode}" ] || [ -L "${release_secret_mode}" ]; then
+  current_release_link="${project_root}/releases/current"
+  [ -L "${current_release_link}" ] || {
+    echo "${current_release_link} must be a symbolic link." >&2
+    exit 1
+  }
+  current_release_target="$(readlink -- "${current_release_link}")"
+  case "${current_release_target}" in
+    "${project_root}/releases"/oci-*) ;;
+    *)
+      echo "${current_release_link} targets an unexpected location." >&2
+      exit 1
+      ;;
+  esac
+  [ "${current_release_target%/*}" = "${project_root}/releases" ] && \
+    [ "$(readlink -f -- "${current_release_link}")" = "${current_release_target}" ] && \
+    [ -d "${current_release_target}" ] && [ ! -L "${current_release_target}" ] && \
+    [ "$(stat -c '%u:%g:%a' "${current_release_target}")" = "0:0:700" ] && \
+    [ -f "${release_secret_mode}" ] && [ ! -L "${release_secret_mode}" ] && \
+    [ "$(stat -c '%u:%g:%a' "${release_secret_mode}")" = "0:0:400" ] || {
+    echo "${release_secret_mode} has unsafe type, ownership, or mode." >&2
+    exit 1
+  }
+  [ "$(wc -l < "${release_secret_mode}" | tr -d '[:space:]')" = "1" ] || {
+    echo "${release_secret_mode} must contain exactly one line." >&2
+    exit 1
+  }
+  selected_secret_mode="$(sed -n '1p' "${release_secret_mode}")"
+  case "${selected_secret_mode}" in
+    staging|vault) ;;
+    *)
+      echo "${release_secret_mode} must contain exactly staging or vault." >&2
+      exit 1
+      ;;
+  esac
+fi
 # The API image is distroless nonroot (UID/GID 65532). The mount root must be
 # traversable and each installed key readable by that identity, but not by other
 # host users.
@@ -195,7 +237,7 @@ python3 "${script_root}/dependency_pki.py" ensure \
   --pki-root "${pki_root}" \
   --runtime-root "${runtime_root}"
 
-if [ ! -f "${runtime_env}" ] && [ "$(sed -n '1p' "${secret_mode}")" = "vault" ]; then
+if [ ! -f "${runtime_env}" ] && [ "${selected_secret_mode}" = "vault" ]; then
   printf '# Production values are hydrated from OCI Vault into /run only.\n' > \
     "${runtime_env}"
   chmod 0600 "${runtime_env}"
@@ -289,7 +331,7 @@ fi
 # The helper publishes files atomically, is idempotent, and never evaluates or
 # prints their values. runtime.env remains only as a non-consumed migration
 # checkpoint for unknown legacy entries.
-if [ "$(sed -n '1p' "${secret_mode}")" = "staging" ]; then
+if [ "${selected_secret_mode}" = "staging" ]; then
   sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
 fi
 
@@ -305,7 +347,7 @@ install -m 0644 -o 0 -g 0 "${script_root}/clixor-runtime-secrets.service" \
 install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
   /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
 if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
-  if [ "$(sed -n '1p' "${secret_mode}")" = "staging" ]; then
+  if [ "${selected_secret_mode}" = "staging" ]; then
     /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
   fi
   sh /usr/local/libexec/clixor/prepare-runtime-secrets.sh
@@ -496,6 +538,6 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
 fi
 
 echo "Clixor OCI ARM64 directories, runtime secrets, and internal PKI are ready."
-if [ "$(sed -n '1p' /etc/clixor/secret-mode)" = "staging" ]; then
+if [ "${selected_secret_mode}" = "staging" ]; then
   echo "Telnyx and APNs remain disabled until production Vault credentials are installed."
 fi

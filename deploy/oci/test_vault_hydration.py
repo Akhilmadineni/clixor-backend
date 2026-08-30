@@ -4,7 +4,9 @@ import base64
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -32,9 +34,11 @@ class VaultHydrationTest(unittest.TestCase):
         self.config_root = self.root / "config"
         self.secret_root = self.root / "secrets"
         self.fixture_root = self.root / "fixtures"
+        self.release_root = self.root / "releases"
         self.config_root.mkdir(mode=0o700)
         self.secret_root.mkdir(mode=0o700)
         self.fixture_root.mkdir(mode=0o700)
+        self.release_root.mkdir(mode=0o700)
         self.mapping_path = self.config_root / "vault-secrets.map"
         self.fake_oci = self.root / "oci"
         self.fake_openssl = self.root / "openssl"
@@ -42,6 +46,10 @@ class VaultHydrationTest(unittest.TestCase):
         self.fail_ocid = self.root / "fail.ocid"
         self.uid = self.config_root.stat().st_uid
         self.gid = self.config_root.stat().st_gid
+        self.release_sequence = 0
+        self.last_release: Path | None = None
+        self.bundle_versions: dict[str, int] = {}
+        self.bundle_content: dict[str, bytes] = {}
 
         self.ocids = {
             name: f"ocid1.vaultsecret.oc1.us-phoenix-1.test{name}0123456789"
@@ -73,26 +81,33 @@ set -eu
 shift 5
 secret_id=
 stage=
-query=
-raw=false
+version_number=
+output=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --secret-id) secret_id=$2; shift 2 ;;
     --stage) stage=$2; shift 2 ;;
-    --query) query=$2; shift 2 ;;
-    --raw-output) raw=true; shift ;;
+    --version-number) version_number=$2; shift 2 ;;
+    --output) output=$2; shift 2 ;;
     *) exit 74 ;;
   esac
 done
-[ "$stage" = CURRENT ] || exit 75
-[ "$query" = 'data."secret-bundle-content".content' ] || exit 76
-[ "$raw" = true ] || exit 77
-printf '%s\n' "$secret_id" >> {self.oci_log!s}
+[ "$output" = json ] || exit 75
+if [ "$stage" = CURRENT ] && [ -z "$version_number" ]; then
+  version_number="$(sed -n '1p' "{self.fixture_root!s}/$secret_id.current")"
+elif [ -z "$stage" ] && [ -n "$version_number" ]; then
+  :
+else
+  exit 76
+fi
+printf '%s %s %s\n' "$secret_id" "${{stage:---version-number}}" "$version_number" >> {self.oci_log!s}
 if [ -s {self.fail_ocid!s} ] && [ "$secret_id" = "$(sed -n '1p' {self.fail_ocid!s})" ]; then
   exit 78
 fi
-[ -f "{self.fixture_root!s}/$secret_id" ] || exit 79
-cat "{self.fixture_root!s}/$secret_id"
+[ -f "{self.fixture_root!s}/$secret_id.$version_number" ] || exit 79
+content="$(cat "{self.fixture_root!s}/$secret_id.$version_number")"
+printf '{{"data":{{"secret-id":"%s","version-number":%s,"secret-bundle-content":{{"content":"%s"}}}}}}\n' \
+  "$secret_id" "$version_number" "$content"
 """
         self.fake_oci.write_text(script, encoding="utf-8")
         self.fake_oci.chmod(0o700)
@@ -204,14 +219,38 @@ exec /usr/bin/openssl pkey -in "$3" -noout
 
     def _write_bundles(self, bundles: dict[str, bytes]) -> None:
         for name, content in bundles.items():
-            encoded = base64.b64encode(content) + b"\n"
-            (self.fixture_root / self.ocids[name]).write_bytes(encoded)
+            ocid = self.ocids[name]
+            if self.bundle_content.get(ocid) != content:
+                self.bundle_versions[ocid] = self.bundle_versions.get(ocid, 0) + 1
+                self.bundle_content[ocid] = content
+                version = self.bundle_versions[ocid]
+                (self.fixture_root / f"{ocid}.{version}").write_bytes(
+                    base64.b64encode(content)
+                )
+            (self.fixture_root / f"{ocid}.current").write_text(
+                f"{self.bundle_versions[ocid]}\n", encoding="ascii"
+            )
+
+    def _new_release(self) -> Path:
+        self.release_sequence += 1
+        release = self.release_root / f"oci-0123456789ab-test{self.release_sequence}"
+        release.mkdir(mode=0o700)
+        mode_file = release / "secret-mode"
+        mode_file.write_bytes(b"vault\n")
+        mode_file.chmod(0o400)
+        self.last_release = release
+        return release
 
     def _hydrate(self) -> tuple[bool, str]:
+        release = self._new_release()
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             changed = HYDRATOR.hydrate(
                 mapping_path=self.mapping_path,
+                candidate_manifest_path=(
+                    release / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=release.name,
                 secret_root=self.secret_root,
                 oci_binary=self.fake_oci,
                 openssl_binary=self.fake_openssl,
@@ -222,6 +261,49 @@ exec /usr/bin/openssl pkey -in "$3" -noout
                 require_root=False,
             )
         return changed, output.getvalue()
+
+    def _approve(self, release: Path | None = None) -> Path:
+        selected = release or self.last_release
+        if selected is None:
+            raise AssertionError("no candidate release")
+        temporary = self.release_root / ".current.test"
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+        temporary.symlink_to(selected)
+        os.replace(temporary, self.release_root / "current")
+        return selected
+
+    def _boot(self) -> tuple[bool, str]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            changed = HYDRATOR.hydrate(
+                approved_manifest_path=(
+                    self.release_root
+                    / "current"
+                    / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                secret_root=self.secret_root,
+                oci_binary=self.fake_oci,
+                openssl_binary=self.fake_openssl,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+                validate_binary=False,
+                require_tmpfs=False,
+                require_root=False,
+            )
+        return changed, output.getvalue()
+
+    def _simulate_reboot(self) -> None:
+        active = self.secret_root / "active"
+        if active.exists() or active.is_symlink():
+            active.unlink()
+        generations = self.secret_root / HYDRATOR.GENERATION_ROOT_NAME
+        if generations.exists():
+            shutil.rmtree(generations)
+
+    def _current_bundle_path(self, artifact: str) -> Path:
+        ocid = self.ocids[artifact]
+        return self.fixture_root / f"{ocid}.{self.bundle_versions[ocid]}"
 
     def _active(self) -> Path:
         return (self.secret_root / "active").resolve(strict=True)
@@ -289,9 +371,10 @@ exec /usr/bin/openssl pkey -in "$3" -noout
 
     def test_idempotent_run_keeps_same_generation(self) -> None:
         self._hydrate()
+        self._approve()
         first_target = os.readlink(self.secret_root / "active")
         first_generations = sorted((self.secret_root / "vault-generations").iterdir())
-        changed, output = self._hydrate()
+        changed, output = self._boot()
         self.assertFalse(changed)
         self.assertEqual(output, "")
         self.assertEqual(os.readlink(self.secret_root / "active"), first_target)
@@ -389,7 +472,7 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         self._hydrate()
         old_target = os.readlink(self.secret_root / "active")
         old_snapshot = self._selected_snapshot()
-        (self.fixture_root / self.ocids["api_env"]).write_bytes(b"not canonical base64\n")
+        self._current_bundle_path("api_env").write_bytes(b"not canonical base64\n")
         with self.assertRaises(HYDRATOR.HydrationError):
             self._hydrate()
         self.assertEqual(os.readlink(self.secret_root / "active"), old_target)
@@ -399,8 +482,8 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         for suffix in (b"AWS_SECRET_ACCESS_KEY=forbidden\n", b"CLUSTER_ENV=production\n"):
             with self.subTest(suffix=suffix):
                 self._write_bundles(self.bundles)
-                path = self.fixture_root / self.ocids["api_env"]
-                path.write_bytes(base64.b64encode(self.bundles["api_env"] + suffix) + b"\n")
+                path = self._current_bundle_path("api_env")
+                path.write_bytes(base64.b64encode(self.bundles["api_env"] + suffix))
                 with self.assertRaises(HYDRATOR.HydrationError):
                     self._hydrate()
                 self.assertFalse((self.secret_root / "active").exists())
@@ -436,9 +519,14 @@ exec /usr/bin/openssl pkey -in "$3" -noout
         self.assertFalse(self.oci_log.exists())
 
     def test_non_tmpfs_runtime_root_is_rejected_before_fetch(self) -> None:
+        release = self._new_release()
         with self.assertRaises(HYDRATOR.HydrationError):
             HYDRATOR.hydrate(
                 mapping_path=self.mapping_path,
+                candidate_manifest_path=(
+                    release / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=release.name,
                 secret_root=self.secret_root,
                 oci_binary=self.fake_oci,
                 openssl_binary=self.fake_openssl,
@@ -517,6 +605,291 @@ exec /usr/bin/openssl pkey -in "$3" -noout
             ),
             old_generations,
         )
+
+    def test_boot_fetches_only_manifest_pinned_versions(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        manifest = json.loads(
+            (approved / HYDRATOR.APPROVED_MANIFEST_NAME).read_text(encoding="ascii")
+        )
+        self.assertEqual(
+            {record["name"]: record["version_number"] for record in manifest["artifacts"]},
+            {
+                name: self.bundle_versions[ocid]
+                for name, ocid in self.ocids.items()
+                if name in HYDRATOR.REQUIRED_MAPPING_NAMES
+            },
+        )
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-future-0123456789abcdefghijklmnopqr",
+        )
+        self._write_bundles(rotated)
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        changed, output = self._boot()
+
+        self.assertTrue(changed)
+        self.assertEqual(output, "")
+        self.assertIn(b"smtp-password-", (self._active() / "api.env").read_bytes())
+        self.assertNotIn(b"smtp-future-", (self._active() / "api.env").read_bytes())
+        selectors = [line.split()[1] for line in self.oci_log.read_text().splitlines()]
+        self.assertEqual(selectors, ["--version-number"] * len(manifest["artifacts"]))
+        self.assertNotIn("CURRENT", self.oci_log.read_text())
+
+    def test_crash_before_release_pointer_commit_reboots_prior_cohort(self) -> None:
+        self._hydrate()
+        prior_release = self._approve()
+        prior_target = os.readlink(self.release_root / "current")
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-candidate-0123456789abcdefghijklmnop",
+        )
+        self._write_bundles(rotated)
+        self._hydrate()
+        candidate_release = self.last_release
+        self.assertIsNotNone(candidate_release)
+        self.assertNotEqual(candidate_release, prior_release)
+        self.assertIn(b"smtp-candidate-", (self._active() / "api.env").read_bytes())
+        self.assertEqual(os.readlink(self.release_root / "current"), prior_target)
+
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+        self._boot()
+
+        self.assertIn(b"smtp-password-", (self._active() / "api.env").read_bytes())
+        self.assertNotIn(b"smtp-candidate-", (self._active() / "api.env").read_bytes())
+        self.assertEqual(os.readlink(self.release_root / "current"), prior_target)
+
+    def test_approved_mapping_snapshot_ignores_later_live_mapping_change(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        approved_mapping = (approved / HYDRATOR.APPROVED_MAPPING_NAME).read_bytes()
+        old_cloudflare_ocid = self.ocids["cloudflare_token"]
+        new_cloudflare_ocid = (
+            "ocid1.vaultsecret.oc1.us-phoenix-1.testcloudflarenew0123456789"
+        )
+        changed_mapping = dict(self.ocids)
+        changed_mapping["cloudflare_token"] = new_cloudflare_ocid
+        self._write_mapping(changed_mapping)
+        self.ocids["cloudflare_token"] = new_cloudflare_ocid
+        self._write_bundles(
+            {"cloudflare_token": self.bundles["cloudflare_token"] + b"new"}
+        )
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        self._boot()
+
+        log = self.oci_log.read_text()
+        self.assertIn(old_cloudflare_ocid, log)
+        self.assertNotIn(new_cloudflare_ocid, log)
+        self.assertEqual(
+            (approved / HYDRATOR.APPROVED_MAPPING_NAME).read_bytes(), approved_mapping
+        )
+
+    def test_incomplete_manifest_is_rejected_before_any_vault_fetch(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        manifest_path = approved / HYDRATOR.APPROVED_MANIFEST_NAME
+        document = json.loads(manifest_path.read_text(encoding="ascii"))
+        document["artifacts"].pop()
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(json.dumps(document) + "\n", encoding="ascii")
+        manifest_path.chmod(0o400)
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "incomplete"):
+            self._boot()
+
+        self.assertFalse(self.oci_log.exists())
+        self.assertFalse((self.secret_root / "active").exists())
+
+    def test_duplicate_manifest_key_is_rejected_before_any_vault_fetch(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        manifest_path = approved / HYDRATOR.APPROVED_MANIFEST_NAME
+        original = manifest_path.read_text(encoding="ascii")
+        duplicate = original.replace("{\n", '{\n  "schema": 1,\n', 1)
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(duplicate, encoding="ascii")
+        manifest_path.chmod(0o400)
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "duplicate key"):
+            self._boot()
+
+        self.assertFalse(self.oci_log.exists())
+
+    def test_mixed_manifest_secret_id_is_rejected_before_any_vault_fetch(self) -> None:
+        self._hydrate()
+        approved = self._approve()
+        manifest_path = approved / HYDRATOR.APPROVED_MANIFEST_NAME
+        document = json.loads(manifest_path.read_text(encoding="ascii"))
+        document["artifacts"][0]["secret_id"] = document["artifacts"][1]["secret_id"]
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(json.dumps(document) + "\n", encoding="ascii")
+        manifest_path.chmod(0o400)
+        self._simulate_reboot()
+        self.oci_log.unlink(missing_ok=True)
+
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "does not match mapping"):
+            self._boot()
+
+        self.assertFalse(self.oci_log.exists())
+
+    def test_candidate_manifest_publish_fault_keeps_prior_boot_approval(self) -> None:
+        self._hydrate()
+        self._approve()
+        prior_pointer = os.readlink(self.release_root / "current")
+        prior_target = os.readlink(self.secret_root / "active")
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-publish-fault-0123456789abcdefghijk",
+        )
+        self._write_bundles(rotated)
+        real_publish = HYDRATOR._atomic_publish_release_file
+
+        def fail_manifest_publish(
+            path: Path, content: bytes, mode: int, expected_uid: int, expected_gid: int
+        ) -> None:
+            if path.name == HYDRATOR.APPROVED_MANIFEST_NAME:
+                raise OSError("injected manifest publication failure")
+            real_publish(path, content, mode, expected_uid, expected_gid)
+
+        with mock.patch.object(
+            HYDRATOR,
+            "_atomic_publish_release_file",
+            side_effect=fail_manifest_publish,
+        ):
+            with self.assertRaises(HYDRATOR.HydrationError):
+                self._hydrate()
+
+        self.assertEqual(os.readlink(self.release_root / "current"), prior_pointer)
+        self.assertEqual(os.readlink(self.secret_root / "active"), prior_target)
+
+    def test_candidate_verification_binds_active_marker_to_release(self) -> None:
+        self._hydrate()
+        candidate = self.last_release
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        HYDRATOR.verify_candidate_selection(
+            candidate_manifest_path=(
+                candidate / HYDRATOR.APPROVED_MANIFEST_NAME
+            ),
+            release_cohort=candidate.name,
+            secret_root=self.secret_root,
+            expected_uid=self.uid,
+            expected_gid=self.gid,
+        )
+        marker = self._active() / HYDRATOR.MARKER_NAME
+        marker.chmod(0o600)
+        marker.write_bytes(
+            marker.read_bytes().replace(
+                b"release_cohort=oci-0123456789ab-test1",
+                b"release_cohort=oci-0123456789ab-other",
+            )
+        )
+        marker.chmod(0o400)
+        with self.assertRaisesRegex(HYDRATOR.HydrationError, "another release"):
+            HYDRATOR.verify_candidate_selection(
+                candidate_manifest_path=(
+                    candidate / HYDRATOR.APPROVED_MANIFEST_NAME
+                ),
+                release_cohort=candidate.name,
+                secret_root=self.secret_root,
+                expected_uid=self.uid,
+                expected_gid=self.gid,
+            )
+
+    def test_release_pointer_swap_fault_preserves_prior_approved_release(self) -> None:
+        self._hydrate()
+        self._approve()
+        prior_pointer = os.readlink(self.release_root / "current")
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-release-swap-0123456789abcdefghijkl",
+        )
+        self._write_bundles(rotated)
+        self._hydrate()
+        candidate = self.last_release
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        real_replace = os.replace
+
+        def fail_release_pointer(source: object, destination: object) -> None:
+            if Path(destination) == self.release_root / "current":
+                raise OSError("injected release pointer failure")
+            real_replace(source, destination)
+
+        with mock.patch.object(HYDRATOR.os, "replace", side_effect=fail_release_pointer):
+            with self.assertRaises(OSError):
+                HYDRATOR.commit_candidate_release(
+                    candidate_manifest_path=(
+                        candidate / HYDRATOR.APPROVED_MANIFEST_NAME
+                    ),
+                    release_cohort=candidate.name,
+                    secret_root=self.secret_root,
+                    expected_uid=self.uid,
+                    expected_gid=self.gid,
+                )
+
+        self.assertEqual(os.readlink(self.release_root / "current"), prior_pointer)
+
+    def test_post_commit_fsync_fault_leaves_complete_new_boot_cohort(self) -> None:
+        self._hydrate()
+        self._approve()
+        rotated = dict(self.bundles)
+        rotated["api_env"] = rotated["api_env"].replace(
+            b"smtp-password-0123456789abcdefghijklmnop",
+            b"smtp-release-commit-0123456789abcdefghijkl",
+        )
+        self._write_bundles(rotated)
+        self._hydrate()
+        candidate = self.last_release
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        real_fsync_directory = HYDRATOR._fsync_directory
+        injected = False
+
+        def fail_after_release_swap(path: Path) -> None:
+            nonlocal injected
+            if (
+                path == self.release_root
+                and (self.release_root / "current").is_symlink()
+                and os.readlink(self.release_root / "current") == str(candidate)
+                and not injected
+            ):
+                injected = True
+                raise OSError("injected release-root fsync failure")
+            real_fsync_directory(path)
+
+        with mock.patch.object(
+            HYDRATOR, "_fsync_directory", side_effect=fail_after_release_swap
+        ):
+            with self.assertRaises(OSError):
+                HYDRATOR.commit_candidate_release(
+                    candidate_manifest_path=(
+                        candidate / HYDRATOR.APPROVED_MANIFEST_NAME
+                    ),
+                    release_cohort=candidate.name,
+                    secret_root=self.secret_root,
+                    expected_uid=self.uid,
+                    expected_gid=self.gid,
+                )
+        self.assertTrue(injected)
+        self.assertEqual(os.readlink(self.release_root / "current"), str(candidate))
+
+        self._simulate_reboot()
+        self._boot()
+        self.assertIn(b"smtp-release-commit-", (self._active() / "api.env").read_bytes())
 
     def test_sandbox_key_requires_matching_api_configuration(self) -> None:
         sandbox_ocid = "ocid1.vaultsecret.oc1.us-phoenix-1.testsandbox0123456789"

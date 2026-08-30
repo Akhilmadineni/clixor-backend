@@ -27,6 +27,10 @@ public_api_readiness_url=${CLIXOR_PUBLIC_API_READINESS_URL:-https://clustr-api.a
 public_association_url=${CLIXOR_PUBLIC_ASSOCIATION_URL:-https://clixor.atlanteanz.com/.well-known/apple-app-site-association}
 public_smoke_mode=${CLIXOR_REQUIRE_PUBLIC_SMOKE:-auto}
 vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
+initial_vault_cutover=${CLIXOR_INITIAL_VAULT_CUTOVER:-false}
+fallback_secret_mode_file=/etc/clixor/secret-mode
+approved_manifest_name=vault-approved-cohort.json
+approved_mapping_name=vault-secrets.map
 minimum_data_headroom_kb=8388608
 minimum_docker_headroom_kb=6291456
 retained_audit_releases=3
@@ -56,6 +60,13 @@ case "${public_api_readiness_url}|${public_association_url}" in
   "https://clixor-oci-canary.atlanteanz.com/health/ready|https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association") ;;
   *) fail "public smoke URLs must be the approved production or OCI canary pair" ;;
 esac
+case "${initial_vault_cutover}" in
+  true|false) ;;
+  *) fail "CLIXOR_INITIAL_VAULT_CUTOVER must be true or false" ;;
+esac
+[ "${initial_vault_cutover}" = "false" ] || \
+  [ "${vault_hydration_mode}" = "true" ] || \
+  fail "initial Vault cutover requires Vault hydration"
 public_smoke_required=false
 [ "${public_smoke_mode}" = "true" ] && public_smoke_required=true
 
@@ -105,6 +116,44 @@ verify_public_ingress() {
 require_unsigned_integer() {
   case "$2" in
     ''|*[!0-9]*) fail "$1 is not an unsigned integer" ;;
+  esac
+}
+
+read_effective_secret_mode() {
+  selected_mode_file=${fallback_secret_mode_file}
+  current_release_link="${release_root}/current"
+  current_release_mode="${current_release_link}/secret-mode"
+  if [ -e "${current_release_mode}" ] || [ -L "${current_release_mode}" ]; then
+    [ -L "${current_release_link}" ] || \
+      fail "current release must be selected by a symbolic link"
+    current_release_target="$(readlink -- "${current_release_link}")"
+    case "${current_release_target}" in
+      "${release_root}"/oci-*) ;;
+      *) fail "current release pointer targets an unexpected location" ;;
+    esac
+    [ "${current_release_target%/*}" = "${release_root}" ] && \
+      [ "$(readlink -f -- "${current_release_link}")" = "${current_release_target}" ] || \
+      fail "current release pointer does not select an immediate release child"
+    [ -d "${current_release_target}" ] && [ ! -L "${current_release_target}" ] || \
+      fail "current release target is unavailable"
+    [ "$(stat -c '%u:%g:%a' "${current_release_target}")" = "0:0:700" ] || \
+      fail "current release target is unsafe"
+    [ -f "${current_release_mode}" ] && [ ! -L "${current_release_mode}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${current_release_mode}")" = "0:0:400" ] || \
+      fail "current release secret mode is unsafe"
+    selected_mode_file=${current_release_mode}
+  else
+    [ -f "${fallback_secret_mode_file}" ] && \
+      [ ! -L "${fallback_secret_mode_file}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${fallback_secret_mode_file}")" = "0:0:600" ] || \
+      fail "fallback secret mode is unsafe"
+  fi
+  effective_secret_mode="$(sed -n '1p' "${selected_mode_file}")"
+  [ "$(wc -l < "${selected_mode_file}" | tr -d '[:space:]')" = "1" ] || \
+    fail "effective secret mode file is invalid"
+  case "${effective_secret_mode}" in
+    staging|vault) ;;
+    *) fail "effective secret mode must be staging or vault" ;;
   esac
 }
 
@@ -443,12 +492,14 @@ esac
 [ "${#source_sha}" -eq 40 ] || \
   fail "source revision must be a full 40-character Git object ID"
 case "${run_id}" in
+  '') fail "run ID is required" ;;
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
+[ "${#run_id}" -le 160 ] || fail "run ID is too long"
 
 for command_name in \
   awk cmp curl df docker du find findmnt flock grep install mktemp mv python3 \
-  readlink rm rsync sed sha256sum sort stat systemctl touch tr
+  readlink rm rsync sed sha256sum sort stat systemctl touch tr wc
 do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
@@ -458,6 +509,25 @@ mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
 preflight_disk_capacity
+read_effective_secret_mode
+if [ "${effective_secret_mode}" = "vault" ]; then
+  [ "${selected_mode_file}" != "${fallback_secret_mode_file}" ] || \
+    fail "legacy unpinned Vault mode requires an explicit staging-to-Vault cutover"
+  [ "${vault_hydration_mode}" = "true" ] || \
+    fail "Vault-backed releases require candidate cohort hydration"
+  [ "${initial_vault_cutover}" = "false" ] || \
+    fail "initial Vault cutover is allowed only while the approved release remains staging"
+else
+  if [ "${vault_hydration_mode}" = "true" ]; then
+    [ "${initial_vault_cutover}" = "true" ] || \
+      fail "staging-to-Vault promotion requires CLIXOR_INITIAL_VAULT_CUTOVER=true"
+    [ -L "${release_root}/current" ] || \
+      fail "initial Vault cutover requires an existing boot-approved staging release"
+  else
+    [ "${initial_vault_cutover}" = "false" ] || \
+      fail "initial Vault cutover requires candidate cohort hydration"
+  fi
+fi
 
 if [ -s "${compose_file}" ] && \
   ! grep -Eq '(/srv/clixor/secrets/(active/)?api.env|/run/clixor/secrets/active/api.env)' \
@@ -508,6 +578,8 @@ do
 done
 release_tag="oci-$(printf '%s' "${source_sha}" | cut -c1-12)-${run_id}"
 release_dir="${release_root}/${release_tag}"
+candidate_manifest="${release_dir}/${approved_manifest_name}"
+candidate_mapping="${release_dir}/${approved_mapping_name}"
 previous_compose="${release_dir}/previous-compose.yaml"
 rollback_compose="${previous_compose}"
 scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
@@ -521,6 +593,12 @@ mkdir -p "${stable_root}" "${release_root}" "${project_root}/runtime"
 [ ! -e "${release_dir}" ] || fail "release directory already exists: ${release_dir}"
 mkdir "${release_dir}"
 chmod 0700 "${release_dir}"
+candidate_secret_mode=staging
+[ "${vault_hydration_mode}" = "false" ] || candidate_secret_mode=vault
+printf '%s\n' "${candidate_secret_mode}" > "${release_dir}/secret-mode.partial"
+chmod 0400 "${release_dir}/secret-mode.partial"
+chown 0:0 "${release_dir}/secret-mode.partial"
+mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
 stage_host_tooling
 capture_host_tooling
 
@@ -741,6 +819,16 @@ retire_persistent_staging_secrets() {
 rollback() {
   status=$?
   trap - 0
+  if [ "${status}" -ne 0 ] && [ -L "${release_root}/current" ] && \
+    [ "$(readlink -- "${release_root}/current" 2>/dev/null || true)" = "${release_dir}" ]; then
+    # The atomic release pointer is the commit record for the application and
+    # exact Vault cohort. Never roll the running host back while leaving boot
+    # approved for the new release if the parent was interrupted just after the
+    # pointer swap.
+    log "release pointer committed before interruption; preserving the committed application and secret cohort"
+    rollback_needed=0
+    vault_generation_changed=false
+  fi
   secret_rollback_failed=0
   cloudflare_rollback_failed=0
   if [ "${status}" -ne 0 ] && [ "${vault_generation_changed}" = "true" ]; then
@@ -970,14 +1058,20 @@ if [ "${vault_hydration_mode}" = "true" ]; then
   [ -x /usr/bin/python3 ] || fail "Python 3 is required for OCI Vault hydration"
   previous_vault_target="$(readlink -- "${runtime_secret_root}/active" 2>/dev/null || true)"
   hydration_status=0
-  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" || \
+  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
+    --candidate-manifest "${candidate_manifest}" \
+    --release-cohort "${release_tag}" || \
     hydration_status=$?
   current_vault_target="$(readlink -- "${runtime_secret_root}/active" 2>/dev/null || true)"
   if [ "${previous_vault_target}" != "${current_vault_target}" ]; then
     vault_generation_changed=true
   fi
-  if [ "${hydration_status}" -eq 0 ] && \
-    [ "${vault_generation_changed}" = "true" ]; then
+  [ "${hydration_status}" -eq 0 ] || fail "OCI Vault hydration failed before deployment"
+  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
+    --verify-candidate-manifest "${candidate_manifest}" \
+    --release-cohort "${release_tag}" || \
+    fail "candidate Vault cohort selection failed validation"
+  if [ "${vault_generation_changed}" = "true" ]; then
     previous_secret_generation_root=
     case "${previous_vault_target}" in
       /srv/clixor/secrets)
@@ -1010,7 +1104,6 @@ if [ "${vault_hydration_mode}" = "true" ]; then
       esac
     done
   fi
-  [ "${hydration_status}" -eq 0 ] || fail "OCI Vault hydration failed before deployment"
 fi
 
 log "building ARM64 release ${new_image}"
@@ -1053,10 +1146,17 @@ if [ "${vault_hydration_mode}" = "true" ]; then
     fail "Vault-backed deployments require durable SMTP password-reset delivery"
 fi
 if grep -q '^CLUSTER_ENV=production$' "${api_env}"; then
-  [ -f /etc/clixor/secret-mode ] && [ ! -L /etc/clixor/secret-mode ] && \
-    [ "$(stat -c '%u:%g:%a' /etc/clixor/secret-mode)" = "0:0:600" ] && \
-    [ "$(sed -n '1p' /etc/clixor/secret-mode)" = "vault" ] || \
-    fail "production requires root-owned OCI Vault secret mode"
+  [ "${vault_hydration_mode}" = "true" ] || \
+    fail "production requires a release-pinned OCI Vault cohort"
+  for approval_file in \
+    "${release_dir}/secret-mode" "${candidate_manifest}" "${candidate_mapping}"
+  do
+    [ -f "${approval_file}" ] && [ ! -L "${approval_file}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${approval_file}")" = "0:0:400" ] || \
+      fail "production release approval metadata is unsafe"
+  done
+  [ "$(sed -n '1p' "${release_dir}/secret-mode")" = "vault" ] || \
+    fail "production release is not approved for Vault boot hydration"
   [ "$(findmnt --noheadings --output FSTYPE --target "${runtime_secret_root}" | tr -d '[:space:]')" = "tmpfs" ] || \
     fail "production runtime secrets are not on tmpfs"
   active_target="$(readlink -- "${runtime_secret_root}/active")"
@@ -1069,7 +1169,11 @@ if grep -q '^CLUSTER_ENV=production$' "${api_env}"; then
     fail "production Vault hydration marker is missing"
   [ "$(stat -c '%u:%g:%a' "${marker}")" = "0:0:400" ] || \
     fail "production Vault hydration marker has unsafe ownership or mode"
-  grep -q '^schema=1$' "${marker}" || fail "production Vault hydration marker is invalid"
+  grep -q '^schema=2$' "${marker}" || fail "production Vault hydration marker is invalid"
+  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
+    --verify-candidate-manifest "${candidate_manifest}" \
+    --release-cohort "${release_tag}" || \
+    fail "production candidate Vault cohort no longer matches the active generation"
   if grep -Eq '^[[:space:]]*[^#[:space:]]' "${runtime_env}"; then
     fail "production requires an empty legacy runtime.env marker"
   fi
@@ -1342,19 +1446,35 @@ python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
   --desired "${release_dir}/dependency-pki.desired" \
   --applied "${pki_applied}"
 
-ln -s "${release_dir}" "${release_dir}/current-link.pending"
-mv -Tf "${release_dir}/current-link.pending" "${release_root}/current"
+release_commit_status=0
+if [ "${vault_hydration_mode}" = "true" ]; then
+  /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
+    --commit-candidate-release "${candidate_manifest}" \
+    --release-cohort "${release_tag}" || \
+    release_commit_status=$?
+else
+  ln -s "${release_dir}" "${release_dir}/current-link.pending"
+  mv -Tf "${release_dir}/current-link.pending" "${release_root}/current" || \
+    release_commit_status=$?
+fi
 [ "$(readlink "${release_root}/current")" = "${release_dir}" ] || \
   fail "current release pointer did not update atomically"
 rollback_needed=0
 vault_generation_changed=false
+[ "${release_commit_status}" -eq 0 ] || \
+  fail "release pointer committed but durable commit verification failed"
 
 # Retire durable staging copies only after the release is committed and its
 # rollback trap is disarmed. A staging-to-Vault cutover deliberately retains
 # the prior files for one full release; the next successful Vault-to-Vault
 # release removes them after proving both the application and connector.
 retire_staging_copies=false
-if [ "${first_deploy}" = "true" ]; then
+if [ "${initial_vault_cutover}" = "true" ]; then
+  # Keep the durable cohort as an operator fallback through one subsequent
+  # approved Vault-to-Vault release. The boot decision already changed
+  # atomically with releases/current; this copy is not selected automatically.
+  retire_staging_copies=false
+elif [ "${first_deploy}" = "true" ]; then
   retire_staging_copies=true
 else
   case "${previous_vault_target}" in

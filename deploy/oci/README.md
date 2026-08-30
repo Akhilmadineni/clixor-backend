@@ -142,38 +142,70 @@ sudo install -d -o root -g root -m 0700 /etc/clixor
 sudo install -o root -g root -m 0600 \
   deploy/oci/vault-secrets.map.example /etc/clixor/vault-secrets.map
 sudoedit /etc/clixor/vault-secrets.map
-printf 'vault\n' > /tmp/clixor-secret-mode
-sudo install -o root -g root -m 0600 \
-  /tmp/clixor-secret-mode /etc/clixor/secret-mode
-rm /tmp/clixor-secret-mode
 ```
 
 Replace every example OCID; placeholders are rejected. Each artifact must use a
 different `ocid1.vaultsecret...` identifier. The mapping accepts no values,
 shell syntax, unknown names, duplicate names, duplicate OCIDs, symbolic links,
-or group/world access.
+or group/world access. Do **not** change `/etc/clixor/secret-mode` to `vault`.
+That file is only the pre-release staging fallback. A production boot may enter
+Vault mode only through an approved release, never through an operator-edited
+global switch.
 
-Run bootstrap once more from the reviewed checkout. It installs the boot-time
-unit and fixed-path hydrator, verifies that `/run/clixor/secrets` is backed by
-`tmpfs`, hydrates it, and makes Docker require successful preparation on every
-boot:
+Run bootstrap once more from the reviewed checkout while the current release is
+still staging. It installs the boot-time unit and fixed-path hydrator, verifies
+that `/run/clixor/secrets` is backed by `tmpfs`, keeps the durable staging cohort
+selected, and makes Docker require successful preparation on every boot:
 
 ```sh
 sudo sh deploy/oci/bootstrap.sh
 sudo readlink /run/clixor/secrets/active
 ```
 
-It authenticates only as the VM instance principal, requests the `CURRENT`
-bundle for every mapped OCID, enforces canonical base64 and bounded content,
-validates exact per-service key allowlists, checks cross-service dependency
-credentials, parses APNs private keys with OpenSSL, and validates the Cloudflare
-token. It stages every artifact under mode-0700 tmpfs storage and emits no secret
-output. Only after every fetch and validation succeeds does one atomic symlink
-swap select the complete generation. Identical reruns keep the current
-generation. Fetch, validation, or pointer-swap failure leaves the previous
-generation selected for the current boot. Vault remains the externally
-recoverable source across reboot; Docker and cloudflared fail closed if boot-time
-hydration cannot reconstruct a complete generation.
+The initial staging-to-Vault transition is an explicit manual release. Complete
+at least one ordinary staging deployment first so
+`/srv/clixor/releases/current` already selects a boot-approved staging release;
+the cutover refuses to run from an uncommitted/fallback-only host. GitHub Actions
+always forces the cutover flag off and therefore cannot perform it:
+
+```sh
+revision="$(git rev-parse HEAD)"
+sudo env \
+  CLIXOR_REQUIRE_PUBLIC_SMOKE=true \
+  CLIXOR_REQUIRE_VAULT_HYDRATION=true \
+  CLIXOR_INITIAL_VAULT_CUTOVER=true \
+  sh deploy/oci/deploy.sh "$PWD" "$revision" manual-vault-cutover-20260830T120000Z
+```
+
+While rollback is armed, deploy authenticates only as the VM instance principal
+and requests one `CURRENT` response for every mapped OCID. Each response contains
+both the base64 content and its OCI `version-number`; they are captured together
+instead of making a racy second version query. The hydrator enforces bounded,
+canonical content, exact per-service key allowlists, cross-service dependency
+consistency, APNs private-key parsing, and the Cloudflare token format. It also
+continues to reject implicit PostgreSQL, Grafana, mail-queue encryption, OTP-HMAC,
+and password-reset-HMAC rotations, which require their documented state-aware
+procedures.
+
+The candidate release receives mode-0400, root-owned
+`vault-approved-cohort.json` and `vault-secrets.map` files. The strict manifest
+contains every artifact exactly once, its mapped OCID, the exact OCI secret
+version, the mapping SHA-256, the release cohort, and a canonical cohort digest.
+Unknown, missing, duplicate, unsorted, reused, mixed, or hash-mismatched records
+are rejected. Only after application readiness, public ingress, backup, and
+restore gates pass does the same atomic `/srv/clixor/releases/current` pointer
+approve the application, `secret-mode=vault`, mapping snapshot, and version
+manifest together. A failure or crash before that pointer change leaves the old
+staging release boot-authoritative.
+
+On every later boot, the unit reads `secret-mode` from the selected release and
+hydrates only the exact `--version-number` values in that release's manifest. It
+never requests Vault `CURRENT`. Changing `/etc/clixor/vault-secrets.map` or
+promoting a new Vault version affects only a future candidate deployment. Keep
+every version referenced by the current and retained rollback releases available
+in OCI Vault; deleting an approved version makes that release intentionally fail
+closed on reboot. Docker and cloudflared start only after the complete pinned
+cohort is reconstructed into tmpfs.
 
 Compose mounts the tmpfs files and stores only nonsecret file paths in container
 metadata. API and migration binaries parse their mounted file before loading
@@ -185,19 +217,21 @@ so host root, the Docker daemon, and code execution inside that container remain
 trusted boundaries; tmpfs is an at-rest and metadata hardening boundary, not
 protection from root compromise.
 
-The production Actions entrypoint repeats hydration while holding the deployment
-lock before any container, file, backup, or migration mutation. Production
-deployment refuses `secret-mode=staging`, persistent staging files, a non-tmpfs
-target, or a missing/unsafe hydration marker. A manual staging deploy may use the
-explicit `/run/.../active -> /srv/clixor/secrets` fallback and locally generated
+The production Actions entrypoint selects a new candidate cohort while holding
+the deployment lock before any container, file, backup, or migration mutation.
+It requires an existing approved Vault release and explicitly sets
+`CLIXOR_INITIAL_VAULT_CUTOVER=false`. Production deployment refuses an unpinned
+legacy Vault mode, an unapproved/mixed manifest, a non-tmpfs target, or a
+missing/unsafe generation marker. A manual staging deploy may use the explicit
+`/run/.../active -> /srv/clixor/secrets` fallback and locally generated
 credentials.
 
-An upgraded host may still contain the former persistent production files under
-`/srv/clixor/secrets` for a deliberately bounded rollback window. After the new
-path-only release, reboot hydration, backup restore drill, and provider canaries
-all pass, inventory and securely remove those legacy values in a separately
-reviewed maintenance operation. Never automate that cleanup as part of hydration
-or deployment, and never remove the externally recoverable Vault versions.
+The initial cutover retains the former persistent files under
+`/srv/clixor/secrets` for one full release. A subsequent successful
+Vault-to-Vault production release retires those staging copies only after public
+ingress, backup, restore, and secret-consumer canaries pass and rollback is
+disarmed. Hydration itself never removes them. Never remove the externally
+recoverable Vault versions referenced by retained release manifests.
 
 ## 4. Deploy an immutable source revision
 
@@ -220,34 +254,39 @@ The deploy script:
    on `/srv/clixor`, and at least 6 GiB free on Docker's filesystem, before
    creating a release or snapshot; when both paths share one filesystem, the
    requirements are added rather than counted twice;
-3. stages and checksums that release's host backup/restore/health programs and
-   systemd units, and captures the active versions plus timer state;
+3. writes the release-local secret mode, stages and checksums that release's
+   host backup/restore/health programs and systemd units, and captures the active
+   versions plus timer state;
 4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
    --list` and SHA-256 verification before changing the active runtime; a clean
    first deployment records an explicit first-deploy marker;
-5. builds and verifies an ARM64 API image tagged with the source revision;
-6. arms application rollback before refreshing runtime configuration,
+5. for Vault, atomically fetches content and OCI version for every mapped
+   artifact, writes and revalidates the strict mapping-bound candidate manifest,
+   then selects its complete tmpfs generation while secret rollback is armed;
+6. builds and verifies an ARM64 API image tagged with the source revision;
+7. arms application rollback before refreshing runtime configuration,
    synchronizing source, or reconciling containers;
-7. refreshes the independent dependency TLS leaves, synchronizes that exact
+8. refreshes the independent dependency TLS leaves, synchronizes that exact
    source to `/srv/clixor/repo`, and restarts dependencies that need a new image,
    scoped secret boundary, or certificate; the small HAProxy TLS edge is always
    replaced because it reads its bind-mounted configuration only at startup;
-8. runs the one-shot migration command, verifies the previous release still
+9. runs the one-shot migration command, verifies the previous release still
    passes readiness on the expanded schema, then replaces `api-a` and `api-b`
    one at a time, requiring direct readiness before replacing the next replica;
-9. reconciles the gateway only after both replicas are ready, validates its
+10. reconciles the gateway only after both replicas are ready, validates its
    reviewed configuration, and performs a graceful Nginx reload when recreation
    is unnecessary; running observability consumers are replaced separately;
-10. for production, verifies both public Cloudflare hostnames while rollback is
+11. for production, verifies both public Cloudflare hostnames while rollback is
    still armed;
-11. creates and uploads a fresh post-migration backup, restores it into an
+12. creates and uploads a fresh post-migration backup, restores it into an
     isolated PostgreSQL container, and runs integrity checks;
-12. only after those gates, atomically publishes each staged host-tool and unit
+13. only after those gates, atomically publishes each staged host-tool and unit
     file, reloads systemd, enables the verified timers, and runs backup health;
-13. records the dependency PKI state and atomically advances the current-release
-    pointer before disarming rollback; and
-14. after the fresh offsite marker and successful release are durable, retains
+14. records the dependency PKI state and atomically advances the current-release
+    pointer, thereby approving the app and exact Vault cohort together, before
+    disarming rollback; and
+15. after the fresh offsite marker and successful release are durable, retains
     the current and immediate previous rollback boundaries plus three small audit
     releases, deletes pre-migration dumps from non-boundary audit releases, and
     removes unused Clixor API image tags except the current and previous images.
@@ -322,11 +361,14 @@ environment rather than inheriting runner-controlled process settings. No OCI,
 GitHub, or application credential belongs in GitHub Actions.
 Every production run first fetches and validates all mapped Vault `CURRENT`
 bundles through the instance principal while holding the root-owned deployment
-lock and before any deployment mutation.
+lock, binds their returned version numbers to the candidate release manifest, and
+does so before any deployment mutation.
 The root-owned entrypoint additionally refuses automated deployment unless the
-hydrated scoped API configuration is mode `0600`, root-owned, and explicitly enables
-production, Telnyx verification, and durable SMTP reset delivery. Manual staging
-deployments remain available for provider canaries before this gate is enabled.
+hydrated scoped API configuration is mode `0440`, owned by `root:65532`, the
+current release already contains a root-only approved manifest/mapping, and the
+API explicitly enables production, Telnyx verification, and durable SMTP reset
+delivery. Manual staging deployments remain available for provider canaries
+before this gate is enabled.
 
 Before bringing the production runner online, protect `main`: require pull
 requests and review, make every CI job a required check, and disallow force pushes
@@ -521,7 +563,8 @@ publication.
 Keep the first deployment in staging while authentication, group, media,
 WebSocket, and account-deletion tests run. Populate the Vault bundles described
 above with distinct production values, promote their intended versions to
-`CURRENT`, hydrate them, and then complete all of these:
+`CURRENT`, run the explicit manual cutover release above, and then complete all
+of these:
 
 - Telnyx sender registration, API/signing credentials, allowed country prefixes,
   and a real-device OTP test;
@@ -538,7 +581,8 @@ values are rejected by the deploy script, and the application's existing product
 validation remains authoritative.
 
 Rotate coordinated bundles during a maintenance window, promote every intended
-version to `CURRENT`, then run the hydrator/deploy once. A PostgreSQL password is
+version to `CURRENT`, then run one candidate deployment; do not invoke boot
+hydration directly. A PostgreSQL password is
 not rotated by changing `POSTGRES_PASSWORD_FILE` on an initialized database:
 change the database role password in the same controlled operation or the API
 will be locked out. Redis/NATS credential changes recreate their containers;
@@ -547,8 +591,9 @@ token change requires a connector restart after the new tunnel token is proven.
 JWT rotation invalidates sessions. The mail-queue key has the stricter drain
 procedure above. Any inconsistent dependency URL/credential bundle, pending mail
 during queue-key rotation, unverified Cloudflare token, or failed real-device
-canary is a rotation stop condition. Previous Vault versions are the reviewed
-rollback source; never copy decrypted tmpfs files back to persistent storage.
+canary is a rotation stop condition. Exact Vault versions referenced by the
+current and retained release manifests are the reviewed rollback source; never
+copy decrypted tmpfs files back to persistent storage.
 
 ## 7. Backups
 
