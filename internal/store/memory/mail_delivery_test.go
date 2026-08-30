@@ -161,7 +161,7 @@ func TestPasswordMutationAndChangedMailAreAtomic(t *testing.T) {
 	}
 
 	changedDelivery := uuid.New()
-	if _, err := persistence.ConsumePasswordResetChallengeWithMail(
+	completion, err := persistence.ConsumePasswordResetChallengeWithMail(
 		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
 		func(email string) (domain.MailDelivery, error) {
 			if email != user.Email {
@@ -169,8 +169,12 @@ func TestPasswordMutationAndChangedMailAreAtomic(t *testing.T) {
 			}
 			return testMailDelivery(changedDelivery, challenge.ID, domain.MailDeliveryPasswordChanged), nil
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if completion.UserID != user.ID || completion.Email != user.Email {
+		t.Fatalf("reset completion identity=%+v, want user=%s email=%q", completion, user.ID, user.Email)
 	}
 	changed, err := persistence.UserByID(ctx, user.ID)
 	if err != nil || changed.PasswordHash != "new-hash" {

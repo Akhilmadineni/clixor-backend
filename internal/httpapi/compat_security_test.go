@@ -37,7 +37,12 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 			"custom": "preserved",
 			"members": []map[string]any{
 				{"id": ownerLocalID, "backendUserId": owner.user.ID, "name": "Owner local", "avatarColor": "#111111"},
-				{"id": memberLocalID, "backendUserId": member.user.ID, "name": "Member local", "avatarColor": "#222222"},
+				{
+					"id": memberLocalID, "backendUserId": member.user.ID,
+					"name": "Spoofed Member", "username": "@spoofed", "avatarColor": "#222222",
+					"email": "metadata-secret@example.com", "phone": "+13125550111",
+					"profileImageData": "private-image-blob", "private": map[string]any{"token": "secret"},
+				},
 				{"id": uuid.NewString(), "backendUserId": added.user.ID, "name": "Stale user", "avatarColor": "#333333"},
 				{"id": pendingLocalID, "name": "Pending contact", "phone": "+13125550000", "avatarColor": "#444444"},
 			},
@@ -49,8 +54,22 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 	if !bytes.Contains(group.Metadata, []byte(pendingLocalID)) {
 		t.Fatalf("contact-only legacy member was removed: %s", group.Metadata)
 	}
+	for _, forbidden := range []string{
+		"Spoofed Member", "@spoofed", "metadata-secret@example.com", "+13125550111",
+		"private-image-blob", `"private"`, "+13125550000",
+	} {
+		if bytes.Contains(group.Metadata, []byte(forbidden)) {
+			t.Fatalf("conversation metadata leaked/spoofed %q: %s", forbidden, group.Metadata)
+		}
+	}
+	for _, authoritative := range []string{"Public Member", "@public_member", "#123456"} {
+		if !bytes.Contains(group.Metadata, []byte(authoritative)) {
+			t.Fatalf("conversation metadata omitted authoritative public identity %q: %s", authoritative, group.Metadata)
+		}
+	}
 
-	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusForbidden, nil)
+	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusNotFound, nil)
+	added.do(t, http.MethodGet, "/v1/conversations/"+uuid.NewString(), nil, http.StatusNotFound, nil)
 	member.do(t, http.MethodPost, "/v1/conversations/"+group.ID.String()+"/members", map[string]any{
 		"user_id": invitee.user.ID, "role": "member",
 	}, http.StatusForbidden, nil)
@@ -77,7 +96,7 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 	owner.do(t, http.MethodDelete,
 		"/v1/conversations/"+group.ID.String()+"/members/"+added.user.ID.String(),
 		nil, http.StatusNoContent, nil)
-	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusForbidden, nil)
+	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusNotFound, nil)
 	owner.do(t, http.MethodPatch, "/v1/conversations/"+group.ID.String(), map[string]any{
 		"metadata": map[string]any{"members": []map[string]any{{
 			"id": uuid.NewString(), "backendUserId": added.user.ID,
@@ -85,7 +104,7 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 		}}},
 	}, http.StatusOK, &group)
 	assertProjectedMember(t, group.Metadata, added.user.ID, "", false)
-	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusForbidden, nil)
+	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusNotFound, nil)
 
 	var created conversationInviteCreationResponse
 	owner.do(t, http.MethodPost, "/v1/conversations/"+group.ID.String()+"/invites",
@@ -164,6 +183,29 @@ func TestRealtimeSocketClosesBeforePostLogoutEvent(t *testing.T) {
 	var event domain.RealtimeEvent
 	if err := socket.ReadJSON(&event); err == nil {
 		t.Fatalf("revoked socket received post-logout event: %+v", event)
+	}
+}
+
+func TestDeleteAccountImmediatelyClosesRealtimeSocket(t *testing.T) {
+	server := newTestHTTPServer(t)
+	deleted := registerTestUser(t, server.URL, "socket-delete@example.com")
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime"
+	socket, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Authorization": []string{"Bearer " + deleted.client.token},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	_ = socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var hello domain.RealtimeEvent
+	if err := socket.ReadJSON(&hello); err != nil || hello.Type != "session.ready" {
+		t.Fatalf("missing realtime hello: event=%+v err=%v", hello, err)
+	}
+	deleted.do(t, http.MethodDelete, "/v1/me", nil, http.StatusNoContent, nil)
+	var event domain.RealtimeEvent
+	if err := socket.ReadJSON(&event); err == nil {
+		t.Fatalf("account-deleted socket remained readable: %+v", event)
 	}
 }
 

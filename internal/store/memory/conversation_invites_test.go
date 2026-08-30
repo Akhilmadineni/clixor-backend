@@ -76,9 +76,26 @@ func TestConversationInviteLifecycleAndAuthorization(t *testing.T) {
 	if !bytes.Contains(accepted.Conversation.Metadata, []byte(firstJoiner.String())) {
 		t.Fatalf("invite acceptance did not project new ACL member: %s", accepted.Conversation.Metadata)
 	}
+	// Simulate metadata written by a legacy node after the relational membership
+	// was committed. Retrying the same invite must heal the projection without
+	// consuming another use.
+	persistence.mu.Lock()
+	stale := persistence.conversations[conversation.ID]
+	stale.Metadata = []byte(`{"members":[]}`)
+	persistence.conversations[conversation.ID] = stale
+	persistence.mu.Unlock()
 	retried, err := persistence.AcceptConversationInvite(ctx, tokenHash[:], firstJoiner)
 	if err != nil || retried.Joined {
 		t.Fatalf("idempotent acceptance failed: accepted=%+v err=%v", retried, err)
+	}
+	if !bytes.Contains(retried.Conversation.Metadata, []byte(firstJoiner.String())) {
+		t.Fatalf("idempotent acceptance did not heal the ACL projection: %s", retried.Conversation.Metadata)
+	}
+	persistence.mu.RLock()
+	persistedMetadata := append([]byte(nil), persistence.conversations[conversation.ID].Metadata...)
+	persistence.mu.RUnlock()
+	if !bytes.Contains(persistedMetadata, []byte(firstJoiner.String())) {
+		t.Fatalf("healed invite projection was not persisted: %s", persistedMetadata)
 	}
 	if uses := persistence.inviteLinks[string(tokenHash[:])].Uses; uses != 1 {
 		t.Fatalf("idempotent acceptance consumed %d uses, want 1", uses)

@@ -93,7 +93,8 @@ func (s *Store) ConsumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 ) (string, error) {
-	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, nil)
+	completion, err := s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, nil)
+	return completion.Email, err
 }
 
 func (s *Store) ConsumePasswordResetChallengeWithMail(
@@ -103,9 +104,9 @@ func (s *Store) ConsumePasswordResetChallengeWithMail(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
-) (string, error) {
+) (store.PasswordResetCompletion, error) {
 	if buildMail == nil {
-		return "", domain.ErrInvalid
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
 	}
 	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail)
 }
@@ -116,7 +117,7 @@ func (s *Store) consumePasswordResetChallenge(
 	newPasswordHash string,
 	maxAttempts int,
 	buildMail store.MailDeliveryBuilder,
-) (string, error) {
+) (store.PasswordResetCompletion, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -124,26 +125,26 @@ func (s *Store) consumePasswordResetChallenge(
 	now := time.Now().UTC()
 	if !ok || challenge.ConsumedAt != nil || !challenge.ExpiresAt.After(now) ||
 		challenge.Attempts >= maxAttempts {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	if len(challenge.CodeHash) != len(codeHash) ||
 		subtle.ConstantTimeCompare(challenge.CodeHash, codeHash) != 1 {
 		challenge.Attempts++
 		s.passwordResets[id] = challenge
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	user, ok := s.users[challenge.UserID]
 	if !ok || user.PasswordHash == "" {
-		return "", domain.ErrUnauthenticated
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
 	}
 	var delivery *domain.MailDelivery
 	if buildMail != nil {
 		built, err := buildMail(user.Email)
 		if err != nil {
-			return "", err
+			return store.PasswordResetCompletion{}, err
 		}
 		if !validMailDelivery(built, domain.MailDeliveryPasswordChanged, id) {
-			return "", domain.ErrInvalid
+			return store.PasswordResetCompletion{}, domain.ErrInvalid
 		}
 		delivery = &built
 	}
@@ -184,7 +185,7 @@ func (s *Store) consumePasswordResetChallenge(
 		copyDelivery.Ciphertext = append([]byte(nil), delivery.Ciphertext...)
 		s.mailDeliveries[delivery.ID] = copyDelivery
 	}
-	return user.Email, nil
+	return store.PasswordResetCompletion{UserID: user.ID, Email: user.Email}, nil
 }
 
 func validMailDelivery(delivery domain.MailDelivery, purpose string, challengeID uuid.UUID) bool {

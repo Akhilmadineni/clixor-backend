@@ -97,7 +97,7 @@ func TestPostgresACLAndLegacyMemberProjectionRemainAtomic(t *testing.T) {
 	if err := persistence.RemoveConversationMember(ctx, conversation.ID, owner.ID, added.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := persistence.Conversation(ctx, conversation.ID, added.ID); !errors.Is(err, domain.ErrForbidden) {
+	if _, err := persistence.Conversation(ctx, conversation.ID, added.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("removed ACL member read returned %v", err)
 	}
 	stale := json.RawMessage(`{"members":[{"id":"stale-replay","backendUserId":"` +
@@ -109,7 +109,7 @@ func TestPostgresACLAndLegacyMemberProjectionRemainAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPostgresProjectedMember(t, updated.Metadata, added.ID, "", false)
-	if _, err := persistence.Conversation(ctx, conversation.ID, added.ID); !errors.Is(err, domain.ErrForbidden) {
+	if _, err := persistence.Conversation(ctx, conversation.ID, added.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("stale metadata restored ACL access: %v", err)
 	}
 }

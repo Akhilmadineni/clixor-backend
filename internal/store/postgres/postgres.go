@@ -605,24 +605,15 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 
 func (s *Store) Conversation(ctx context.Context, id, userID uuid.UUID) (domain.Conversation, error) {
 	var conversation domain.Conversation
-	var member bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,c.created_at,c.updated_at,
-		       EXISTS(SELECT 1 FROM conversation_members m WHERE m.conversation_id=c.id AND m.user_id=$2)
-		FROM conversations c WHERE c.id=$1`, id, userID,
+		SELECT c.id,c.kind,c.title,c.avatar_url,c.metadata,c.created_by,c.last_seq,c.created_at,c.updated_at
+		FROM conversations c
+		JOIN conversation_members m ON m.conversation_id=c.id AND m.user_id=$2
+		WHERE c.id=$1`, id, userID,
 	).Scan(&conversation.ID, &conversation.Kind, &conversation.Title, &conversation.AvatarURL,
 		&conversation.Metadata, &conversation.CreatedBy, &conversation.LastSeq,
-		&conversation.CreatedAt, &conversation.UpdatedAt, &member)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Conversation{}, domain.ErrNotFound
-	}
-	if err != nil {
-		return domain.Conversation{}, err
-	}
-	if !member {
-		return domain.Conversation{}, domain.ErrForbidden
-	}
-	return conversation, nil
+		&conversation.CreatedAt, &conversation.UpdatedAt)
+	return conversation, mapError(err)
 }
 
 func (s *Store) ListConversations(ctx context.Context, userID uuid.UUID, before time.Time, limit int) ([]domain.Conversation, error) {

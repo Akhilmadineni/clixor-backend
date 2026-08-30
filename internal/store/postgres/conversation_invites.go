@@ -143,6 +143,22 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 		return domain.ConversationInviteAcceptance{}, err
 	}
 	if alreadyMember {
+		projected, projectionErr := projectConversationMetadata(
+			ctx, tx, conversation.ID, conversation.Metadata,
+		)
+		if projectionErr != nil {
+			return domain.ConversationInviteAcceptance{}, projectionErr
+		}
+		if !store.JSONValuesEqual(projected, conversation.Metadata) {
+			conversation.Metadata = projected
+			err = tx.QueryRow(ctx, `
+				UPDATE conversations SET metadata=$2,updated_at=$3 WHERE id=$1
+				RETURNING updated_at`, conversation.ID, conversation.Metadata, now,
+			).Scan(&conversation.UpdatedAt)
+			if err != nil {
+				return domain.ConversationInviteAcceptance{}, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return domain.ConversationInviteAcceptance{}, err
 		}

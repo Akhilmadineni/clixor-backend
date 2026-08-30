@@ -119,6 +119,7 @@ type ConversationMember struct {
 	Username       string     `json:"username,omitempty"`
 	AvatarURL      string     `json:"avatar_url,omitempty"`
 	AvatarColor    string     `json:"avatar_color,omitempty"`
+	Bio            string     `json:"bio,omitempty"`
 }
 
 // PublicUser is the deliberately narrow directory representation returned by

@@ -911,7 +911,8 @@ func (s *Store) Conversation(_ context.Context, id, userID uuid.UUID) (domain.Co
 		return domain.Conversation{}, domain.ErrNotFound
 	}
 	if _, ok := s.members[id][userID]; !ok {
-		return domain.Conversation{}, domain.ErrForbidden
+		// Do not reveal whether a high-entropy conversation identifier exists.
+		return domain.Conversation{}, domain.ErrNotFound
 	}
 	return conversation, nil
 }
@@ -1164,6 +1165,17 @@ func (s *Store) AcceptConversationInvite(_ context.Context, tokenHash []byte, us
 	}
 	members := s.members[invite.ConversationID]
 	if _, alreadyMember := members[userID]; alreadyMember {
+		projected, err := store.ProjectConversationMembers(
+			conversation.Metadata, s.conversationMembersLocked(conversation.ID),
+		)
+		if err != nil {
+			return domain.ConversationInviteAcceptance{}, err
+		}
+		if !store.JSONValuesEqual(projected, conversation.Metadata) {
+			conversation.Metadata = projected
+			conversation.UpdatedAt = now
+			s.conversations[conversation.ID] = conversation
+		}
 		return domain.ConversationInviteAcceptance{Conversation: conversation, Joined: false}, nil
 	}
 	if invite.Uses >= invite.MaxUses {

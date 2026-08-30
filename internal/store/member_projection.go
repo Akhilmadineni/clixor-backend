@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -11,6 +12,17 @@ import (
 )
 
 const defaultMemberAvatarColor = "#4A6CF7"
+
+// JSONValuesEqual compares decoded values rather than wire formatting. This is
+// important for PostgreSQL jsonb, whose canonical whitespace/key ordering can
+// differ from encoding/json even when the stored projection is already healed.
+func JSONValuesEqual(first, second json.RawMessage) bool {
+	var firstValue, secondValue any
+	if json.Unmarshal(first, &firstValue) != nil || json.Unmarshal(second, &secondValue) != nil {
+		return bytes.Equal(bytes.TrimSpace(first), bytes.TrimSpace(second))
+	}
+	return reflect.DeepEqual(firstValue, secondValue)
+}
 
 // ConversationMemberWithPublicIdentity attaches only fields suitable for
 // disclosure to another conversation member. In particular, account email,
@@ -22,6 +34,7 @@ func ConversationMemberWithPublicIdentity(member domain.ConversationMember, user
 		member.DisplayName = strings.TrimSpace(profile.DisplayName)
 	}
 	member.Username = strings.TrimSpace(profile.Username)
+	member.Bio = strings.TrimSpace(profile.Bio)
 	member.AvatarURL = strings.TrimSpace(user.AvatarURL)
 	if member.AvatarURL == "" {
 		member.AvatarURL = strings.TrimSpace(profile.ProfileImageURL)
@@ -106,17 +119,29 @@ func ProjectConversationMembers(
 		if json.Unmarshal(raw, &object) != nil {
 			continue
 		}
-		backendID, hasBackendID := memberBackendUserID(object)
-		if !hasBackendID {
-			// Contact-only and historical local members cannot authenticate and
-			// therefore cannot affect the relational authorization boundary.
-			projected = append(projected, cloneRaw(raw))
+		backendID, backendIDPresent, backendIDValid := memberBackendUserID(object)
+		if !backendIDPresent {
+			// Contact-only and historical local members cannot authenticate. Keep
+			// only the narrow display projection needed by legacy expense history;
+			// never replay phone, email, image blobs, or arbitrary private fields.
+			if contact, ok := marshalContactOnlyMember(object); ok {
+				projected = append(projected, contact)
+			}
+			continue
+		}
+		// A present backend identity must be one unambiguous UUID. Treating a
+		// malformed or aliased value as contact-only would let stale metadata
+		// bypass the authoritative registered-member projection.
+		if !backendIDValid {
 			continue
 		}
 		member, authorized := authoritative[backendID]
 		if !authorized {
 			if memberIsDeletedTombstone(object) {
-				projected = append(projected, cloneRaw(raw))
+				// Historical financial records need the stable local identifier, not
+				// the deleted person's former PII. Rebuild a minimal server-owned
+				// tombstone instead of trusting the client-supplied object.
+				projected = append(projected, marshalDeletedMember(object, backendID))
 			}
 			continue
 		}
@@ -177,92 +202,180 @@ func compactJSONObject(raw json.RawMessage) json.RawMessage {
 	return result
 }
 
-func memberBackendUserID(object map[string]json.RawMessage) (uuid.UUID, bool) {
+func memberBackendUserID(object map[string]json.RawMessage) (uuid.UUID, bool, bool) {
+	found := false
+	var result uuid.UUID
 	for key, raw := range object {
 		if normalizeJSONKey(key) != "backenduserid" {
 			continue
 		}
+		if found {
+			return uuid.Nil, true, false
+		}
+		found = true
 		var value string
 		if json.Unmarshal(raw, &value) != nil {
-			continue
+			return uuid.Nil, true, false
 		}
 		id, err := uuid.Parse(strings.TrimSpace(value))
-		if err == nil {
-			return id, true
+		if err != nil || id == uuid.Nil {
+			return uuid.Nil, true, false
 		}
+		result = id
 	}
-	return uuid.Nil, false
+	return result, found, found
 }
 
 func memberIsDeletedTombstone(object map[string]json.RawMessage) bool {
+	found := false
+	deleted := false
 	for key, raw := range object {
 		if normalizeJSONKey(key) != "isdeleted" {
 			continue
 		}
-		var deleted bool
-		return json.Unmarshal(raw, &deleted) == nil && deleted
+		if found || json.Unmarshal(raw, &deleted) != nil {
+			return false
+		}
+		found = true
 	}
-	return false
+	return found && deleted
 }
 
 func marshalProjectedMember(
 	existing map[string]json.RawMessage,
 	member domain.ConversationMember,
 ) json.RawMessage {
-	object := make(map[string]json.RawMessage, len(existing)+7)
-	for key, value := range existing {
-		if normalizeJSONKey(key) == "backenduserid" {
-			continue
-		}
-		object[key] = cloneRaw(value)
-	}
+	object := make(map[string]json.RawMessage, 8)
 	setJSON(object, "backendUserId", member.UserID.String())
-	if !hasNonEmptyString(object, "id") {
-		setJSON(object, "id", member.UserID.String())
+	setJSON(object, "id", stableLocalMemberID(existing, member.UserID))
+	name := boundedString(member.DisplayName, 100)
+	if name == "" {
+		name = boundedString(strings.TrimPrefix(strings.TrimSpace(member.Username), "@"), 100)
 	}
-	if !hasNonEmptyString(object, "name") {
-		name := strings.TrimSpace(member.DisplayName)
-		if name == "" {
-			name = strings.TrimPrefix(strings.TrimSpace(member.Username), "@")
-		}
-		if name == "" {
-			name = "Member"
-		}
-		setJSON(object, "name", name)
+	if name == "" {
+		name = "Member"
 	}
-	if !hasNonEmptyString(object, "avatarColor") {
-		color := strings.TrimSpace(member.AvatarColor)
-		if color == "" {
-			color = defaultMemberAvatarColor
-		}
-		setJSON(object, "avatarColor", color)
+	setJSON(object, "name", name)
+	color := normalizedAvatarColor(member.AvatarColor)
+	setJSON(object, "avatarColor", color)
+	setJSON(object, "rosterState", "active")
+	if username := boundedString(member.Username, 31); username != "" {
+		setJSON(object, "username", username)
 	}
-	if !hasNonEmptyString(object, "username") && strings.TrimSpace(member.Username) != "" {
-		setJSON(object, "username", strings.TrimSpace(member.Username))
+	if bio := boundedString(member.Bio, 500); bio != "" {
+		setJSON(object, "bio", bio)
 	}
-	if !hasNonEmptyString(object, "profileImageURL") && strings.TrimSpace(member.AvatarURL) != "" {
-		setJSON(object, "profileImageURL", strings.TrimSpace(member.AvatarURL))
+	if avatarURL := boundedString(member.AvatarURL, 2048); avatarURL != "" {
+		setJSON(object, "profileImageURL", avatarURL)
 	}
 	result, _ := json.Marshal(object)
 	return result
 }
 
-func hasNonEmptyString(object map[string]json.RawMessage, wanted string) bool {
+func marshalContactOnlyMember(existing map[string]json.RawMessage) (json.RawMessage, bool) {
+	localID, present, valid := uniqueStringField(existing, "id")
+	localID, localIDValid := safeLocalMemberID(localID)
+	if !present || !valid || !localIDValid {
+		return nil, false
+	}
+	object := make(map[string]json.RawMessage, 6)
+	setJSON(object, "id", localID)
+	name, _, nameValid := uniqueStringField(existing, "name")
+	name = boundedString(name, 100)
+	if !nameValid || name == "" {
+		name = "Member"
+	}
+	setJSON(object, "name", name)
+	color, _, colorValid := uniqueStringField(existing, "avatarColor")
+	if !colorValid {
+		color = ""
+	}
+	setJSON(object, "avatarColor", normalizedAvatarColor(color))
+	setJSON(object, "rosterState", "pendingContact")
+	if username, present, valid := uniqueStringField(existing, "username"); present && valid {
+		if username = boundedString(username, 31); username != "" {
+			setJSON(object, "username", username)
+		}
+	}
+	if bio, present, valid := uniqueStringField(existing, "bio"); present && valid {
+		if bio = boundedString(bio, 500); bio != "" {
+			setJSON(object, "bio", bio)
+		}
+	}
+	encoded, _ := json.Marshal(object)
+	return encoded, true
+}
+
+func marshalDeletedMember(existing map[string]json.RawMessage, backendID uuid.UUID) json.RawMessage {
+	object := make(map[string]json.RawMessage, 6)
+	setJSON(object, "id", stableLocalMemberID(existing, backendID))
+	setJSON(object, "backendUserId", backendID.String())
+	setJSON(object, "name", DeletedUserDisplayName)
+	setJSON(object, "avatarColor", defaultMemberAvatarColor)
+	setJSON(object, "isDeleted", true)
+	setJSON(object, "rosterState", "inactiveTombstone")
+	encoded, _ := json.Marshal(object)
+	return encoded
+}
+
+func stableLocalMemberID(existing map[string]json.RawMessage, fallback uuid.UUID) string {
+	value, present, valid := uniqueStringField(existing, "id")
+	if present && valid {
+		if value, safe := safeLocalMemberID(value); safe {
+			return value
+		}
+	}
+	return fallback.String()
+}
+
+func safeLocalMemberID(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed == uuid.Nil {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+func uniqueStringField(object map[string]json.RawMessage, wanted string) (string, bool, bool) {
+	found := false
+	value := ""
 	for key, raw := range object {
 		if normalizeJSONKey(key) != normalizeJSONKey(wanted) {
 			continue
 		}
-		var value string
-		return json.Unmarshal(raw, &value) == nil && strings.TrimSpace(value) != ""
+		if found || json.Unmarshal(raw, &value) != nil {
+			return "", true, false
+		}
+		found = true
 	}
-	return false
+	return strings.TrimSpace(value), found, found
+}
+
+func boundedString(value string, maximum int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maximum {
+		return ""
+	}
+	return value
+}
+
+func normalizedAvatarColor(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) != 7 || value[0] != '#' {
+		return defaultMemberAvatarColor
+	}
+	for _, character := range value[1:] {
+		if !((character >= '0' && character <= '9') ||
+			(character >= 'a' && character <= 'f') ||
+			(character >= 'A' && character <= 'F')) {
+			return defaultMemberAvatarColor
+		}
+	}
+	return value
 }
 
 func setJSON(object map[string]json.RawMessage, key string, value any) {
 	encoded, _ := json.Marshal(value)
 	object[key] = encoded
-}
-
-func cloneRaw(raw json.RawMessage) json.RawMessage {
-	return append(json.RawMessage(nil), raw...)
 }

@@ -336,6 +336,13 @@ paths:
             schema:
               type: object
               additionalProperties: false
+              anyOf:
+                - required: [phones]
+                  properties:
+                    phones: {minItems: 1}
+                - required: [usernames]
+                  properties:
+                    usernames: {minItems: 1}
               properties:
                 phones:
                   type: array
@@ -422,6 +429,47 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Conversation"}
+  /conversations/{conversation_id}:
+    get:
+      operationId: getConversation
+      description: Returns 404 both when the conversation does not exist and when the caller is not a member, preventing identifier enumeration.
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "200":
+          description: Conversation visible to the authenticated member
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Conversation"}
+        "404": {description: Conversation absent or not visible to this caller}
+    patch:
+      operationId: updateConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                title: {type: string, maxLength: 200}
+                avatar_url: {type: string, maxLength: 2048}
+                metadata: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Updated conversation; registered member metadata is rebuilt from the authoritative ACL/public identity view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Conversation"}
+    delete:
+      operationId: deleteConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "204": {description: Conversation deleted}
   /conversations/{conversation_id}/members:
     get:
       operationId: listConversationMembers
@@ -963,6 +1011,7 @@ components:
         username: {type: string}
         avatar_url: {type: string}
         avatar_color: {type: string}
+        bio: {type: string}
     ConversationInvite:
       type: object
       additionalProperties: false

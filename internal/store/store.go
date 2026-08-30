@@ -126,6 +126,15 @@ func (l MediaReservationLimits) Validate() error {
 // perform network I/O.
 type MailDeliveryBuilder func(string) (domain.MailDelivery, error)
 
+// PasswordResetCompletion returns the authoritative account identity from the
+// same transaction that changed the password and revoked its sessions. The
+// caller can therefore fence local realtime sockets without a second lookup
+// that could fail after the password mutation has committed.
+type PasswordResetCompletion struct {
+	UserID uuid.UUID
+	Email  string
+}
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -148,7 +157,7 @@ type Store interface {
 	CreatePasswordResetChallengeWithMail(context.Context, domain.PasswordResetChallenge, MailDeliveryBuilder) error
 	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
 	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
-	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (string, error)
+	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (PasswordResetCompletion, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)

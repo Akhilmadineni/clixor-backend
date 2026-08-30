@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
@@ -29,22 +30,25 @@ import (
 )
 
 type Server struct {
-	store             store.Store
-	tokens            *auth.TokenManager
-	bus               events.Bus
-	limiter           ratelimit.Limiter
-	media             media.Service
-	mailQueue         clustrmail.QueueSealer
-	verifier          verification.Service
-	apple             appleauth.Verifier
-	presence          presence.Service
-	logger            *slog.Logger
-	dummyHash         string
-	metricsToken      string
-	trustedProxyCIDRs []netip.Prefix
-	passwordReset     PasswordResetPolicy
-	mediaPolicy       MediaPolicy
-	mediaVerifySlots  chan struct{}
+	store                  store.Store
+	tokens                 *auth.TokenManager
+	bus                    events.Bus
+	limiter                ratelimit.Limiter
+	media                  media.Service
+	mailQueue              clustrmail.QueueSealer
+	verifier               verification.Service
+	apple                  appleauth.Verifier
+	presence               presence.Service
+	logger                 *slog.Logger
+	dummyHash              string
+	metricsToken           string
+	trustedProxyCIDRs      []netip.Prefix
+	passwordReset          PasswordResetPolicy
+	mediaPolicy            MediaPolicy
+	mediaVerifySlots       chan struct{}
+	sessionRevocations     *sessionRevocationCache
+	sessionRevocationsOnce sync.Once
+	realtimeSessionRecheck time.Duration
 }
 
 // buildRevision is replaced with the exact reviewed Git object ID in release
@@ -93,6 +97,10 @@ func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter r
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
 		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset, mediaPolicy: mediaPolicy,
 		mediaVerifySlots: make(chan struct{}, mediaPolicy.VerificationConcurrency),
+		sessionRevocations: newSessionRevocationCache(
+			sessionRevocationCacheCapacity, sessionRevocationCacheRetention, time.Now,
+		),
+		realtimeSessionRecheck: realtimeDurableSessionRecheckInterval,
 	}
 }
 

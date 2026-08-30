@@ -159,7 +159,7 @@ func TestPostgresPasswordChangedMailCascadesWithResetChallenge(t *testing.T) {
 		t.Fatalf("challenge consumed after failed mail transaction: consumed=%v err=%v", consumedAt, err)
 	}
 	changedID := uuid.New()
-	if _, err := persistence.ConsumePasswordResetChallengeWithMail(
+	completion, err := persistence.ConsumePasswordResetChallengeWithMail(
 		ctx, challenge.ID, challenge.CodeHash, "new-hash", 5,
 		func(email string) (domain.MailDelivery, error) {
 			if email != user.Email {
@@ -169,8 +169,12 @@ func TestPostgresPasswordChangedMailCascadesWithResetChallenge(t *testing.T) {
 				changedID, challenge.ID, domain.MailDeliveryPasswordChanged,
 			), nil
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if completion.UserID != user.ID || completion.Email != user.Email {
+		t.Fatalf("reset completion identity=%+v, want user=%s email=%q", completion, user.ID, user.Email)
 	}
 	var changedCount int
 	if err := persistence.pool.QueryRow(ctx, `

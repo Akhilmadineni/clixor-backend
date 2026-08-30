@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -15,21 +16,28 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	memberID := uuid.New()
 	removedID := uuid.New()
 	deletedID := uuid.New()
+	ownerLocalID := uuid.NewString()
+	deletedLocalID := uuid.NewString()
+	pendingLocalID := uuid.NewString()
 	joined := time.Now().UTC()
 	metadata := json.RawMessage(`{
 		"theme":"trip",
 		"members":[
-			{"id":"local-owner-id","backendUserId":"` + ownerID.String() + `","name":"Local owner","avatarColor":"#111111","custom":"keep"},
+			{"id":"` + ownerLocalID + `","backendUserId":"` + ownerID.String() + `","name":"Spoofed owner","email":"private@example.com","phone":"+13125550199","username":"@spoof","avatarColor":"#111111","profileImageData":"private-blob","custom":"drop"},
 			{"id":"duplicate-owner","backendUserId":"` + ownerID.String() + `","name":"Duplicate"},
 			{"id":"removed-local","backendUserId":"` + removedID.String() + `","name":"Removed"},
-			{"id":"deleted-local","backendUserId":"` + deletedID.String() + `","name":"Deleted user","isDeleted":true},
-			{"id":"pending-contact","name":"Pending contact","phone":"+13125550123","avatarColor":"#222222"}
+			{"id":"` + deletedLocalID + `","backendUserId":"` + deletedID.String() + `","name":"Spoofed tombstone","email":"deleted@example.com","phone":"+13125550198","isDeleted":true},
+			{"id":"` + pendingLocalID + `","name":"Pending contact","phone":"+13125550123","avatarColor":"#222222"}
+			,{"id":"` + uuid.NewString() + `","backendUserId":"not-a-uuid","name":"Malformed"}
+			,{"id":"` + uuid.NewString() + `","backendUserId":"` + ownerID.String() + `","backend_user_id":"` + memberID.String() + `","name":"Ambiguous"}
+			,{"id":"contact@example.com","name":"Unsafe local ID"}
 		]
 	}`)
 	projected, err := ProjectConversationMembers(metadata, []domain.ConversationMember{
 		{
 			ConversationID: uuid.New(), UserID: ownerID, Role: "owner", JoinedAt: joined,
 			DisplayName: "Server owner", Username: "@owner", AvatarColor: "#AAAAAA",
+			AvatarURL: "clustr-media://owner", Bio: "public bio",
 		},
 		{
 			ConversationID: uuid.New(), UserID: memberID, Role: "member", JoinedAt: joined.Add(time.Second),
@@ -53,9 +61,11 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	for _, member := range root.Members {
 		byID[member["id"].(string)] = member
 	}
-	owner := byID["local-owner-id"]
-	if owner == nil || owner["custom"] != "keep" || owner["name"] != "Local owner" {
-		t.Fatalf("owner local object was not preserved: %+v", owner)
+	owner := byID[ownerLocalID]
+	if owner == nil || owner["name"] != "Server owner" || owner["username"] != "@owner" ||
+		owner["avatarColor"] != "#AAAAAA" || owner["profileImageURL"] != "clustr-media://owner" ||
+		owner["bio"] != "public bio" || owner["rosterState"] != "active" {
+		t.Fatalf("owner was not rebuilt from authoritative identity: %+v", owner)
 	}
 	if _, duplicate := byID["duplicate-owner"]; duplicate {
 		t.Fatalf("duplicate ACL projection was retained: %+v", root.Members)
@@ -63,13 +73,54 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	if _, removed := byID["removed-local"]; removed {
 		t.Fatalf("removed ACL user remained projected: %+v", root.Members)
 	}
-	if byID["deleted-local"] == nil || byID["pending-contact"] == nil {
+	deleted := byID[deletedLocalID]
+	if deleted == nil || deleted["name"] != DeletedUserDisplayName || deleted["isDeleted"] != true ||
+		byID[pendingLocalID] == nil {
 		t.Fatalf("historical/contact-only members were lost: %+v", root.Members)
+	}
+	if len(deleted) != 6 || deleted["backendUserId"] != deletedID.String() ||
+		deleted["avatarColor"] != defaultMemberAvatarColor ||
+		deleted["rosterState"] != "inactiveTombstone" {
+		t.Fatalf("deleted member was not reduced to a minimal server tombstone: %+v", deleted)
+	}
+	contact := byID[pendingLocalID]
+	if len(contact) != 4 || contact["name"] != "Pending contact" || contact["avatarColor"] != "#222222" ||
+		contact["rosterState"] != "pendingContact" {
+		t.Fatalf("contact-only member was not reduced to the safe display projection: %+v", contact)
 	}
 	synthesized := byID[memberID.String()]
 	if synthesized == nil || synthesized["backendUserId"] != memberID.String() ||
 		synthesized["name"] != "New member" || synthesized["avatarColor"] != "#BBBBBB" {
 		t.Fatalf("missing ACL member was not safely synthesized: %+v", synthesized)
+	}
+	encoded := string(projected)
+	for _, forbidden := range []string{
+		"private@example.com", "+13125550199", "@spoof", "private-blob", "custom",
+		"deleted@example.com", "+13125550198", "+13125550123", "Malformed", "Ambiguous",
+		"contact@example.com", "Unsafe local ID",
+	} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("member projection retained forbidden value %q: %s", forbidden, projected)
+		}
+	}
+	for range 100 {
+		repeated, repeatErr := ProjectConversationMembers(metadata, []domain.ConversationMember{
+			{
+				ConversationID: uuid.New(), UserID: ownerID, Role: "owner", JoinedAt: joined,
+				DisplayName: "Server owner", Username: "@owner", AvatarColor: "#AAAAAA",
+				AvatarURL: "clustr-media://owner", Bio: "public bio",
+			},
+			{
+				ConversationID: uuid.New(), UserID: memberID, Role: "member", JoinedAt: joined.Add(time.Second),
+				DisplayName: "New member", Username: "@member", AvatarColor: "#BBBBBB",
+			},
+		})
+		if repeatErr != nil {
+			t.Fatal(repeatErr)
+		}
+		if !bytes.Equal(repeated, projected) {
+			t.Fatalf("ambiguous identity handling was nondeterministic:\nfirst: %s\nnext:  %s", projected, repeated)
+		}
 	}
 }
 
@@ -101,5 +152,17 @@ func TestPublicUserFromUserNeverLeaksPrivateDirectoryFields(t *testing.T) {
 	}
 	if !strings.Contains(string(phoneResult), user.Phone) || strings.Contains(string(phoneResult), user.Email) {
 		t.Fatalf("exact phone lookup correlation is incorrect: %s", phoneResult)
+	}
+}
+
+func TestJSONValuesEqualIgnoresJSONBWireFormatting(t *testing.T) {
+	if !JSONValuesEqual(
+		json.RawMessage(`{"members":[{"id":"one"}],"theme":"trip"}`),
+		json.RawMessage(`{ "theme": "trip", "members": [ { "id": "one" } ] }`),
+	) {
+		t.Fatal("semantically equal JSON values compared unequal")
+	}
+	if JSONValuesEqual(json.RawMessage(`{"members":[]}`), json.RawMessage(`{"members":[{}]}`)) {
+		t.Fatal("different JSON values compared equal")
 	}
 }
