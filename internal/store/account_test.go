@@ -56,9 +56,8 @@ func TestAnonymizeAccountJSONCoversCreatorAliasesAndIdentityInProse(t *testing.T
 		"actorDisplayName":"Akhil Madineni",
 		"ownerName":"Akhil Madineni",
 		"ownerDisplayName":"Akhil Madineni",
-		"description":"Akhil Madineni (@akhil) paid 42.75; email akhil@example.com or call +13125550177.",
+		"description":"Akhil Madineni / Akhil Madineni (@akhil) paid 42.75; email akhil@example.com or call +13125550177.",
 		"mentions":["@akhil","contact akhil@example.com"],
-		"repeated":"Akhil Madineni / Akhil Madineni",
 		"expenseId":"` + expenseID.String() + `",
 		"amount":42.75,
 		"currency":"USD"
@@ -88,5 +87,39 @@ func TestAnonymizeAccountJSONCoversCreatorAliasesAndIdentityInProse(t *testing.T
 		if !strings.Contains(text, retained) {
 			t.Fatalf("anonymized creator JSON removed required %q: %s", retained, text)
 		}
+	}
+}
+
+func TestAnonymizeAccountJSONDoesNotBlankCommonNameOutsideIdentitySchema(t *testing.T) {
+	userID := uuid.New()
+	settlementID := uuid.New()
+	raw := json.RawMessage(`{
+		"createdBy":"` + userID.String() + `",
+		"creatorDisplayName":"\u0041",
+		"description":"A paid the settlement",
+		"grade":"A",
+		"label":"A",
+		"settlementId":"` + settlementID.String() + `",
+		"amount":18.5
+	}`)
+	anonymized, changed, err := AnonymizeAccountJSON(raw, AccountIdentity{
+		UserID: userID, DisplayName: "A",
+	})
+	if err != nil || !changed {
+		t.Fatalf("changed=%t err=%v", changed, err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(anonymized, &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["creatorDisplayName"] != DeletedUserDisplayName ||
+		value["description"] != "Deleted user paid the settlement" {
+		t.Fatalf("identity fields were not sanitized: %s", anonymized)
+	}
+	if value["grade"] != "A" || value["label"] != "A" {
+		t.Fatalf("common-name collision corrupted unrelated fields: %s", anonymized)
+	}
+	if value["settlementId"] != settlementID.String() || value["amount"] != 18.5 {
+		t.Fatalf("financial history changed: %s", anonymized)
 	}
 }

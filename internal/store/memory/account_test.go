@@ -288,7 +288,7 @@ func TestDeleteAccountDropsSanitizedEntityOutboxAndPreservesUnrelatedEvent(t *te
 	ctx := context.Background()
 	persistence := New()
 	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
-		Email: "outbox-delete@example.com", DisplayName: "Name Only PII",
+		Email: "outbox-delete@example.com", DisplayName: "A",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -305,16 +305,18 @@ func TestDeleteAccountDropsSanitizedEntityOutboxAndPreservesUnrelatedEvent(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	sanitizedID, unrelatedID := uuid.New(), uuid.New()
+	sanitizedID, unrelatedID, settlementID := uuid.New(), uuid.New(), uuid.New()
 	if _, err := persistence.PutEntity(ctx, domain.Entity{
 		ConversationID: conversation.ID, Kind: "note", ID: sanitizedID,
-		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"description":"Name Only PII"}`),
+		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"payer":{"backendUserId":"` +
+			deleted.ID.String() + `","displayName":"\u0041"},"settlementId":"` +
+			settlementID.String() + `","amount":42.75}`),
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := persistence.PutEntity(ctx, domain.Entity{
 		ConversationID: conversation.ID, Kind: "note", ID: unrelatedID,
-		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"description":"keep unrelated"}`),
+		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"description":"A remains unrelated","amount":7}`),
 	}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -329,9 +331,17 @@ func TestDeleteAccountDropsSanitizedEntityOutboxAndPreservesUnrelatedEvent(t *te
 		}
 		if entity.ID == sanitizedID {
 			foundSanitized = true
+			text := string(event.Payload)
+			if strings.Contains(text, `"displayName":"A"`) ||
+				!strings.Contains(text, settlementID.String()) || !strings.Contains(text, `"amount":42.75`) {
+				t.Fatalf("sanitized event lost history or retained escaped name: %s", text)
+			}
 		}
 		if entity.ID == unrelatedID {
 			foundUnrelated = true
+			if !strings.Contains(string(event.Payload), "A remains unrelated") {
+				t.Fatalf("common-name collision corrupted unrelated event: %s", event.Payload)
+			}
 		}
 	}
 	if !foundSanitized {
@@ -340,9 +350,190 @@ func TestDeleteAccountDropsSanitizedEntityOutboxAndPreservesUnrelatedEvent(t *te
 	if !foundUnrelated {
 		t.Fatal("unrelated shared-conversation event was removed")
 	}
+}
+
+func TestDeleteAccountNeverMutatesSharedE2EECiphertextOrEnvelope(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "e2ee-delete@example.com", DisplayName: "A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "e2ee-remaining@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: deleted.ID, Name: "sender", Platform: "ios",
+		IdentityKey: "identity", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID, MemberIDs: []uuid.UUID{deleted.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := "A"
+	envelope := json.RawMessage(`{"wrappedKey":"A","header":{"nonce":"A"}}`)
+	message, _, err := persistence.CreateMessage(ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: conversation.ID,
+		SenderID: deleted.ID, SenderDeviceID: device.ID, ContentType: "ciphertext",
+		Ciphertext: ciphertext, Envelope: envelope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventID int64
+	var before json.RawMessage
 	for _, event := range persistence.outbox {
-		if strings.Contains(strings.ToLower(string(event.Payload)), "name only pii") {
-			t.Fatalf("display-name-only stale event survived: %s", event.Payload)
+		if event.Topic == "message.created" {
+			eventID = event.ID
+			before = append(json.RawMessage(nil), event.Payload...)
 		}
+	}
+	if eventID == 0 {
+		t.Fatal("message outbox event is missing")
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	var after json.RawMessage
+	for _, event := range persistence.outbox {
+		if event.ID == eventID {
+			after = event.Payload
+		}
+	}
+	if string(after) != string(before) {
+		t.Fatalf("E2EE outbox bytes changed during erasure:\nbefore=%s\nafter=%s", before, after)
+	}
+	messages, err := persistence.ListMessages(ctx, store.ListMessagesParams{
+		ConversationID: conversation.ID, UserID: remaining.ID, Limit: 10,
+	})
+	if err != nil || len(messages) != 1 || messages[0].ID != message.ID {
+		t.Fatalf("retained messages=%+v err=%v", messages, err)
+	}
+	if messages[0].Ciphertext != ciphertext || string(messages[0].Envelope) != string(envelope) {
+		t.Fatalf("E2EE message bytes changed: ciphertext=%q envelope=%s", messages[0].Ciphertext, messages[0].Envelope)
+	}
+}
+
+func TestDeleteAccountDropsStaleAffectedVersionAndPreservesSafeCurrentEventAndPush(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "stale-delete@example.com", DisplayName: "A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "stale-remaining@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedDevice, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: deleted.ID, Name: "deleted", Platform: "ios",
+		PushToken: "deleted-token", IdentityKey: "deleted-identity", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remainingDevice, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: remaining.ID, Name: "remaining", Platform: "ios",
+		PushToken: "remaining-token", IdentityKey: "remaining-identity", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID, MemberIDs: []uuid.UUID{deleted.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entityID, settlementID := uuid.New(), uuid.New()
+	entity, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "expense", ID: entityID, CreatedBy: remaining.ID,
+		Payload: json.RawMessage(`{"payer":{"backendUserId":"` + deleted.ID.String() +
+			`","displayName":"\u0041"},"settlementId":"` + settlementID.String() + `","amount":64.25}`),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := entity.Version
+	safePayload := json.RawMessage(`{"label":"A","settlementId":"` + settlementID.String() + `","amount":64.25}`)
+	if _, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "expense", ID: entityID, CreatedBy: remaining.ID,
+		Payload: safePayload,
+	}, &expected); err != nil {
+		t.Fatal(err)
+	}
+	var staleEvent, currentEvent domain.OutboxEvent
+	for _, event := range persistence.outbox {
+		if event.Topic != "entity.updated" {
+			continue
+		}
+		var version domain.Entity
+		if json.Unmarshal(event.Payload, &version) != nil || version.ID != entityID {
+			continue
+		}
+		switch version.Version {
+		case 1:
+			staleEvent = event
+		case 2:
+			currentEvent = event
+		}
+	}
+	if staleEvent.ID == 0 || currentEvent.ID == 0 {
+		t.Fatalf("entity versions missing: stale=%+v current=%+v", staleEvent, currentEvent)
+	}
+	for _, event := range []domain.OutboxEvent{staleEvent, currentEvent} {
+		inserted, err := persistence.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+			OutboxEventID: event.ID, ConversationID: conversation.ID, EntityID: entityID,
+			NotificationID: uuid.NewString(), Title: "generic", Body: "generic", Kind: "activity",
+		}, []uuid.UUID{deleted.ID, remaining.ID})
+		if err != nil || inserted != 2 {
+			t.Fatalf("enqueue event=%d inserted=%d err=%v", event.ID, inserted, err)
+		}
+	}
+	currentBytes := append(json.RawMessage(nil), currentEvent.Payload...)
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	seenCurrent := false
+	for _, event := range persistence.outbox {
+		if event.ID == staleEvent.ID {
+			t.Fatal("stale identity-bearing entity version survived")
+		}
+		if event.ID == currentEvent.ID {
+			seenCurrent = true
+			if string(event.Payload) != string(currentBytes) {
+				t.Fatalf("safe current event changed:\nbefore=%s\nafter=%s", currentBytes, event.Payload)
+			}
+		}
+	}
+	if !seenCurrent {
+		t.Fatal("safe current entity event was removed")
+	}
+	for _, delivery := range persistence.pushDeliveries {
+		if delivery.OutboxEventID == staleEvent.ID || delivery.DeviceID == deletedDevice.ID {
+			t.Fatalf("stale/deleted-recipient push survived: %+v", delivery)
+		}
+		if delivery.OutboxEventID == currentEvent.ID && delivery.DeviceID != remainingDevice.ID {
+			t.Fatalf("unexpected current-event push: %+v", delivery)
+		}
+	}
+	key := conversation.ID.String() + ":expense:" + entityID.String()
+	retained := persistence.entities[key]
+	if string(retained.Payload) != string(safePayload) || !strings.Contains(string(retained.Payload), settlementID.String()) {
+		t.Fatalf("safe financial entity changed: %s", retained.Payload)
 	}
 }

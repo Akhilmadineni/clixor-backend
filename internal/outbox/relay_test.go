@@ -123,25 +123,22 @@ func TestReassignedPushTokenNeverReceivesPreviousAccountMetadata(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim delivery: items=%d error=%v", len(claimed), err)
 	}
+	if claimed[0].Title != genericPushTitle || claimed[0].Body != genericPushBody ||
+		claimed[0].Kind != genericPushKind {
+		t.Fatalf("durable push retained account metadata: %+v", claimed[0])
+	}
 
 	// Simulate account switching after the worker copied the token but before
-	// APNs accepted the request. The old delivery may still race through, so its
-	// visible copy and routing data must be account-agnostic.
+	// APNs accepted the request. The delivery lease re-fetches the device and
+	// must suppress the now-ownerless old delivery entirely.
 	reassigned := fixture.outsiderDevices[0]
 	reassigned.PushToken = claimed[0].PushToken
 	if _, err := fixture.store.UpsertDevice(fixture.ctx, reassigned); err != nil {
 		t.Fatal(err)
 	}
 	fixture.relay.deliverPush(fixture.ctx, claimed[0])
-	if got := fixture.push.callCount(); got != 1 {
-		t.Fatalf("push calls = %d, want 1", got)
-	}
-	call := fixture.push.calls[0]
-	if call.title != genericPushTitle || call.body != genericPushBody {
-		t.Fatalf("reassigned token received account metadata: title=%q body=%q", call.title, call.body)
-	}
-	if len(call.data) != 1 || call.data["type"] != genericPushKind {
-		t.Fatalf("reassigned token received routing metadata: %#v", call.data)
+	if got := fixture.push.callCount(); got != 0 {
+		t.Fatalf("reassigned token received %d stale pushes", got)
 	}
 }
 
@@ -647,6 +644,37 @@ func TestTransientPushRetriesDurablyWithoutRepublishingRealtime(t *testing.T) {
 		if call.notificationID != message.ID.String() {
 			t.Fatalf("retry notification ID = %q, want %s", call.notificationID, message.ID)
 		}
+	}
+}
+
+func TestSuccessfulRealtimeDeliveryIsAcknowledgedAndCannotBeReclaimed(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bus := &countingBus{}
+	fixture.relay.bus = bus
+
+	fixture.relay.flush(fixture.ctx)
+	if got := bus.publishCount.Load(); got != 1 {
+		t.Fatalf("successful realtime publishes=%d, want 1", got)
+	}
+	reclaimed, err := fixture.store.LockRealtimeOutboxBatch(fixture.ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("successful realtime event was reclaimable: %+v", reclaimed)
+	}
+
+	fixture.relay.flush(fixture.ctx)
+	if got := bus.publishCount.Load(); got != 1 {
+		t.Fatalf("acknowledged realtime event was redelivered: publishes=%d", got)
 	}
 }
 

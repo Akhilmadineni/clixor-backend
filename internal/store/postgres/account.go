@@ -11,6 +11,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -27,6 +28,20 @@ type accountConversation struct {
 // non-loginable tombstones where shared messages and financial entities still
 // require their foreign keys.
 func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := s.deleteAccount(ctx, userID)
+		if !isAccountDeletionRetryable(err) || attempt == maxAttempts-1 {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) deleteAccount(ctx context.Context, userID uuid.UUID) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
@@ -38,12 +53,23 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	return tx.Commit(ctx)
 }
 
+func isAccountDeletionRetryable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
 func (s *Store) deleteAccountTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	userID uuid.UUID,
 	beforeMutation store.AccountDeletionFence,
 ) error {
+	// This must be the first lock in every account-erasure transaction. Active
+	// delivery callbacks hold the shared form, so erasure cannot take user or
+	// transport row locks while a callback uses another pooled Store method.
+	if err := lockAccountDeliveryBarrierExclusive(ctx, tx); err != nil {
+		return err
+	}
 	if err := lockMediaQuota(ctx, tx, "user", userID); err != nil {
 		return err
 	}
@@ -249,25 +275,19 @@ func (s *Store) deleteAccountTx(
 		}
 		entityRows.Close()
 		for _, entity := range entities {
-			payload, changed, err := store.AnonymizeAccountJSON(entity.Payload, identity)
+			referencesIdentity, err := store.AccountJSONReferencesIdentity(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if entity.CreatedBy != userID && !referencesIdentity {
+				continue
+			}
+			payload, changed, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity)
 			if err != nil {
 				return err
 			}
 			if !changed {
 				continue
-			}
-			// Remove every queued representation of the entity we are about to
-			// sanitize. Matching the immutable aggregate/kind/id tuple avoids both
-			// retaining an older PII-bearing payload and deleting unrelated events
-			// from the same shared conversation.
-			if _, err := tx.Exec(ctx, `
-				DELETE FROM outbox_events
-				WHERE aggregate_id=$1
-				  AND topic IN ('entity.updated','entity.deleted')
-				  AND payload->>'kind'=$2
-				  AND payload->>'id'=$3`,
-				entity.ConversationID, entity.Kind, entity.ID.String()); err != nil {
-				return err
 			}
 			entity.Payload = payload
 			entity.Version++
@@ -346,6 +366,22 @@ func (s *Store) deleteAccountTx(
 		}
 	}
 
+	// Establish transport-row ownership before clearing device credentials.
+	// Realtime/APNs delivery leases hold row-share locks while their external
+	// callback runs. These exact deletes/updates therefore serialize erasure:
+	// publication first is allowed to finish, while erasure first makes the
+	// later callback re-fetch observe no deliverable row.
+	if err := sanitizeAccountOutbox(
+		ctx, tx, identity, deletedConversationIDs, sharedConversationIDs, updatedEntities,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM push_deliveries
+		WHERE device_id IN (SELECT id FROM devices WHERE user_id=$1)`, userID); err != nil {
+		return err
+	}
+
 	statements := []struct {
 		query string
 		args  []any
@@ -367,21 +403,6 @@ func (s *Store) deleteAccountTx(
 		if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
 			return err
 		}
-	}
-
-	// The outbox is transport state, not an audit log. Remove stale copies of
-	// identity data before enqueueing the sanitized entity updates below.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM outbox_events
-			WHERE aggregate_id=ANY($6)
-			   OR position($1 in payload::text)>0
-			   OR ($2<>'' AND position(lower($2) in lower(payload::text))>0)
-			   OR ($3<>'' AND position($3 in payload::text)>0)
-			   OR ($4<>'' AND position(lower($4) in lower(payload::text))>0)
-			   OR ($5<>'' AND position(lower($5) in lower(payload::text))>0)`,
-		userID.String(), identity.Email, identity.Phone, identity.Username, identity.DisplayName,
-		deletedConversationIDs); err != nil {
-		return err
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -409,6 +430,91 @@ func (s *Store) deleteAccountTx(
 			); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func sanitizeAccountOutbox(
+	ctx context.Context,
+	tx pgx.Tx,
+	identity store.AccountIdentity,
+	deletedConversationIDs, sharedConversationIDs []uuid.UUID,
+	updatedEntities []domain.Entity,
+) error {
+	if len(deletedConversationIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM outbox_events WHERE aggregate_id=ANY($1)`, deletedConversationIDs); err != nil {
+			return err
+		}
+	}
+	if len(sharedConversationIDs) == 0 {
+		return nil
+	}
+	topics := []string{
+		"conversation.created", "entity.updated", "entity.deleted",
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id,topic,payload
+		FROM outbox_events
+		WHERE aggregate_id=ANY($1) AND topic=ANY($2)
+		ORDER BY id
+		FOR UPDATE`, sharedConversationIDs, topics)
+	if err != nil {
+		return err
+	}
+	type affectedEvent struct {
+		id      int64
+		topic   string
+		payload json.RawMessage
+	}
+	var events []affectedEvent
+	for rows.Next() {
+		var event affectedEvent
+		if err := rows.Scan(&event.id, &event.topic, &event.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	affectedEntities := make(map[string]struct{}, len(updatedEntities))
+	for _, entity := range updatedEntities {
+		affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()] = struct{}{}
+	}
+	for _, event := range events {
+		if !store.AccountSanitizableOutboxTopic(event.topic) {
+			return domain.ErrInvalid
+		}
+		authorized, err := store.AccountJSONReferencesIdentity(event.payload, identity)
+		if err == nil && (event.topic == "entity.updated" || event.topic == "entity.deleted") {
+			var entity domain.Entity
+			if json.Unmarshal(event.payload, &entity) == nil {
+				_, entityAffected := affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()]
+				authorized = authorized || entityAffected
+			}
+		}
+		if err == nil && !authorized {
+			continue
+		}
+		_, changed, err := store.AnonymizeAccountJSONWithAuthority(event.payload, identity)
+		if err != nil {
+			// JSONB itself is valid, but a structurally unsupported value must not
+			// retain erased identity in disposable transport state.
+			if _, deleteErr := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); deleteErr != nil {
+				return deleteErr
+			}
+			continue
+		}
+		if !changed {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -25,6 +25,27 @@ type Store struct {
 	pool *pgxpool.Pool
 }
 
+// accountDeliveryBarrierKey is a process-independent transaction advisory
+// lock used as an RW barrier between external delivery callbacks and account
+// erasure. Delivery leases take the shared form before touching transport
+// rows. Account erasure takes the exclusive form before touching any user,
+// conversation, outbox, or push row. This fixed ordering prevents a callback
+// that uses another pooled Store method from forming a row-lock cycle with an
+// erasure transaction.
+const accountDeliveryBarrierKey int64 = 0x436c69786f724552
+
+func lockAccountDeliveryBarrierShared(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock_shared($1)`, accountDeliveryBarrierKey)
+	return err
+}
+
+func lockAccountDeliveryBarrierExclusive(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock($1)`, accountDeliveryBarrierKey)
+	return err
+}
+
 func Open(ctx context.Context, databaseURL string, autoMigrate bool) (*Store, error) {
 	return OpenWithPool(ctx, databaseURL, autoMigrate, 35, 5)
 }
@@ -2819,6 +2840,46 @@ func (s *Store) LockMediaDeleteOutboxBatch(ctx context.Context, limit int) ([]do
 	return s.lockOutboxBatch(ctx, limit, "media.delete")
 }
 
+func (s *Store) DeliverRealtimeOutbox(
+	ctx context.Context,
+	id int64,
+	attempt int,
+	deliver func(context.Context, domain.OutboxEvent) error,
+) error {
+	if id < 1 || attempt < 1 || deliver == nil {
+		return domain.ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockAccountDeliveryBarrierShared(ctx, tx); err != nil {
+		return err
+	}
+	var event domain.OutboxEvent
+	err = tx.QueryRow(ctx, `
+		SELECT id,topic,aggregate_id,payload,created_at,published_at,
+		       available_at,locked_until,attempts
+		FROM outbox_events
+		WHERE id=$1 AND attempts=$2 AND published_at IS NULL
+		  AND topic<>'media.delete' AND locked_until IS NOT NULL
+		FOR SHARE`, id, attempt).Scan(
+		&event.ID, &event.Topic, &event.AggregateID, &event.Payload, &event.CreatedAt,
+		&event.PublishedAt, &event.AvailableAt, &event.LockedUntil, &event.Attempts,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := deliver(ctx, event); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) lockOutboxBatch(
 	ctx context.Context,
 	limit int,
@@ -2894,7 +2955,41 @@ func (s *Store) EnqueuePushDeliveries(
 		delivery.EntityID == uuid.Nil || strings.TrimSpace(delivery.NotificationID) == "" {
 		return 0, domain.ErrInvalid
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	// Account deletion locks the user row FOR UPDATE before it removes device
+	// deliveries. Holding these live-recipient rows FOR SHARE makes creation of
+	// new delivery rows use the same serialization point: enqueue first is
+	// purged by deletion, while deletion first makes the recipient ineligible.
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM users
+		WHERE id=ANY($1) AND deleted_at IS NULL
+		ORDER BY id
+		FOR SHARE`, recipientIDs)
+	if err != nil {
+		return 0, err
+	}
+	var liveRecipientIDs []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		liveRecipientIDs = append(liveRecipientIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if len(liveRecipientIDs) == 0 {
+		return 0, tx.Commit(ctx)
+	}
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO push_deliveries(
 			outbox_event_id,device_id,title,body,kind,conversation_id,entity_id,notification_id
 		)
@@ -2905,9 +3000,12 @@ func (s *Store) EnqueuePushDeliveries(
 		  AND device.push_token<>''
 		ON CONFLICT(outbox_event_id,device_id) DO NOTHING`,
 		delivery.OutboxEventID, delivery.Title, delivery.Body, delivery.Kind,
-		delivery.ConversationID, delivery.EntityID, delivery.NotificationID, recipientIDs)
+		delivery.ConversationID, delivery.EntityID, delivery.NotificationID, liveRecipientIDs)
 	if err != nil {
 		return 0, mapError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
 	}
 	return int(tag.RowsAffected()), nil
 }
@@ -2969,6 +3067,56 @@ func (s *Store) LockPushDeliveryBatch(
 		deliveries = append(deliveries, delivery)
 	}
 	return deliveries, rows.Err()
+}
+
+func (s *Store) WithPushDeliveryLease(
+	ctx context.Context,
+	id int64,
+	leaseToken uuid.UUID,
+	deliver func(context.Context, domain.PushDelivery) error,
+) error {
+	if id < 1 || leaseToken == uuid.Nil || deliver == nil {
+		return domain.ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockAccountDeliveryBarrierShared(ctx, tx); err != nil {
+		return err
+	}
+	var delivery domain.PushDelivery
+	err = tx.QueryRow(ctx, `
+		SELECT delivery.id,delivery.outbox_event_id,delivery.device_id,
+		       device.user_id,COALESCE(device.push_token,''),
+		       delivery.title,delivery.body,delivery.kind,delivery.conversation_id,
+		       delivery.entity_id,delivery.notification_id,delivery.status,
+		       delivery.attempts,delivery.next_attempt_at,delivery.lease_token,
+		       delivery.locked_until,delivery.created_at,delivery.delivered_at,
+		       delivery.dead_lettered_at,delivery.last_error_class
+		FROM push_deliveries AS delivery
+		JOIN devices AS device ON device.id=delivery.device_id
+		WHERE delivery.id=$1 AND delivery.status='pending' AND delivery.lease_token=$2
+		FOR SHARE OF delivery`, id, leaseToken).Scan(
+		&delivery.ID, &delivery.OutboxEventID, &delivery.DeviceID,
+		&delivery.UserID, &delivery.PushToken, &delivery.Title, &delivery.Body,
+		&delivery.Kind, &delivery.ConversationID, &delivery.EntityID,
+		&delivery.NotificationID, &delivery.Status, &delivery.Attempts,
+		&delivery.NextAttemptAt, &delivery.LeaseToken, &delivery.LockedUntil,
+		&delivery.CreatedAt, &delivery.DeliveredAt, &delivery.DeadLetteredAt,
+		&delivery.LastErrorClass,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := deliver(ctx, delivery); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) FinishPushDelivery(
