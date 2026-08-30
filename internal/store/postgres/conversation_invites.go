@@ -181,6 +181,9 @@ func (s *Store) AcceptConversationInvite(ctx context.Context, tokenHash []byte, 
 	if memberCount >= 1024 {
 		return domain.ConversationInviteAcceptance{}, domain.ErrInvalid
 	}
+	if err := validateConversationMemberAdmission(ctx, tx, invite.ConversationID, userID); err != nil {
+		return domain.ConversationInviteAcceptance{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
 		VALUES($1,$2,'member',$3)`, invite.ConversationID, userID, now); err != nil {

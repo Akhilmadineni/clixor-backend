@@ -43,6 +43,34 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	}
 }
 
+func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000018_conversation_member_identity_namespace.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)",
+		"FROM conversation_member_tombstones tombstone",
+		"mapping.local_id<>tombstone.local_id",
+		"reserved.local_id=active.user_id",
+		"PERFORM id FROM conversations WHERE id=NEW.conversation_id FOR UPDATE",
+		"conversation_member_backend_local_disjoint",
+		"BEFORE INSERT ON conversation_members",
+		"BEFORE INSERT ON conversation_member_local_ids",
+		"conversation member local IDs are immutable",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("identity-namespace migration is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"UPDATE conversation_member_local_ids SET", "ON CONFLICT DO UPDATE"} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("identity-namespace migration can remap immutable history via %q", forbidden)
+		}
+	}
+}
+
 func TestImmutableMediaPublicationMigrationIsRollingCompatible(t *testing.T) {
 	raw, err := migrationFiles.ReadFile("migrations/000014_media_immutable_publication.sql")
 	if err != nil {

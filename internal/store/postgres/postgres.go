@@ -1013,6 +1013,9 @@ func ensureConversationMemberLocalIDs(
 	if err != nil {
 		return nil, err
 	}
+	if err := store.ValidateConversationMemberLocalIDNamespace(members, all); err != nil {
+		return nil, err
+	}
 	wanted := make(map[uuid.UUID]struct{}, len(members))
 	for _, member := range members {
 		wanted[member.UserID] = struct{}{}
@@ -1027,6 +1030,41 @@ func ensureConversationMemberLocalIDs(
 		return nil, fmt.Errorf("conversation member local-ID mapping incomplete")
 	}
 	return filtered, nil
+}
+
+// validateConversationMemberAdmission runs while the conversation row is
+// locked. It protects both collision directions before membership mutation:
+// the joining backend UUID cannot be another identity's reserved local UUID,
+// and the joiner's immutable local UUID cannot already be an active backend
+// identity. Historical mappings remain reserved after removal.
+func validateConversationMemberAdmission(ctx context.Context, query interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}, conversationID, userID uuid.UUID) error {
+	var collision bool
+	err := query.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM conversation_member_local_ids reserved
+			WHERE reserved.conversation_id=$1
+			  AND reserved.local_id=$2
+			  AND reserved.user_id<>$2
+			UNION ALL
+			SELECT 1
+			FROM conversation_member_local_ids own
+			JOIN conversation_members active
+			  ON active.conversation_id=own.conversation_id
+			 AND active.user_id=own.local_id
+			WHERE own.conversation_id=$1
+			  AND own.user_id=$2
+			  AND active.user_id<>own.user_id
+		)`, conversationID, userID).Scan(&collision)
+	if err != nil {
+		return err
+	}
+	if collision {
+		return domain.ErrConflict
+	}
+	return nil
 }
 
 func (s *Store) ConversationMemberIDs(ctx context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -1091,6 +1129,9 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 		if memberCount >= 1024 {
 			return domain.ErrInvalid
 		}
+	}
+	if err := validateConversationMemberAdmission(ctx, tx, conversationID, userID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
@@ -1203,6 +1244,9 @@ func (s *Store) ClaimConversationInvites(ctx context.Context, userID uuid.UUID, 
 			FOR UPDATE`, conversationID, phone).Scan(&inviteStillPending); errors.Is(err, pgx.ErrNoRows) {
 			continue
 		} else if err != nil {
+			return nil, err
+		}
+		if err := validateConversationMemberAdmission(ctx, tx, conversationID, userID); err != nil {
 			return nil, err
 		}
 		tag, err := tx.Exec(ctx, `
@@ -3030,6 +3074,9 @@ func mapError(err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
+		if pgErr.ConstraintName == "conversation_member_backend_local_disjoint" {
+			return domain.ErrConflict
+		}
 		switch pgErr.Code {
 		case "23505":
 			return domain.ErrConflict

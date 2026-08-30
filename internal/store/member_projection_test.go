@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -155,6 +156,42 @@ func TestConversationMemberLocalIDsRejectCollisionsAndRemainImmutable(t *testing
 	}
 	if !bytes.Contains(projected, []byte(firstStable.String())) {
 		t.Fatalf("projection did not use server-owned mapping: %s", projected)
+	}
+}
+
+func TestConversationMemberLocalIDNamespaceReservesInactiveHistory(t *testing.T) {
+	conversationID := uuid.New()
+	first, future := uuid.New(), uuid.New()
+	mappings := []ConversationMemberLocalID{{UserID: first, LocalID: future}}
+	if err := ValidateConversationMemberLocalIDNamespace([]domain.ConversationMember{
+		{ConversationID: conversationID, UserID: first},
+	}, mappings); err != nil {
+		t.Fatalf("inactive future backend UUID should remain a valid local reservation: %v", err)
+	}
+	if err := ValidateConversationMemberLocalIDNamespace([]domain.ConversationMember{
+		{ConversationID: conversationID, UserID: first},
+		{ConversationID: conversationID, UserID: future},
+	}, append(mappings, ConversationMemberLocalID{UserID: future, LocalID: uuid.New()})); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("future member collision returned %v, want conflict", err)
+	}
+	if err := ValidateEntityParticipants(
+		"expense",
+		json.RawMessage(`{"paidBy":"`+future.String()+`","splitBetween":["`+future.String()+`"]}`),
+		nil,
+		[]domain.ConversationMember{{ConversationID: conversationID, UserID: first}},
+		mappings...,
+	); err != nil {
+		t.Fatalf("reserved local ID no longer identified its sole active owner: %v", err)
+	}
+	inactive := uuid.New()
+	if err := ValidateConversationMemberLocalIDNamespace(
+		[]domain.ConversationMember{{ConversationID: conversationID, UserID: first}},
+		[]ConversationMemberLocalID{
+			{UserID: first, LocalID: uuid.New()},
+			{UserID: inactive, LocalID: first},
+		},
+	); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("active backend collision with inactive historical local ID returned %v, want conflict", err)
 	}
 }
 

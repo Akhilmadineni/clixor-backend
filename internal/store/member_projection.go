@@ -98,6 +98,49 @@ type ConversationMemberLocalID struct {
 	LocalID uuid.UUID
 }
 
+// ValidateConversationMemberLocalIDNamespace enforces that the two accepted
+// financial-participant namespaces cannot describe different people. A local
+// ID remains reserved even while its owner is inactive, so admitting a future
+// member whose backend UUID equals that reservation must fail rather than make
+// historical expense payloads ambiguous.
+func ValidateConversationMemberLocalIDNamespace(
+	members []domain.ConversationMember,
+	mappings []ConversationMemberLocalID,
+) error {
+	active := make(map[uuid.UUID]struct{}, len(members))
+	for _, member := range members {
+		if member.UserID == uuid.Nil {
+			return domain.ErrConflict
+		}
+		active[member.UserID] = struct{}{}
+	}
+
+	localOwner := make(map[uuid.UUID]uuid.UUID, len(mappings))
+	localByUser := make(map[uuid.UUID]uuid.UUID, len(mappings))
+	for _, mapping := range mappings {
+		if mapping.UserID == uuid.Nil || mapping.LocalID == uuid.Nil {
+			return domain.ErrConflict
+		}
+		if prior, exists := localByUser[mapping.UserID]; exists && prior != mapping.LocalID {
+			return domain.ErrConflict
+		}
+		if owner, exists := localOwner[mapping.LocalID]; exists && owner != mapping.UserID {
+			return domain.ErrConflict
+		}
+		localByUser[mapping.UserID] = mapping.LocalID
+		localOwner[mapping.LocalID] = mapping.UserID
+	}
+	for userID := range active {
+		if _, mapped := localByUser[userID]; !mapped {
+			return domain.ErrConflict
+		}
+		if owner, reserved := localOwner[userID]; reserved && owner != userID {
+			return domain.ErrConflict
+		}
+	}
+	return nil
+}
+
 // DeriveConversationMemberLocalIDs fills missing mappings deterministically.
 // Existing mappings always win. A metadata proposal is accepted only when the
 // backend identity is unambiguous, its local UUID is unique, and it cannot
