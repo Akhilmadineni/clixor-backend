@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: clixor-backend-oci-production-deploy
@@ -25,25 +26,28 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, clixor-oci-production]
     timeout-minutes: 90
     steps:
-      - name: Check out the CI-approved revision
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          clean: true
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Deploy the approved revision
+      - name: Deploy the CI-approved revision from root-owned source
         env:
           DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
-          DEPLOY_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: >-
-          sudo -n /usr/local/sbin/clixor-actions-deploy
-          "$GITHUB_WORKSPACE" "$DEPLOY_SHA" "$DEPLOY_RUN_ID"
-
-      - name: Verify public OCI ingress
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          DEPLOY_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          curl --fail --show-error --silent --retry 12 --retry-all-errors --retry-delay 5 --max-time 10 \
-            https://clustr-api.atlanteanz.com/health/ready >/dev/null
-          curl --fail --show-error --silent --retry 6 --retry-all-errors --retry-delay 5 --max-time 10 \
-            https://clixor.atlanteanz.com/.well-known/apple-app-site-association >/dev/null
+          set -euo pipefail
+          umask 077
+          approval_audience="clixor-oci-production:${DEPLOY_SHA}:${SOURCE_RUN_ID}:${DEPLOY_RUN_ID}:${DEPLOY_RUN_ATTEMPT}"
+          response_file="${RUNNER_TEMP}/clixor-oidc-response-${DEPLOY_RUN_ID}-${DEPLOY_RUN_ATTEMPT}.json"
+          token_file="${RUNNER_TEMP}/clixor-oidc-token-${DEPLOY_RUN_ID}-${DEPLOY_RUN_ATTEMPT}"
+          cleanup() {
+            rm -f -- "${response_file}" "${token_file}"
+          }
+          trap cleanup EXIT
+          curl --fail --silent --show-error --max-time 15 \
+            --header "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${approval_audience}" \
+            --output "${response_file}"
+          python3 -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")).get("value"); print(value) if isinstance(value,str) and value else sys.exit("missing OIDC token")' \
+            "${response_file}" > "${token_file}"
+          sudo -n /usr/local/sbin/clixor-actions-deploy \
+            "${DEPLOY_SHA}" "${SOURCE_RUN_ID}" "${DEPLOY_RUN_ID}" "${DEPLOY_RUN_ATTEMPT}" \
+            < "${token_file}"

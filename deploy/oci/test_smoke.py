@@ -280,9 +280,20 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("clixor-oci-production", deploy_workflow)
         self.assertIn("cancel-in-progress: false", deploy_workflow)
         self.assertIn("timeout-minutes: 90", deploy_workflow)
+        self.assertIn("id-token: write", deploy_workflow)
+        self.assertIn("ACTIONS_ID_TOKEN_REQUEST_URL", deploy_workflow)
+        self.assertNotIn("actions/checkout@", deploy_workflow)
         self.assertIn('[ "${#source_sha}" -eq 40 ]', wrapper)
-        self.assertIn('[ "${actual_sha}" = "${source_sha}" ]', wrapper)
-        self.assertIn("status --porcelain --untracked-files=all", wrapper)
+        self.assertIn("/usr/local/libexec/clixor/verify-github-deploy", wrapper)
+        self.assertIn("https://github.com/Akhilmadineni/clixor-backend.git", wrapper)
+        self.assertIn("refs/remotes/origin/main", wrapper)
+        self.assertIn('[ "${trusted_main}" = "${source_sha}" ]', wrapper)
+        self.assertIn("archive", wrapper)
+        self.assertIn("approved_source", wrapper)
+        self.assertIn('/usr/bin/env -i PATH="${PATH}" HOME="${HOME}"', wrapper)
+        self.assertIn("trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true", wrapper)
+        self.assertNotIn("GITHUB_WORKSPACE", wrapper)
+        self.assertNotIn("canonical_source_root", wrapper)
         self.assertIn("CLUSTER_ENV=production", wrapper)
         self.assertIn("CLUSTER_VERIFICATION_PROVIDER=telnyx", wrapper)
         self.assertIn("CLUSTER_MAIL_PROVIDER=smtp", wrapper)
@@ -525,7 +536,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         fresh_gate = deploy.index(
             'backup_gate_start="${release_dir}/post-migration-backup-gate-start"'
         )
-        restart_backup = deploy.index("docker restart clixor-oci-postgres-backup")
+        restart_backup = deploy.index("--force-recreate postgres-backup")
         newer_proof = deploy.index('-newer "${backup_gate_start}"')
         offsite_gate = deploy.index("systemctl start clixor-offsite-backup.service")
         health_enable = deploy.index(
@@ -548,6 +559,39 @@ class ReleaseHardeningTests(unittest.TestCase):
             'if [ ! -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]',
             deploy,
         )
+
+    def test_runtime_config_consumers_reload_and_public_smoke_is_transactional(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        for service in ("dependency-tls", "api-gateway", "postgres-backup"):
+            with self.subTest(service=service):
+                self.assertRegex(
+                    deploy,
+                    rf"--force-recreate\s+{re.escape(service)}",
+                )
+        self.assertIn("prometheus_was_running", deploy)
+        self.assertIn("grafana_was_running", deploy)
+        self.assertIn('previous_runtime_root="${release_dir}/previous-runtime"', deploy)
+        capture = deploy.index("for runtime_config in")
+        restore = deploy.index(
+            '"${previous_runtime_root}/api-gateway/nginx.conf"'
+        )
+        rollback_reconcile = deploy.index(
+            'log "ERROR: rollback configuration consumers did not restart"'
+        )
+        self.assertLess(capture, restore)
+        self.assertLess(restore, rollback_reconcile)
+        public_smoke = deploy.index("verify_public_ingress\n")
+        release_pointer = deploy.index('mv -Tf "${release_dir}/current-link.pending"')
+        rollback_disarm = deploy.rindex("rollback_needed=0")
+        self.assertLess(public_smoke, release_pointer)
+        self.assertLess(public_smoke, rollback_disarm)
+
+        workflow = (
+            self.oci_root.parent.parent / ".github" / "workflows" / "deploy-oci.yml"
+        ).read_text(encoding="utf-8")
+        wrapper = (self.oci_root / "actions-deploy.sh").read_text(encoding="utf-8")
+        self.assertIn("CLIXOR_REQUIRE_PUBLIC_SMOKE=true", wrapper)
+        self.assertNotIn("Verify public OCI ingress", workflow)
 
 
 class BackupManifestTests(unittest.TestCase):

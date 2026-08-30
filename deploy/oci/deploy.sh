@@ -18,6 +18,9 @@ compose_file="${stable_root}/deploy/oci/compose.yaml"
 pki_desired="${project_root}/runtime/dependency-pki.desired"
 pki_applied="${project_root}/runtime/dependency-pki.applied"
 gateway_readiness_url=http://172.30.254.2:8080/health/ready
+public_api_readiness_url=https://clustr-api.atlanteanz.com/health/ready
+public_association_url=https://clixor.atlanteanz.com/.well-known/apple-app-site-association
+public_smoke_mode=${CLIXOR_REQUIRE_PUBLIC_SMOKE:-auto}
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -29,6 +32,22 @@ log() {
 fail() {
   log "ERROR: $*" >&2
   exit 1
+}
+
+case "${public_smoke_mode}" in
+  auto|true|false) ;;
+  *) fail "CLIXOR_REQUIRE_PUBLIC_SMOKE must be auto, true, or false" ;;
+esac
+public_smoke_required=false
+[ "${public_smoke_mode}" = "true" ] && public_smoke_required=true
+
+verify_public_ingress() {
+  log "verifying public Cloudflare ingress before release finalization"
+  curl --fail --silent --show-error --retry 12 --retry-all-errors \
+    --retry-delay 5 --max-time 10 "${public_api_readiness_url}" >/dev/null
+  curl --fail --silent --show-error --retry 6 --retry-all-errors \
+    --retry-delay 5 --max-time 10 --header 'Cache-Control: no-cache' \
+    "${public_association_url}" >/dev/null
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
@@ -46,7 +65,7 @@ case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
 
-for command_name in cmp curl docker find flock python3 rsync sha256sum systemctl touch; do
+for command_name in cmp curl docker find flock install python3 rsync sha256sum systemctl touch; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
@@ -60,12 +79,16 @@ flock -n 9 || fail "another deployment holds ${lock_file}"
 # so changing files alone is insufficient: affected containers must be replaced
 # once to remove API/provider credentials from docker inspect.
 legacy_dependency_scope=false
-legacy_backup_scope=false
 legacy_grafana_scope=false
-legacy_grafana_running=false
+prometheus_was_running=false
+grafana_was_running=false
+[ "$(docker inspect clixor-oci-prometheus --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] && \
+  prometheus_was_running=true
+[ "$(docker inspect clixor-oci-grafana --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] && \
+  grafana_was_running=true
 for container_name in \
   clixor-oci-postgres clixor-oci-redis clixor-oci-nats \
-  clixor-oci-postgres-backup clixor-oci-grafana
+  clixor-oci-grafana
 do
   if docker inspect "${container_name}" \
     --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
@@ -74,14 +97,8 @@ do
       clixor-oci-postgres|clixor-oci-redis|clixor-oci-nats)
         legacy_dependency_scope=true
         ;;
-      clixor-oci-postgres-backup)
-        legacy_backup_scope=true
-        ;;
       clixor-oci-grafana)
         legacy_grafana_scope=true
-        if [ "$(docker inspect "${container_name}" --format '{{.State.Running}}')" = "true" ]; then
-          legacy_grafana_running=true
-        fi
         ;;
     esac
   fi
@@ -92,6 +109,7 @@ release_dir="${release_root}/${release_tag}"
 previous_compose="${release_dir}/previous-compose.yaml"
 rollback_compose="${previous_compose}"
 scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
+previous_runtime_root="${release_dir}/previous-runtime"
 pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
@@ -158,6 +176,37 @@ else
   cp "${source_root}/deploy/oci/compose.yaml" "${scoped_rollback_compose}"
   [ -s "${scoped_rollback_compose}" ] || \
     fail "scoped rollback Compose model is empty"
+
+  # Ordinary bind-mounted file contents are outside Compose's state model. Keep
+  # the exact active copies so a public-smoke or later gate failure can restore
+  # both the prior image and the configuration processes parsed at startup.
+  install -d -m 0700 -o 0 -g 0 \
+    "${previous_runtime_root}/dependency-tls" \
+    "${previous_runtime_root}/api-gateway" \
+    "${previous_runtime_root}/postgres-backup"
+  for runtime_config in \
+    dependency-tls/haproxy.cfg \
+    api-gateway/nginx.conf \
+    postgres-backup/backup.sh
+  do
+    [ -s "${project_root}/runtime/${runtime_config}" ] || \
+      fail "active runtime configuration is missing: ${runtime_config}"
+    install -m 0600 -o 0 -g 0 \
+      "${project_root}/runtime/${runtime_config}" \
+      "${previous_runtime_root}/${runtime_config}"
+  done
+  if [ "${prometheus_was_running}" = "true" ]; then
+    install -d -m 0700 -o 0 -g 0 "${previous_runtime_root}/prometheus"
+    install -m 0600 -o 0 -g 0 \
+      "${project_root}/runtime/prometheus/prometheus.yml" \
+      "${previous_runtime_root}/prometheus/prometheus.yml"
+  fi
+  if [ "${grafana_was_running}" = "true" ]; then
+    install -d -m 0700 -o 0 -g 0 "${previous_runtime_root}/grafana"
+    install -m 0600 -o 0 -g 0 \
+      "${project_root}/runtime/grafana/datasource.yml" \
+      "${previous_runtime_root}/grafana/datasource.yml"
+  fi
 fi
 printf '%s\n' "${source_sha}" > "${release_dir}/source-sha"
 if [ "${first_deploy}" = "true" ]; then
@@ -200,6 +249,36 @@ rollback() {
         log "ERROR: rollback Compose model is unavailable" >&2
         rollback_failed=1
       fi
+      if [ "${rollback_failed}" -eq 0 ]; then
+        if ! install -m 0400 -o 99 -g 99 \
+          "${previous_runtime_root}/dependency-tls/haproxy.cfg" \
+          "${project_root}/runtime/dependency-tls/haproxy.cfg" || \
+          ! install -m 0400 -o 101 -g 101 \
+          "${previous_runtime_root}/api-gateway/nginx.conf" \
+          "${project_root}/runtime/api-gateway/nginx.conf" || \
+          ! install -m 0500 -o 0 -g 0 \
+          "${previous_runtime_root}/postgres-backup/backup.sh" \
+          "${project_root}/runtime/postgres-backup/backup.sh"; then
+          log "ERROR: could not restore prior runtime configuration" >&2
+          rollback_failed=1
+        fi
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${prometheus_was_running}" = "true" ] && \
+        ! install -m 0400 -o 65534 -g 65534 \
+          "${previous_runtime_root}/prometheus/prometheus.yml" \
+          "${project_root}/runtime/prometheus/prometheus.yml"; then
+        log "ERROR: could not restore prior Prometheus configuration" >&2
+        rollback_failed=1
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${grafana_was_running}" = "true" ] && \
+        ! install -m 0400 -o 472 -g 472 \
+          "${previous_runtime_root}/grafana/datasource.yml" \
+          "${project_root}/runtime/grafana/datasource.yml"; then
+        log "ERROR: could not restore prior Grafana configuration" >&2
+        rollback_failed=1
+      fi
       previous_tag=${previous_image#clixor-api:}
       if [ "${rollback_failed}" -eq 0 ]; then
         if ! cp "${selected_rollback_compose}" "${compose_file}" || \
@@ -212,6 +291,29 @@ rollback() {
         ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
           --file "${compose_file}" up -d --no-build --remove-orphans; then
         log "ERROR: rollback Compose reconciliation failed" >&2
+        rollback_failed=1
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
+          --file "${compose_file}" up -d --no-build --no-deps --force-recreate \
+          dependency-tls api-gateway postgres-backup; then
+        log "ERROR: rollback configuration consumers did not restart" >&2
+        rollback_failed=1
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${prometheus_was_running}" = "true" ] && \
+        ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
+          --file "${compose_file}" --profile observability up -d --no-build \
+          --no-deps --force-recreate prometheus; then
+        log "ERROR: rollback Prometheus did not restart" >&2
+        rollback_failed=1
+      fi
+      if [ "${rollback_failed}" -eq 0 ] && \
+        [ "${grafana_was_running}" = "true" ] && \
+        ! CLIXOR_IMAGE_TAG="${previous_tag}" docker compose \
+          --file "${compose_file}" --profile observability up -d --no-build \
+          --no-deps --force-recreate grafana; then
+        log "ERROR: rollback Grafana did not restart" >&2
         rollback_failed=1
       fi
 
@@ -312,6 +414,10 @@ do
   grep -Eq "^${required_key}=.+" "${api_env}" || \
     fail "runtime configuration is missing ${required_key}"
 done
+if [ "${public_smoke_mode}" = "auto" ] && \
+  grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
+  public_smoke_required=true
+fi
 [ -s "${pki_desired}" ] || fail "desired dependency PKI state is missing"
 install -m 0600 -o 0 -g 0 "${pki_desired}" \
   "${release_dir}/dependency-pki.desired"
@@ -370,18 +476,12 @@ for dependency_container in clixor-oci-postgres clixor-oci-redis clixor-oci-nats
   done
 done
 
-recreate_dependency_tls=${legacy_dependency_scope}
-case " ${pki_restart_services} " in
-  *" dependency-tls "*) recreate_dependency_tls=true ;;
-esac
-if [ "${recreate_dependency_tls}" = "true" ]; then
-  log "recreating dependency-tls for scoped secrets or its new Redis TLS leaf"
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-    up -d --no-build --no-deps --force-recreate dependency-tls
-else
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-    up -d --no-build --no-deps dependency-tls
-fi
+# HAProxy reads both its mounted configuration and certificate only at process
+# start. Compose tracks the bind path, not file contents, so every release must
+# replace this small stateless proxy even when the leaf digest is unchanged.
+log "recreating dependency-tls to apply its reviewed configuration and Redis TLS leaf"
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  up -d --no-build --no-deps --force-recreate dependency-tls
 
 attempt=1
 while :; do
@@ -414,21 +514,26 @@ CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d 
 CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" up -d --no-build \
   --remove-orphans
 
-if [ "${legacy_backup_scope}" = "true" ]; then
-  log "replacing legacy backup container to remove inherited API credentials"
+# Nginx, Prometheus, and Grafana read their bind-mounted configuration only at
+# process start. Preserve the operator's observability run/stop state while
+# guaranteeing that every running consumer uses this exact release's files.
+log "recreating api-gateway to apply the reviewed ingress configuration"
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  up -d --no-build --no-deps --force-recreate api-gateway
+if [ "${prometheus_was_running}" = "true" ]; then
+  log "recreating running Prometheus to apply the reviewed scrape configuration"
   CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-    up -d --no-build --no-deps --force-recreate postgres-backup
+    --profile observability up -d --no-build --no-deps --force-recreate prometheus
 fi
-if [ "${legacy_grafana_scope}" = "true" ]; then
-  if [ "${legacy_grafana_running}" = "true" ]; then
-    log "replacing legacy Grafana container to remove inherited API credentials"
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-      --profile observability up -d --no-build --no-deps --force-recreate grafana
-  else
-    # The persistent Grafana data directory is untouched; only the stopped
-    # immutable container configuration containing old secrets is removed.
-    docker rm clixor-oci-grafana >/dev/null
-  fi
+if [ "${grafana_was_running}" = "true" ]; then
+  log "recreating running Grafana to apply its reviewed provisioning configuration"
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    --profile observability up -d --no-build --no-deps --force-recreate grafana
+elif [ "${legacy_grafana_scope}" = "true" ] && \
+  docker inspect clixor-oci-grafana >/dev/null 2>&1; then
+  # The persistent Grafana data directory is untouched; only the stopped
+  # immutable container configuration containing old secrets is removed.
+  docker rm clixor-oci-grafana >/dev/null
 fi
 
 attempt=1
@@ -449,15 +554,23 @@ for replica in api-a api-b; do
     "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the gateway"
 done
 log "both API replicas completed native OCI media-provider startup and readiness"
+if [ "${public_smoke_required}" = "true" ]; then
+  verify_public_ingress
+else
+  log "public ingress smoke is deferred for this non-production staging deployment"
+fi
 
 log "forcing a fresh post-migration backup for the isolated restore release gate"
 backup_gate_start="${release_dir}/post-migration-backup-gate-start"
 touch "${backup_gate_start}"
 # The long-running backup worker creates a dump immediately at startup. Restart
 # it after the gate timestamp so a pre-migration LAST_SUCCESS can never satisfy
-# this release, even when the application schema did not change.
+# this release, even when the application schema did not change. Force-recreate
+# also makes the long-running shell consume this release's mounted backup script
+# and removes any credentials retained by the retired all-secrets container.
 sleep 1
-docker restart clixor-oci-postgres-backup >/dev/null
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  up -d --no-build --no-deps --force-recreate postgres-backup
 backup_attempt=1
 while :; do
   if [ -s "${project_root}/backups/postgres/LAST_SUCCESS" ] && \

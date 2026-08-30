@@ -131,18 +131,23 @@ The deploy script:
 4. arms application rollback before refreshing runtime configuration,
    synchronizing source, or reconciling containers;
 5. refreshes the independent dependency TLS leaves, synchronizes that exact
-   source to `/srv/clixor/repo`, and restarts only dependencies that need a new
-   image, scoped secret boundary, or certificate before health-checking them;
+   source to `/srv/clixor/repo`, and restarts dependencies that need a new image,
+   scoped secret boundary, or certificate; the small HAProxy TLS edge is always
+   replaced because it reads its bind-mounted configuration only at startup;
 6. runs the one-shot migration command;
 7. starts both API replicas and the internal gateway;
-8. requires gateway and per-replica readiness;
-9. creates and uploads a fresh post-migration backup, restores it into an
-   isolated PostgreSQL container, and runs integrity checks; and
-10. records the dependency PKI state and atomically advances the current-release
+8. force-replaces the gateway and every running observability configuration
+   consumer, then requires gateway and per-replica readiness;
+9. for production, verifies both public Cloudflare hostnames while rollback is
+   still armed;
+10. creates and uploads a fresh post-migration backup, restores it into an
+    isolated PostgreSQL container, and runs integrity checks; and
+11. records the dependency PKI state and atomically advances the current-release
     pointer before disarming rollback.
 
-A failed upgrade restores the previous Compose model and API image when one
-exists. A failed first deployment stops the incomplete Compose stack without
+A failed upgrade, when a previous release exists, restores its Compose model,
+API image, and captured startup configuration, then force-replaces those
+configuration consumers. A failed first deployment stops the incomplete stack without
 deleting its bind-mounted data and removes only the copied active Compose marker
 so a clean retry is possible. Database migrations are forward-only: neither
 path automatically runs `pg_restore`, reverses migrations, or deletes database
@@ -152,9 +157,12 @@ rollback mechanism.
 The first digest-pinned and per-service-PKI rollout intentionally recreates
 PostgreSQL, Redis, NATS, and HAProxy once. Schedule that transition in a
 maintenance window because the single-node A1 topology has no redundant
-database/cache/event-bus instance. Later releases restart only services whose
-reviewed image, configuration, scoped-secret boundary, or leaf certificate
-changed.
+database/cache/event-bus instance. Nginx, HAProxy, the backup worker, Prometheus,
+and Grafana read ordinary bind-mounted files rather than Docker Config objects.
+Each deployment therefore force-replaces the always-running gateway/TLS
+edge/backup worker and any observability process that was already running. This
+guarantees that a security or routing edit is active rather than merely present
+on the host. Stopped optional observability services remain stopped.
 
 Check local state:
 
@@ -179,13 +187,26 @@ repeat the architecture and provenance review before changing any pin.
 After the first manual deployment and Cloudflare cutover are verified, a
 repository-scoped runner can enable `.github/workflows/deploy-oci.yml`. The
 workflow accepts only a successful `push`-triggered `CI` run on this repository's
-`main`, checks out that exact approved SHA, serializes production deployments, and
-uses the same snapshot, migration, readiness, and application-rollback path as a
-manual deployment. No OCI or application credential belongs in GitHub Actions.
+`main`, serializes production deployments, and uses the same snapshot, migration,
+readiness, public-ingress, and application-rollback path as a manual deployment.
+It requests a short-lived GitHub OIDC token bound to the workflow and run. The
+root-owned entrypoint verifies that signature, verifies the completed CI run with
+GitHub's public Actions API, fetches the exact current `main` SHA from the pinned
+public repository URL into a root-only bare mirror, and runs a root-owned archive.
+It never executes a file from the runner-writable checkout and invokes the
+verifier, Git transport, archive tools, and deployment under an explicit empty
+environment rather than inheriting runner-controlled process settings. No OCI,
+GitHub, or application credential belongs in GitHub Actions.
 The root-owned entrypoint additionally refuses automated deployment unless the
 scoped API configuration is mode `0600`, root-owned, and explicitly enables
 production, Telnyx verification, and durable SMTP reset delivery. Manual staging
 deployments remain available for provider canaries before this gate is enabled.
+
+Before bringing the production runner online, protect `main`: require pull
+requests and review, make every CI job a required check, and disallow force pushes
+and branch deletion. The root boundary requires a successful CI run and the exact
+current main tip, but repository governance must still prevent an unreviewed main
+push from becoming an approved production source.
 
 Create a dedicated unprivileged account and fixed runner directory:
 
@@ -226,9 +247,13 @@ self-hosted runners from taking this job. Install the small root-owned validatio
 entrypoint and grant only that entrypoint through passwordless sudo:
 
 ```sh
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/clixor
 sudo install -o root -g root -m 0755 \
   /home/ubuntu/clixor-backend/deploy/oci/actions-deploy.sh \
   /usr/local/sbin/clixor-actions-deploy
+sudo install -o root -g root -m 0755 \
+  /home/ubuntu/clixor-backend/deploy/oci/verify_github_deploy.py \
+  /usr/local/libexec/clixor/verify-github-deploy
 sudo visudo -f /etc/sudoers.d/clixor-actions-deploy
 ```
 
@@ -251,8 +276,12 @@ Keep the runner repository-scoped and dedicated to production. Do not add the
 custom production label to the retired NAS runner or any shared runner. Leave the
 OCI runner offline until all scoped files under `/srv/clixor/secrets`, native OCI media,
 backups, and the Cloudflare tunnel have passed their manual release gates. If the
-runner installation path, repository name, or work-directory name changes, update
-and reinstall the root-owned validation entrypoint before enabling it.
+repository owner/name or workflow path changes, update and reinstall both
+root-owned verification files before enabling it.
+The unauthenticated source-run verification intentionally depends on this
+repository remaining public. If the repository becomes private, disable the
+runner until this boundary is replaced with a reviewed GitHub App or equivalent
+read-only verifier; never silently fall back to trusting the runner checkout.
 
 API startup creates an OCI instance-principal signer and performs `HeadBucket` on
 the configured media bucket. Therefore, successful readiness for both replicas
