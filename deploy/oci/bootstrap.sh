@@ -32,11 +32,12 @@ if [ "${CLIXOR_SKIP_PACKAGES:-false}" != "true" ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install --yes --no-install-recommends \
-    ca-certificates curl docker.io docker-compose-v2 openssl python3 rsync unzip util-linux
+    ca-certificates curl docker.io docker-buildx docker-compose-v2 openssl python3 rsync unzip util-linux
   unset DEBIAN_FRONTEND
 fi
 systemctl enable --now docker
 docker compose version >/dev/null
+docker buildx version >/dev/null
 
 script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 if ! command -v oci >/dev/null 2>&1; then

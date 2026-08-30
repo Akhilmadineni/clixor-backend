@@ -39,6 +39,7 @@ esac
 for command_name in curl docker flock rsync; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
+docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
 
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
@@ -103,7 +104,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 log "building ARM64 release ${new_image}"
-docker build \
+docker buildx build --load \
   --pull \
   --label "org.opencontainers.image.revision=${source_sha}" \
   --label "org.opencontainers.image.source=https://github.com/Akhilmadineni/clixor-backend" \
