@@ -28,6 +28,11 @@ load balancer, managed database, or application secret.
 The instance has no public IP. Cloudflare Tunnel remains the only application
 ingress and is configured only after the runtime secrets are installed.
 
+The stack deliberately waits 90 seconds after a new Vault becomes active before
+creating its first key. OCI can briefly publish the Vault management endpoint
+before its unique hostname is resolvable, which otherwise makes a clean
+Resource Manager apply fail and succeed only on retry.
+
 ## Cost guardrails
 
 The variables reject non-A1 shapes, more than 2 OCPUs, more than 12 GB RAM, and
