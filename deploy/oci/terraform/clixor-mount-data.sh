@@ -57,7 +57,7 @@ if [[ ! -b "$root_source" ]]; then
   echo "unable to prove the root filesystem block-device ancestry" >&2
   exit 2
 fi
-mapfile -t root_maj_min < <(lsblk -s -nr -o MAJ:MIN "$root_source" | awk 'NF')
+mapfile -t root_maj_min < <(lsblk -s -nr -o MAJ:MIN "$root_source" | awk 'NF { print $1 }')
 if ((${#root_maj_min[@]} == 0)); then
   echo "unable to enumerate the root filesystem block-device ancestry" >&2
   exit 2
@@ -89,7 +89,7 @@ done
 target_is_mounted=false
 if mountpoint -q "$mount_point"; then
   target_is_mounted=true
-  mounted_maj_min=$(findmnt -n -o MAJ:MIN --target "$mount_point")
+  mounted_maj_min=$(findmnt -n -o MAJ:MIN --target "$mount_point" | tr -d '[:space:]')
   if [[ "$mounted_maj_min" != "$device_maj_min" ]]; then
     echo "refusing unexpected device already mounted at $mount_point" >&2
     exit 3
@@ -175,6 +175,7 @@ if [[ "$mounted_maj_min" != "$device_maj_min" || "$mounted_filesystem" != xfs ||
 fi
 
 install -d -m 0750 -o root -g docker \
+  "$mount_point" \
   "$mount_point/app" \
   "$mount_point/data" \
   "$mount_point/backups" \
