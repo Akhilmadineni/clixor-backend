@@ -124,23 +124,37 @@ The deploy script:
 
 1. takes an exclusive host lock;
 2. for an upgrade, captures the previous Compose model, API image, release
-   pointer, and a non-empty mode-0600 PostgreSQL dump before changing the active
-   runtime; a clean first deployment records an explicit first-deploy marker;
+   pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
+   --list` and SHA-256 verification before changing the active runtime; a clean
+   first deployment records an explicit first-deploy marker;
 3. builds and verifies an ARM64 API image tagged with the source revision;
 4. arms application rollback before refreshing runtime configuration,
    synchronizing source, or reconciling containers;
-5. synchronizes that exact source to `/srv/clixor/repo` and starts and
-   health-checks the internal dependencies;
+5. refreshes the independent dependency TLS leaves, synchronizes that exact
+   source to `/srv/clixor/repo`, and restarts only dependencies that need a new
+   image, scoped secret boundary, or certificate before health-checking them;
 6. runs the one-shot migration command;
-7. starts both API replicas and the internal gateway; and
-8. requires gateway and per-replica readiness before recording success.
+7. starts both API replicas and the internal gateway;
+8. requires gateway and per-replica readiness;
+9. creates and uploads a fresh post-migration backup, restores it into an
+   isolated PostgreSQL container, and runs integrity checks; and
+10. records the dependency PKI state and atomically advances the current-release
+    pointer before disarming rollback.
 
 A failed upgrade restores the previous Compose model and API image when one
 exists. A failed first deployment stops the incomplete Compose stack without
-deleting its bind-mounted data. Database migrations are forward-only: neither
+deleting its bind-mounted data and removes only the copied active Compose marker
+so a clean retry is possible. Database migrations are forward-only: neither
 path automatically runs `pg_restore`, reverses migrations, or deletes database
 files. The pre-change dump is an operator recovery artifact, not an automatic
 rollback mechanism.
+
+The first digest-pinned and per-service-PKI rollout intentionally recreates
+PostgreSQL, Redis, NATS, and HAProxy once. Schedule that transition in a
+maintenance window because the single-node A1 topology has no redundant
+database/cache/event-bus instance. Later releases restart only services whose
+reviewed image, configuration, scoped-secret boundary, or leaf certificate
+changed.
 
 Check local state:
 

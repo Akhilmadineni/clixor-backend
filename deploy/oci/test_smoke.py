@@ -208,8 +208,13 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("sha256sum --check", script)
         self.assertNotIn("pg_restore --clean", script)
         self.assertIn("scoped_runtime_ready", script)
+        self.assertIn(
+            '[ "${previous_compose_uses_scoped}" = "false" ] && scoped_runtime_ready',
+            script,
+        )
         self.assertIn('cmp -s "${selected_rollback_compose}" "${compose_file}"', script)
         self.assertIn('if [ "${actual_image}" != "${previous_image}" ]', script)
+        self.assertIn('rm -f -- "${compose_file}"', script)
         release_pointer = script.index('mv -Tf "${release_dir}/current-link.pending"')
         release_complete = script.rindex("rollback_needed=0")
         self.assertLess(release_pointer, release_complete)

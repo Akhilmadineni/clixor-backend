@@ -8,12 +8,14 @@ example hostnames, image names, secret stores, and paging destinations before us
 - API availability: 99.95% per calendar month, excluding planned maintenance.
 - Authenticated message acknowledgement: p95 under 250 ms and p99 under 750 ms.
 - Durable message-to-realtime outbox lag: p99 under 2 seconds.
-- Recovery point objective: 5 minutes for PostgreSQL and encrypted media metadata.
-- Recovery time objective: 60 minutes for a regional restore.
+- PostgreSQL backup freshness objective: no more than 8 hours between the live
+  database and the latest verified same-region offsite dump.
+- Basic same-region dump-restore objective: 4 hours. Cross-region recovery and
+  point-in-time recovery are not implemented and have no production SLO yet.
 
 Page when the five-minute error ratio exceeds 2%, readiness fails on more than one
 replica, p99 message acknowledgement exceeds 2 seconds, outbox lag exceeds 10
-seconds, or PostgreSQL replication/backup freshness exceeds the RPO. Alert without
+seconds, or PostgreSQL backup freshness exceeds 8 hours. Alert without
 paging on sustained rate limiting, a rise in
 `clustr_push_delivery_failures_total`, any sustained dead-letter growth, prekey
 depletion, or a single replica restart loop.
@@ -21,7 +23,8 @@ depletion, or a single replica restart loop.
 ## Deployment
 
 1. Build and scan one immutable image digest. Never deploy a mutable tag.
-2. Snapshot PostgreSQL and confirm the latest continuous-archive restore point.
+2. Validate and checksum a pre-change PostgreSQL custom dump. After migration,
+   require a fresh offsite dump and isolated restore drill before promotion.
 3. Run `/clustr-migrate` as the one-shot migration job and require success.
 4. Roll out one canary API replica. Verify readiness, auth, message replay,
    WebSocket delivery, outbox lag, and media upload/download.
@@ -128,12 +131,15 @@ base64 32-byte key, re-enable mail, restart, and complete a real-mailbox canary.
 
 ## Backups and restore
 
-- PostgreSQL: encrypted daily base backup plus continuous WAL archiving to a
-  separate account/region. Retain 35 days and test point-in-time recovery monthly.
-- OCI Object Storage media: encryption at rest, versioning, lifecycle policy,
-  and a tested cross-region recovery plan. Treat payloads as plaintext-sensitive
-  until audited client-side encryption is deployed; PARs and metadata are always
-  sensitive.
+- PostgreSQL: custom-format dumps every six hours, seven-day local retention,
+  and immutable uploads to the same-region versioned OCI backup bucket. Current
+  objects expire after 14 days and previous versions after 21 days. This is not
+  continuous WAL archiving, point-in-time recovery, or cross-region disaster
+  recovery.
+- OCI Object Storage media: same-region encryption at rest and a lifecycle rule
+  that aborts incomplete multipart uploads. The media bucket is not versioned or
+  cross-region replicated. Treat payloads as plaintext-sensitive until audited
+  client-side encryption is deployed; PARs and metadata are always sensitive.
 - Alert on `clustr_media_pending_cleanup_total{result="failed"}` and sustained
   media quota/rate-limit rejections. Confirm OCI lifecycle rules abort incomplete
   multipart uploads, stored-object limits match the product plan, the configured
@@ -147,14 +153,17 @@ base64 32-byte key, re-enable mail, restart, and complete a real-mailbox canary.
   messages plus the transactional outbox are the recovery source of truth.
 - Export backup success and restore-point age as monitored metrics.
 
-A restore drill is successful only after membership counts, per-conversation
-message sequences, receipt watermarks, entity versions, media metadata, and a
-sample of stored-payload hashes match the source environment.
+The automated release gate is a basic integrity drill: it validates the dump
+checksum, restores into an isolated PostgreSQL 17 container, requires the exact
+migration set, reads core tables, and runs `pg_amcheck`. A full disaster-recovery
+exercise additionally compares membership counts, per-conversation sequences,
+receipt watermarks, entity versions, media metadata, and sampled payload hashes
+against a captured source manifest; that broader exercise remains a launch gate.
 
 ## Secret and key rotation
 
-- Store PostgreSQL, Redis, NATS, S3, Telnyx, OTP HMAC, APNs, JWT, and metrics credentials in
-  a managed secret store; never commit or place them in ConfigMaps.
+- Store PostgreSQL, Redis, NATS, OCI mail/Telnyx, OTP HMAC, APNs, JWT, and metrics
+  credentials in a managed secret store; never commit or place them in ConfigMaps.
 - Rotate infrastructure credentials at least every 90 days and immediately after
   suspected exposure.
 - JWT signing-key rotation needs an overlapping key ring before public launch; the
@@ -177,7 +186,8 @@ sample of stored-payload hashes match the source environment.
 
 ## Required launch exercises
 
-- PostgreSQL primary loss and point-in-time restore.
+- PostgreSQL primary loss and verified same-region dump restore; separately design
+  and test point-in-time and cross-region recovery before assigning those SLOs.
 - Redis loss during login and normal authenticated traffic.
 - NATS outage/reconnect with outbox replay and duplicate-event client handling.
 - APNs outage and invalid-device-token handling.
@@ -187,6 +197,7 @@ sample of stored-payload hashes match the source environment.
   depletion load tests.
 - Concurrent pending-media quota races across both API replicas, expired upload
   cleanup, invalid checksum/content-type rejection, and conversation deletion
-  while MinIO is unavailable (the outbox must retry without losing object keys).
+  while OCI Object Storage is unavailable (the outbox must retry without losing
+  object keys).
 - External penetration test, abuse review, privacy review, and client cryptography
   audit.
