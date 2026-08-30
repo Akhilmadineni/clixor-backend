@@ -16,10 +16,9 @@ fail() {
 
 [ "$#" -eq 0 ] || fail "initial staging worker does not accept arguments"
 [ "$(id -u)" -eq 0 ] || fail "run as root"
-if [ -d "${release_root}" ] && \
-  [ -n "$(find "${release_root}" -mindepth 1 -maxdepth 1 -name 'oci-*' -print -quit)" ]; then
-  fail "initial staging fallback is forbidden after release history exists"
-fi
+# Only releases/current is authority. Pending or orphaned candidate directories
+# are deliberately ignored; the runtime reconciler will not start application
+# containers or ingress without a committed current pointer.
 [ ! -e "${release_root}/current" ] && [ ! -L "${release_root}/current" ] || \
   fail "initial staging fallback is forbidden after a release is approved"
 [ -f "${fallback_mode_file}" ] && [ ! -L "${fallback_mode_file}" ] || \

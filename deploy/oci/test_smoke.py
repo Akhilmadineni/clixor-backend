@@ -224,7 +224,9 @@ class ReleaseHardeningTests(unittest.TestCase):
         )
         self.assertIn('cmp -s "${selected_rollback_compose}" "${compose_file}"', script)
         self.assertIn('if [ "${actual_image}" != "${previous_image}" ]', script)
-        self.assertIn('rm -f -- "${compose_file}"', script)
+        self.assertNotIn('rm -f -- "${compose_file}"', script)
+        self.assertIn('--file "${deployment_compose_file}" down --remove-orphans', script)
+        self.assertIn('"${stable_runtime_controller}" reconcile', script)
         release_pointer = script.index("release_pointer_committed || fail")
         release_complete = script.rindex("\ndisarm_committed_release_rollback\n")
         self.assertLess(release_pointer, release_complete)
@@ -425,15 +427,14 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(rollback_disarm, first_restore)
 
         pointer_observation = deploy.index("release_pointer_committed || fail")
+        pointer_journal = deploy.index("journal_phase pointer-committed", pointer_observation)
+        journal_archive = deploy.index("journal-archive", pointer_journal)
         success_disarm = deploy.index(
-            "disarm_committed_release_rollback", pointer_observation
+            "disarm_committed_release_rollback", journal_archive
         )
-        post_swap_failure = deploy.index(
-            'fail "release pointer committed but durable commit verification failed"',
-            success_disarm,
-        )
-        self.assertLess(pointer_observation, success_disarm)
-        self.assertLess(success_disarm, post_swap_failure)
+        self.assertLess(pointer_observation, pointer_journal)
+        self.assertLess(pointer_journal, journal_archive)
+        self.assertLess(journal_archive, success_disarm)
 
     def test_boot_secret_tooling_is_release_local_and_bootstrap_is_deferred(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
@@ -488,7 +489,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("--approved-release-manifest", worker)
         self.assertIn('hydrator="${boot_root}/hydrate-vault-secrets.py"', worker)
         self.assertNotIn("/etc/clixor/secret-mode", worker)
-        self.assertIn("release history exists", launcher)
+        self.assertIn("Candidate and orphan directories are never boot authority", launcher)
         self.assertIn("boot checksum manifest is incomplete", launcher)
         self.assertIn(
             "ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py",
@@ -905,7 +906,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn(
             "CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true", deploy
         )
-        self.assertIn('host_tool_stage="${release_dir}/host-tools"', deploy)
+        self.assertIn('host_tool_stage="${runtime_bundle_root}/host-tools"', deploy)
         self.assertIn(
             'previous_host_tool_root="${release_dir}/previous-host-tools"',
             deploy,

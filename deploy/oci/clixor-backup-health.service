@@ -1,6 +1,7 @@
 [Unit]
 Description=Check Clixor local, offsite, and restore-drill backup freshness
-After=clixor-offsite-backup.service
+After=clixor-offsite-backup.service clixor-runtime-reconcile.service
+ConditionPathExists=/run/clixor/runtime-ready
 ConditionPathExists=/etc/clixor/offsite-backup.env
 
 [Service]

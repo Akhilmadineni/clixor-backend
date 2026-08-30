@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically verify the release-selected Clixor runtime
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=clixor-runtime-watchdog.service
+
+[Install]
+WantedBy=timers.target

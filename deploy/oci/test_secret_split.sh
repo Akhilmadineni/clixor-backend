@@ -135,9 +135,12 @@ grep -Fq -- '--commit-candidate-release "${candidate_manifest}"' \
 grep -Fq -- '--approved-release-manifest "${approved_manifest}"' \
   "${script_root}/prepare-runtime-secrets.sh" || \
   fail "boot-time hydration does not require the resolved release manifest"
-grep -Fq 'release history exists but the boot approval pointer is unavailable' \
+grep -Fq 'Candidate and orphan directories are never boot authority' \
   "${script_root}/prepare-runtime-secrets-launcher.py" || \
-  fail "boot can silently downgrade to staging after losing its release pointer"
+  fail "boot secret selection does not exclude uncommitted candidates"
+grep -Fq 'raise ReconcileError("no committed release is selected")' \
+  "${script_root}/runtime-reconciler.py" || \
+  fail "runtime can start without a committed current release"
 grep -Fq 'command.extend(("--version-number", str(version_number)))' \
   "${script_root}/hydrate-vault-secrets.py" || \
   fail "approved boot hydration does not pin OCI secret versions"

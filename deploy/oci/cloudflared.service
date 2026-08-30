@@ -1,9 +1,10 @@
 [Unit]
 Description=Clixor Cloudflare Tunnel connector
 Documentation=https://developers.cloudflare.com/tunnel/
-After=network-online.target docker.service
+After=network-online.target docker.service clixor-runtime-reconcile.service
 Wants=network-online.target
 Requires=docker.service
+ConditionPathExists=/run/clixor/runtime-ready
 
 [Service]
 Type=notify

@@ -117,6 +117,8 @@ jobs:
           CLIXOR_IMAGE_TAG=ci docker compose --file ../compose.yaml config --quiet
       - name: Test OCI backup health gate
         run: sh ../test-backup.sh
+      - name: Test crash-consistent OCI runtime selection
+        run: python3 ../test_runtime_reconciler.py -v
       - name: Test OCI deployment helpers offline
         run: python3 -m unittest discover -v -s .. -p 'test_*.py'
       - name: Check the data-volume mount helper

@@ -6,6 +6,7 @@ ulimit -c 0
 project_root=/srv/clixor
 stable_root="${project_root}/repo"
 release_root="${project_root}/releases"
+pending_release_root="${release_root}/pending"
 runtime_env="${project_root}/secrets/runtime.env"
 runtime_secret_root=/run/clixor/secrets
 active_secret_root="${runtime_secret_root}/active"
@@ -18,6 +19,8 @@ backup_env="${active_secret_root}/backup.env"
 migrate_env="${active_secret_root}/migrate.env"
 lock_file="${project_root}/runtime/deploy.lock"
 compose_file="${stable_root}/deploy/oci/compose.yaml"
+stable_runtime_controller=/usr/local/libexec/clixor/runtime-reconciler.py
+stable_runtime_bundle=/usr/local/libexec/clixor/runtime_bundle.py
 pki_desired="${project_root}/runtime/dependency-pki.desired"
 pki_applied="${project_root}/runtime/dependency-pki.applied"
 backup_tool_root=/usr/local/libexec/clixor
@@ -38,6 +41,10 @@ retained_audit_releases=3
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
+
+journal_phase() {
+  /usr/bin/python3 "${stable_runtime_controller}" journal-phase --phase "$1"
+}
 
 log() {
   printf '[clixor-oci-deploy] %s\n' "$*"
@@ -89,8 +96,10 @@ verify_public_ingress() {
   log "verifying public Cloudflare ingress for revision ${expected_public_revision}"
   curl --fail --silent --show-error --retry 12 --retry-all-errors \
     --retry-delay 5 --max-time 10 --proto '=https' --tlsv1.2 \
-    --max-filesize 65536 --dump-header "${api_headers}.partial" \
-    --output "${api_body}.partial" "${public_api_readiness_url}" || \
+    --max-filesize 65536 --header 'Cache-Control: no-cache' \
+    --header 'Pragma: no-cache' --dump-header "${api_headers}.partial" \
+    --output "${api_body}.partial" \
+    "${public_api_readiness_url}?release=${expected_public_revision}" || \
     return 1
   curl --fail --silent --show-error --retry 6 --retry-all-errors \
     --retry-delay 5 --max-time 10 --proto '=https' --tlsv1.2 \
@@ -242,8 +251,11 @@ stage_release_boot_tooling() {
 }
 
 stage_host_tooling() {
-  install -d -m 0700 -o 0 -g 0 \
-    "${host_tool_stage}/bin" "${host_tool_stage}/systemd"
+  /usr/bin/python3 "${source_root}/deploy/oci/runtime_bundle.py" \
+    stage-host-tools \
+    --release "${release_dir}" \
+    --source "${source_root}" \
+    --cloudflared-binary /usr/bin/cloudflared
   install -m 0500 -o 0 -g 0 \
     "${source_root}/deploy/oci/release_retention.py" \
     "${release_dir}/release_retention.py"
@@ -255,11 +267,8 @@ stage_host_tooling() {
   )
   : > "${host_tool_stage}/SHA256SUMS.partial"
   for tool_name in \
-    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py cloudflared
   do
-    install -m 0500 -o 0 -g 0 \
-      "${source_root}/deploy/oci/${tool_name}" \
-      "${host_tool_stage}/bin/${tool_name}"
     (
       cd "${host_tool_stage}"
       sha256sum "bin/${tool_name}"
@@ -273,17 +282,11 @@ stage_host_tooling() {
     clixor-restore-drill.service \
     clixor-restore-drill.timer
   do
-    install -m 0644 -o 0 -g 0 \
-      "${source_root}/deploy/oci/${unit_name}" \
-      "${host_tool_stage}/systemd/${unit_name}"
     (
       cd "${host_tool_stage}"
       sha256sum "systemd/${unit_name}"
     ) >> "${host_tool_stage}/SHA256SUMS.partial"
   done
-  install -m 0644 -o 0 -g 0 \
-    "${source_root}/deploy/oci/cloudflared.service" \
-    "${host_tool_stage}/systemd/cloudflared.service"
   (
     cd "${host_tool_stage}"
     sha256sum systemd/cloudflared.service
@@ -439,6 +442,8 @@ wait_cloudflared_active() {
 validate_cloudflared_runtime() {
   [ -x /usr/bin/cloudflared ] || \
     fail "production requires the signed cloudflared package"
+  cmp -s "${host_tool_stage}/bin/cloudflared" /usr/bin/cloudflared || \
+    fail "cloudflared changed after the release-local runtime snapshot"
   [ -x /usr/bin/dpkg ] || fail "dpkg is required to validate cloudflared"
   cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
     sed -n 's/^cloudflared version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
@@ -708,7 +713,7 @@ ensure_gateway_for_probe() {
   if [ "$(docker inspect clixor-oci-api-gateway \
     --format '{{.State.Running}}' 2>/dev/null || true)" != "true" ]; then
     log "starting the internal gateway so the first API replica can be probed"
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
       up -d --no-build --no-deps api-gateway
   fi
 }
@@ -816,9 +821,23 @@ do
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
 
+for stable_runtime_file in \
+  "${stable_runtime_controller}" "${stable_runtime_bundle}"
+do
+  [ -f "${stable_runtime_file}" ] && [ ! -L "${stable_runtime_file}" ] && \
+    [ "$(stat -c '%u:%g:%a' "${stable_runtime_file}")" = "0:0:500" ] || \
+    fail "stable runtime controller is missing or unsafe; run the explicit bootstrap transition"
+done
+
 mkdir -p "${project_root}/runtime"
 exec 9>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
+install -d -m 0700 -o 0 -g 0 "${pending_release_root}"
+if [ -L "${release_root}/current" ]; then
+  /usr/bin/python3 "${stable_runtime_controller}" validate-release \
+    --release "$(readlink -- "${release_root}/current")" || \
+    fail "current release lacks a complete crash-consistent runtime baseline; run explicit bootstrap"
+fi
 preflight_disk_capacity
 read_effective_secret_mode
 if [ "${effective_secret_mode}" = "vault" ]; then
@@ -847,6 +866,7 @@ if [ -s "${compose_file}" ] && \
 fi
 
 vault_generation_changed=false
+journal_active=false
 cloudflare_secret_changed=false
 vault_postgres_secret_changed=false
 vault_postgres_secret_activated=false
@@ -862,7 +882,6 @@ current_vault_target=
 # so changing files alone is insufficient: affected containers must be replaced
 # once to remove API/provider credentials from docker inspect.
 legacy_dependency_scope=false
-legacy_grafana_scope=false
 prometheus_was_running=false
 grafana_was_running=false
 [ "$(docker inspect clixor-oci-prometheus --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] && \
@@ -870,8 +889,7 @@ grafana_was_running=false
 [ "$(docker inspect clixor-oci-grafana --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] && \
   grafana_was_running=true
 for container_name in \
-  clixor-oci-postgres clixor-oci-redis clixor-oci-nats \
-  clixor-oci-grafana
+  clixor-oci-postgres clixor-oci-redis clixor-oci-nats
 do
   if docker inspect "${container_name}" \
     --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
@@ -880,21 +898,21 @@ do
       clixor-oci-postgres|clixor-oci-redis|clixor-oci-nats)
         legacy_dependency_scope=true
         ;;
-      clixor-oci-grafana)
-        legacy_grafana_scope=true
-        ;;
     esac
   fi
 done
 release_tag="oci-$(printf '%s' "${source_sha}" | cut -c1-12)-${run_id}"
-release_dir="${release_root}/${release_tag}"
+release_dir="${pending_release_root}/${release_tag}"
+final_release_dir="${release_root}/${release_tag}"
 candidate_manifest="${release_dir}/${approved_manifest_name}"
 candidate_mapping="${release_dir}/${approved_mapping_name}"
 previous_compose="${release_dir}/previous-compose.yaml"
 rollback_compose="${previous_compose}"
 scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
 previous_runtime_root="${release_dir}/previous-runtime"
-host_tool_stage="${release_dir}/host-tools"
+runtime_bundle_root="${release_dir}/runtime-bundle"
+deployment_compose_file="${runtime_bundle_root}/compose.yaml"
+host_tool_stage="${runtime_bundle_root}/host-tools"
 boot_secret_stage="${release_dir}/boot-secrets"
 previous_host_tool_root="${release_dir}/previous-host-tools"
 previous_cloudflare_root="${release_dir}/previous-cloudflared"
@@ -902,7 +920,13 @@ pre_migration_dump="${release_dir}/pre-migration.dump"
 new_image="clixor-api:${release_tag}"
 
 mkdir -p "${stable_root}" "${release_root}" "${project_root}/runtime"
-[ ! -e "${release_dir}" ] || fail "release directory already exists: ${release_dir}"
+/usr/bin/python3 "${stable_runtime_controller}" quarantine-pending \
+  --candidate "${release_dir}" || \
+  fail "could not safely quarantine an interrupted pre-journal candidate"
+[ ! -e "${release_dir}" ] && [ ! -L "${release_dir}" ] || \
+  fail "pending release directory already exists: ${release_dir}"
+[ ! -e "${final_release_dir}" ] && [ ! -L "${final_release_dir}" ] || \
+  fail "final release directory already exists: ${final_release_dir}"
 mkdir "${release_dir}"
 chmod 0700 "${release_dir}"
 candidate_secret_mode=staging
@@ -911,6 +935,11 @@ printf '%s\n' "${candidate_secret_mode}" > "${release_dir}/secret-mode.partial"
 chmod 0400 "${release_dir}/secret-mode.partial"
 chown 0:0 "${release_dir}/secret-mode.partial"
 mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
+/usr/bin/python3 "${source_root}/deploy/oci/runtime_bundle.py" stage-source \
+  --release "${release_dir}" \
+  --source "${source_root}" \
+  --source-sha "${source_sha}" \
+  --compose-source "${source_root}/deploy/oci/compose.yaml"
 stage_release_boot_tooling
 stage_host_tooling
 capture_host_tooling
@@ -1280,6 +1309,15 @@ rollback() {
         fi
       done
 
+      # The stable reconciler is the final rollback authority. It restores the
+      # selected release's exact source, Compose model, PKI, host tools and
+      # service state; it never restores or deletes database files.
+      if [ "${rollback_failed}" -eq 0 ] && \
+        ! /usr/bin/python3 "${stable_runtime_controller}" reconcile; then
+        log "ERROR: selected-release reconciliation failed during rollback" >&2
+        rollback_failed=1
+      fi
+
       rollback_attempt=1
       rollback_ready=false
       if [ "${rollback_failed}" -eq 0 ]; then
@@ -1314,12 +1352,11 @@ rollback() {
       fi
     else
       log "first deployment failed; stopping the incomplete application stack"
-      if [ -s "${compose_file}" ]; then
+      if [ -s "${deployment_compose_file}" ]; then
         if ! CLIXOR_IMAGE_TAG="${release_tag}" docker compose \
-          --file "${compose_file}" down --remove-orphans; then
+          --file "${deployment_compose_file}" down --remove-orphans; then
           application_rollback_failed=1
         fi
-        rm -f -- "${compose_file}" || application_rollback_failed=1
       fi
     fi
   fi
@@ -1333,11 +1370,36 @@ rollback() {
       log "ERROR: rollback verdict: incomplete (application=${application_rollback_failed} secrets=${secret_rollback_failed} cloudflared=${cloudflare_rollback_failed} host-tools=${host_tool_rollback_failed})" >&2
     fi
   fi
+  if [ "${status}" -ne 0 ] && [ "${journal_active}" = "true" ] && \
+    ! release_pointer_committed && \
+    [ "${application_rollback_failed}" -eq 0 ] && \
+    [ "${secret_rollback_failed}" -eq 0 ] && \
+    [ "${cloudflare_rollback_failed}" -eq 0 ] && \
+    [ "${host_tool_rollback_failed}" -eq 0 ]; then
+    if /usr/bin/python3 "${stable_runtime_controller}" journal-archive \
+      --outcome rolled-back; then
+      journal_active=false
+      log "durably archived the rolled-back deployment journal"
+    else
+      log "ERROR: rolled-back runtime is safe but its pending journal requires watchdog review" >&2
+    fi
+  fi
   exit "${status}"
 }
 trap rollback 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+previous_journal_release=${previous_release:-none}
+previous_journal_image=${previous_image:-none}
+/usr/bin/python3 "${stable_runtime_controller}" journal-create \
+  --candidate "${release_dir}" \
+  --source-sha "${source_sha}" \
+  --previous-release "${previous_journal_release}" \
+  --previous-image "${previous_journal_image}" || \
+  fail "could not durably create the pre-mutation deployment journal"
+journal_active=true
+journal_phase secrets-hydrating
 
 # Hydrate only after the exit trap is armed. From this point onward, every
 # failure restores the exact previously selected generation before attempting
@@ -1394,6 +1456,7 @@ if [ "${vault_hydration_mode}" = "true" ]; then
     done
   fi
 fi
+journal_phase secrets-hydrated
 
 # Compare the desired credential with the file actually mounted in each running
 # singleton. This also catches a Vault generation selected before this deploy,
@@ -1421,6 +1484,7 @@ image_architecture="$(docker image inspect "${new_image}" --format '{{.Architect
 # or running a forward migration. The captured dump is for operator recovery;
 # this script never restores it automatically.
 rollback_needed=1
+journal_phase runtime-mutating
 
 # Idempotently refresh permissions, certificates and checked-in runtime config.
 # Package installation belongs to the explicit first bootstrap, not every deploy.
@@ -1523,11 +1587,11 @@ rsync -a --delete \
   --exclude='/coverage.out' \
   "${source_root}/" "${stable_root}/"
 
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" config --quiet
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" config --quiet
 if [ "${vault_postgres_secret_changed}" = "true" ] && \
   [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ]; then
   log "verifying hydrated PostgreSQL credentials before replacing dependencies"
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
     run --rm --no-deps --entrypoint psql postgres-backup \
     --host postgres.clixor.internal --username clixor --dbname clixor \
     --command 'SELECT 1' >/dev/null || \
@@ -1564,10 +1628,10 @@ for dependency_service in postgres redis nats; do
         nats) vault_nats_secret_activated=true ;;
       esac
     fi
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
       up -d --no-build --no-deps --force-recreate "${dependency_service}"
   else
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
       up -d --no-build --no-deps "${dependency_service}"
   fi
 done
@@ -1592,7 +1656,7 @@ done
 # start. Compose tracks the bind path, not file contents, so every release must
 # replace this small stateless proxy even when the leaf digest is unchanged.
 log "recreating dependency-tls to apply its reviewed configuration and Redis TLS leaf"
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
   up -d --no-build --no-deps --force-recreate dependency-tls
 
 attempt=1
@@ -1608,6 +1672,7 @@ while :; do
   attempt=$((attempt + 1))
   sleep 2
 done
+journal_phase runtime-mutated
 
 if [ "${first_deploy}" = "true" ]; then
   [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
@@ -1618,8 +1683,9 @@ else
 fi
 
 log "applying transactional forward migrations"
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
-  --profile migration run --rm migrate
+journal_phase migrating
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
+  --profile migration run --rm --name clixor-oci-migrate migrate
 
 # Every migration in a rolling release must be expand-compatible with the prior
 # binary. Keep one previously ready replica serving while the other is replaced,
@@ -1631,14 +1697,15 @@ if [ "${first_deploy}" = "false" ]; then
     "${gateway_readiness_url}" >/dev/null || \
     fail "the previous release is not ready after forward migration"
 fi
+journal_phase migrated
 log "replacing api-a while api-b remains available"
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
   up -d --no-build --no-deps api-a
 ensure_gateway_for_probe
 wait_replica_ready api-a
 
 log "replacing api-b only after api-a passed readiness"
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
   up -d --no-build --no-deps api-b
 wait_replica_ready api-b
 
@@ -1646,23 +1713,26 @@ wait_replica_ready api-b
 # process start. Preserve the operator's observability run/stop state while
 # guaranteeing that every running consumer uses this exact release's files.
 log "reconciling the gateway after both API replicas are ready"
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
   up -d --no-build --no-deps --remove-orphans api-gateway
 docker exec clixor-oci-api-gateway nginx -t
 docker exec clixor-oci-api-gateway nginx -s reload
 if [ "${prometheus_was_running}" = "true" ]; then
   log "recreating running Prometheus to apply the reviewed scrape configuration"
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
     --profile observability up -d --no-build --no-deps --force-recreate prometheus
+elif docker inspect clixor-oci-prometheus >/dev/null 2>&1; then
+  # Keep the bind-mounted data, but remove stopped immutable metadata whose
+  # legacy restart policy could otherwise become a second boot authority.
+  docker rm clixor-oci-prometheus >/dev/null
 fi
 if [ "${grafana_was_running}" = "true" ]; then
   log "recreating running Grafana to apply its reviewed provisioning configuration"
-  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+  CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
     --profile observability up -d --no-build --no-deps --force-recreate grafana
-elif [ "${legacy_grafana_scope}" = "true" ] && \
-  docker inspect clixor-oci-grafana >/dev/null 2>&1; then
-  # The persistent Grafana data directory is untouched; only the stopped
-  # immutable container configuration containing old secrets is removed.
+elif docker inspect clixor-oci-grafana >/dev/null 2>&1; then
+  # The persistent Grafana data directory is untouched; only stopped immutable
+  # metadata (including any retired secret/restart configuration) is removed.
   docker rm clixor-oci-grafana >/dev/null
 fi
 
@@ -1670,8 +1740,8 @@ attempt=1
 until curl --fail --silent --show-error --max-time 5 \
   "${gateway_readiness_url}" >/dev/null; do
   if [ "${attempt}" -ge 60 ]; then
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" ps
-    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" ps
+    CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
       logs --tail=100 api-a api-b api-gateway
     fail "local API readiness did not pass within 120 seconds"
   fi
@@ -1684,6 +1754,43 @@ for replica in api-a api-b; do
     "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the gateway"
 done
 log "both API replicas completed native OCI media-provider startup and readiness"
+
+# The applied marker is part of the exact runtime selection. A crash after this
+# point is recovered from releases/current, which restores the previous marker;
+# migrations themselves remain forward/expand-compatible and are never undone.
+python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
+  --desired "${release_dir}/dependency-pki.desired" \
+  --applied "${pki_applied}"
+candidate_cloudflared=false
+if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
+  candidate_cloudflared=true
+fi
+runtime_state_input="${release_dir}/runtime-state.partial"
+{
+  printf 'cloudflared_enabled=%s\n' "${candidate_cloudflared}"
+  printf 'cloudflared_active=%s\n' "${candidate_cloudflared}"
+  printf 'prometheus_active=%s\n' "${prometheus_was_running}"
+  printf 'grafana_active=%s\n' "${grafana_was_running}"
+  printf 'offsite_timer_enabled=true\n'
+  printf 'restore_timer_enabled=true\n'
+  printf 'health_timer_enabled=true\n'
+} > "${runtime_state_input}"
+chmod 0600 "${runtime_state_input}"
+candidate_image_id="$(docker image inspect "${new_image}" --format '{{.Id}}')"
+/usr/bin/python3 "${source_root}/deploy/oci/runtime_bundle.py" finalize \
+  --release "${release_dir}" \
+  --runtime-root "${project_root}/runtime" \
+  --pki-root "${project_root}/secrets/pki" \
+  --source-sha "${source_sha}" \
+  --image-ref "${new_image}" \
+  --image-id "${candidate_image_id}" \
+  --state-file "${runtime_state_input}"
+rm -f -- "${runtime_state_input}"
+/usr/bin/python3 "${stable_runtime_controller}" validate-release \
+  --release "${release_dir}"
+/usr/bin/python3 "${stable_runtime_controller}" permit-candidate-ingress \
+  --candidate "${release_dir}"
+
 if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
   validate_cloudflared_runtime
   activate_cloudflared
@@ -1706,7 +1813,7 @@ touch "${backup_gate_start}"
 # also makes the long-running shell consume this release's mounted backup script
 # and removes any credentials retained by the retired all-secrets container.
 sleep 1
-CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${compose_file}" \
+CLIXOR_IMAGE_TAG="${release_tag}" docker compose --file "${deployment_compose_file}" \
   up -d --no-build --no-deps --force-recreate postgres-backup
 backup_attempt=1
 while :; do
@@ -1739,16 +1846,38 @@ systemctl enable --now \
   clixor-backup-health.timer
 systemctl start clixor-backup-health.service
 printf 'activated\n' > "${release_dir}/host-tools-state"
+journal_phase candidate-ready
 
-python3 "${source_root}/deploy/oci/dependency_pki.py" mark-applied \
-  --desired "${release_dir}/dependency-pki.desired" \
-  --applied "${pki_applied}"
+# Publication and pointer selection are separate durable phases. The watchdog
+# treats only releases/current as authority if SIGKILL or power loss lands in
+# either window. Rebase every rollback/audit path after the atomic directory
+# rename so the exit trap remains valid until pointer commit.
+journal_phase publishing
+/usr/bin/python3 "${stable_runtime_controller}" publish-release \
+  --candidate "${release_dir}"
+release_dir="${final_release_dir}"
+candidate_manifest="${release_dir}/${approved_manifest_name}"
+candidate_mapping="${release_dir}/${approved_mapping_name}"
+previous_compose="${release_dir}/previous-compose.yaml"
+rollback_compose="${previous_compose}"
+scoped_rollback_compose="${release_dir}/scoped-rollback-compose.yaml"
+previous_runtime_root="${release_dir}/previous-runtime"
+runtime_bundle_root="${release_dir}/runtime-bundle"
+deployment_compose_file="${runtime_bundle_root}/compose.yaml"
+host_tool_stage="${runtime_bundle_root}/host-tools"
+boot_secret_stage="${release_dir}/boot-secrets"
+previous_host_tool_root="${release_dir}/previous-host-tools"
+previous_cloudflare_root="${release_dir}/previous-cloudflared"
+pre_migration_dump="${release_dir}/pre-migration.dump"
+backup_gate_start="${release_dir}/post-migration-backup-gate-start"
+journal_phase release-published
 
 release_commit_status=0
 /usr/bin/python3 \
   "${source_root}/deploy/oci/prepare-runtime-secrets-launcher.py" \
   --verify-release-bundle "${release_dir}" || \
   release_commit_status=$?
+journal_phase pointer-committing
 if [ "${vault_hydration_mode}" = "true" ]; then
   if [ "${release_commit_status}" -eq 0 ]; then
     /usr/bin/python3 "${source_root}/deploy/oci/hydrate-vault-secrets.py" \
@@ -1764,10 +1893,15 @@ else
       release_commit_status=$?
   fi
 fi
-release_pointer_committed || fail "current release pointer did not update atomically"
-disarm_committed_release_rollback
 [ "${release_commit_status}" -eq 0 ] || \
-  fail "release pointer committed but durable commit verification failed"
+  fail "durable release-pointer commit failed"
+release_pointer_committed || fail "current release pointer did not update atomically"
+journal_phase pointer-committed
+/usr/bin/python3 "${stable_runtime_controller}" journal-archive \
+  --outcome committed
+journal_active=false
+disarm_committed_release_rollback
+systemctl enable --now clixor-runtime-watchdog.timer
 log "deployed ${new_image}; API readiness passed"
 if ! prune_release_history; then
   log "WARNING: bounded post-release retention did not complete; capacity preflight remains authoritative"

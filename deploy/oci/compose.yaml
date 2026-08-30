@@ -63,7 +63,9 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    restart: unless-stopped
+    # Docker is not the boot authority. The stable current-release reconciler
+    # starts this exact model only after pinned secrets and bundle validation.
+    restart: "no"
     shm_size: 512m
     mem_limit: 3g
     cpus: 1.25
@@ -96,7 +98,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    restart: unless-stopped
+    restart: "no"
     cap_drop:
       - ALL
     mem_limit: 768m
@@ -125,7 +127,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-    restart: unless-stopped
+    restart: "no"
     cap_drop:
       - ALL
     mem_limit: 512m
@@ -155,7 +157,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    restart: unless-stopped
+    restart: "no"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -182,6 +184,7 @@ services:
       - /tmp:size=16m,mode=1777
     cap_drop:
       - ALL
+    restart: "no"
     volumes:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
       - /run/clixor/secrets/active/migrate.env:/run/secrets/migrate.env:ro
@@ -204,7 +207,7 @@ services:
       clixor_ingress:
         ipv4_address: 172.30.254.3
       clixor_egress:
-    restart: unless-stopped
+    restart: "no"
     init: true
     read_only: true
     tmpfs:
@@ -238,7 +241,7 @@ services:
       clixor_ingress:
         ipv4_address: 172.30.254.4
       clixor_egress:
-    restart: unless-stopped
+    restart: "no"
     init: true
     read_only: true
     tmpfs:
@@ -272,7 +275,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-    restart: unless-stopped
+    restart: "no"
     read_only: true
     tmpfs:
       - /var/cache/nginx:size=32m,uid=101,gid=101,mode=0750
@@ -303,7 +306,7 @@ services:
       - /srv/clixor/secrets/pki/ca.crt:/run/pki/ca.crt:ro
       - /run/clixor/secrets/active/postgres.pgpass:/run/secrets/postgres.pgpass:ro
       - /srv/clixor/backups:/backups
-    restart: unless-stopped
+    restart: "no"
     read_only: true
     tmpfs:
       - /tmp:size=256m
@@ -327,7 +330,7 @@ services:
       - /srv/clixor/runtime/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - /run/clixor/secrets/active/metrics.token:/run/secrets/metrics.token:ro
       - /srv/clixor/data/prometheus:/prometheus
-    restart: unless-stopped
+    restart: "no"
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -352,7 +355,7 @@ services:
       - /srv/clixor/data/grafana:/var/lib/grafana
       - /run/clixor/secrets/active/grafana.ini:/run/secrets/grafana.ini:ro
       - /srv/clixor/runtime/grafana/datasource.yml:/etc/grafana/provisioning/datasources/clixor.yml:ro
-    restart: unless-stopped
+    restart: "no"
     mem_limit: 512m
     cpus: 0.30
     <<: *service-security

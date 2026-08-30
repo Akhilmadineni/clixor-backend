@@ -1,7 +1,8 @@
 [Unit]
 Description=Clixor immutable offsite PostgreSQL backup upload
 Wants=network-online.target
-After=network-online.target docker.service
+After=network-online.target docker.service clixor-runtime-reconcile.service
+ConditionPathExists=/run/clixor/runtime-ready
 ConditionPathIsDirectory=/srv/clixor/backups/postgres
 ConditionPathExists=/etc/clixor/offsite-backup.env
 

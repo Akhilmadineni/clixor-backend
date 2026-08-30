@@ -83,6 +83,18 @@ Docker configuration still contains secret-valued environment entries are force-
 once (a stopped Grafana container is removed); persistent data volumes are not
 deleted.
 
+Bootstrap is also the explicit transition for an existing pre-runtime-bundle
+staging VM (including the staging layout produced by revision `9e41d3b`). While
+holding the deployment lock, it requires `releases/current` to select a staging
+release whose two live API replicas, immutable image ID/revision label, and
+`/srv/clixor/repo` source all agree. It then creates and fsyncs a complete
+schema-2 runtime baseline under `releases/pending`, validates it, and atomically
+adds only that bundle to the already selected release. The current pointer and
+PostgreSQL files are never changed. A partial baseline is renamed into
+root-owned quarantine and a retry reconstructs it. Bootstrap refuses this
+one-time transition for Vault mode or any source/image/PKI mismatch; resolve the
+mismatch instead of bypassing the check.
+
 The bootstrap preserves and pins an existing `/srv/clixor/secrets/pki/ca.crt`
 trust root. It fails closed if that certificate and its private key are missing
 as a pair, do not match, or change after being pinned. The CA signs three
@@ -345,64 +357,115 @@ The deploy script:
    on `/srv/clixor`, and at least 6 GiB free on Docker's filesystem, before
    creating a release or snapshot; when both paths share one filesystem, the
    requirements are added rather than counted twice;
-3. writes the release-local secret mode; stages and checksums that release's
-   boot worker and Vault hydrator, then its host backup/restore/health programs,
-   systemd units, and
-   `cloudflared.service`; validates the connector unit with systemd; captures
-   the exact effective old connector-unit content/checksum and enabled/active
-   state; and captures the active backup-tool versions plus timer state;
+3. stages the candidate only under `releases/pending`; writes its secret mode;
+   snapshots the exact approved source and no-auto-restart Compose model; stages
+   and checksums its boot worker, Vault hydrator, backup/restore/health programs,
+   systemd units, connector unit, and the exact installed `cloudflared`
+   executable; and captures the previous host state for the synchronous
+   exit-trap rollback;
 4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
    --list` and SHA-256 verification before changing the active runtime; a clean
    first deployment records an explicit first-deploy marker;
-5. for Vault, atomically fetches content and OCI version for every mapped
+5. creates and fsyncs the schema-2 deployment journal before secrets or active
+   runtime can change, then advances it consecutively through secret hydration,
+   runtime mutation, migration, candidate validation, publication, and pointer
+   commit;
+6. for Vault, atomically fetches content and OCI version for every mapped
    artifact, writes and revalidates the strict mapping-bound candidate manifest,
    then selects its complete tmpfs generation while secret rollback is armed;
-6. rejects live Redis or NATS credential changes on an existing singleton;
-7. builds and verifies an ARM64 API image tagged with the full source revision;
-8. arms application rollback before refreshing runtime configuration,
-   synchronizing source, or reconciling containers;
+7. rejects live Redis or NATS credential changes on an existing singleton;
+8. builds and verifies an ARM64 API image tagged with the full source revision,
+   and arms application rollback before the first active runtime mutation;
 9. refreshes the independent dependency TLS leaves, synchronizes that exact
    source to `/srv/clixor/repo`, and restarts dependencies that need a new image,
    scoped secret boundary, or certificate; the small HAProxy TLS edge is always
    replaced because it reads its bind-mounted configuration only at startup;
-10. runs the one-shot migration command, verifies the previous release still
-   passes readiness on the expanded schema, then replaces `api-a` and `api-b`
-   one at a time, requiring direct readiness before replacing the next replica;
+10. runs the one-shot forward, expand-compatible migration command, verifies the
+    previous release still passes readiness, then replaces `api-a` and `api-b`
+    one at a time, requiring direct readiness before replacing the next replica;
 11. reconciles the gateway only after both replicas are ready, validates its
-   reviewed configuration, and performs a graceful Nginx reload when recreation
-   is unnecessary; running observability consumers are replaced separately;
-12. for production, atomically publishes the reviewed connector unit, reloads
-    systemd, and restarts cloudflared only when its token or unit changed; the
-    service must report `Type=notify` readiness within 90 seconds before both
-    public Cloudflare hostnames are checked against the exact deployed revision;
-13. while rollback is still armed, atomically publishes the new backup/restore
-    programs and units and reloads systemd so every following gate uses the exact
-    candidate-release tooling;
-14. creates and uploads a fresh post-migration backup, restores it into an
+    reviewed configuration, and handles running observability consumers
+    separately;
+12. records applied PKI and creates a complete schema-2 runtime bundle containing
+    exact source, Compose, immutable image reference and ID, runtime configuration,
+    dependency TLS leaves, host tools, connector unit/executable, and intended
+    service state; every file, mode, and size is inventoried by SHA-256 and
+    fsynced;
+13. writes the runtime-ready marker only after validating that bundle and both
+    candidate API containers' image IDs; for production, activates the reviewed
+    connector and checks both public hostnames against the exact revision;
+14. while rollback remains armed, publishes candidate backup/restore tooling,
+    creates and uploads a fresh post-migration backup, restores it into an
     isolated PostgreSQL container, runs integrity checks, enables the verified
     timers, and runs backup health;
-15. records the dependency PKI state, revalidates and fsyncs the release-local
-    boot bundle, and atomically advances and fsyncs the current-release pointer,
-    thereby approving the application, boot worker, and exact Vault cohort
-    together; successful pointer observation disarms application, Vault,
-    connector, and host-tool rollback before any post-swap failure can run; and
-16. after the fresh offsite marker and successful release are durable, retains
-    the current and immediate previous rollback boundaries plus three small audit
-    releases, deletes pre-migration dumps from non-boundary audit releases, and
-    removes unused Clixor API image tags except the current and previous images.
+15. atomically renames the complete pending directory into the release root,
+    updates the ready marker, and revalidates both runtime and boot bundles;
+16. only then atomically advances and fsyncs `releases/current`, recording the
+    pointer phase and atomically archiving the journal before rollback is
+    disarmed; the pointer approves application, source/config, boot tooling,
+    host tooling, image identity, service state, and Vault cohort together; and
+17. after the fresh offsite marker and successful release are durable, retains
+    current and previous rollback boundaries plus three audit releases, strips
+    non-boundary migration dumps, and removes unused non-boundary API image tags.
 
 A failed upgrade restores the prior Vault selection, the exact captured
 cloudflared unit checksum plus enabled/active state, the captured host programs,
 systemd units, and timer state, then its Compose model, API image, and captured
-startup configuration. Connector readiness and public ingress are rechecked when
+startup configuration. The stable reconciler then restores the selected
+release's exact source, runtime files, PKI, host tools, Compose model, and service
+state. Connector readiness and public ingress are rechecked when
 the prior connector was active. Cloudflared or host-tool restoration failures are
 part of the final rollback verdict rather than warnings. A failed first
-deployment performs the same host restoration and stops the incomplete stack
-without deleting its bind-mounted data. Database migrations are
+deployment performs the same host restoration, stops the incomplete stack, and
+renames its release artifact into quarantine without deleting it or its
+bind-mounted data. Database migrations are
 forward-only: neither path automatically runs `pg_restore`, reverses migrations,
 or deletes database files. The pre-change dump is an operator recovery artifact,
 not an automatic rollback mechanism.
+
+### Crash-consistent boot and deployment recovery
+
+Docker is not the boot authority. Every persistent Compose service has
+`restart: "no"`, so Docker cannot independently revive whichever candidate
+containers happened to exist when the VM lost power. After release-pinned secret
+hydration and Docker, `clixor-runtime-reconcile.service` stops ingress and known
+containers, validates only the absolute immediate child selected by
+`releases/current`, restores its complete checksummed runtime bundle,
+force-recreates its exact image/Compose selection, restores the release-selected
+cloudflared executable, verifies both replicas plus exact local revision
+readiness, and only then writes `/run/clixor/runtime-ready`. Cloudflared and the
+backup/restore/health services are ordered after that reconciler and require the
+ready marker. The reconciler never copies, restores, removes, or rolls back
+PostgreSQL data files.
+
+The durable journal is `/srv/clixor/runtime/deploy-transaction.json`. Its file
+and parent are fsynced on creation and every consecutive phase change.
+`clixor-runtime-watchdog.timer` runs the stable controller every minute. It tries
+the deployment lock without blocking: while a deploy holds the lock it does
+nothing; after SIGKILL or power loss it ignores the uncommitted candidate,
+reconciles only `current`, atomically archives the journal, and renames any
+non-current candidate to `/srv/clixor/releases/quarantine`. If the pointer swap
+was already durable, the pointer is the commit record and the watchdog reconciles
+the new release. Invalid bundles, unavailable exact image IDs, corrupt journals,
+unsafe paths, checksum drift, and inability to stop exposed runtime all fail
+closed. A corrupt journal is retained for operator inspection.
+
+Pending and quarantined directories are not committed history and do not prevent
+initial staging-secret preparation. A pre-journal SIGKILL leftover with the same
+run identity is renamed to quarantine on retry. Recovery never deletes data,
+volumes, pre-migration dumps, or quarantined evidence.
+
+Inspect the selection and recovery state with:
+
+```sh
+sudo readlink /srv/clixor/releases/current
+sudo systemctl status --no-pager clixor-runtime-reconcile.service
+sudo systemctl status --no-pager clixor-runtime-watchdog.timer
+sudo ls -la /srv/clixor/runtime/deploy-transaction.json \
+  /srv/clixor/runtime/deploy-transactions \
+  /srv/clixor/releases/quarantine 2>/dev/null
+```
 
 Rolling availability requires expand/contract database changes. A release may
 add nullable columns, tables, indexes, and behavior understood by both the old
@@ -435,7 +498,8 @@ Check local state:
 ```sh
 curl --fail http://172.30.254.2:8080/health/ready
 sudo env CLIXOR_IMAGE_TAG="$(basename "$(readlink /srv/clixor/releases/current)")" \
-  docker compose --file /srv/clixor/repo/deploy/oci/compose.yaml ps
+  docker compose --file \
+  "$(readlink /srv/clixor/releases/current)/runtime-bundle/compose.yaml" ps
 ```
 
 The exact SHA argument is the deployment boundary. Deploying `main` does not

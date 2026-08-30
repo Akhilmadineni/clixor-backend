@@ -1,0 +1,22 @@
+[Unit]
+Description=Restore and start the exact Clixor release selected by releases/current
+Requires=clixor-runtime-secrets.service docker.service
+After=clixor-runtime-secrets.service docker.service
+Before=cloudflared.service clixor-offsite-backup.service clixor-restore-drill.service clixor-backup-health.service
+RequiresMountsFor=/srv/clixor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/runtime-reconciler.py reconcile --boot
+RemainAfterExit=yes
+UMask=0077
+LimitCORE=0
+TimeoutStartSec=15m
+
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/srv/clixor /run/clixor /etc/systemd/system /usr/local/libexec/clixor /usr/bin
+
+[Install]
+WantedBy=multi-user.target

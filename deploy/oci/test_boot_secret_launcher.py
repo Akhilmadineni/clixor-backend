@@ -102,13 +102,10 @@ class BootSecretLauncherTest(unittest.TestCase):
             ),
         )
 
-    def test_initial_staging_is_allowed_only_before_release_history(self) -> None:
+    def test_initial_staging_ignores_unselected_candidate_history(self) -> None:
         self.assertEqual(self._select(), (str(self.initial_worker),))
         self._release("history")
-        with self.assertRaisesRegex(
-            LAUNCHER.LaunchError, "release history exists"
-        ):
-            self._select()
+        self.assertEqual(self._select(), (str(self.initial_worker),))
 
     def test_pointer_and_release_paths_fail_closed(self) -> None:
         release = self._release("safe")

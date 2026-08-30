@@ -98,8 +98,13 @@ def validate_release_bundle(
     expected_uid: int,
     expected_gid: int,
 ) -> Path:
-    if not release.is_absolute() or release.parent != release_root:
-        raise LaunchError("release must be an immediate absolute child of the release root")
+    if not release.is_absolute() or release.parent not in {
+        release_root,
+        release_root / "pending",
+    }:
+        raise LaunchError(
+            "release must be an immediate committed or pending child of the release root"
+        )
     if RELEASE_RE.fullmatch(release.name) is None:
         raise LaunchError("release name is invalid")
     _validate_directory(release, expected_uid, expected_gid, exact_mode=0o700)
@@ -249,10 +254,10 @@ def select_boot_command(
     try:
         current_metadata = current.lstat()
     except FileNotFoundError:
-        if any(entry.name.startswith("oci-") for entry in release_root.iterdir()):
-            raise LaunchError(
-                "release history exists but the boot approval pointer is unavailable"
-            )
+        # Candidate and orphan directories are never boot authority.  With no
+        # current pointer, initial staging secrets may be prepared, but the
+        # independent runtime reconciler keeps every application container and
+        # ingress stopped.  This also makes a failed first deploy retryable.
         return _select_initial_staging(
             initial_staging_worker, expected_uid, expected_gid
         )

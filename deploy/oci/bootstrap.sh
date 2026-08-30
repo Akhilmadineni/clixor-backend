@@ -398,10 +398,6 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
         exit 1
       }
     fi
-  elif [ -d "${project_root}/releases" ] && \
-    [ -n "$(find "${project_root}/releases" -mindepth 1 -maxdepth 1 -name 'oci-*' -print -quit)" ]; then
-    echo "Release history exists without a boot approval pointer; repair it before installing the stable runtime-secret launcher." >&2
-    exit 1
   elif [ "${stable_launcher_installed}" = "false" ] && \
     [ "${selected_secret_mode}" != "staging" ]; then
     echo "Initial stable-launcher bootstrap requires staging secret mode." >&2
@@ -420,6 +416,34 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
     /etc/systemd/system/clixor-runtime-secrets.service
   install -m 0644 -o 0 -g 0 "${script_root}/docker-runtime-secrets.conf" \
     /etc/systemd/system/docker.service.d/clixor-runtime-secrets.conf
+  # Existing 9e41-style staging releases contain only the boot-secret cohort.
+  # Before installing the new boot authority, atomically extend the selected
+  # staging release with a complete schema-2 runtime baseline. This explicit
+  # transition holds the same lock as deployments and fails closed on any
+  # source/image/PKI mismatch.
+  install -d -m 0700 -o 0 -g 0 "${project_root}/releases/pending"
+  if [ -L "${project_root}/releases/current" ]; then
+    exec 8>"${project_root}/runtime/deploy.lock"
+    flock -n 8 || {
+      echo "A deployment is active; refusing the runtime-controller transition." >&2
+      exit 1
+    }
+    controller_source_root="$(CDPATH= cd -- "${script_root}/../.." && pwd)"
+    /usr/bin/python3 "${script_root}/runtime-reconciler.py" \
+      establish-legacy-baseline --controller-source "${controller_source_root}"
+  fi
+  install -m 0500 -o 0 -g 0 "${script_root}/runtime_bundle.py" \
+    /usr/local/libexec/clixor/runtime_bundle.py
+  install -m 0500 -o 0 -g 0 "${script_root}/runtime-reconciler.py" \
+    /usr/local/libexec/clixor/runtime-reconciler.py
+  for runtime_unit in \
+    clixor-runtime-reconcile.service \
+    clixor-runtime-watchdog.service \
+    clixor-runtime-watchdog.timer
+  do
+    install -m 0644 -o 0 -g 0 "${script_root}/${runtime_unit}" \
+      "/etc/systemd/system/${runtime_unit}"
+  done
   if [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
     if [ "${selected_secret_mode}" = "staging" ]; then
       /usr/bin/python3 /usr/local/libexec/clixor/prepare-staging-secrets.py
@@ -428,7 +452,15 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
       /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
   fi
   systemctl daemon-reload
-  systemctl enable clixor-runtime-secrets.service
+  systemctl enable \
+    clixor-runtime-secrets.service \
+    clixor-runtime-reconcile.service \
+    clixor-runtime-watchdog.timer
+  if [ -L "${project_root}/releases/current" ]; then
+    systemctl restart clixor-runtime-reconcile.service
+    systemctl start clixor-runtime-watchdog.timer
+    systemctl try-restart cloudflared.service >/dev/null 2>&1 || true
+  fi
 fi
 
 runtime_secret_root=/run/clixor/secrets
