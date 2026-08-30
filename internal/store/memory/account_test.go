@@ -283,3 +283,66 @@ func TestDeleteAccountSanitizesLiveAndReplayableChoreCreatorPII(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteAccountDropsSanitizedEntityOutboxAndPreservesUnrelatedEvent(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "outbox-delete@example.com", DisplayName: "Name Only PII",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "outbox-remaining@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID, MemberIDs: []uuid.UUID{deleted.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sanitizedID, unrelatedID := uuid.New(), uuid.New()
+	if _, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "note", ID: sanitizedID,
+		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"description":"Name Only PII"}`),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "note", ID: unrelatedID,
+		CreatedBy: remaining.ID, Payload: json.RawMessage(`{"description":"keep unrelated"}`),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	foundSanitized, foundUnrelated := false, false
+	for _, event := range persistence.outbox {
+		var entity domain.Entity
+		if json.Unmarshal(event.Payload, &entity) != nil {
+			continue
+		}
+		if entity.ID == sanitizedID {
+			foundSanitized = true
+		}
+		if entity.ID == unrelatedID {
+			foundUnrelated = true
+		}
+	}
+	if !foundSanitized {
+		t.Fatal("sanitized replacement event is missing")
+	}
+	if !foundUnrelated {
+		t.Fatal("unrelated shared-conversation event was removed")
+	}
+	for _, event := range persistence.outbox {
+		if strings.Contains(strings.ToLower(string(event.Payload)), "name only pii") {
+			t.Fatalf("display-name-only stale event survived: %s", event.Payload)
+		}
+	}
+}

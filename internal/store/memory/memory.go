@@ -635,9 +635,21 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 
 	filtered := s.outbox[:0]
 	removedOutboxIDs := make(map[int64]struct{})
-	needles := [][]byte{[]byte(userID.String()), []byte(identity.Email), []byte(identity.Phone), []byte(identity.Username)}
+	sanitizedEntities := make(map[string]struct{}, len(updatedEntities))
+	for _, entity := range updatedEntities {
+		sanitizedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()] = struct{}{}
+	}
+	needles := [][]byte{[]byte(userID.String()), []byte(identity.Email), []byte(identity.Phone), []byte(identity.Username), []byte(identity.DisplayName)}
 	for _, event := range s.outbox {
-		if _, deleted := deletedConversations[event.AggregateID]; deleted || containsAny(event.Payload, needles) {
+		_, deleted := deletedConversations[event.AggregateID]
+		sanitized := false
+		if event.Topic == "entity.updated" || event.Topic == "entity.deleted" {
+			var entity domain.Entity
+			if json.Unmarshal(event.Payload, &entity) == nil {
+				_, sanitized = sanitizedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()]
+			}
+		}
+		if deleted || sanitized || containsAnyFold(event.Payload, needles) {
 			removedOutboxIDs[event.ID] = struct{}{}
 			continue
 		}
@@ -676,9 +688,10 @@ func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid
 	return result
 }
 
-func containsAny(payload []byte, needles [][]byte) bool {
+func containsAnyFold(payload []byte, needles [][]byte) bool {
+	folded := bytes.ToLower(payload)
 	for _, needle := range needles {
-		if len(needle) > 0 && bytes.Contains(payload, needle) {
+		if len(needle) > 0 && bytes.Contains(folded, bytes.ToLower(needle)) {
 			return true
 		}
 	}

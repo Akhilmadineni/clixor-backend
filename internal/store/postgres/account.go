@@ -256,6 +256,19 @@ func (s *Store) deleteAccountTx(
 			if !changed {
 				continue
 			}
+			// Remove every queued representation of the entity we are about to
+			// sanitize. Matching the immutable aggregate/kind/id tuple avoids both
+			// retaining an older PII-bearing payload and deleting unrelated events
+			// from the same shared conversation.
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM outbox_events
+				WHERE aggregate_id=$1
+				  AND topic IN ('entity.updated','entity.deleted')
+				  AND payload->>'kind'=$2
+				  AND payload->>'id'=$3`,
+				entity.ConversationID, entity.Kind, entity.ID.String()); err != nil {
+				return err
+			}
 			entity.Payload = payload
 			entity.Version++
 			entity.UpdatedAt = time.Now().UTC()
@@ -360,12 +373,13 @@ func (s *Store) deleteAccountTx(
 	// identity data before enqueueing the sanitized entity updates below.
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM outbox_events
-		WHERE aggregate_id=ANY($5)
-		   OR position($1 in payload::text)>0
-		   OR ($2<>'' AND position(lower($2) in lower(payload::text))>0)
-		   OR ($3<>'' AND position($3 in payload::text)>0)
-		   OR ($4<>'' AND position(lower($4) in lower(payload::text))>0)`,
-		userID.String(), identity.Email, identity.Phone, identity.Username,
+			WHERE aggregate_id=ANY($6)
+			   OR position($1 in payload::text)>0
+			   OR ($2<>'' AND position(lower($2) in lower(payload::text))>0)
+			   OR ($3<>'' AND position($3 in payload::text)>0)
+			   OR ($4<>'' AND position(lower($4) in lower(payload::text))>0)
+			   OR ($5<>'' AND position(lower($5) in lower(payload::text))>0)`,
+		userID.String(), identity.Email, identity.Phone, identity.Username, identity.DisplayName,
 		deletedConversationIDs); err != nil {
 		return err
 	}

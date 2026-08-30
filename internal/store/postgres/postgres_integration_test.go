@@ -691,6 +691,14 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	}, &expected); err != nil {
 		t.Fatal(err)
 	}
+	unrelatedOutboxEntityID := uuid.New()
+	if _, err := persistence.pool.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES
+		('entity.updated',$1,jsonb_build_object('conversation_id',$1,'kind','expense','id',$2,'payload',jsonb_build_object('description',$3))),
+		('entity.updated',$1,jsonb_build_object('conversation_id',$1,'kind','note','id',$4,'payload',jsonb_build_object('description','keep unrelated')))`,
+		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID); err != nil {
+		t.Fatal(err)
+	}
 	choreID, rotationID, financialID := uuid.New(), uuid.New(), uuid.New()
 	baseChore := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` +
 		shared.ID.String() + `","createdBy":"` + deletedUser.ID.String() +
@@ -738,6 +746,13 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 
 	if err := persistence.DeleteAccount(ctx, deletedUser.ID); err != nil {
 		t.Fatal(err)
+	}
+	var staleNameCount, unrelatedEventCount int
+	if err := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE position(lower($1) in lower(payload::text))>0`, "Postgres Delete").Scan(&staleNameCount); err != nil || staleNameCount != 0 {
+		t.Fatalf("display-name-only stale outbox survived: count=%d err=%v", staleNameCount, err)
+	}
+	if err := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE payload->>'id'=$1`, unrelatedOutboxEntityID.String()).Scan(&unrelatedEventCount); err != nil || unrelatedEventCount != 1 {
+		t.Fatalf("unrelated shared-conversation outbox was not preserved: count=%d err=%v", unrelatedEventCount, err)
 	}
 	var resetCount int
 	if err := persistence.pool.QueryRow(ctx,
