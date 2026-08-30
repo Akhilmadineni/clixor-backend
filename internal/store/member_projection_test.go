@@ -120,6 +120,44 @@ func TestProjectConversationMembersUsesACLAndPreservesStableLocalObjects(t *test
 	}
 }
 
+func TestConversationMemberLocalIDsRejectCollisionsAndRemainImmutable(t *testing.T) {
+	conversationID, first, second := uuid.New(), uuid.New(), uuid.New()
+	firstStable := uuid.New()
+	members := []domain.ConversationMember{
+		{ConversationID: conversationID, UserID: first},
+		{ConversationID: conversationID, UserID: second},
+	}
+	malicious := json.RawMessage(`{"members":[` +
+		`{"id":"` + second.String() + `","backendUserId":"` + first.String() + `"},` +
+		`{"id":"` + second.String() + `","backendUserId":"` + second.String() + `"}` +
+		`]}`)
+	derived := DeriveConversationMemberLocalIDs(malicious, members, []ConversationMemberLocalID{
+		{UserID: first, LocalID: firstStable},
+	})
+	byUser := make(map[uuid.UUID]uuid.UUID)
+	byLocal := make(map[uuid.UUID]uuid.UUID)
+	for _, mapping := range derived {
+		if owner, collision := byLocal[mapping.LocalID]; collision && owner != mapping.UserID {
+			t.Fatalf("local ID collision survived: %+v", derived)
+		}
+		byUser[mapping.UserID] = mapping.LocalID
+		byLocal[mapping.LocalID] = mapping.UserID
+	}
+	if byUser[first] != firstStable {
+		t.Fatalf("metadata remapped immutable local ID: got %s want %s", byUser[first], firstStable)
+	}
+	if byUser[second] != second {
+		t.Fatalf("colliding proposal was not replaced with safe baseline: %+v", derived)
+	}
+	projected, err := ProjectConversationMembersWithLocalIDs(malicious, members, derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(projected, []byte(firstStable.String())) {
+		t.Fatalf("projection did not use server-owned mapping: %s", projected)
+	}
+}
+
 func TestPublicUserFromUserNeverLeaksPrivateDirectoryFields(t *testing.T) {
 	user := domain.User{
 		ID: uuid.New(), Email: "secret@example.com", Phone: "+13125550123",

@@ -32,6 +32,18 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.deleteAccountTx(ctx, tx, userID, nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) deleteAccountTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	userID uuid.UUID,
+	beforeMutation store.AccountDeletionFence,
+) error {
 	if err := lockMediaQuota(ctx, tx, "user", userID); err != nil {
 		return err
 	}
@@ -40,7 +52,7 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	var profile json.RawMessage
 	var deletedAt *time.Time
 	identity.UserID = userID
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT COALESCE(email,''),COALESCE(phone,''),display_name,profile,deleted_at
 		FROM users WHERE id=$1 FOR UPDATE`, userID,
 	).Scan(&identity.Email, &identity.Phone, &identity.DisplayName, &profile, &deletedAt)
@@ -51,6 +63,11 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 		return err
 	}
 	identity.Username = accountUsername(profile)
+	if beforeMutation != nil {
+		if err := beforeMutation(userID); err != nil {
+			return err
+		}
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT c.id,c.created_by,c.metadata,m.role,successor.user_id
@@ -175,11 +192,17 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 			conversation.id, userID); err != nil {
 			return err
 		}
-		tombstone := store.NewConversationMemberTombstone(metadata, userID)
+		tombstone := store.ConversationMemberTombstone{UserID: userID}
+		if err := tx.QueryRow(ctx, `
+			SELECT local_id FROM conversation_member_local_ids
+			WHERE conversation_id=$1 AND user_id=$2`, conversation.id, userID,
+		).Scan(&tombstone.LocalID); err != nil {
+			return mapError(err)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
-			VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO UPDATE
-			SET local_id=EXCLUDED.local_id,removed_at=now()`, conversation.id, userID, tombstone.LocalID); err != nil {
+			VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
+			conversation.id, userID, tombstone.LocalID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -311,7 +334,7 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 			}
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func accountUsername(profile json.RawMessage) string {

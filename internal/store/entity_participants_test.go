@@ -45,4 +45,38 @@ func TestValidateEntityParticipantsRequiresCurrentActiveRoster(t *testing.T) {
 			}
 		}
 	}
+	for _, malformed := range []json.RawMessage{
+		json.RawMessage(`{"customAmounts":{"` + activeLocal.String() + `":"10"}}`),
+		json.RawMessage(`{"customAmounts":{"` + activeLocal.String() + `":null}}`),
+		json.RawMessage(`{"customAmounts":{"not-a-uuid":10}}`),
+		json.RawMessage(`{"customAmounts":{"` + activeLocal.String() + `":-1}}`),
+		json.RawMessage(`{"paidBy":["` + activeLocal.String() + `"]}`),
+		json.RawMessage(`{"splitBetween":"` + activeLocal.String() + `"}`),
+		json.RawMessage(`{"payer":{"backendUserId":"` + activeBackend.String() + `","user_id":"` + activeBackend.String() + `"}}`),
+		json.RawMessage(`{"payer":{"backendUserId":"` + activeBackend.String() + `","unknownIdentity":"` + activeBackend.String() + `"}}`),
+		json.RawMessage(`{"participants":["` + activeBackend.String() + `",{"backendUserId":"` + activeBackend.String() + `"}]}`),
+		json.RawMessage(`{"paidBy":"` + activeLocal.String() + `","paid_by":"` + activeLocal.String() + `"}`),
+	} {
+		if err := ValidateEntityParticipants("expense", malformed, metadata, members); !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("malformed participant shape accepted: %s: %v", malformed, err)
+		}
+	}
+}
+
+func TestValidateEntityParticipantsAcceptsCanonicalSwiftUUIDCase(t *testing.T) {
+	userID := uuid.MustParse("12345678-1234-4234-9234-123456789abc")
+	members := []domain.ConversationMember{{UserID: userID}}
+	payload := json.RawMessage(`{"paidBy":"12345678-1234-4234-9234-123456789ABC","splitBetween":["12345678-1234-4234-9234-123456789ABC"],"customAmounts":{"12345678-1234-4234-9234-123456789ABC":1.25}}`)
+	if err := ValidateEntityParticipants("expense", payload, nil, members); err != nil {
+		t.Fatalf("canonical uppercase Foundation UUID rejected: %v", err)
+	}
+	for _, invalid := range []json.RawMessage{
+		json.RawMessage(`{"paidBy":" 12345678-1234-4234-9234-123456789ABC"}`),
+		json.RawMessage(`{"paidBy":"12345678123442349234123456789ABC"}`),
+		json.RawMessage(`{"paidBy":"urn:uuid:12345678-1234-4234-9234-123456789ABC"}`),
+	} {
+		if err := ValidateEntityParticipants("expense", invalid, nil, members); !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("non-canonical UUID accepted: payload=%s err=%v", invalid, err)
+		}
+	}
 }

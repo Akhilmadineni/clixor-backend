@@ -230,6 +230,36 @@ paths:
               schema: {$ref: "#/components/schemas/AgeAssurance"}
         "422": {description: Invalid or inconsistent age evidence}
         "429": {description: Underage-to-adult recheck cooldown is active}
+  /me/deletion-intents/{request_id}:
+    put:
+      operationId: putAccountDeletionIntent
+      description: Durably registers a recovery capability before account deletion. Only a SHA-256 verifier is stored.
+      parameters:
+        - {$ref: "#/components/parameters/RequestID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountDeletionCapability"}
+      responses:
+        "204": {description: Intent registered or identical live-account intent already exists}
+        "409": {description: Request ID is already bound to another account or capability}
+  /account-deletions/{request_id}/execute:
+    post:
+      security: []
+      operationId: executeAccountDeletionIntent
+      description: Executes or reconciles account deletion using the previously registered recovery capability.
+      parameters:
+        - {$ref: "#/components/parameters/RequestID"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AccountDeletionCapability"}
+      responses:
+        "204": {description: Account deletion completed or was already completed}
+        "404": {description: Capability is invalid or missing}
+        "429": {description: Too many capability attempts}
   /me/avatar:
     post:
       operationId: createProfileMediaUpload
@@ -772,6 +802,7 @@ components:
     InviteID: {name: invite_id, in: path, required: true, schema: {type: string, format: uuid}}
     DeviceID: {name: device_id, in: path, required: true, schema: {type: string, format: uuid}}
     UserID: {name: user_id, in: path, required: true, schema: {type: string, format: uuid}}
+    RequestID: {name: request_id, in: path, required: true, schema: {type: string, format: uuid}}
     EntityKind:
       name: kind
       in: path
@@ -786,6 +817,15 @@ components:
       description: Current version for optimistic concurrency, or 0 when creating
       schema: {type: integer, format: int64, minimum: 0}
   schemas:
+    AccountDeletionCapability:
+      type: object
+      additionalProperties: false
+      required: [recovery_token]
+      properties:
+        recovery_token:
+          type: string
+          pattern: "^[A-Za-z0-9_-]{43}$"
+          description: Unpadded base64url encoding of exactly 32 random bytes.
     ConversationMediaUploadRequest:
       type: object
       additionalProperties: false

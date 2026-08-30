@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -85,6 +86,133 @@ func ProjectConversationMembers(
 	members []domain.ConversationMember,
 	tombstones ...ConversationMemberTombstone,
 ) (json.RawMessage, error) {
+	localIDs := DeriveConversationMemberLocalIDs(metadata, members, nil)
+	return ProjectConversationMembersWithLocalIDs(metadata, members, localIDs, tombstones...)
+}
+
+// ConversationMemberLocalID is an immutable store-owned mapping between an
+// account UUID and the legacy UUID used inside entity payloads. Metadata can
+// propose a collision-free initial value, but can never update this mapping.
+type ConversationMemberLocalID struct {
+	UserID  uuid.UUID
+	LocalID uuid.UUID
+}
+
+// DeriveConversationMemberLocalIDs fills missing mappings deterministically.
+// Existing mappings always win. A metadata proposal is accepted only when the
+// backend identity is unambiguous, its local UUID is unique, and it cannot
+// collide with another active user's backend UUID.
+func DeriveConversationMemberLocalIDs(
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+	existing []ConversationMemberLocalID,
+) []ConversationMemberLocalID {
+	ordered := append([]domain.ConversationMember(nil), members...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].UserID.String() < ordered[j].UserID.String() })
+	active := make(map[uuid.UUID]struct{}, len(ordered))
+	conversationID := uuid.Nil
+	for _, member := range ordered {
+		active[member.UserID] = struct{}{}
+		if conversationID == uuid.Nil {
+			conversationID = member.ConversationID
+		}
+	}
+	result := make(map[uuid.UUID]uuid.UUID, len(ordered))
+	used := make(map[uuid.UUID]uuid.UUID, len(ordered))
+	for _, mapping := range existing {
+		if mapping.UserID == uuid.Nil || mapping.LocalID == uuid.Nil {
+			continue
+		}
+		if owner, collision := used[mapping.LocalID]; collision && owner != mapping.UserID {
+			continue
+		}
+		used[mapping.LocalID] = mapping.UserID
+		if _, wanted := active[mapping.UserID]; wanted {
+			result[mapping.UserID] = mapping.LocalID
+		}
+	}
+	candidates := metadataLocalIDCandidates(metadata, active)
+	for _, member := range ordered {
+		if _, found := result[member.UserID]; found {
+			continue
+		}
+		localID := candidates[member.UserID]
+		if localID != uuid.Nil {
+			if owner, collision := used[localID]; collision && owner != member.UserID {
+				localID = uuid.Nil
+			}
+			if _, backendCollision := active[localID]; backendCollision && localID != member.UserID {
+				localID = uuid.Nil
+			}
+		}
+		if localID == uuid.Nil {
+			localID = member.UserID
+		}
+		for attempt := 0; ; attempt++ {
+			owner, collision := used[localID]
+			if !collision || owner == member.UserID {
+				break
+			}
+			localID = uuid.NewSHA1(conversationID, []byte(fmt.Sprintf("member-local:%s:%d", member.UserID, attempt)))
+		}
+		result[member.UserID] = localID
+		used[localID] = member.UserID
+	}
+	mappings := make([]ConversationMemberLocalID, 0, len(result))
+	for _, member := range ordered {
+		mappings = append(mappings, ConversationMemberLocalID{UserID: member.UserID, LocalID: result[member.UserID]})
+	}
+	return mappings
+}
+
+func metadataLocalIDCandidates(metadata json.RawMessage, active map[uuid.UUID]struct{}) map[uuid.UUID]uuid.UUID {
+	result := make(map[uuid.UUID]uuid.UUID)
+	invalid := make(map[uuid.UUID]bool)
+	localOwners := make(map[uuid.UUID]uuid.UUID)
+	var root map[string]json.RawMessage
+	var rawMembers []json.RawMessage
+	if json.Unmarshal(metadata, &root) != nil || json.Unmarshal(root["members"], &rawMembers) != nil {
+		return result
+	}
+	for _, raw := range rawMembers {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(raw, &object) != nil {
+			continue
+		}
+		backendID, present, valid := memberBackendUserID(object)
+		if !present || !valid {
+			continue
+		}
+		if _, authorized := active[backendID]; !authorized {
+			continue
+		}
+		local, present, valid := uniqueStringField(object, "id")
+		localID, err := uuid.Parse(local)
+		if !present || !valid || err != nil || localID == uuid.Nil {
+			continue
+		}
+		if prior, exists := result[backendID]; exists && prior != localID {
+			invalid[backendID] = true
+		}
+		result[backendID] = localID
+		if owner, exists := localOwners[localID]; exists && owner != backendID {
+			invalid[owner], invalid[backendID] = true, true
+		} else {
+			localOwners[localID] = backendID
+		}
+	}
+	for userID := range invalid {
+		delete(result, userID)
+	}
+	return result
+}
+
+func ProjectConversationMembersWithLocalIDs(
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+	localIDs []ConversationMemberLocalID,
+	tombstones ...ConversationMemberTombstone,
+) (json.RawMessage, error) {
 	root := make(map[string]json.RawMessage)
 	trimmed := bytes.TrimSpace(metadata)
 	if len(trimmed) != 0 && !bytes.Equal(trimmed, []byte("null")) {
@@ -106,6 +234,12 @@ func ProjectConversationMembers(
 	authoritative := make(map[uuid.UUID]domain.ConversationMember, len(ordered))
 	for _, member := range ordered {
 		authoritative[member.UserID] = member
+	}
+	localByUser := make(map[uuid.UUID]uuid.UUID, len(localIDs))
+	for _, mapping := range localIDs {
+		if mapping.UserID != uuid.Nil && mapping.LocalID != uuid.Nil {
+			localByUser[mapping.UserID] = mapping.LocalID
+		}
 	}
 
 	var existing []json.RawMessage
@@ -138,14 +272,14 @@ func ProjectConversationMembers(
 		if _, duplicate := seen[backendID]; duplicate {
 			continue
 		}
-		projected = append(projected, marshalProjectedMember(object, member))
+		projected = append(projected, marshalProjectedMember(member, localByUser[member.UserID]))
 		seen[backendID] = struct{}{}
 	}
 	for _, member := range ordered {
 		if _, ok := seen[member.UserID]; ok {
 			continue
 		}
-		projected = append(projected, marshalProjectedMember(nil, member))
+		projected = append(projected, marshalProjectedMember(member, localByUser[member.UserID]))
 		seen[member.UserID] = struct{}{}
 	}
 	for _, tombstone := range tombstones {
@@ -283,13 +417,13 @@ func memberIsDeletedTombstone(object map[string]json.RawMessage) bool {
 	return found && deleted
 }
 
-func marshalProjectedMember(
-	existing map[string]json.RawMessage,
-	member domain.ConversationMember,
-) json.RawMessage {
+func marshalProjectedMember(member domain.ConversationMember, localID uuid.UUID) json.RawMessage {
 	object := make(map[string]json.RawMessage, 8)
 	setJSON(object, "backendUserId", member.UserID.String())
-	setJSON(object, "id", stableLocalMemberID(existing, member.UserID))
+	if localID == uuid.Nil {
+		localID = member.UserID
+	}
+	setJSON(object, "id", localID.String())
 	name := boundedString(member.DisplayName, 100)
 	if name == "" {
 		name = boundedString(strings.TrimPrefix(strings.TrimSpace(member.Username), "@"), 100)
@@ -325,25 +459,6 @@ func marshalTrustedDeletedMember(tombstone ConversationMemberTombstone) json.Raw
 	setJSON(object, "rosterState", "inactiveTombstone")
 	encoded, _ := json.Marshal(object)
 	return encoded
-}
-
-func stableLocalMemberID(existing map[string]json.RawMessage, fallback uuid.UUID) string {
-	value, present, valid := uniqueStringField(existing, "id")
-	if present && valid {
-		if value, safe := safeLocalMemberID(value); safe {
-			return value
-		}
-	}
-	return fallback.String()
-}
-
-func safeLocalMemberID(value string) (string, bool) {
-	value = strings.TrimSpace(value)
-	parsed, err := uuid.Parse(value)
-	if err != nil || parsed == uuid.Nil {
-		return "", false
-	}
-	return parsed.String(), true
 }
 
 func uniqueStringField(object map[string]json.RawMessage, wanted string) (string, bool, bool) {

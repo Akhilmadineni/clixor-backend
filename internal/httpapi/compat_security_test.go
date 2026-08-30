@@ -77,6 +77,14 @@ func TestAuthoritativeACLProjectsLegacyMembersAndRejectsStaleMetadata(t *testing
 		"user_id": added.user.ID, "role": "member",
 	}, http.StatusNoContent, nil)
 	added.do(t, http.MethodGet, "/v1/conversations/"+group.ID.String(), nil, http.StatusOK, nil)
+	owner.do(t, http.MethodPatch, "/v1/conversations/"+group.ID.String(), map[string]any{
+		"metadata": map[string]any{"members": []map[string]any{
+			{"id": uuid.NewString(), "backendUserId": owner.user.ID},
+			{"id": ownerLocalID, "backendUserId": member.user.ID},
+		}},
+	}, http.StatusOK, &group)
+	assertProjectedMember(t, group.Metadata, owner.user.ID, ownerLocalID, true)
+	assertProjectedMember(t, group.Metadata, member.user.ID, memberLocalID, true)
 
 	memberBody := authenticatedRawRequest(
 		t, owner.client, http.MethodGet,

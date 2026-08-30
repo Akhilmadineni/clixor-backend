@@ -64,6 +64,7 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 	defer subscription.Close()
 
 	connection.SetReadLimit(16 << 10)
+	_ = connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_ = connection.SetReadDeadline(time.Now().Add(70 * time.Second))
 	connection.SetPongHandler(func(string) error {
 		return connection.SetReadDeadline(time.Now().Add(70 * time.Second))
@@ -112,8 +113,10 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				published, _ := guard.WhileActive(func() error {
+					actionContext, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+					defer cancel()
 					members, memberErr := s.store.ListConversationMembers(
-						r.Context(), *frame.ConversationID, id.UserID,
+						actionContext, *frame.ConversationID, id.UserID,
 					)
 					if memberErr != nil {
 						return nil
@@ -127,7 +130,7 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 					payload, _ := json.Marshal(map[string]any{
 						"user_id": id.UserID, "device_id": id.DeviceID, "active": frame.Active,
 					})
-					return s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
+					return s.bus.Publish(actionContext, recipients, domain.RealtimeEvent{
 						ID: uuid.NewString(), Type: "typing.changed", ConversationID: frame.ConversationID,
 						Payload: payload, OccurredAt: time.Now().UTC(),
 					})

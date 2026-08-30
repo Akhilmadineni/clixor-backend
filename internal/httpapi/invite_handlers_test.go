@@ -127,6 +127,12 @@ func TestSecureConversationInviteHTTPContract(t *testing.T) {
 	if retried.Joined || retried.Conversation.ID != group.ID {
 		t.Fatalf("invite retry was not idempotent: %+v", retried)
 	}
+	var exhaustedMemberPreview map[string]json.RawMessage
+	firstJoiner.do(t, http.MethodPost, "/v1/invites/preview",
+		map[string]any{"token": active.Token}, http.StatusOK, &exhaustedMemberPreview)
+	if string(exhaustedMemberPreview["already_member"]) != "true" {
+		t.Fatalf("exhausted invite hid existing membership: %s", mustJSON(t, exhaustedMemberPreview))
+	}
 	secondJoiner.do(t, http.MethodPost, "/v1/invites/preview",
 		map[string]any{"token": active.Token}, http.StatusGone, nil)
 	secondJoiner.do(t, http.MethodPost, "/v1/invites/accept",
@@ -138,6 +144,12 @@ func TestSecureConversationInviteHTTPContract(t *testing.T) {
 		map[string]any{"token": active.Token}, http.StatusOK, &revokedRetry)
 	if revokedRetry.Joined || revokedRetry.Conversation.ID != group.ID {
 		t.Fatalf("authorized revoked-token retry was not idempotent: %+v", revokedRetry)
+	}
+	var revokedMemberPreview map[string]json.RawMessage
+	firstJoiner.do(t, http.MethodPost, "/v1/invites/preview",
+		map[string]any{"token": active.Token}, http.StatusOK, &revokedMemberPreview)
+	if string(revokedMemberPreview["already_member"]) != "true" {
+		t.Fatalf("revoked invite hid existing membership: %s", mustJSON(t, revokedMemberPreview))
 	}
 
 	for _, fixedPath := range []string{"/v1/invites/preview", "/v1/invites/accept"} {

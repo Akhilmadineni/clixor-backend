@@ -58,12 +58,8 @@ func (s *Server) verifyAppleIdentity(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	device, err := s.registerDevice(r, user.ID, request.DeviceID, request.DeviceName, request.Platform)
-	if err != nil {
-		writeDomainError(w, err)
-		return
-	}
-	tokens, err := s.tokens.Issue(r.Context(), user.ID, device.ID)
+	device := newAuthDevice(user.ID, request.DeviceID, request.DeviceName, request.Platform)
+	user, device, tokens, err := s.tokens.IssueWithDevice(r.Context(), user.ID, nil, device)
 	if err != nil {
 		writeDomainError(w, err)
 		return

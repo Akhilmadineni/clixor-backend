@@ -82,6 +82,22 @@ type PasswordResetChallenge struct {
 	CreatedAt  time.Time
 }
 
+const (
+	AccountDeletionPending   = "pending"
+	AccountDeletionCompleted = "completed"
+)
+
+// AccountDeletionIntent stores only a capability verifier and lifecycle state;
+// it deliberately carries no email, phone, display name, or raw token.
+type AccountDeletionIntent struct {
+	RequestID   uuid.UUID
+	UserID      uuid.UUID
+	TokenHash   []byte
+	State       string
+	CreatedAt   time.Time
+	CompletedAt *time.Time
+}
+
 type OneTimePreKey struct {
 	ID        int64      `json:"-"`
 	DeviceID  uuid.UUID  `json:"-"`

@@ -80,8 +80,10 @@ func (s *Store) ConversationInvitePreview(ctx context.Context, tokenHash []byte,
 	if err != nil {
 		return domain.ConversationInvitePreview{}, mapError(err)
 	}
-	if err := postgresConversationInviteActiveError(invite, time.Now()); err != nil {
-		return domain.ConversationInvitePreview{}, err
+	if !preview.AlreadyMember {
+		if err := postgresConversationInviteActiveError(invite, time.Now()); err != nil {
+			return domain.ConversationInvitePreview{}, err
+		}
 	}
 	preview.InviteID = invite.ID
 	preview.ExpiresAt = invite.ExpiresAt

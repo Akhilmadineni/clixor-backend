@@ -16,6 +16,18 @@ type CreateUserParams struct {
 	PasswordHash string
 }
 
+// SessionIssueParams binds device registration and refresh-session creation to
+// one live-account serialization point. Password login additionally supplies
+// the exact hash that was verified outside the store; a reset that changes the
+// hash before this transaction acquires the user lock makes issuance fail.
+type SessionIssueParams struct {
+	UserID                   uuid.UUID
+	ExpectedPasswordHash     string
+	RequirePasswordHashMatch bool
+	Device                   domain.Device
+	Session                  domain.Session
+}
+
 type CreateConversationParams struct {
 	ID           uuid.UUID
 	Kind         string
@@ -136,6 +148,7 @@ type PasswordResetCompletion struct {
 }
 
 type PasswordResetFence func(uuid.UUID) error
+type AccountDeletionFence func(uuid.UUID) error
 
 type Store interface {
 	Close()
@@ -155,6 +168,8 @@ type Store interface {
 	AgeAssurance(context.Context, uuid.UUID) (domain.AgeAssurance, error)
 	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
+	PutAccountDeletionIntent(context.Context, domain.AccountDeletionIntent) error
+	ExecuteAccountDeletionIntent(context.Context, uuid.UUID, []byte, AccountDeletionFence) error
 	CreatePasswordResetChallenge(context.Context, domain.PasswordResetChallenge) error
 	CreatePasswordResetChallengeWithMail(context.Context, domain.PasswordResetChallenge, MailDeliveryBuilder) error
 	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
@@ -170,6 +185,7 @@ type Store interface {
 	ClaimPreKeys(context.Context, uuid.UUID) ([]domain.PreKeyBundle, error)
 
 	CreateSession(context.Context, domain.Session) error
+	IssueSession(context.Context, SessionIssueParams) (domain.User, domain.Device, error)
 	RotateSession(context.Context, uuid.UUID, []byte, []byte, time.Time) (domain.Session, error)
 	RevokeSession(context.Context, uuid.UUID, uuid.UUID) error
 	SessionActive(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)

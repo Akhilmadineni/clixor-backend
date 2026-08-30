@@ -63,6 +63,42 @@ func (m *TokenManager) Issue(ctx context.Context, userID, deviceID uuid.UUID) (T
 	return m.pair(userID, deviceID, sessionID, refreshSecret, now)
 }
 
+// IssueWithDevice persists the authenticated device and its first refresh
+// session atomically under the store's live-user lock. expectedPasswordHash is
+// non-nil only for password login and closes the verify/reset stale-hash race.
+func (m *TokenManager) IssueWithDevice(
+	ctx context.Context,
+	userID uuid.UUID,
+	expectedPasswordHash *string,
+	device domain.Device,
+) (domain.User, domain.Device, TokenPair, error) {
+	sessionID := uuid.New()
+	refreshSecret, err := randomToken(48)
+	if err != nil {
+		return domain.User{}, domain.Device{}, TokenPair{}, err
+	}
+	now := m.now()
+	session := domain.Session{
+		ID: sessionID, UserID: userID, DeviceID: device.ID,
+		RefreshTokenHash: refreshHash(refreshSecret), CreatedAt: now,
+		ExpiresAt: now.Add(m.refreshTTL),
+	}
+	params := store.SessionIssueParams{UserID: userID, Device: device, Session: session}
+	if expectedPasswordHash != nil {
+		params.ExpectedPasswordHash = *expectedPasswordHash
+		params.RequirePasswordHashMatch = true
+	}
+	user, persistedDevice, err := m.store.IssueSession(ctx, params)
+	if err != nil {
+		return domain.User{}, domain.Device{}, TokenPair{}, err
+	}
+	pair, err := m.pair(userID, persistedDevice.ID, sessionID, refreshSecret, now)
+	if err != nil {
+		return domain.User{}, domain.Device{}, TokenPair{}, err
+	}
+	return user, persistedDevice, pair, nil
+}
+
 func (m *TokenManager) Refresh(ctx context.Context, refreshToken string) (TokenPair, error) {
 	sessionID, oldSecret, err := parseRefreshToken(refreshToken)
 	if err != nil {

@@ -116,7 +116,7 @@ func (b *MemoryBus) FenceSessions(_ context.Context, userID uuid.UUID, sessionID
 	if b.fences[userID] == nil {
 		b.fences[userID] = make(map[uuid.UUID]memoryFence)
 	}
-	b.fences[userID][ticketID] = memoryFence{sessionID: cloneSessionID(sessionID), validUntil: time.Now().Add(realtimeOwnerTTL)}
+	b.fences[userID][ticketID] = memoryFence{sessionID: cloneSessionID(sessionID), validUntil: time.Now().Add(realtimeFenceTTL)}
 	owners := make([]*memorySessionOwner, 0, len(b.owners[userID]))
 	for owner := range b.owners[userID] {
 		owners = append(owners, owner)

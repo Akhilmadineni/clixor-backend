@@ -234,14 +234,31 @@ func (s *Store) UserByExternalIdentity(ctx context.Context, provider, subject st
 }
 
 func (s *Store) LinkExternalIdentity(ctx context.Context, provider, subject string, userID uuid.UUID, email string) error {
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Serialize identity material with deletion. A bare INSERT .. SELECT can
+	// retain its pre-delete MVCC candidate while waiting on the foreign-key row
+	// and recreate PII after the deletion transaction has cleaned this table.
+	if err := lockLiveUser(ctx, tx, userID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO external_identities(provider,subject,user_id,email)
 		VALUES($1,$2,$3,NULLIF($4,''))
 		ON CONFLICT(provider,subject) DO UPDATE SET
 		  email=COALESCE(EXCLUDED.email,external_identities.email)
 		WHERE external_identities.user_id=EXCLUDED.user_id`,
 		provider, subject, userID, email)
-	return mapError(err)
+	if err != nil {
+		return mapError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrConflict
+	}
+	return tx.Commit(ctx)
 }
 
 // UpdateUserPhone attaches a verified phone number to an existing account (as opposed to
@@ -268,6 +285,9 @@ func (s *Store) UpsertDevice(ctx context.Context, device domain.Device) (domain.
 		return domain.Device{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, device.UserID); err != nil {
+		return domain.Device{}, err
+	}
 	if device.PushToken != "" {
 		// Serialize ownership transfers for this exact token, then clear its old
 		// owner in the same transaction as the authenticated device upsert. A
@@ -422,12 +442,102 @@ func (s *Store) ClaimPreKeys(ctx context.Context, targetUserID uuid.UUID) ([]dom
 }
 
 func (s *Store) CreateSession(ctx context.Context, session domain.Session) error {
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, session.UserID); err != nil {
+		return domain.ErrUnauthenticated
+	}
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO sessions(id,user_id,device_id,refresh_token_hash,expires_at,created_at)
-		VALUES($1,$2,$3,$4,$5,$6)`,
+		SELECT $1,$2,$3,$4,$5,$6 FROM devices d
+		WHERE d.user_id=$2 AND d.id=$3`,
 		session.ID, session.UserID, session.DeviceID, session.RefreshTokenHash,
 		session.ExpiresAt, session.CreatedAt)
-	return mapError(err)
+	if err != nil {
+		return mapError(err)
+	}
+	if tag.RowsAffected() != 1 {
+		return domain.ErrUnauthenticated
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *Store) IssueSession(
+	ctx context.Context,
+	p store.SessionIssueParams,
+) (domain.User, domain.Device, error) {
+	if p.UserID == uuid.Nil || p.Device.ID == uuid.Nil || p.Device.UserID != p.UserID ||
+		p.Session.ID == uuid.Nil || p.Session.UserID != p.UserID ||
+		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
+		return domain.User{}, domain.Device{}, domain.ErrInvalid
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return domain.User{}, domain.Device{}, err
+	}
+	defer tx.Rollback(ctx)
+	user, err := scanUser(tx.QueryRow(ctx, `
+		SELECT id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,
+		       password_hash,created_at,updated_at
+		FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, p.UserID))
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, domain.ErrNotFound) {
+		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
+	}
+	if err != nil {
+		return domain.User{}, domain.Device{}, err
+	}
+	if p.RequirePasswordHashMatch && subtle.ConstantTimeCompare(
+		[]byte(user.PasswordHash), []byte(p.ExpectedPasswordHash),
+	) != 1 {
+		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
+	}
+	device := p.Device
+	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
+	if device.CreatedAt.IsZero() {
+		device.CreatedAt = time.Now().UTC()
+	}
+	if device.PushToken != "" {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, device.PushToken); err != nil {
+			return domain.User{}, domain.Device{}, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE devices SET push_token='' WHERE push_token=$1 AND id<>$2`,
+			device.PushToken, device.ID); err != nil {
+			return domain.User{}, domain.Device{}, err
+		}
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO devices (id,user_id,name,platform,push_token,identity_key,signed_prekey,last_seen_at,created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8)
+		ON CONFLICT (id) DO UPDATE SET
+			name=EXCLUDED.name,platform=EXCLUDED.platform,
+			push_token=CASE WHEN EXCLUDED.push_token='' THEN devices.push_token ELSE EXCLUDED.push_token END,
+			identity_key=CASE WHEN EXCLUDED.identity_key='' THEN devices.identity_key ELSE EXCLUDED.identity_key END,
+			signed_prekey=COALESCE(EXCLUDED.signed_prekey,devices.signed_prekey),last_seen_at=now()
+		WHERE devices.user_id=EXCLUDED.user_id
+		RETURNING id,user_id,name,platform,push_token,identity_key,COALESCE(signed_prekey,'null'::jsonb),last_seen_at,created_at`,
+		device.ID, device.UserID, device.Name, device.Platform, device.PushToken,
+		device.IdentityKey, nullableJSON(device.SignedPreKey), device.CreatedAt,
+	).Scan(&device.ID, &device.UserID, &device.Name, &device.Platform, &device.PushToken,
+		&device.IdentityKey, &device.SignedPreKey, &device.LastSeenAt, &device.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.User{}, domain.Device{}, domain.ErrConflict
+	}
+	if err != nil {
+		return domain.User{}, domain.Device{}, mapError(err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sessions(id,user_id,device_id,refresh_token_hash,expires_at,created_at)
+		VALUES($1,$2,$3,$4,$5,$6)`, p.Session.ID, p.Session.UserID, p.Session.DeviceID,
+		p.Session.RefreshTokenHash, p.Session.ExpiresAt, p.Session.CreatedAt); err != nil {
+		return domain.User{}, domain.Device{}, mapError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.User{}, domain.Device{}, mapError(err)
+	}
+	return user, device, nil
 }
 
 func (s *Store) RotateSession(ctx context.Context, id uuid.UUID, oldHash, newHash []byte, expiresAt time.Time) (domain.Session, error) {
@@ -438,9 +548,10 @@ func (s *Store) RotateSession(ctx context.Context, id uuid.UUID, oldHash, newHas
 	}
 	defer tx.Rollback(ctx)
 	err = tx.QueryRow(ctx, `
-		SELECT id,user_id,device_id,refresh_token_hash,previous_refresh_token_hash,
-		       expires_at,revoked_at,created_at
-		FROM sessions WHERE id=$1 FOR UPDATE`, id,
+		SELECT s.id,s.user_id,s.device_id,s.refresh_token_hash,s.previous_refresh_token_hash,
+		       s.expires_at,s.revoked_at,s.created_at
+		FROM sessions s JOIN users u ON u.id=s.user_id
+		WHERE s.id=$1 AND u.deleted_at IS NULL FOR UPDATE OF s,u`, id,
 	).Scan(&session.ID, &session.UserID, &session.DeviceID, &session.RefreshTokenHash,
 		&session.PreviousRefreshTokenHash, &session.ExpiresAt, &session.RevokedAt,
 		&session.CreatedAt)
@@ -495,9 +606,9 @@ func (s *Store) SessionActive(ctx context.Context, id, userID, deviceID uuid.UUI
 	var active bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT EXISTS(
-			SELECT 1 FROM sessions
-			WHERE id=$1 AND user_id=$2 AND device_id=$3
-			  AND revoked_at IS NULL AND expires_at>now()
+			SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id
+			WHERE s.id=$1 AND s.user_id=$2 AND s.device_id=$3
+			  AND s.revoked_at IS NULL AND s.expires_at>now() AND u.deleted_at IS NULL
 		)`, id, userID, deviceID).Scan(&active)
 	return active, err
 }
@@ -591,6 +702,16 @@ func (s *Store) CreateConversation(ctx context.Context, p store.CreateConversati
 		if _, err := tx.Exec(ctx, `
 			UPDATE conversations SET metadata=$2 WHERE id=$1`,
 			conversation.ID, conversation.Metadata); err != nil {
+			return domain.Conversation{}, err
+		}
+	} else {
+		members, memberErr := listConversationMembers(ctx, tx, conversation.ID)
+		if memberErr != nil {
+			return domain.Conversation{}, memberErr
+		}
+		if _, err := ensureConversationMemberLocalIDs(
+			ctx, tx, conversation.ID, conversation.Metadata, members,
+		); err != nil {
 			return domain.Conversation{}, err
 		}
 	}
@@ -813,11 +934,16 @@ func projectConversationMetadata(
 	ctx context.Context,
 	query interface {
 		Query(context.Context, string, ...any) (pgx.Rows, error)
+		Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 	},
 	conversationID uuid.UUID,
 	metadata json.RawMessage,
 ) (json.RawMessage, error) {
 	members, err := listConversationMembers(ctx, query, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	localIDs, err := ensureConversationMemberLocalIDs(ctx, query, conversationID, metadata, members)
 	if err != nil {
 		return nil, err
 	}
@@ -839,7 +965,68 @@ func projectConversationMetadata(
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return store.ProjectConversationMembers(metadata, members, tombstones...)
+	return store.ProjectConversationMembersWithLocalIDs(metadata, members, localIDs, tombstones...)
+}
+
+func ensureConversationMemberLocalIDs(
+	ctx context.Context,
+	query interface {
+		Query(context.Context, string, ...any) (pgx.Rows, error)
+		Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	},
+	conversationID uuid.UUID,
+	metadata json.RawMessage,
+	members []domain.ConversationMember,
+) ([]store.ConversationMemberLocalID, error) {
+	load := func() ([]store.ConversationMemberLocalID, error) {
+		rows, err := query.Query(ctx, `
+			SELECT user_id,local_id FROM conversation_member_local_ids
+			WHERE conversation_id=$1 ORDER BY user_id`, conversationID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var result []store.ConversationMemberLocalID
+		for rows.Next() {
+			var mapping store.ConversationMemberLocalID
+			if err := rows.Scan(&mapping.UserID, &mapping.LocalID); err != nil {
+				return nil, err
+			}
+			result = append(result, mapping)
+		}
+		return result, rows.Err()
+	}
+	existing, err := load()
+	if err != nil {
+		return nil, err
+	}
+	derived := store.DeriveConversationMemberLocalIDs(metadata, members, existing)
+	for _, mapping := range derived {
+		if _, err := query.Exec(ctx, `
+			INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)
+			VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,
+			conversationID, mapping.UserID, mapping.LocalID); err != nil {
+			return nil, err
+		}
+	}
+	all, err := load()
+	if err != nil {
+		return nil, err
+	}
+	wanted := make(map[uuid.UUID]struct{}, len(members))
+	for _, member := range members {
+		wanted[member.UserID] = struct{}{}
+	}
+	filtered := make([]store.ConversationMemberLocalID, 0, len(members))
+	for _, mapping := range all {
+		if _, active := wanted[mapping.UserID]; active {
+			filtered = append(filtered, mapping)
+		}
+	}
+	if len(filtered) != len(wanted) {
+		return nil, fmt.Errorf("conversation member local-ID mapping incomplete")
+	}
+	return filtered, nil
 }
 
 func (s *Store) ConversationMemberIDs(ctx context.Context, conversationID uuid.UUID) ([]uuid.UUID, error) {
@@ -1094,11 +1281,17 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 	if actorID != userID && actorRole != "owner" && actorRole != "admin" {
 		return domain.ErrForbidden
 	}
-	tombstone := store.NewConversationMemberTombstone(metadata, userID)
+	var tombstone store.ConversationMemberTombstone
+	tombstone.UserID = userID
+	if err := tx.QueryRow(ctx, `
+		SELECT local_id FROM conversation_member_local_ids
+		WHERE conversation_id=$1 AND user_id=$2`, conversationID, userID).Scan(&tombstone.LocalID); err != nil {
+		return mapError(err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
-		VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO UPDATE
-		SET local_id=EXCLUDED.local_id,removed_at=now()`, conversationID, userID, tombstone.LocalID); err != nil {
+		VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
+		conversationID, userID, tombstone.LocalID); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx, `
@@ -1356,7 +1549,15 @@ func (s *Store) PutEntity(ctx context.Context, entity domain.Entity, expectedVer
 	if err != nil {
 		return domain.Entity{}, err
 	}
-	if err := store.ValidateEntityParticipants(entity.Kind, entity.Payload, conversationMetadata, activeMembers); err != nil {
+	localIDs, err := ensureConversationMemberLocalIDs(
+		ctx, tx, entity.ConversationID, conversationMetadata, activeMembers,
+	)
+	if err != nil {
+		return domain.Entity{}, err
+	}
+	if err := store.ValidateEntityParticipants(
+		entity.Kind, entity.Payload, conversationMetadata, activeMembers, localIDs...,
+	); err != nil {
 		return domain.Entity{}, err
 	}
 	var expected any
@@ -2774,10 +2975,11 @@ func (s *Store) requireMember(ctx context.Context, query memberQuerier, conversa
 	return nil
 }
 
-// lockLiveUser is the common first lock for state created in additive extension
-// tables. Account deletion also locks this row first, so an old replica's
-// tombstone trigger either cleans a completed write or makes a later write fail;
-// extension rows cannot appear after deletion.
+// lockLiveUser is the common user-row serialization point for state created in
+// additive extension tables. Account deletion takes its media advisory before
+// this row; writers that only need the user row never subsequently wait on that
+// advisory, so completed writes are cleaned and later writes fail without a
+// lock-order cycle.
 func lockLiveUser(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
 	var lockedUserID uuid.UUID
 	err := tx.QueryRow(ctx, `

@@ -116,8 +116,8 @@ func TestConversationInviteLifecycleAndAuthorization(t *testing.T) {
 	if err := persistence.RevokeConversationInvite(ctx, conversation.ID, admin, invite.ID); err != nil {
 		t.Fatalf("idempotent revoke failed: %v", err)
 	}
-	if _, err := persistence.ConversationInvitePreview(ctx, tokenHash[:], firstJoiner); !errors.Is(err, domain.ErrInviteRevoked) {
-		t.Fatalf("revoked preview returned %v, want revoked", err)
+	if preview, err := persistence.ConversationInvitePreview(ctx, tokenHash[:], firstJoiner); err != nil || !preview.AlreadyMember {
+		t.Fatalf("revoked member preview returned preview=%+v err=%v, want already-member success", preview, err)
 	}
 	persistence.mu.Lock()
 	stale = persistence.conversations[conversation.ID]
