@@ -31,11 +31,11 @@ func pruneRotationOperations(ctx context.Context, persistence store.Store, cutof
 	deleted, err := persistence.PruneChoreRotationOperations(ctx, cutoff, batchSize)
 	observability.ChoreRotationCleanupDuration.Observe(time.Since(started).Seconds())
 	if err != nil {
-		observability.ChoreRotationCleanup.WithLabelValues("failed").Inc()
+		observability.ChoreRotationCleanupFailedRuns.Inc()
 		logger.Error("chore_rotation_cleanup_failed", "error", err, "duration", time.Since(started))
 		return 0
 	}
-	observability.ChoreRotationCleanup.WithLabelValues("deleted").Add(float64(deleted))
-	logger.Info("chore_rotation_cleanup_completed", "deleted", deleted, "duration", time.Since(started))
+	observability.ChoreRotationCleanupDeletedRows.Add(float64(deleted))
+	logger.Info("chore_rotation_cleanup_completed", "deleted_rows", deleted, "duration", time.Since(started))
 	return deleted
 }

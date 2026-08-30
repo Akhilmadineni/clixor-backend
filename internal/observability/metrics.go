@@ -47,10 +47,15 @@ var (
 		Help: "Expired media reservations and cleanup failures.",
 	}, []string{"result"})
 
-	ChoreRotationCleanup = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_total",
-		Help: "Expired chore-rotation replay records pruned and cleanup failures.",
-	}, []string{"result"})
+	ChoreRotationCleanupDeletedRows = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_deleted_rows_total",
+		Help: "Expired chore-rotation replay rows deleted.",
+	})
+
+	ChoreRotationCleanupFailedRuns = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_failed_runs_total",
+		Help: "Chore-rotation cleanup runs that failed.",
+	})
 
 	ChoreRotationCleanupDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "clustr", Subsystem: "chores", Name: "rotation_cleanup_duration_seconds",

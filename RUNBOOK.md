@@ -63,12 +63,15 @@ then every `CLUSTER_CHORE_ROTATION_CLEANUP_INTERVAL` (one hour by default). Each
 transaction deletes at most `CLUSTER_CHORE_ROTATION_CLEANUP_BATCH_SIZE` expired
 rows (500 by default), orders oldest first, uses `SKIP LOCKED`, and has a local
 five-second statement timeout. Failures retain the rows and retry on the next
-tick. Monitor `clustr_chores_rotation_cleanup_total` and
-`clustr_chores_rotation_cleanup_duration_seconds`; alert if failures persist or
-no rows are deleted while expired-row counts rise. For an incident run, restart
-one healthy API replica rather than issuing an unbounded manual DELETE; confirm
-batch progress with `SELECT count(*) FROM chore_rotation_operations WHERE
-expires_at<=now()`.
+tick. Monitor `clustr_chores_rotation_cleanup_deleted_rows_total`,
+`clustr_chores_rotation_cleanup_failed_runs_total`, and
+`clustr_chores_rotation_cleanup_duration_seconds`; alert if failed runs persist
+or no rows are deleted while expired-row counts rise. The deleted-row counter
+counts rows and the failed-run counter counts attempts, so neither should be
+used as the denominator of a mixed-unit success ratio. For an incident run,
+restart one healthy API replica rather than issuing an unbounded manual DELETE;
+confirm batch progress with `SELECT count(*) FROM
+chore_rotation_operations WHERE expires_at<=now()`.
 
 `clustr_messaging_transition_messages_total` counts accepted messages from the
 installed production-05b codec. Those payloads are base64-encoded JSON,
