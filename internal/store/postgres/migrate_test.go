@@ -50,9 +50,11 @@ func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T)
 	}
 	sql := string(raw)
 	for _, required := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"SET LOCAL statement_timeout = '30s'",
 		"LOCK TABLE users IN EXCLUSIVE MODE",
 		"LOCK TABLE conversations IN EXCLUSIVE MODE",
-		"LOCK TABLE conversation_members, conversation_member_local_ids",
+		"LOCK TABLE conversation_members, conversation_member_local_ids,\n    conversation_member_tombstones",
 		"IN SHARE ROW EXCLUSIVE MODE",
 		"INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)",
 		"FROM conversation_member_tombstones tombstone",
@@ -63,6 +65,9 @@ func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T)
 		"BEFORE INSERT ON conversation_members",
 		"BEFORE INSERT ON conversation_member_local_ids",
 		"conversation member local IDs are immutable",
+		"conversation member tombstones are immutable",
+		"BEFORE INSERT ON conversation_member_tombstones",
+		"BEFORE UPDATE ON conversation_member_tombstones",
 	} {
 		if !strings.Contains(sql, required) {
 			t.Fatalf("identity-namespace migration is missing %q", required)
@@ -71,10 +76,13 @@ func TestConversationMemberIdentityNamespaceMigrationIsHistorySafe(t *testing.T)
 	userLockAt := strings.Index(sql, "LOCK TABLE users IN EXCLUSIVE MODE")
 	conversationLockAt := strings.Index(sql, "LOCK TABLE conversations IN EXCLUSIVE MODE")
 	lockAt := strings.Index(sql, "LOCK TABLE conversation_members, conversation_member_local_ids")
+	lockTimeoutAt := strings.Index(sql, "SET LOCAL lock_timeout")
+	statementTimeoutAt := strings.Index(sql, "SET LOCAL statement_timeout")
 	validationAt := strings.Index(sql, "DO $$")
 	triggerAt := strings.Index(sql, "CREATE TRIGGER conversation_members_identity_namespace_insert")
-	if userLockAt < 0 || conversationLockAt < 0 || lockAt < 0 || validationAt < 0 || triggerAt < 0 ||
-		userLockAt > conversationLockAt || conversationLockAt > lockAt || lockAt > validationAt || lockAt > triggerAt {
+	if lockTimeoutAt < 0 || statementTimeoutAt < 0 || userLockAt < 0 || conversationLockAt < 0 || lockAt < 0 || validationAt < 0 || triggerAt < 0 ||
+		lockTimeoutAt > statementTimeoutAt || statementTimeoutAt > userLockAt || userLockAt > conversationLockAt ||
+		conversationLockAt > lockAt || lockAt > validationAt || lockAt > triggerAt {
 		t.Fatal("identity namespace tables must be write-locked before validation and trigger creation")
 	}
 	for _, forbidden := range []string{"UPDATE conversation_member_local_ids SET", "ON CONFLICT DO UPDATE"} {

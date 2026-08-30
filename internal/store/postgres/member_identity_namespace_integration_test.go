@@ -249,7 +249,8 @@ func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHisto
 	if _, err := migrationTx.Exec(ctx, `
 		LOCK TABLE users IN EXCLUSIVE MODE;
 		LOCK TABLE conversations IN EXCLUSIVE MODE;
-		LOCK TABLE conversation_members, conversation_member_local_ids
+		LOCK TABLE conversation_members, conversation_member_local_ids,
+			conversation_member_tombstones
 		IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
@@ -506,6 +507,10 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 			{"local ids update", `UPDATE conversation_member_local_ids SET created_at=created_at WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
 			{"local ids delete", `DELETE FROM conversation_member_local_ids WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.owner} }},
 			{"local ids truncate", `TRUNCATE conversation_member_local_ids`, func(f fixture) []any { return nil }},
+			{"tombstones insert", `INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id) VALUES($1,$2,$2)`, func(f fixture) []any { return []any{f.conversation, f.joining} }},
+			{"tombstones update", `UPDATE conversation_member_tombstones SET removed_at=removed_at WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.historical} }},
+			{"tombstones delete", `DELETE FROM conversation_member_tombstones WHERE conversation_id=$1 AND user_id=$2`, func(f fixture) []any { return []any{f.conversation, f.historical} }},
+			{"tombstones truncate", `TRUNCATE conversation_member_tombstones`, func(f fixture) []any { return nil }},
 		}
 		for _, operation := range operations {
 			t.Run(operation.name, func(t *testing.T) {
@@ -531,6 +536,44 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 					t.Fatalf("%s failed after fence rollback: %v", operation.name, err)
 				}
 			})
+		}
+	})
+
+	t.Run("tombstone mutation after backfill waits for and is rejected by trigger commit", func(t *testing.T) {
+		f := newFixture(t, false)
+		at := bytes.Index(migrationSQL, []byte("CREATE OR REPLACE FUNCTION enforce_conversation_member_identity_namespace"))
+		if at < 0 {
+			t.Fatal("migration trigger marker missing")
+		}
+		migrationTx, err := f.migration.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer migrationTx.Rollback(ctx)
+		if _, err := migrationTx.Exec(ctx, string(migrationSQL[:at])); err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := f.writer.Exec(ctx, `UPDATE conversation_member_tombstones
+				SET local_id=$3 WHERE conversation_id=$1 AND user_id=$2`,
+				f.conversation, f.historical, uuid.New())
+			result <- err
+		}()
+		select {
+		case err := <-result:
+			t.Fatalf("tombstone mutation slipped between backfill and trigger commit: %v", err)
+		case <-time.After(150 * time.Millisecond):
+		}
+		if _, err := migrationTx.Exec(ctx, string(migrationSQL[at:])); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrationTx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var pgErr *pgconn.PgError
+		if err := <-result; !errors.As(err, &pgErr) || pgErr.ConstraintName != "conversation_member_backend_local_disjoint" {
+			t.Fatalf("tombstone mutation resumed without immutable trigger rejection: %v", err)
 		}
 	})
 
@@ -563,11 +606,45 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 			t.Fatalf("failed migration changed all-column history:\nbefore %s\nafter  %s", before, after)
 		}
 		var triggerCount int
-		if err := f.migration.QueryRow(ctx, `SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'conversation%identity_namespace%' AND tgrelid IN ('conversation_members'::regclass,'conversation_member_local_ids'::regclass)`).Scan(&triggerCount); err != nil || triggerCount != 0 {
+		if err := f.migration.QueryRow(ctx, `SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'conversation%identity_namespace%' AND tgrelid IN ('conversation_members'::regclass,'conversation_member_local_ids'::regclass,'conversation_member_tombstones'::regclass)`).Scan(&triggerCount); err != nil || triggerCount != 0 {
 			t.Fatalf("failed migration left triggers=%d err=%v", triggerCount, err)
 		}
 		if _, err := f.migration.Exec(ctx, string(migrationSQL)); err != nil {
 			t.Fatalf("exact migration rerun failed: %v", err)
+		}
+	})
+
+	t.Run("lock timeout fails closed and retry succeeds", func(t *testing.T) {
+		f := newFixture(t, false)
+		blocker, err := f.writer.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := blocker.Exec(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, f.owner); err != nil {
+			t.Fatal(err)
+		}
+		migrationTx, err := f.migration.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, failure := migrationTx.Exec(ctx, string(migrationSQL))
+		elapsed := time.Since(started)
+		var pgErr *pgconn.PgError
+		if !errors.As(failure, &pgErr) || pgErr.Code != "55P03" {
+			t.Fatalf("lock timeout failure=%v, want lock_not_available", failure)
+		}
+		if elapsed < 4*time.Second || elapsed > 10*time.Second {
+			t.Fatalf("lock timeout elapsed=%s, want bounded five-second failure", elapsed)
+		}
+		if err := migrationTx.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := blocker.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.migration.Exec(ctx, string(migrationSQL)); err != nil {
+			t.Fatalf("migration retry after blocker removal: %v", err)
 		}
 	})
 }

@@ -12,9 +12,15 @@
 -- Retain all locks until this migration transaction commits. An old replica must
 -- therefore either commit before validation or resume only after the triggers
 -- below are visible; no write can slip between validation and enforcement.
+-- Fail rather than turn an unexpected long transaction or cardinality increase
+-- into an unbounded production outage. The deployment may safely retry this
+-- fully transactional migration after the blocker/capacity gate is resolved.
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '30s';
 LOCK TABLE users IN EXCLUSIVE MODE;
 LOCK TABLE conversations IN EXCLUSIVE MODE;
-LOCK TABLE conversation_members, conversation_member_local_ids
+LOCK TABLE conversation_members, conversation_member_local_ids,
+    conversation_member_tombstones
     IN SHARE ROW EXCLUSIVE MODE;
 
 DO $$
@@ -144,3 +150,36 @@ FOR EACH ROW EXECUTE FUNCTION enforce_conversation_member_identity_namespace();
 CREATE TRIGGER conversation_member_local_ids_identity_namespace_update
 BEFORE UPDATE ON conversation_member_local_ids
 FOR EACH ROW EXECUTE FUNCTION enforce_conversation_member_identity_namespace();
+
+CREATE OR REPLACE FUNCTION enforce_conversation_member_tombstone_identity()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    PERFORM id FROM conversations WHERE id=NEW.conversation_id FOR UPDATE;
+    IF TG_OP='UPDATE' THEN
+        RAISE EXCEPTION 'conversation member tombstones are immutable'
+            USING ERRCODE='23514',
+                  CONSTRAINT='conversation_member_backend_local_disjoint';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM conversation_member_local_ids mapping
+        WHERE mapping.conversation_id=NEW.conversation_id
+          AND mapping.user_id=NEW.user_id
+          AND mapping.local_id=NEW.local_id
+    ) THEN
+        RAISE EXCEPTION 'conversation member tombstone disagrees with immutable local ID'
+            USING ERRCODE='23514',
+                  CONSTRAINT='conversation_member_backend_local_disjoint';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER conversation_member_tombstones_identity_namespace_insert
+BEFORE INSERT ON conversation_member_tombstones
+FOR EACH ROW EXECUTE FUNCTION enforce_conversation_member_tombstone_identity();
+
+CREATE TRIGGER conversation_member_tombstones_identity_namespace_update
+BEFORE UPDATE ON conversation_member_tombstones
+FOR EACH ROW EXECUTE FUNCTION enforce_conversation_member_tombstone_identity();
