@@ -25,8 +25,9 @@ load balancer, managed database, or application secret.
   capability is SMTP and whose policy grants `use approved-senders` only for
   the exact `no-reply@mail.atlanteanz.com` address in the mail compartment;
 - an instance-principal dynamic group and scoped policy for secret-bundle reads,
-  bucket-scoped media/PAR access, and create/inspect-only backup uploads (the VM
-  cannot overwrite or delete off-site backup objects);
+  bucket-scoped media/PAR access, and create/inspect/read-only backup access for
+  immutable uploads and isolated restore drills (the VM cannot overwrite or
+  delete off-site backup objects);
 - a regional, bucket-scoped service policy required to execute the Object
   Storage lifecycle rules.
 

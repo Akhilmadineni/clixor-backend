@@ -48,6 +48,37 @@ if ! command -v oci >/dev/null 2>&1; then
   sh "${script_root}/install-oci-cli.sh"
 fi
 
+oci_backup_bucket=${CLIXOR_OCI_BACKUP_BUCKET:-clixor-prod-backups}
+oci_backup_prefix=${CLIXOR_OCI_BACKUP_PREFIX:-clixor}
+case "${oci_backup_bucket}" in
+  ''|*[!A-Za-z0-9._-]*)
+    echo "CLIXOR_OCI_BACKUP_BUCKET contains unsupported characters." >&2
+    exit 1
+    ;;
+esac
+case "${oci_backup_prefix}" in
+  ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+    echo "CLIXOR_OCI_BACKUP_PREFIX contains unsupported characters." >&2
+    exit 1
+    ;;
+esac
+if [ "${#oci_backup_prefix}" -gt 63 ]; then
+  echo "CLIXOR_OCI_BACKUP_PREFIX is longer than 63 characters." >&2
+  exit 1
+fi
+backup_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get \
+  --query data --raw-output)"
+[ -n "${backup_namespace}" ] || {
+  echo "Could not resolve the OCI Object Storage namespace for backups." >&2
+  exit 1
+}
+OCI_CLI_AUTH=instance_principal oci os bucket get \
+  --namespace-name "${backup_namespace}" \
+  --name "${oci_backup_bucket}" >/dev/null || {
+  echo "Instance principal cannot read OCI backup bucket ${oci_backup_bucket}." >&2
+  exit 1
+}
+
 project_root=/srv/clixor
 secret_root="${project_root}/secrets"
 pki_root="${secret_root}/pki"
@@ -55,10 +86,16 @@ apns_root="${secret_root}/apns"
 runtime_env="${secret_root}/runtime.env"
 api_env="${secret_root}/api.env"
 runtime_root="${project_root}/runtime"
+backup_tool_root=/usr/local/libexec/clixor
+backup_config_root=/etc/clixor
+backup_config="${backup_config_root}/offsite-backup.env"
+systemd_unit_root=/etc/systemd/system
 
 install -d -m 0750 "${project_root}" "${project_root}/repo" \
   "${project_root}/releases" "${project_root}/data" "${runtime_root}" \
   "${project_root}/backups"
+install -d -m 0700 -o 0 -g 0 "${project_root}/restore-drills"
+install -d -m 0755 -o 0 -g 0 "${backup_tool_root}" "${backup_config_root}"
 install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
 # The API image is distroless nonroot (UID/GID 65532). The mount root must be
 # traversable and each installed key readable by that identity, but not by other
@@ -227,6 +264,33 @@ install -m 0400 -o 101 -g 101 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
   "${runtime_root}/postgres-backup/backup.sh"
+install -m 0500 -o 0 -g 0 "${script_root}/offsite-backup.sh" \
+  "${backup_tool_root}/offsite-backup.sh"
+install -m 0500 -o 0 -g 0 "${script_root}/backup-health.sh" \
+  "${backup_tool_root}/backup-health.sh"
+install -m 0500 -o 0 -g 0 "${script_root}/restore-drill.sh" \
+  "${backup_tool_root}/restore-drill.sh"
+install -m 0500 -o 0 -g 0 "${script_root}/backup_manifest.py" \
+  "${backup_tool_root}/backup_manifest.py"
+for unit_name in \
+  clixor-offsite-backup.service \
+  clixor-offsite-backup.timer \
+  clixor-backup-health.service \
+  clixor-backup-health.timer \
+  clixor-restore-drill.service \
+  clixor-restore-drill.timer
+do
+  install -m 0644 -o 0 -g 0 "${script_root}/${unit_name}" \
+    "${systemd_unit_root}/${unit_name}"
+done
+backup_config_partial="$(mktemp "${backup_config_root}/offsite-backup.env.XXXXXXXX")"
+{
+  printf 'OCI_BACKUP_BUCKET=%s\n' "${oci_backup_bucket}"
+  printf 'OCI_BACKUP_PREFIX=%s\n' "${oci_backup_prefix}"
+} > "${backup_config_partial}"
+chmod 0600 "${backup_config_partial}"
+chown 0:0 "${backup_config_partial}"
+mv "${backup_config_partial}" "${backup_config}"
 install -m 0400 -o 65534 -g 65534 "${script_root}/prometheus.yml" \
   "${runtime_root}/prometheus/prometheus.yml"
 chown 65534:65534 "${runtime_root}/prometheus/metrics.token"
@@ -271,6 +335,17 @@ do
     exit 1
   }
 done
+
+systemctl daemon-reload
+systemctl enable --now clixor-offsite-backup.timer
+if [ -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]; then
+  systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
+else
+  # deploy.sh performs the first offsite restore drill as a release gate. Never
+  # report backup health or schedule later drills before that gate has passed.
+  systemctl disable --now clixor-restore-drill.timer clixor-backup-health.timer \
+    >/dev/null 2>&1 || true
+fi
 
 echo "Clixor OCI ARM64 directories, staging secrets, and internal PKI are ready."
 echo "Telnyx and APNs remain disabled until production credentials are installed."

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Clixor backup freshness hourly
+
+[Timer]
+OnBootSec=90min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+AccuracySec=1min
+Unit=clixor-backup-health.service
+
+[Install]
+WantedBy=timers.target

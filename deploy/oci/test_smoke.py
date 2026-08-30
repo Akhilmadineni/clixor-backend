@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import socket
 import struct
@@ -8,12 +9,15 @@ import sys
 import unittest
 import urllib.error
 from contextlib import redirect_stderr
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import smoke  # noqa: E402
+import backup_manifest  # noqa: E402
 
 
 def server_frame(opcode: int, payload: bytes, *, final: bool = True) -> bytes:
@@ -350,6 +354,206 @@ class ReleaseHardeningTests(unittest.TestCase):
             re.findall(r'^output "(mail_[^"]+)"', outputs, re.MULTILINE)
         )
         self.assertEqual(actual_mail_outputs, expected_mail_outputs)
+
+    def test_backup_units_are_installed_and_use_only_instance_principal(self) -> None:
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        offsite = (self.oci_root / "offsite-backup.sh").read_text(encoding="utf-8")
+        service = (self.oci_root / "clixor-offsite-backup.service").read_text(
+            encoding="utf-8"
+        )
+        backup_timer = (self.oci_root / "clixor-offsite-backup.timer").read_text(
+            encoding="utf-8"
+        )
+        health_timer = (self.oci_root / "clixor-backup-health.timer").read_text(
+            encoding="utf-8"
+        )
+        health = (self.oci_root / "backup-health.sh").read_text(encoding="utf-8")
+        restore_service = (self.oci_root / "clixor-restore-drill.service").read_text(
+            encoding="utf-8"
+        )
+        restore_timer = (self.oci_root / "clixor-restore-drill.timer").read_text(
+            encoding="utf-8"
+        )
+        identity = (self.oci_root / "terraform" / "identity.tf").read_text(
+            encoding="utf-8"
+        )
+
+        for installed_name in (
+            "offsite-backup.sh",
+            "backup-health.sh",
+            "restore-drill.sh",
+            "backup_manifest.py",
+            "clixor-offsite-backup.service",
+            "clixor-offsite-backup.timer",
+            "clixor-backup-health.service",
+            "clixor-backup-health.timer",
+            "clixor-restore-drill.service",
+            "clixor-restore-drill.timer",
+        ):
+            with self.subTest(installed_name=installed_name):
+                self.assertIn(installed_name, bootstrap)
+        self.assertIn("systemctl enable --now clixor-offsite-backup.timer", bootstrap)
+        self.assertIn("OCI_CLI_AUTH=instance_principal", offsite)
+        self.assertIn("--no-multipart", offsite)
+        self.assertIn("--no-overwrite", offsite)
+        self.assertIn("--verify-checksum", offsite)
+        self.assertNotIn("--force", offsite)
+        self.assertLess(
+            offsite.index(
+                'upload_immutable "${latest_dump}.sha256" "${object_prefix}.sha256"'
+            ),
+            offsite.index('upload_immutable "${latest_dump}" "${object_prefix}"'),
+        )
+        self.assertIn("User=root", service)
+        self.assertIn("Environment=OCI_CLI_AUTH=instance_principal", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("CapabilityBoundingSet=", service)
+        self.assertIn("OnUnitActiveSec=6h", backup_timer)
+        self.assertIn("OnUnitActiveSec=1h", health_timer)
+        self.assertIn(
+            "clixor-offsite-backup.service clixor-restore-drill.service", health
+        )
+        self.assertIn("OnCalendar=Sun *-*-* 04:30:00 UTC", restore_timer)
+        self.assertIn("User=root", restore_service)
+        self.assertIn("Environment=OCI_CLI_AUTH=instance_principal", restore_service)
+        self.assertIn("ProtectSystem=strict", restore_service)
+        self.assertIn("clixor-restore-drill.timer clixor-backup-health.timer", bootstrap)
+        self.assertLess(
+            bootstrap.index('if [ -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]'),
+            bootstrap.index("systemctl enable --now clixor-restore-drill.timer"),
+        )
+        self.assertIn("request.permission = 'OBJECT_READ'", identity)
+
+        backup_policy = next(
+            line for line in identity.splitlines() if "backups.name" in line and "OBJECT_CREATE" in line
+        )
+        self.assertNotIn("OBJECT_OVERWRITE", backup_policy)
+        self.assertNotIn("OBJECT_DELETE", backup_policy)
+        for forbidden_credential in (
+            "OCI_CLI_KEY",
+            "OCI_CLI_USER",
+            "AWS_ACCESS_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+        ):
+            self.assertNotIn(forbidden_credential, service + offsite)
+
+    def test_restore_drill_is_ephemeral_and_never_mounts_production_data(self) -> None:
+        restore = (self.oci_root / "restore-drill.sh").read_text(encoding="utf-8")
+        self.assertIn("postgres_image=postgres:17.5-alpine", restore)
+        self.assertIn("--pull=never", restore)
+        self.assertIn("--network none", restore)
+        self.assertNotIn("--publish", restore)
+        self.assertNotIn("/srv/clixor/data/postgres", restore)
+        self.assertNotIn("/srv/clixor/secrets/runtime.env", restore)
+        self.assertIn("trap cleanup EXIT", restore)
+        self.assertIn("docker rm --force", restore)
+        self.assertIn("rm -rf -- \"${work_dir}\"", restore)
+        self.assertIn("pg_restore --username restore_admin", restore)
+        self.assertIn("--no-owner --no-privileges --exit-on-error", restore)
+        self.assertIn("pg_amcheck --username restore_admin", restore)
+        self.assertIn("schema_migrations", restore)
+        self.assertIn("RESTORE_DRILL_LAST_SUCCESS", restore)
+        self.assertNotIn("docker exec -e PGPASSWORD", restore)
+        self.assertNotIn("docker exec -i -e PGPASSWORD", restore)
+        self.assertIn('PGPASSWORD="$POSTGRES_PASSWORD"', restore)
+
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        restore_gate = deploy.index("systemctl start clixor-restore-drill.service")
+        fresh_gate = deploy.index(
+            'backup_gate_start="${release_dir}/post-migration-backup-gate-start"'
+        )
+        restart_backup = deploy.index("docker restart clixor-oci-postgres-backup")
+        newer_proof = deploy.index('-newer "${backup_gate_start}"')
+        offsite_gate = deploy.index("systemctl start clixor-offsite-backup.service")
+        health_enable = deploy.index(
+            "systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer"
+        )
+        release_complete = deploy.rindex("rollback_needed=0")
+        self.assertLess(fresh_gate, restart_backup)
+        self.assertLess(restart_backup, newer_proof)
+        self.assertLess(newer_proof, offsite_gate)
+        self.assertLess(offsite_gate, restore_gate)
+        self.assertLess(restore_gate, health_enable)
+        self.assertLess(health_enable, release_complete)
+        self.assertIn(
+            'find "${project_root}/backups/OFFSITE_LAST_SUCCESS"', deploy
+        )
+        self.assertIn(
+            'find "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS"', deploy
+        )
+        self.assertNotIn(
+            'if [ ! -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ]',
+            deploy,
+        )
+
+
+class BackupManifestTests(unittest.TestCase):
+    def test_selects_latest_complete_fresh_pair_and_ignores_incomplete_dump(self) -> None:
+        prefix = "clixor"
+        document = {
+            "data": [
+                {"name": f"{prefix}/postgres/clixor-20260830T100000Z.dump", "size": 10},
+                {"name": f"{prefix}/postgres/clixor-20260830T100000Z.dump.sha256", "size": 90},
+                {"name": f"{prefix}/postgres/clixor-20260830T120000Z.dump", "size": 20},
+                {"name": f"{prefix}/postgres/clixor-20260830T120000Z.dump.sha256", "size": 90},
+                {"name": f"{prefix}/postgres/clixor-20260830T130000Z.dump", "size": 30},
+            ]
+        }
+        selected = backup_manifest.select_latest_complete_backup(
+            document,
+            prefix,
+            480,
+            now=datetime(2026, 8, 30, 13, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            selected.name, "clixor/postgres/clixor-20260830T120000Z.dump"
+        )
+        self.assertEqual(selected.size, 20)
+
+    def test_rejects_stale_backup_and_invalid_prefix(self) -> None:
+        document = {
+            "data": [
+                {"name": "clixor/postgres/clixor-20260829T120000Z.dump", "size": 20},
+                {"name": "clixor/postgres/clixor-20260829T120000Z.dump.sha256", "size": 90},
+            ]
+        }
+        with self.assertRaises(backup_manifest.BackupManifestError):
+            backup_manifest.select_latest_complete_backup(
+                document,
+                "clixor",
+                60,
+                now=datetime(2026, 8, 30, 13, 0, tzinfo=timezone.utc),
+            )
+        with self.assertRaises(backup_manifest.BackupManifestError):
+            backup_manifest.select_latest_complete_backup(
+                document,
+                "../escape",
+                60,
+                now=datetime(2026, 8, 30, 13, 0, tzinfo=timezone.utc),
+            )
+
+    def test_checksum_and_migration_contracts(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            dump = root / "clixor-20260830T120000Z.dump"
+            dump.write_bytes(b"verified backup fixture")
+            checksum = root / f"{dump.name}.sha256"
+            checksum.write_text(
+                f"{hashlib.sha256(dump.read_bytes()).hexdigest()}  {dump.name}\n",
+                encoding="ascii",
+            )
+            backup_manifest.verify_checksum(dump, checksum)
+            dump.write_bytes(b"corrupted backup fixture")
+            with self.assertRaises(backup_manifest.BackupManifestError):
+                backup_manifest.verify_checksum(dump, checksum)
+
+            migrations = root / "migrations"
+            migrations.mkdir()
+            (migrations / "000001_initial.sql").write_text("SELECT 1;", encoding="utf-8")
+            (migrations / "000002_next.sql").write_text("SELECT 2;", encoding="utf-8")
+            self.assertEqual(
+                backup_manifest.required_migration_versions(migrations), [1, 2]
+            )
 
 
 if __name__ == "__main__":

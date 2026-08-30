@@ -24,7 +24,7 @@ resource "oci_identity_policy" "instance_principal" {
   statements = [
     "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to read secret-bundles in compartment id ${local.deployment_compartment_id}",
     "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to read buckets in compartment id ${local.deployment_compartment_id} where target.bucket.name = '${oci_objectstorage_bucket.backups.name}'",
-    "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to manage objects in compartment id ${local.deployment_compartment_id} where all {target.bucket.name = '${oci_objectstorage_bucket.backups.name}', any {request.permission = 'OBJECT_CREATE', request.permission = 'OBJECT_INSPECT'}}",
+    "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to manage objects in compartment id ${local.deployment_compartment_id} where all {target.bucket.name = '${oci_objectstorage_bucket.backups.name}', any {request.permission = 'OBJECT_CREATE', request.permission = 'OBJECT_INSPECT', request.permission = 'OBJECT_READ'}}",
     "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to read buckets in compartment id ${local.deployment_compartment_id} where target.bucket.name = '${oci_objectstorage_bucket.media.name}'",
     "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to manage buckets in compartment id ${local.deployment_compartment_id} where all {target.bucket.name = '${oci_objectstorage_bucket.media.name}', request.permission = 'PAR_MANAGE'}",
     "Allow dynamic-group ${oci_identity_dynamic_group.clixor_hosts.name} to manage objects in compartment id ${local.deployment_compartment_id} where target.bucket.name = '${oci_objectstorage_bucket.media.name}'",

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the Clixor isolated restore drill weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00 UTC
+RandomizedDelaySec=2h
+Persistent=true
+Unit=clixor-restore-drill.service
+
+[Install]
+WantedBy=timers.target

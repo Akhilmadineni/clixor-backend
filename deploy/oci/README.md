@@ -21,8 +21,9 @@ ingress and reaches that bridge from the host.
 - The two API replicas survive one API-process failure, but not VM, boot-volume,
   availability-domain, PostgreSQL, Redis, or NATS failure. OCI Object Storage is
   outside the VM failure domain but still depends on regional OCI availability.
-- `/srv/clixor/backups` is on the same VM. It is useful for operator mistakes,
-  but is not disaster recovery until copied to a versioned off-instance bucket.
+- `/srv/clixor/backups` is only local staging. A root-owned timer copies verified
+  dumps to the private, versioned Object Storage backup bucket; that still does
+  not make the single-VM database highly available.
 - Secrets live only in root-owned, per-service environment files outside the
   repository. PostgreSQL, Redis, NATS, backup, Grafana, migration, and the API
   each receive only their allowlisted configuration; only the API receives JWT,
@@ -368,40 +369,82 @@ The default stack performs a six-hourly custom-format PostgreSQL dump with a
 SHA-256 checksum and seven-day local retention. OCI Object Storage is already the
 primary media store and is not copied into the VM backup directory.
 
-`offsite-backup.sh` is intentionally staged but not scheduled. It uploads the
-PostgreSQL copies to OCI Object Storage using the VM's instance-principal identity, so no
-static cloud API key is stored on the VM or in this repository.
+Bootstrap installs root-owned backup programs in `/usr/local/libexec/clixor`, a
+mode-0600 non-secret bucket/prefix file at `/etc/clixor/offsite-backup.env`, and
+three hardened timer pairs:
 
-The instance policy permits create/inspect only in the backup bucket. Timestamped
-objects are never overwritten, and the VM cannot delete either current objects or
-older versions. Before treating the bucket as ransomware-resistant disaster
-recovery, create and test a time-bound retention rule; lock it only after its
-mandatory review period because an OCI retention-rule lock is irreversible.
+- `clixor-offsite-backup.timer` checks for a locally generated dump no more than
+  eight hours old and uploads every six hours. It uses only the VM instance
+  principal. Both the checksum and dump are single-part, checksum-verified,
+  `--no-overwrite` objects; rerunning the service safely confirms an existing
+  pair instead of creating a new version.
+- `clixor-backup-health.timer` checks hourly after its initial boot delay. It
+  fails when the local or offsite success marker is older than eight hours, the
+  latest local checksum fails, the previous upload or restore service failed,
+  or the last successful isolated restore drill is older than 30 days.
+- `clixor-restore-drill.timer` repeats the isolated restore verification weekly.
+  It and the health timer remain disabled until `deploy.sh` has passed its first
+  restore gate. Every deployment restarts the backup worker after migrations,
+  proves that `LAST_SUCCESS` is newer than that gate start, uploads the resulting
+  complete immutable pair, and restores it against the checked-out exact
+  migration set before recording the release as current. A failure triggers the
+  normal application rollback path; forward migrations are never auto-restored
+  or reversed.
 
-Before enabling it:
+The Terraform instance policy permits only `OBJECT_CREATE`, `OBJECT_INSPECT`,
+and `OBJECT_READ` in the named backup bucket. Read is required to download a
+restore candidate. The VM still has no object overwrite, delete, version-delete,
+retention-rule, or bucket-management permission. No OCI API key, Object Storage
+customer secret key, database credential, or NAS dependency is used by these
+host jobs.
 
-1. confirm the Terraform-created private backup bucket exists;
-2. enable object versioning and retention appropriate for recovery;
-3. put this instance in a narrowly scoped OCI dynamic group;
-4. grant that group object access only to the backup bucket;
-5. verify the bootstrap-installed OCI CLI can use instance-principal
-   authentication; and
-6. run an isolated PostgreSQL restore test and a separate native-media lifecycle
-   test.
-
-Manual canary:
+Inspect the gates without printing any application secret:
 
 ```sh
-sudo env OCI_BACKUP_BUCKET=clixor-prod-backups \
-  sh /srv/clixor/repo/deploy/oci/offsite-backup.sh
+sudo systemctl start clixor-offsite-backup.service
+sudo systemctl status clixor-offsite-backup.service --no-pager
+sudo systemctl start clixor-backup-health.service
+systemctl list-timers 'clixor-*'
 ```
 
-Only schedule that command after the canary and restore drill pass. Alert if
-`OFFSITE_LAST_SUCCESS`, the PostgreSQL `LAST_SUCCESS`, disk usage, or certificate
-expiry becomes stale. Object Storage capacity beyond the account's free allowance
-is billable, so enforce budget alerts and retention. Media retention and deletion
-recovery are separate from the PostgreSQL backup policy; test the application’s
-intended permanent-deletion behavior before enabling bucket versioning.
+Every production deploy runs the drill synchronously against a newly generated
+post-migration backup as a release gate. For an operator-requested drill, use
+the same root-owned unit during a
+low-traffic window after confirming at least four times the compressed dump
+size plus 2 GiB is free on `/srv/clixor`:
+
+```sh
+sudo systemctl start clixor-restore-drill.service
+sudo systemctl status clixor-restore-drill.service --no-pager
+```
+
+The drill lists the private bucket through the instance principal, selects the
+newest fresh dump with a matching checksum object, downloads both to a unique
+mode-0700 workspace under `/srv/clixor/restore-drills`, and validates the strict
+one-line SHA-256 manifest. It starts the already-installed
+`postgres:17.5-alpine` image with `--network none`, no published port, an
+ephemeral random credential, a separate temporary data directory, read-only
+root filesystem, dropped capabilities, and CPU/memory/PID limits. It then runs
+`pg_restore --exit-on-error`, requires the exact checked-out migration set,
+reads core tables, and runs `pg_amcheck`. An exit trap removes the container and
+workspace on success, failure, or signal. It never loads the production runtime
+environment, joins a production Docker network, mounts
+`/srv/clixor/data/postgres`, restores into production, or runs a forward
+migration.
+
+The success marker records only timestamp, immutable object name, and migration
+versions. Check failures with:
+
+```sh
+sudo journalctl -u clixor-offsite-backup.service \
+  -u clixor-restore-drill.service -u clixor-backup-health.service
+```
+
+Object Storage capacity beyond the account's free allowance is billable, so
+keep budget and lifecycle alerts active. This change deliberately creates no
+retention lock: review and test a time-bound rule separately because an OCI
+retention-rule lock is irreversible. Media retention and deletion recovery are
+separate from the PostgreSQL backup policy.
 
 ## 7. Optional observability
 

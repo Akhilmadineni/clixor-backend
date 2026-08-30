@@ -44,7 +44,7 @@ case "${run_id}" in
   *[!A-Za-z0-9._-]*) fail "run ID contains unsupported characters" ;;
 esac
 
-for command_name in curl docker flock rsync; do
+for command_name in curl docker find flock rsync systemctl touch; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
@@ -325,6 +325,43 @@ for replica in api-a api-b; do
     "http://${replica}:8080/health/ready" || fail "${replica} readiness failed through the gateway"
 done
 log "both API replicas completed native OCI media-provider startup and readiness"
+
+log "forcing a fresh post-migration backup for the isolated restore release gate"
+backup_gate_start="${release_dir}/post-migration-backup-gate-start"
+touch "${backup_gate_start}"
+# The long-running backup worker creates a dump immediately at startup. Restart
+# it after the gate timestamp so a pre-migration LAST_SUCCESS can never satisfy
+# this release, even when the application schema did not change.
+sleep 1
+docker restart clixor-oci-postgres-backup >/dev/null
+backup_attempt=1
+while :; do
+  if [ -s "${project_root}/backups/postgres/LAST_SUCCESS" ] && \
+    [ -n "$(find "${project_root}/backups/postgres/LAST_SUCCESS" \
+      -newer "${backup_gate_start}" -print 2>/dev/null)" ]; then
+    break
+  fi
+  [ "$(docker inspect clixor-oci-postgres-backup \
+    --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
+    fail "the PostgreSQL backup container exited during the release gate"
+  [ "${backup_attempt}" -lt 120 ] || \
+    fail "the PostgreSQL backup container did not produce a fresh backup within 10 minutes"
+  backup_attempt=$((backup_attempt + 1))
+  sleep 5
+done
+systemctl start clixor-offsite-backup.service
+[ -s "${project_root}/backups/OFFSITE_LAST_SUCCESS" ] && \
+  [ -n "$(find "${project_root}/backups/OFFSITE_LAST_SUCCESS" \
+    -newer "${backup_gate_start}" -print 2>/dev/null)" ] || \
+  fail "the offsite upload did not produce a fresh success marker"
+systemctl start clixor-restore-drill.service
+[ -s "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" ] && \
+  [ -n "$(find "${project_root}/backups/RESTORE_DRILL_LAST_SUCCESS" \
+    -newer "${backup_gate_start}" -print 2>/dev/null)" ] || \
+  fail "the isolated restore drill did not produce a fresh success marker"
+systemctl enable --now clixor-restore-drill.timer clixor-backup-health.timer
+systemctl start clixor-backup-health.service
+
 rollback_needed=0
 ln -sfn "${release_dir}" "${release_root}/current"
 log "deployed ${new_image}; API readiness passed"
