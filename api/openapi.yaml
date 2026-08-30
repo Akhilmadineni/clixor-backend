@@ -735,6 +735,41 @@ paths:
         - {$ref: "#/components/parameters/ExpectedVersion"}
       responses:
         "204": {description: Tombstone created}
+  /conversations/{conversation_id}/chores/{chore_id}/rotate:
+    post:
+      operationId: rotateChore
+      description: Atomically updates one live chore and creates its activity feed item. Identical operation replays return the durable original result for at least 90 days.
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+        - {name: chore_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [operation_id, expected_chore_version, chore, feed_item]
+              properties:
+                operation_id: {type: string, format: uuid}
+                expected_chore_version: {type: integer, format: int64, minimum: 1}
+                chore: {type: object, additionalProperties: true}
+                feed_item: {type: object, additionalProperties: true}
+      responses:
+        "200":
+          description: Authoritative chore and feed entities, including on an identical replay
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operation_id, chore, feed_item]
+                properties:
+                  operation_id: {type: string, format: uuid}
+                  chore: {type: object, additionalProperties: true}
+                  feed_item: {type: object, additionalProperties: true}
+        "403": {description: Actor is not an active conversation member}
+        "404": {description: Chore is absent or tombstoned}
+        "409": {description: Stale version or operation binding mismatch}
   /conversations/{conversation_id}/media:
     post:
       operationId: createMediaUpload

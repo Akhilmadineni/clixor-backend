@@ -195,6 +195,7 @@ func (s *Server) Router() http.Handler {
 					router.Get("/entities/{kind}", s.listEntities)
 					router.Put("/entities/{kind}/{entityID}", s.putEntity)
 					router.Delete("/entities/{kind}/{entityID}", s.deleteEntity)
+					router.Post("/chores/{choreID}/rotate", s.rotateChore)
 				})
 			})
 			router.With(s.rateLimitIdentity("conversation-invite-preview", 120, time.Minute)).

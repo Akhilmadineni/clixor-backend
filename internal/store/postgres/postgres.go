@@ -1718,6 +1718,103 @@ func (s *Store) DeleteEntity(ctx context.Context, conversationID, actorID uuid.U
 	return entity, nil
 }
 
+func (s *Store) RotateChore(ctx context.Context, p store.RotateChoreParams) (store.RotateChoreResult, error) {
+	if p.OperationID == uuid.Nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	defer tx.Rollback(ctx)
+	// Serialize both the first execution and concurrent replays before looking
+	// up the durable result. The lock key is scoped to this database.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, p.OperationID); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	var priorConversation, priorActor, priorChore uuid.UUID
+	var priorHash []byte
+	var choreJSON, feedJSON []byte
+	err = tx.QueryRow(ctx, `SELECT conversation_id,actor_id,chore_id,request_hash,chore_result,feed_result FROM chore_rotation_operations WHERE operation_id=$1`, p.OperationID).
+		Scan(&priorConversation, &priorActor, &priorChore, &priorHash, &choreJSON, &feedJSON)
+	if err == nil {
+		if priorConversation != p.ConversationID || priorActor != p.ActorID || priorChore != p.ChoreID || subtle.ConstantTimeCompare(priorHash, p.RequestHash) != 1 {
+			return store.RotateChoreResult{}, domain.ErrConflict
+		}
+		var result store.RotateChoreResult
+		result.OperationID = p.OperationID
+		if json.Unmarshal(choreJSON, &result.Chore) != nil || json.Unmarshal(feedJSON, &result.FeedItem) != nil {
+			return store.RotateChoreResult{}, fmt.Errorf("decode chore rotation result")
+		}
+		return result, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return store.RotateChoreResult{}, err
+	}
+	if p.Validate() != nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	if err := s.requireMember(ctx, tx, p.ConversationID, p.ActorID); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	var metadata json.RawMessage
+	if err := tx.QueryRow(ctx, `SELECT metadata FROM conversations WHERE id=$1 FOR SHARE`, p.ConversationID).Scan(&metadata); err != nil {
+		return store.RotateChoreResult{}, mapError(err)
+	}
+	var chore domain.Entity
+	err = tx.QueryRow(ctx, `SELECT conversation_id,kind,id,version,payload,created_by,created_at,updated_at,deleted_at FROM entities WHERE conversation_id=$1 AND kind='chore' AND id=$2 AND deleted_at IS NULL FOR UPDATE`, p.ConversationID, p.ChoreID).
+		Scan(&chore.ConversationID, &chore.Kind, &chore.ID, &chore.Version, &chore.Payload, &chore.CreatedBy, &chore.CreatedAt, &chore.UpdatedAt, &chore.DeletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.RotateChoreResult{}, domain.ErrNotFound
+	}
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if chore.Version != p.ExpectedChoreVersion {
+		return store.RotateChoreResult{}, domain.ErrConflict
+	}
+	members, err := listConversationMembers(ctx, tx, p.ConversationID)
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	localIDs, err := ensureConversationMemberLocalIDs(ctx, tx, p.ConversationID, metadata, members)
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err = store.ValidateEntityParticipants("chore", p.ChorePayload, metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err = store.ValidateEntityParticipants("feed_item", p.FeedPayload, metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	err = tx.QueryRow(ctx, `UPDATE entities SET version=version+1,payload=$3,updated_at=now() WHERE conversation_id=$1 AND kind='chore' AND id=$2 AND deleted_at IS NULL RETURNING conversation_id,kind,id,version,payload,created_by,created_at,updated_at,deleted_at`, p.ConversationID, p.ChoreID, p.ChorePayload).
+		Scan(&chore.ConversationID, &chore.Kind, &chore.ID, &chore.Version, &chore.Payload, &chore.CreatedBy, &chore.CreatedAt, &chore.UpdatedAt, &chore.DeletedAt)
+	if err != nil {
+		return store.RotateChoreResult{}, mapError(err)
+	}
+	var feed domain.Entity
+	err = tx.QueryRow(ctx, `INSERT INTO entities(conversation_id,kind,id,version,payload,created_by,created_at,updated_at) VALUES($1,'feed_item',$2,1,$3,$4,now(),now()) RETURNING conversation_id,kind,id,version,payload,created_by,created_at,updated_at,deleted_at`, p.ConversationID, p.OperationID, p.FeedPayload, p.ActorID).
+		Scan(&feed.ConversationID, &feed.Kind, &feed.ID, &feed.Version, &feed.Payload, &feed.CreatedBy, &feed.CreatedAt, &feed.UpdatedAt, &feed.DeletedAt)
+	if err != nil {
+		return store.RotateChoreResult{}, mapError(err)
+	}
+	for _, entity := range []domain.Entity{chore, feed} {
+		payload, _ := json.Marshal(entity)
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('entity.updated',$1,$2)`, p.ConversationID, payload); err != nil {
+			return store.RotateChoreResult{}, err
+		}
+	}
+	choreJSON, _ = json.Marshal(chore)
+	feedJSON, _ = json.Marshal(feed)
+	if _, err = tx.Exec(ctx, `INSERT INTO chore_rotation_operations(operation_id,conversation_id,actor_id,chore_id,request_hash,chore_result,feed_result) VALUES($1,$2,$3,$4,$5,$6,$7)`, p.OperationID, p.ConversationID, p.ActorID, p.ChoreID, p.RequestHash, choreJSON, feedJSON); err != nil {
+		return store.RotateChoreResult{}, mapError(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	return store.RotateChoreResult{OperationID: p.OperationID, Chore: chore, FeedItem: feed}, nil
+}
+
 func (s *Store) CreateMedia(ctx context.Context, media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
 	if err := limits.Validate(); err != nil {
 		return domain.MediaObject{}, err

@@ -44,6 +44,7 @@ type Store struct {
 	clientMessages            map[string]domain.Message
 	receipts                  map[string]domain.Receipt
 	entities                  map[string]domain.Entity
+	choreRotations            map[uuid.UUID]memoryChoreRotation
 	media                     map[uuid.UUID]domain.MediaObject
 	mediaUploadCapabilities   map[uuid.UUID]string
 	outbox                    []domain.OutboxEvent
@@ -78,6 +79,7 @@ func New() *Store {
 		clientMessages:            make(map[string]domain.Message),
 		receipts:                  make(map[string]domain.Receipt),
 		entities:                  make(map[string]domain.Entity),
+		choreRotations:            make(map[uuid.UUID]memoryChoreRotation),
 		media:                     make(map[uuid.UUID]domain.MediaObject),
 		mediaUploadCapabilities:   make(map[uuid.UUID]string),
 		nextOutboxID:              1,
@@ -85,6 +87,12 @@ func New() *Store {
 		pushDeliveryByEventDevice: make(map[string]int64),
 		nextPushDeliveryID:        1,
 	}
+}
+
+type memoryChoreRotation struct {
+	ConversationID, ActorID, ChoreID uuid.UUID
+	RequestHash                      []byte
+	Result                           store.RotateChoreResult
 }
 
 func (*Store) Close()                     {}
@@ -1890,6 +1898,73 @@ func (s *Store) DeleteEntity(_ context.Context, conversationID, actorID uuid.UUI
 	payload, _ := json.Marshal(entity)
 	s.appendOutbox("entity.deleted", conversationID, payload)
 	return entity, nil
+}
+
+func (s *Store) RotateChore(_ context.Context, p store.RotateChoreParams) (store.RotateChoreResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.OperationID == uuid.Nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	if prior, ok := s.choreRotations[p.OperationID]; ok {
+		if prior.ConversationID != p.ConversationID || prior.ActorID != p.ActorID ||
+			prior.ChoreID != p.ChoreID || !bytes.Equal(prior.RequestHash, p.RequestHash) {
+			return store.RotateChoreResult{}, domain.ErrConflict
+		}
+		return cloneChoreRotationResult(prior.Result), nil
+	}
+	if p.Validate() != nil {
+		return store.RotateChoreResult{}, domain.ErrInvalid
+	}
+	if _, ok := s.members[p.ConversationID][p.ActorID]; !ok {
+		return store.RotateChoreResult{}, domain.ErrForbidden
+	}
+	key := entityKey(p.ConversationID, "chore", p.ChoreID)
+	chore, ok := s.entities[key]
+	if !ok || chore.DeletedAt != nil {
+		return store.RotateChoreResult{}, domain.ErrNotFound
+	}
+	if chore.Version != p.ExpectedChoreVersion {
+		return store.RotateChoreResult{}, domain.ErrConflict
+	}
+	conversation, ok := s.conversations[p.ConversationID]
+	if !ok {
+		return store.RotateChoreResult{}, domain.ErrNotFound
+	}
+	members := s.conversationMembersLocked(p.ConversationID)
+	localIDs, err := s.ensureConversationMemberLocalIDsLocked(p.ConversationID, conversation.Metadata, members)
+	if err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err := store.ValidateEntityParticipants("chore", p.ChorePayload, conversation.Metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	if err := store.ValidateEntityParticipants("feed_item", p.FeedPayload, conversation.Metadata, members, localIDs...); err != nil {
+		return store.RotateChoreResult{}, err
+	}
+	now := time.Now().UTC()
+	chore.Payload, chore.Version, chore.UpdatedAt = cloneJSON(p.ChorePayload), chore.Version+1, now
+	feed := domain.Entity{ConversationID: p.ConversationID, Kind: "feed_item", ID: p.OperationID, Version: 1,
+		Payload: cloneJSON(p.FeedPayload), CreatedBy: p.ActorID, CreatedAt: now, UpdatedAt: now}
+	if _, exists := s.entities[entityKey(p.ConversationID, "feed_item", p.OperationID)]; exists {
+		return store.RotateChoreResult{}, domain.ErrConflict
+	}
+	result := store.RotateChoreResult{OperationID: p.OperationID, Chore: chore, FeedItem: feed}
+	// All validation precedes this atomic critical-section commit.
+	s.entities[key] = chore
+	s.entities[entityKey(p.ConversationID, "feed_item", p.OperationID)] = feed
+	for _, entity := range []domain.Entity{chore, feed} {
+		payload, _ := json.Marshal(entity)
+		s.appendOutbox("entity.updated", p.ConversationID, payload)
+	}
+	s.choreRotations[p.OperationID] = memoryChoreRotation{p.ConversationID, p.ActorID, p.ChoreID, append([]byte(nil), p.RequestHash...), cloneChoreRotationResult(result)}
+	return cloneChoreRotationResult(result), nil
+}
+
+func cloneChoreRotationResult(result store.RotateChoreResult) store.RotateChoreResult {
+	result.Chore.Payload = cloneJSON(result.Chore.Payload)
+	result.FeedItem.Payload = cloneJSON(result.FeedItem.Payload)
+	return result
 }
 
 func (s *Store) CreateMedia(_ context.Context, media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
