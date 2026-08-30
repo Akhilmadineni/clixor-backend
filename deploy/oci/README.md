@@ -8,16 +8,54 @@ Two small API processes sit behind an internal Nginx gateway. PostgreSQL,
 Redis, and NATS are single-instance services with no published ports. The API
 uses authenticated private-CA TLS for each dependency and accesses a private OCI
 Object Storage media bucket with its instance principal. The API gateway has a
-fixed address on an internal Docker bridge; Cloudflare Tunnel is the sole HTTP
-ingress and reaches that bridge from the host.
+connector-authenticated Unix-socket origin boundary: the public API is not
+reachable on a host TCP port and only the systemd cloudflared identity belongs
+to `clixor-origin`. The TCP listener serves exact health paths, clears
+`CF-Connecting-IP`, and returns 404 for every application route.
+Systemd tmpfiles creates the root-owned boundary before Docker at cold boot;
+Compose has `create_host_path: false`, so a missing boundary stops the gateway
+instead of silently replacing it with daemon-default permissions.
+
+## Canary-first Cloudflare ownership transfer
+
+Actions always deploys `clixor-oci-canary.atlanteanz.com`; `deploy.sh` rejects a
+production stage. The gate runs readiness/association checks and the disposable
+`smoke.py` lifecycle: account creation/deletion, WebSocket upgrade and reconnect,
+E2EE message delivery, OCI PAR upload/download, authorization, and verified media
+cleanup. Root-owned `canary-public-smoke.txt` binds that evidence to the exact
+release SHA. Before any production route edit, run:
+
+```
+python3 deploy/oci/validate-canary-promotion.py \
+  --evidence /srv/clixor/releases/current/canary-public-smoke.txt \
+  --revision "$(cat /srv/clixor/releases/current/source-sha)"
+```
+
+Promotion is a control-plane ownership transfer, never another deploy. Freeze
+writes and drain the old connector first. Confirm it has zero active tunnel
+connections, then make one reviewed Cloudflare transaction that removes the
+production hostname from the old tunnel and assigns it to the already-healthy
+OCI tunnel. Do not temporarily configure the hostname on both tunnels and do
+not use load balancing between them. Verify the exact revision publicly before
+unfreezing writes. Rollback is the inverse while writes remain frozen: remove
+the OCI ownership, restore the old single owner, verify it, then unfreeze. If
+the control-plane update or verification is ambiguous, keep writes frozen and
+both connectors' production route disabled. Canary cleanup/removal happens only
+after production verification evidence is retained.
+
+The remotely managed canary route must point to
+`unix:/run/clixor-origin/gateway.sock`; the checked-in example is the reviewed
+route shape. The tunnel token exists only in the Vault-selected tmpfs cohort and
+is passed with systemd `LoadCredential`; `/etc/cloudflared/token` is unsupported.
 
 ## Security and availability boundaries
 
 - On the bundled private-subnet foundation, allow SSH only from the OCI Bastion
   private endpoint. Do not open 80, 443, 8080, 3000, 5432, 6379, or 4222 in
   the VCN security list, network security group, or Ubuntu firewall.
-- Host `cloudflared` connects only to the internal gateway at
-  `172.30.254.2:8080`; the gateway has no egress network or published host port.
+- Host `cloudflared` connects only through the group-protected Unix socket. The
+  fixed bridge address exposes health checks only; the gateway has no egress
+  network or published host port.
 - The two API replicas survive one API-process failure, but not VM, boot-volume,
   availability-domain, PostgreSQL, Redis, or NATS failure. OCI Object Storage is
   outside the VM failure domain but still depends on regional OCI availability.

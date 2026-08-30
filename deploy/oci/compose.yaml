@@ -261,7 +261,10 @@ services:
   api-gateway:
     image: nginx:1.29-alpine@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
     container_name: clixor-oci-api-gateway
-    user: "101:101"
+    # GID 987 is the host clixor-origin group. The gateway creates its Unix
+    # socket group-accessible only to the connector identity.
+    user: "101:987"
+    command: ["/bin/sh", "-c", "umask 007 && exec nginx -g 'daemon off;'"]
     depends_on:
       - api-a
       - api-b
@@ -270,6 +273,13 @@ services:
         ipv4_address: 172.30.254.2
     volumes:
       - /srv/clixor/runtime/api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - type: bind
+        source: /run/clixor-origin
+        target: /run/clixor-origin
+        bind:
+          # Never let Docker create an absent boot-time trust boundary as
+          # root:root with daemon defaults.
+          create_host_path: false
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
       interval: 10s

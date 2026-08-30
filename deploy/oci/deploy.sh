@@ -30,6 +30,9 @@ gateway_readiness_url=http://172.30.254.2:8080/health/ready
 public_api_readiness_url=${CLIXOR_PUBLIC_API_READINESS_URL:-https://clustr-api.atlanteanz.com/health/ready}
 public_association_url=${CLIXOR_PUBLIC_ASSOCIATION_URL:-https://clixor.atlanteanz.com/.well-known/apple-app-site-association}
 public_smoke_mode=${CLIXOR_REQUIRE_PUBLIC_SMOKE:-auto}
+ingress_stage=${CLIXOR_INGRESS_STAGE:-manual}
+public_smoke_base_url=${CLIXOR_PUBLIC_SMOKE_BASE_URL:-}
+public_smoke_legal_url=${CLIXOR_PUBLIC_SMOKE_LEGAL_URL:-https://clixor.atlanteanz.com}
 vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
 initial_vault_cutover=${CLIXOR_INITIAL_VAULT_CUTOVER:-false}
 fallback_secret_mode_file=/etc/clixor/secret-mode
@@ -67,6 +70,18 @@ case "${public_api_readiness_url}|${public_association_url}" in
   "https://clustr-api.atlanteanz.com/health/ready|https://clixor.atlanteanz.com/.well-known/apple-app-site-association"|\
   "https://clixor-oci-canary.atlanteanz.com/health/ready|https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association") ;;
   *) fail "public smoke URLs must be the approved production or OCI canary pair" ;;
+esac
+case "${ingress_stage}" in
+  canary)
+    [ "${public_api_readiness_url}" = "https://clixor-oci-canary.atlanteanz.com/health/ready" ] && \
+      [ "${public_association_url}" = "https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association" ] || \
+      fail "canary deployment cannot activate or smoke a production hostname"
+    ;;
+  production)
+    fail "production route ownership is a separate evidence-gated promotion; deploy canary first"
+    ;;
+  manual) ;;
+  *) fail "CLIXOR_INGRESS_STAGE must be canary, production, or manual" ;;
 esac
 case "${initial_vault_cutover}" in
   true|false) ;;
@@ -121,6 +136,55 @@ verify_public_ingress() {
     --association-headers "${association_headers}" \
     --association-body "${association_body}" \
     --expected-revision "${expected_public_revision}"
+}
+
+run_disposable_public_smoke() {
+  expected_public_revision=${1:-}
+  [ -n "${public_smoke_base_url}" ] || \
+    fail "CLIXOR_PUBLIC_SMOKE_BASE_URL is required for the public write gate"
+  [ "${public_smoke_base_url}" = "https://clixor-oci-canary.atlanteanz.com" ] || \
+    fail "automated disposable smoke may target only the reviewed canary hostname"
+  media_namespace="$(sed -n 's/^CLUSTER_OCI_OBJECT_STORAGE_NAMESPACE=//p' "${api_env}" | tail -n 1)"
+  media_region="$(sed -n 's/^CLUSTER_OCI_OBJECT_STORAGE_REGION=//p' "${api_env}" | tail -n 1)"
+  [ -n "${media_namespace}" ] && [ -n "${media_region}" ] || \
+    fail "OCI media identity is unavailable for public smoke"
+  media_host="${media_namespace}.objectstorage.${media_region}.oci.customer-oci.com"
+  smoke_evidence="${release_dir}/canary-public-smoke.txt"
+  smoke_partial="${smoke_evidence}.partial"
+  rm -f -- "${smoke_partial}"
+  python3 "${source_root}/deploy/oci/smoke.py" \
+    --base-url "${public_smoke_base_url}" \
+    --legal-base-url "${public_smoke_legal_url}" \
+    --expected-media-host "${media_host}" \
+    --confirm-disposable-writes DELETE_ALL_SMOKE_DATA > "${smoke_partial}"
+  grep -Eq '^smoke=passed prefix=clixor-smoke-[^ ]+ checks=[1-9][0-9]* cleanup=passed$' \
+    "${smoke_partial}" || fail "disposable public smoke evidence is invalid"
+  {
+    printf 'revision=%s\n' "${expected_public_revision}"
+    printf 'stage=canary\n'
+    cat "${smoke_partial}"
+  } > "${smoke_evidence}"
+  rm -f -- "${smoke_partial}"
+  chown 0:0 "${smoke_evidence}"
+  chmod 0400 "${smoke_evidence}"
+}
+
+verify_production_not_candidate() {
+  candidate_revision=${1:-}
+  negative_headers="${release_dir}/production-negative.headers"
+  rm -f -- "${negative_headers}.partial"
+  curl --fail --silent --show-error --retry 3 --retry-all-errors \
+    --retry-delay 2 --max-time 10 --proto '=https' --tlsv1.2 \
+    --header 'Cache-Control: no-cache' --dump-header "${negative_headers}.partial" \
+    --output /dev/null \
+    "https://clustr-api.atlanteanz.com/health/ready?candidate-negative=${candidate_revision}" || \
+    fail "production ownership is ambiguous; refusing canary writes"
+  if grep -Eiq "^x-clixor-revision:[[:space:]]*${candidate_revision}[[:space:]]*$" \
+    "${negative_headers}.partial"; then
+    fail "candidate connector unexpectedly owns the production hostname"
+  fi
+  chmod 0600 "${negative_headers}.partial"
+  mv -f -- "${negative_headers}.partial" "${negative_headers}"
 }
 
 require_unsigned_integer() {
@@ -1813,6 +1877,8 @@ else
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"
+  [ "${ingress_stage}" != "canary" ] || verify_production_not_candidate "${source_sha}"
+  run_disposable_public_smoke "${source_sha}"
 else
   log "public ingress smoke is deferred for this non-production staging deployment"
 fi

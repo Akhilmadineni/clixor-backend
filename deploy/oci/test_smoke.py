@@ -321,7 +321,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("quarantine-staging-secrets.sh", ci)
 
-    def test_cloudflared_requires_token_file_capable_release_and_fallback(self) -> None:
+    def test_cloudflared_requires_token_file_release_and_unix_canary_route(self) -> None:
         installer = (self.oci_root / "install-cloudflared-service.sh").read_text(
             encoding="utf-8"
         )
@@ -333,8 +333,9 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("dpkg --compare-versions", installer)
         self.assertIn("--protocol auto", unit)
         self.assertNotIn("--protocol quic", unit)
-        self.assertIn("protocol: auto", local_config)
-        self.assertNotIn("protocol: quic", local_config)
+        self.assertIn("service: unix:/run/clixor-origin/gateway.sock", local_config)
+        self.assertNotIn("credentials-file:", local_config)
+        self.assertNotIn("/etc/cloudflared/token", installer)
         self.assertIn(
             "LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token",
             unit,

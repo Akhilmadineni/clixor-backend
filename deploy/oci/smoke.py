@@ -969,6 +969,21 @@ class SmokeSuite:
             "cross-replica realtime delivery did not publish message.created",
         )
 
+        # A successful first upgrade is insufficient: exercise the mobile
+        # reconnect path through Cloudflare and require a second authenticated
+        # RFC 6455 upgrade before accepting the canary.
+        self.websocket.close()
+        self.websocket = WebSocketClient(self.api_origin, member_session.access_token)
+        reconnected = self.websocket.receive_json(15.0)
+        reconnect_payload = reconnected.get("payload")
+        self.check(
+            reconnected.get("type") == "session.ready"
+            and isinstance(reconnect_payload, dict)
+            and reconnect_payload.get("user_id") == member.user_id
+            and reconnect_payload.get("device_id") == member.device_id,
+            "realtime reconnect did not restore the authenticated identity",
+        )
+
         listed = json_object(
             self.api.expect(
                 "GET",

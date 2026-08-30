@@ -173,6 +173,11 @@ trusted_env /usr/bin/tar --extract --file="${source_archive}" --directory="${app
   fail "approved archive has no OCI deployment entrypoint"
 
 trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true \
+  CLIXOR_INGRESS_STAGE=canary \
+  CLIXOR_PUBLIC_API_READINESS_URL=https://clixor-oci-canary.atlanteanz.com/health/ready \
+  CLIXOR_PUBLIC_ASSOCIATION_URL=https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association \
+  CLIXOR_PUBLIC_SMOKE_BASE_URL=https://clixor-oci-canary.atlanteanz.com \
+  CLIXOR_PUBLIC_SMOKE_LEGAL_URL=https://clixor.atlanteanz.com \
   CLIXOR_INITIAL_VAULT_CUTOVER=false \
   /bin/sh "${approved_source}/deploy/oci/deploy.sh" \
   "${approved_source}" "${source_sha}" "${deploy_run_id}-${deploy_run_attempt}"

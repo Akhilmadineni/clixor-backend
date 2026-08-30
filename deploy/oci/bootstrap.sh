@@ -224,6 +224,27 @@ install -d -m 0750 -o 0 -g 99 "${runtime_root}/dependency-tls"
 install -d -m 0750 -o 0 -g 70 "${runtime_root}/postgres-tls"
 install -d -m 0750 -o 0 -g 1000 "${runtime_root}/nats-tls"
 install -d -m 0750 -o 101 -g 101 "${runtime_root}/api-gateway"
+if getent group 987 >/dev/null 2>&1; then
+  [ "$(getent group 987 | cut -d: -f1)" = "clixor-origin" ] || {
+    echo "Host GID 987 is already assigned outside the connector boundary." >&2
+    exit 1
+  }
+elif getent group clixor-origin >/dev/null 2>&1; then
+  [ "$(getent group clixor-origin | cut -d: -f3)" = "987" ] || {
+    echo "clixor-origin must use reviewed GID 987." >&2
+    exit 1
+  }
+else
+  groupadd --system --gid 987 clixor-origin
+fi
+install -m 0644 -o 0 -g 0 "${script_root}/clixor-origin.conf" \
+  /etc/tmpfiles.d/clixor-origin.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/clixor-origin.conf
+[ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
+  [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "0:987:750" ] || {
+  echo "Connector origin tmpfs boundary is unsafe." >&2
+  exit 1
+}
 install -d -m 0750 -o 0 -g 0 "${runtime_root}/postgres-backup"
 install -d -m 0750 -o 65534 -g 65534 "${runtime_root}/prometheus"
 install -d -m 0750 -o 472 -g 472 "${runtime_root}/grafana"

@@ -32,6 +32,20 @@ D2F5_SOURCE_SHA = "d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c"
 TEMP_ROOT = "/private/tmp" if Path("/private/tmp").is_dir() else None
 
 
+def _materialize_legacy_controller(target: Path) -> None:
+    """Use immutable Git objects, never today's mutable controller files."""
+    repository = SCRIPT_ROOT.parent.parent
+    target.mkdir(parents=True, mode=0o700)
+    for relative in RECONCILER.LEGACY_CONTROLLER_FILES:
+        content = subprocess.check_output(
+            ["git", "show", f"{RECONCILER.LEGACY_CONTROLLER_REVISION}:{relative}"],
+            cwd=repository,
+        )
+        path = target.parent.parent / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+
 def _compose() -> str:
     services = []
     for index in range(11):
@@ -653,8 +667,8 @@ class LegacyBaselineTests(unittest.TestCase):
             }
             runner = GitArchiveRunner(outputs)
             controller_source = fixture.root / "controller-source"
-            shutil.copytree(SCRIPT_ROOT, controller_source / "deploy" / "oci")
-            approved_compose = (SCRIPT_ROOT / "compose.yaml").read_bytes()
+            _materialize_legacy_controller(controller_source / "deploy" / "oci")
+            approved_compose = (controller_source / "deploy" / "oci" / "compose.yaml").read_bytes()
             original_verify = RECONCILER._verified_legacy_controller
 
             def verify_then_drift(source):
@@ -729,7 +743,7 @@ class LegacyBaselineTests(unittest.TestCase):
     def test_legacy_controller_cohort_rejects_content_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="clixor-controller-", dir=TEMP_ROOT) as temporary:
             source = Path(temporary) / "source"
-            shutil.copytree(SCRIPT_ROOT, source / "deploy" / "oci")
+            _materialize_legacy_controller(source / "deploy" / "oci")
             self.assertEqual(
                 set(RECONCILER._verified_legacy_controller(source)),
                 set(RECONCILER.LEGACY_CONTROLLER_FILES),
