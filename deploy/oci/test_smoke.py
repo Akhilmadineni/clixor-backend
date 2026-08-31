@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import inspect
 import os
 import re
 import socket
@@ -116,6 +117,15 @@ class ValidationTests(unittest.TestCase):
         arguments[1] = "https://api.example.com"
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             smoke.parse_args(arguments)
+
+    def test_canary_legal_documents_are_allowed_without_weakening_production(self) -> None:
+        source = inspect.getsource(smoke.SmokeSuite.verify_edge_and_legal)
+        self.assertIn(
+            'self.api_origin != "https://clixor-oci-canary.atlanteanz.com"', source
+        )
+        self.assertIn("production API legal path", source)
+        self.assertIn("Privacy Policy &amp; Terms of Use", source)
+        self.assertIn("redirect.status != 308", source)
 
     def test_deploy_uses_the_exact_destructive_smoke_confirmation(self) -> None:
         deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(

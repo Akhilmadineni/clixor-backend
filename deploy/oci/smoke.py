@@ -741,6 +741,19 @@ class SmokeSuite:
             redirect = self.transport.request(
                 "GET", self.api_origin + path, label=f"legal redirect {path}"
             )
+            if redirect.status == 200:
+                if self.api_origin != "https://clixor-oci-canary.atlanteanz.com":
+                    raise SmokeFailure(
+                        f"production API legal path {path} did not redirect"
+                    )
+                assert_cloudflare(redirect)
+                assert_security_headers(redirect, public_cache=True)
+                self.check(
+                    "text/html" in redirect.header("content-type").lower()
+                    and b"Privacy Policy &amp; Terms of Use" in redirect.body,
+                    f"canary legal document {path} had unexpected content",
+                )
+                continue
             if redirect.status != 308:
                 raise SmokeFailure(f"legal redirect {path} returned {redirect.status}")
             assert_cloudflare(redirect)
@@ -1301,7 +1314,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--canary-api-only",
         action="store_true",
-        help="verify legal redirect targets but defer old production legal documents",
+        help="verify canary legal documents but defer the production legal origin",
     )
     args = parser.parse_args(argv)
     if args.confirm_disposable_writes != CONFIRMATION:
