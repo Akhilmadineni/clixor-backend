@@ -143,6 +143,7 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("type_ok=", source)
         self.assertIn("user_ok=", source)
         self.assertIn("device_ok=", source)
+        self.assertIn("error_code=", source)
         self.assertNotIn("member.user_id!r", source)
         self.assertNotIn("member.device_id!r", source)
 

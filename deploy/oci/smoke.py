@@ -984,13 +984,21 @@ class SmokeSuite:
         )
         if not ready_identity_valid:
             payload = ready_payload if isinstance(ready_payload, dict) else {}
+            event_error = ready.get("error")
+            error_code = (
+                event_error.get("code")
+                if isinstance(event_error, dict)
+                and isinstance(event_error.get("code"), str)
+                else "none"
+            )
             raise SmokeFailure(
                 "realtime session.ready identity was incorrect "
                 f"(type_ok={ready.get('type') == 'session.ready'} "
                 f"payload_object={isinstance(ready_payload, dict)} "
                 f"user_ok={payload.get('user_id') == member.user_id} "
                 f"device_ok={payload.get('device_id') == member.device_id} "
-                f"heartbeat_numeric={isinstance(payload.get('heartbeat_seconds'), (int, float))})"
+                f"heartbeat_numeric={isinstance(payload.get('heartbeat_seconds'), (int, float))} "
+                f"error_code={error_code})"
             )
         self.check(True, "realtime session.ready identity was incorrect")
 
