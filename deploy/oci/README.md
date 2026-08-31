@@ -912,6 +912,71 @@ Do not add either production hostname manually. The root promotion controller
 adds them only after the reviewed old-tunnel rules have been retired under the
 edge fence and closed local gate.
 
+### Release-bound staging canary connector
+
+The first OCI canary does **not** require or permit a partial seven-secret
+production cohort. Keep the application on its complete staging cohort. In the
+Cloudflare control plane, save exactly the two rules above on the dedicated
+candidate tunnel, record the returned outer configuration version, and create
+one proxied CNAME:
+
+- `clixor-oci-canary.atlanteanz.com` ->
+  `94cf7377-7b59-4209-b3b0-e68ec7ebb1d6.cfargotunnel.com`
+
+The candidate connector token must be an OCI Vault secret. Record the secret
+OCID and an exact positive numeric secret version; `CURRENT` and `LATEST` are
+intentionally rejected. The existing instance-principal policy in
+`terraform/identity.tf` already grants the VM `read secret-bundles` in the
+deployment compartment, so no OCI user API key belongs on the VM. The account
+ID, tunnel ID, secret OCID, secret version, and Cloudflare config version are
+identifiers, not token values, and are release-inventoried for review.
+
+From the root-owned, commit-authenticated source directory, deploy only after
+the production origin capability is absent:
+
+```sh
+test ! -e /run/clixor-origin-gate/public-open
+revision="$(git rev-parse HEAD)"
+sudo env \
+  CLIXOR_ENABLE_CANARY_CONNECTOR=true \
+  CLIXOR_CANARY_CLOUDFLARE_ACCOUNT_ID='<32-hex-account-id>' \
+  CLIXOR_CANARY_CLOUDFLARE_TUNNEL_ID='94cf7377-7b59-4209-b3b0-e68ec7ebb1d6' \
+  CLIXOR_CANARY_CLOUDFLARE_SECRET_OCID='<vault-secret-ocid>' \
+  CLIXOR_CANARY_CLOUDFLARE_SECRET_VERSION='<exact-positive-version>' \
+  CLIXOR_CANARY_CLOUDFLARE_CONFIG_VERSION='<exact-positive-version>' \
+  CLIXOR_INGRESS_STAGE=canary \
+  CLIXOR_REQUIRE_PUBLIC_SMOKE=true \
+  CLIXOR_REQUIRE_VAULT_HYDRATION=false \
+  CLIXOR_INITIAL_VAULT_CUTOVER=false \
+  CLIXOR_PUBLIC_API_READINESS_URL='https://clixor-oci-canary.atlanteanz.com/health/ready' \
+  CLIXOR_PUBLIC_ASSOCIATION_URL='https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association' \
+  CLIXOR_PUBLIC_SMOKE_BASE_URL='https://clixor-oci-canary.atlanteanz.com' \
+  CLIXOR_PUBLIC_SMOKE_LEGAL_URL='https://clixor.atlanteanz.com' \
+  sh deploy/oci/deploy.sh "$PWD" "$revision" "manual-canary-$(date +%s)"
+```
+
+The release-local credential controller calls OCI CLI with
+`--auth instance_principal` and the exact `--version-number`, validates the
+token's embedded Cloudflare account and tunnel IDs, and atomically publishes it
+as root-owned mode 0600 only under `/run/clixor/cloudflare-connector`. It never
+prints the OCI response or token. The systemd connector receives a private copy
+through `LoadCredential`; neither the token nor a derived credential enters the
+release bundle, `/srv`, environment, argv, logs, or container mounts.
+
+Before public smoke, deployment reads cloudflared's loopback-only `/config`
+endpoint and requires the exact reviewed config version, the single canary
+hostname, terminal 404, and disabled private routing. Nginx independently
+returns 503 for both production hostnames while the root-owned production gate
+is absent. The disposable canary still exercises the complete API write,
+realtime, media, cleanup, and legal-redirect contract; while the retired NAS
+route is unavailable it deliberately does not fetch the external production
+legal HTML documents. Those documents remain a separate pre-production gate.
+The release manifest owns connector enabled/active state; reboot,
+watchdog recovery, and rollback re-fetch or restore only the credential bound
+to `releases/current`. A connector-disabled staging release removes the exact
+owned tmpfs files. This path never invokes the seven-artifact Vault hydrator and
+never changes application container secret selection.
+
 After selecting the production Vault generation, run the normal immutable
 release. `deploy.sh` checksum-stages and systemd-validates the hardened unit,
 captures the exact effective old fragment and state, atomically publishes the
@@ -932,7 +997,7 @@ restart; schedule the first pinned-version transition inside the maintenance
 window. Exit rollback restarts the captured prior binary, and crash recovery
 keeps ingress closed until the committed release is restored.
 
-The token stays root-owned at mode `0600`; systemd exposes it to the dynamic
+The selected token stays root-owned at mode `0600`; systemd exposes it to the dynamic
 connector identity only through `LoadCredential`. Do not place it in
 `runtime.env`, a cloud-init payload, GitHub Actions, or the `cloudflared` command
 line. The unit uses Cloudflare's `auto` transport so it prefers QUIC and can fall

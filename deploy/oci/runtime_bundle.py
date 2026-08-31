@@ -32,9 +32,15 @@ RELEASE_RE = re.compile(r"^oci-[0-9a-f]{12}-[A-Za-z0-9._-]{1,160}$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+VAULT_SECRET_OCID_RE = re.compile(r"^ocid1\.vaultsecret\.oc1\.phx\.[a-z0-9]{20,}$")
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 CLOUDFLARED_BINARY = Path("/usr/bin/cloudflared")
+CANARY_CONNECTOR_METADATA = "cloudflare-canary-connector.json"
+CANARY_CONNECTOR_HELPER = "host-tools/bin/cloudflare-canary-credential.py"
+CANARY_HOSTNAME = "clixor-oci-canary.atlanteanz.com"
+CANARY_ORIGIN = "unix:/run/clixor-origin/gateway.sock"
 
 SOURCE_EXCLUDES = frozenset({".git", ".DS_Store", ".build", "coverage.out"})
 
@@ -449,6 +455,13 @@ def stage_host_tools(
             host_root / category / name,
             executable=executable,
         )
+    connector_helper = source_root / "deploy" / "oci" / "cloudflare-canary-credential.py"
+    if connector_helper.is_file() and not connector_helper.is_symlink():
+        _copy_locked(
+            connector_helper,
+            host_root / "bin" / "cloudflare-canary-credential.py",
+            executable=True,
+        )
     promoter = host_root / "bin" / "cloudflare-promote.py"
     checksum = (_sha256_file(promoter)
                 + "  /usr/local/libexec/clixor/cloudflare-promote.py\n").encode("ascii")
@@ -751,6 +764,53 @@ def _require_bool(value: Any, description: str) -> bool:
     return value
 
 
+def _validate_canary_connector_metadata(path: Path) -> Mapping[str, Any]:
+    """Validate the non-secret, release-inventoried canary selection."""
+
+    document = _load_json(path)
+    if set(document) != {
+        "schema", "mode", "account_id", "tunnel_id", "secret", "remote_config"
+    }:
+        raise BundleError("canary connector metadata fields are invalid")
+    if document.get("schema") != 1 or document.get("mode") != "canary":
+        raise BundleError("canary connector metadata schema is invalid")
+    account_id = document.get("account_id")
+    tunnel_id = document.get("tunnel_id")
+    secret = document.get("secret")
+    remote = document.get("remote_config")
+    if not isinstance(account_id, str) or ACCOUNT_ID_RE.fullmatch(account_id) is None:
+        raise BundleError("canary connector account ID is invalid")
+    try:
+        import uuid
+
+        if str(uuid.UUID(str(tunnel_id))) != tunnel_id:
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise BundleError("canary connector tunnel ID is invalid") from None
+    if not isinstance(secret, dict) or set(secret) != {"ocid", "version"}:
+        raise BundleError("canary connector secret selection is invalid")
+    secret_ocid = secret.get("ocid")
+    secret_version = secret.get("version")
+    if (not isinstance(secret_ocid, str)
+            or VAULT_SECRET_OCID_RE.fullmatch(secret_ocid) is None
+            or isinstance(secret_version, bool)
+            or not isinstance(secret_version, int)
+            or secret_version <= 0):
+        raise BundleError("canary connector secret selection is invalid")
+    expected_ingress = [
+        {"hostname": CANARY_HOSTNAME, "service": CANARY_ORIGIN},
+        {"service": "http_status:404"},
+    ]
+    if (not isinstance(remote, dict)
+            or set(remote) != {"version", "ingress"}
+            or isinstance(remote.get("version"), bool)
+            or not isinstance(remote.get("version"), int)
+            or remote["version"] <= 0
+            or remote.get("ingress") != expected_ingress):
+        raise BundleError("canary connector remote configuration is invalid")
+    return document
+
+
 def validate_runtime_bundle(
     release: Path,
     *,
@@ -906,6 +966,16 @@ def validate_runtime_bundle(
                 raise BundleError("runtime bundle file checksum changed")
     if actual_paths != set(expected_inventory):
         raise BundleError("runtime bundle is missing an inventoried file")
+    canary_metadata_present = CANARY_CONNECTOR_METADATA in actual_paths
+    if canary_metadata_present:
+        metadata_record = expected_inventory[CANARY_CONNECTOR_METADATA]
+        if metadata_record[2] != 0o400:
+            raise BundleError("canary connector metadata mode is unsafe")
+        _validate_canary_connector_metadata(bundle / CANARY_CONNECTOR_METADATA)
+        if CANARY_CONNECTOR_HELPER not in actual_paths:
+            raise BundleError("canary connector credential controller is missing")
+        if cloudflared != {"enabled": True, "active": True}:
+            raise BundleError("canary connector release must own active connector state")
     promotion_paths = actual_paths.intersection(PROMOTION_EXTENSION_REQUIRED)
     extension = release / PROMOTION_EXTENSION_DIRECTORY
     if promotion_paths == PROMOTION_EXTENSION_REQUIRED:

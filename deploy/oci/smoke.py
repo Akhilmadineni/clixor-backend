@@ -547,6 +547,7 @@ class SmokeSuite:
         media_host: str,
         *,
         cleanup_timeout: float = 45.0,
+        verify_legal_documents: bool = True,
         transport: HTTPTransport | None = None,
     ) -> None:
         self.transport = transport or HTTPTransport()
@@ -555,6 +556,7 @@ class SmokeSuite:
         self.legal_origin = legal_origin
         self.media_host = media_host
         self.cleanup_timeout = cleanup_timeout
+        self.verify_legal_documents = verify_legal_documents
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         self.prefix = f"clixor-smoke-{stamp}-{uuid.uuid4().hex[:8]}"
         self.accounts: list[DisposableAccount] = []
@@ -678,6 +680,8 @@ class SmokeSuite:
                 redirect.header("location") == self.legal_origin + path,
                 f"legal redirect {path} targeted the wrong origin",
             )
+            if not self.verify_legal_documents:
+                continue
             document = self.transport.request(
                 "GET", self.legal_origin + path, label=f"legal document {path}"
             )
@@ -1172,12 +1176,14 @@ def run(
     media_host: str,
     *,
     cleanup_timeout: float = 45.0,
+    verify_legal_documents: bool = True,
 ) -> tuple[str, int]:
     suite = SmokeSuite(
         api_origin,
         legal_origin,
         media_host,
         cleanup_timeout=cleanup_timeout,
+        verify_legal_documents=verify_legal_documents,
     )
     primary: BaseException | None = None
     cleanup_failures: list[str] = []
@@ -1220,6 +1226,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"must equal {CONFIRMATION}",
     )
     parser.add_argument("--cleanup-timeout", type=float, default=45.0)
+    parser.add_argument(
+        "--canary-api-only",
+        action="store_true",
+        help="verify legal redirect targets but defer old production legal documents",
+    )
     args = parser.parse_args(argv)
     if args.confirm_disposable_writes != CONFIRMATION:
         parser.error(f"--confirm-disposable-writes must equal {CONFIRMATION}")
@@ -1233,6 +1244,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(error))
     if args.base_url == args.legal_base_url:
         parser.error("API and legal origins must be different")
+    if args.canary_api_only and args.base_url != "https://clixor-oci-canary.atlanteanz.com":
+        parser.error("--canary-api-only may target only the reviewed OCI canary")
     return args
 
 
@@ -1244,6 +1257,7 @@ def main(argv: list[str] | None = None) -> int:
             args.legal_base_url,
             args.expected_media_host,
             cleanup_timeout=args.cleanup_timeout,
+            verify_legal_documents=not args.canary_api_only,
         )
     except SmokeFailure as error:
         print(f"smoke=failed reason={error}", file=sys.stderr)

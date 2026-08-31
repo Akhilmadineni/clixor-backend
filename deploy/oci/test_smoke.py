@@ -63,6 +63,20 @@ class FakeAPI:
 
 
 class ValidationTests(unittest.TestCase):
+    def test_canary_api_only_scope_is_pinned(self) -> None:
+        arguments = [
+            "--base-url", "https://clixor-oci-canary.atlanteanz.com",
+            "--legal-base-url", "https://clixor.atlanteanz.com",
+            "--expected-media-host", "namespace.objectstorage.us-phoenix-1.oci.customer-oci.com",
+            "--confirm-disposable-writes", smoke.CONFIRMATION,
+            "--canary-api-only",
+        ]
+        parsed = smoke.parse_args(arguments)
+        self.assertTrue(parsed.canary_api_only)
+        arguments[1] = "https://api.example.com"
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            smoke.parse_args(arguments)
+
     def test_https_origin_validation(self) -> None:
         self.assertEqual(
             smoke.validate_origin("https://API.Example.com/", "test"),
@@ -343,9 +357,12 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertNotIn("credentials-file:", local_config)
         self.assertNotIn("/etc/cloudflared/token", installer)
         self.assertIn(
-            "LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token",
+            "LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token",
             unit,
         )
+        self.assertIn("--metrics 127.0.0.1:20241", unit)
+        self.assertIn("cloudflare-canary-credential.py", installer)
+        self.assertIn("validate-release", installer)
 
     def test_cloudflared_package_install_is_pinned_and_release_transactional(self) -> None:
         canonical = (

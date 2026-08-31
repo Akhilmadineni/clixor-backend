@@ -156,8 +156,13 @@ grep -Fq 'prepare-runtime-secrets-launcher.py' \
 grep -Fq 'if [ "${defer_host_tool_activation}" = "false" ]; then' \
   "${script_root}/bootstrap.sh" || \
   fail "normal deferred bootstrap can overwrite boot-critical host artifacts"
-grep -q 'LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token' \
-  "${script_root}/cloudflared.service" || fail "cloudflared does not use the tmpfs generation"
+grep -q 'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token' \
+  "${script_root}/cloudflared.service" || fail "cloudflared does not use the release-bound tmpfs credential"
+grep -q 'cloudflare-canary-credential.py' \
+  "${script_root}/install-cloudflared-service.sh" && \
+  grep -q '"${connector_controller}" verify' \
+    "${script_root}/install-cloudflared-service.sh" || \
+  fail "cloudflared installer does not verify the selected release credential"
 sh -n "${script_root}/prepare-runtime-secrets.sh" \
   "${script_root}/prepare-initial-staging-secrets.sh"
 python3 "${script_root}/test_boot_secret_launcher.py"

@@ -36,6 +36,12 @@ public_smoke_base_url=${CLIXOR_PUBLIC_SMOKE_BASE_URL:-}
 public_smoke_legal_url=${CLIXOR_PUBLIC_SMOKE_LEGAL_URL:-https://clixor.atlanteanz.com}
 vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
 initial_vault_cutover=${CLIXOR_INITIAL_VAULT_CUTOVER:-false}
+canary_connector_enabled=${CLIXOR_ENABLE_CANARY_CONNECTOR:-false}
+canary_cloudflare_account_id=${CLIXOR_CANARY_CLOUDFLARE_ACCOUNT_ID:-}
+canary_cloudflare_tunnel_id=${CLIXOR_CANARY_CLOUDFLARE_TUNNEL_ID:-}
+canary_cloudflare_secret_ocid=${CLIXOR_CANARY_CLOUDFLARE_SECRET_OCID:-}
+canary_cloudflare_secret_version=${CLIXOR_CANARY_CLOUDFLARE_SECRET_VERSION:-}
+canary_cloudflare_config_version=${CLIXOR_CANARY_CLOUDFLARE_CONFIG_VERSION:-}
 fallback_secret_mode_file=/etc/clixor/secret-mode
 approved_manifest_name=vault-approved-cohort.json
 approved_mapping_name=vault-secrets.map
@@ -68,6 +74,34 @@ case "${vault_hydration_mode}" in
   true|false) ;;
   *) fail "CLIXOR_REQUIRE_VAULT_HYDRATION must be true or false" ;;
 esac
+case "${canary_connector_enabled}" in
+  true|false) ;;
+  *) fail "CLIXOR_ENABLE_CANARY_CONNECTOR must be true or false" ;;
+esac
+if [ "${canary_connector_enabled}" = "true" ]; then
+  [ "${ingress_stage}" = "canary" ] || \
+    fail "the canary connector requires CLIXOR_INGRESS_STAGE=canary"
+  [ "${public_smoke_mode}" = "true" ] || \
+    fail "the canary connector requires CLIXOR_REQUIRE_PUBLIC_SMOKE=true"
+  [ "${vault_hydration_mode}" = "false" ] || \
+    fail "the canary connector cannot bypass the complete Vault cohort"
+  [ "${initial_vault_cutover}" = "false" ] || \
+    fail "the canary connector cannot perform a Vault cutover"
+  for required_canary_value in \
+    "${canary_cloudflare_account_id}" "${canary_cloudflare_tunnel_id}" \
+    "${canary_cloudflare_secret_ocid}" "${canary_cloudflare_secret_version}" \
+    "${canary_cloudflare_config_version}"
+  do
+    [ -n "${required_canary_value}" ] || \
+      fail "all release-bound canary connector inputs are required"
+  done
+  case "${canary_cloudflare_secret_version}:${canary_cloudflare_config_version}" in
+    *[!0-9:]*|:*|*:|0:*|*:0) fail "canary secret/config versions must be positive integers" ;;
+  esac
+else
+  [ -z "${canary_cloudflare_account_id}${canary_cloudflare_tunnel_id}${canary_cloudflare_secret_ocid}${canary_cloudflare_secret_version}${canary_cloudflare_config_version}" ] || \
+    fail "canary connector inputs require CLIXOR_ENABLE_CANARY_CONNECTOR=true"
+fi
 case "${public_api_readiness_url}|${public_association_url}" in
   "https://clustr-api.atlanteanz.com/health/ready|https://clixor.atlanteanz.com/.well-known/apple-app-site-association"|\
   "https://clixor-oci-canary.atlanteanz.com/health/ready|https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association") ;;
@@ -162,11 +196,15 @@ run_disposable_public_smoke() {
   media_host="${media_namespace}.objectstorage.${media_region}.oci.customer-oci.com"
   smoke_evidence="${release_dir}/canary-public-smoke.txt"
   smoke_partial="${smoke_evidence}.partial"
+  smoke_scope=
+  [ "${canary_connector_enabled}" = "false" ] || \
+    smoke_scope=--canary-api-only
   rm -f -- "${smoke_partial}"
   python3 "${source_root}/deploy/oci/smoke.py" \
     --base-url "${public_smoke_base_url}" \
     --legal-base-url "${public_smoke_legal_url}" \
     --expected-media-host "${media_host}" \
+    ${smoke_scope} \
     --confirm-disposable-writes DELETE_ALL_SMOKE_DATA > "${smoke_partial}"
   grep -Eq '^smoke=passed prefix=clixor-smoke-[^ ]+ checks=[1-9][0-9]* cleanup=passed$' \
     "${smoke_partial}" || fail "disposable public smoke evidence is invalid"
@@ -343,7 +381,8 @@ stage_host_tooling() {
   : > "${host_tool_stage}/SHA256SUMS.partial"
   for tool_name in \
     offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py \
-    cloudflare-promote.py cloudflare-promote.py.sha256 cloudflared
+    cloudflare-promote.py cloudflare-promote.py.sha256 \
+    cloudflare-canary-credential.py cloudflared
   do
     (
       cd "${host_tool_stage}"
@@ -380,9 +419,12 @@ stage_host_tooling() {
     sha256sum --check SHA256SUMS >/dev/null
   ) || fail "staged host backup tooling failed checksum verification"
   grep -Fxq \
-    'LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token' \
+    'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token' \
     "${host_tool_stage}/systemd/cloudflared.service" || \
     fail "staged cloudflared unit does not use the approved credential path"
+  grep -Fq -- '--metrics 127.0.0.1:20241' \
+    "${host_tool_stage}/systemd/cloudflared.service" || \
+    fail "staged cloudflared unit lacks the reviewed local config endpoint"
   grep -Fq -- '--token-file %d/cloudflare-token' \
     "${host_tool_stage}/systemd/cloudflared.service" || \
     fail "staged cloudflared unit does not use systemd credentials"
@@ -658,6 +700,35 @@ activate_cloudflared() {
   fi
 }
 
+restore_previous_connector_credential() {
+  previous_connector_helper=
+  case "${previous_release:-}" in
+    "${release_root}"/oci-*)
+      previous_connector_helper="${previous_release}/runtime-bundle/host-tools/bin/cloudflare-canary-credential.py"
+      ;;
+  esac
+  if [ -n "${previous_connector_helper}" ] && \
+    [ -f "${previous_connector_helper}" ] && \
+    [ ! -L "${previous_connector_helper}" ]; then
+    /usr/bin/python3 "${previous_connector_helper}" prepare \
+      --release "${previous_release}" \
+      --project-root "${project_root}"
+    return $?
+  fi
+  # Historical reviewed units load directly from the complete Vault/staging
+  # cohort. They neither need nor own this new release-bound tmpfs selection.
+  if [ -f "${previous_cloudflare_root}/cloudflared.service" ] && \
+    grep -Fq '/run/clixor/cloudflare-connector/token' \
+      "${previous_cloudflare_root}/cloudflared.service"; then
+    return 1
+  fi
+  rm -f -- \
+    /run/clixor/cloudflare-connector/token \
+    /run/clixor/cloudflare-connector/selection.json || return 1
+  rmdir /run/clixor/cloudflare-connector 2>/dev/null || \
+    [ ! -e /run/clixor/cloudflare-connector ]
+}
+
 restore_cloudflared() {
   restore_status=0
   saved_binary="$(sed -n '1p' \
@@ -768,6 +839,8 @@ restore_cloudflared() {
       ;;
   esac
   systemctl daemon-reload || restore_status=1
+
+  restore_previous_connector_credential || restore_status=1
 
   if [ "${saved_enabled}" = "enabled" ]; then
     systemctl enable cloudflared.service >/dev/null 2>&1 || restore_status=1
@@ -1130,6 +1203,15 @@ case "${topology_ownership_state}" in
   uninitialized|pre-cutover-old|oci-live) ;;
   *) fail "Cloudflare topology ownership state is unknown" ;;
 esac
+if [ "${canary_connector_enabled}" = "true" ]; then
+  case "${topology_ownership_state}" in
+    uninitialized|pre-cutover-old) ;;
+    *) fail "canary connector is forbidden after OCI owns production traffic" ;;
+  esac
+  [ ! -e /run/clixor-origin-gate/public-open ] && \
+    [ ! -L /run/clixor-origin-gate/public-open ] || \
+    fail "production origin gate must remain closed during canary"
+fi
 install -d -m 0700 -o 0 -g 0 "${pending_release_root}"
 if [ -L "${release_root}/current" ]; then
   /usr/bin/python3 "${stable_runtime_controller}" validate-release \
@@ -1239,6 +1321,16 @@ mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
   --source "${source_root}" \
   --source-sha "${source_sha}" \
   --compose-source "${source_root}/deploy/oci/compose.yaml"
+if [ "${canary_connector_enabled}" = "true" ]; then
+  /usr/bin/python3 "${source_root}/deploy/oci/cloudflare-canary-credential.py" \
+    stage-metadata \
+    --release "${release_dir}" \
+    --account-id "${canary_cloudflare_account_id}" \
+    --tunnel-id "${canary_cloudflare_tunnel_id}" \
+    --secret-ocid "${canary_cloudflare_secret_ocid}" \
+    --secret-version "${canary_cloudflare_secret_version}" \
+    --remote-config-version "${canary_cloudflare_config_version}"
+fi
 stage_release_boot_tooling
 sh "${source_root}/deploy/oci/install-cloudflared-package.sh" \
   stage "${cloudflared_candidate}"
@@ -1823,6 +1915,22 @@ if [ "${vault_hydration_mode}" = "true" ]; then
   grep -qx 'CLUSTER_MAIL_PROVIDER=smtp' "${api_env}" || \
     fail "Vault-backed deployments require durable SMTP password-reset delivery"
 fi
+if [ "${canary_connector_enabled}" = "true" ]; then
+  [ "${candidate_secret_mode}" = "staging" ] || \
+    fail "canary connector must keep the application on its complete staging cohort"
+  grep -qx 'CLUSTER_ENV=staging' "${api_env}" || \
+    fail "canary connector requires the staging application environment"
+  [ ! -e /run/clixor-origin-gate/public-open ] && \
+    [ ! -L /run/clixor-origin-gate/public-open ] || \
+    fail "production origin gate opened during canary deployment"
+  grep -Fq 'server_name clustr-api.atlanteanz.com clixor.atlanteanz.com;' \
+    "${source_root}/deploy/oci/api-gateway-nginx.conf" && \
+    grep -Fq 'if (!-f /run/clixor-origin-gate/public-open)' \
+    "${source_root}/deploy/oci/api-gateway-nginx.conf" && \
+    grep -Fq 'server_name clixor-oci-canary.atlanteanz.com;' \
+    "${source_root}/deploy/oci/api-gateway-nginx.conf" || \
+    fail "candidate Nginx model does not fail production closed"
+fi
 if grep -q '^CLUSTER_ENV=production$' "${api_env}"; then
   [ "${vault_hydration_mode}" = "true" ] || \
     fail "production requires a release-pinned OCI Vault cohort"
@@ -2080,6 +2188,7 @@ candidate_cloudflared=false
 if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
   candidate_cloudflared=true
 fi
+[ "${canary_connector_enabled}" = "false" ] || candidate_cloudflared=true
 runtime_state_input="${release_dir}/runtime-state.partial"
 {
   printf 'cloudflared_enabled=%s\n' "${candidate_cloudflared}"
@@ -2106,11 +2215,21 @@ rm -f -- "${runtime_state_input}"
 /usr/bin/python3 "${stable_runtime_controller}" permit-candidate-ingress \
   --candidate "${release_dir}"
 
-if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
+if [ "${candidate_cloudflared}" = "true" ]; then
+  /usr/bin/python3 \
+    "${host_tool_stage}/bin/cloudflare-canary-credential.py" prepare \
+    --release "${release_dir}" \
+    --project-root "${project_root}"
+  [ "${canary_connector_enabled}" = "false" ] || cloudflare_secret_changed=true
   validate_cloudflared_runtime
   activate_cloudflared
+  if [ "${canary_connector_enabled}" = "true" ]; then
+    /usr/bin/python3 \
+      "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify-remote \
+      --release "${release_dir}"
+  fi
 else
-  log "cloudflared unit activation is deferred for this non-production staging deployment"
+  log "cloudflared unit activation is deferred for this connector-disabled staging deployment"
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"

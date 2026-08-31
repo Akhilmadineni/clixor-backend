@@ -10,12 +10,12 @@ ConditionPathExists=/run/clixor/runtime-ready
 Type=notify
 DynamicUser=yes
 SupplementaryGroups=clixor-origin
-LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token
+LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token
 # Reassert the tmpfs boundary after every boot. The `+` prefix applies only to
 # this mkdir/metadata operation; the connector itself remains DynamicUser.
 ExecStartPre=+/usr/bin/install -d -m 0750 -o 986 -g 987 /run/clixor-origin
 # `auto` prefers QUIC and falls back to HTTP/2 when UDP is unavailable.
-ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol auto run --token-file %d/cloudflare-token
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol auto --metrics 127.0.0.1:20241 run --token-file %d/cloudflare-token
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=90s

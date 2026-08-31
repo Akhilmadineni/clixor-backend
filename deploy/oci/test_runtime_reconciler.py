@@ -311,6 +311,71 @@ class RuntimeBundleTests(unittest.TestCase):
                 release, expected_uid=uid, expected_gid=gid
             )
 
+    def test_canary_connector_metadata_is_inventoried_and_requires_active_state(self) -> None:
+        shutil.copy2(
+            SCRIPT_ROOT / "cloudflare-canary-credential.py",
+            self.fixture.source / "deploy" / "oci" / "cloudflare-canary-credential.py",
+        )
+        self.fixture.state.write_text(
+            "cloudflared_enabled=true\n"
+            "cloudflared_active=true\n"
+            "prometheus_active=false\n"
+            "grafana_active=false\n"
+            "offsite_timer_enabled=true\n"
+            "restore_timer_enabled=true\n"
+            "health_timer_enabled=true\n",
+            encoding="ascii",
+        )
+        release = self.fixture.pending / "oci-0123456789ab-canary"
+        release.mkdir(mode=0o700)
+        runtime_bundle.stage_source(release, self.fixture.source, SOURCE_SHA)
+        metadata = release / "runtime-bundle" / runtime_bundle.CANARY_CONNECTOR_METADATA
+        metadata.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "mode": "canary",
+                    "account_id": "8ceacad35a884128e4575cd7b7d793b4",
+                    "tunnel_id": "94cf7377-7b59-4209-b3b0-e68ec7ebb1d6",
+                    "secret": {
+                        "ocid": "ocid1.vaultsecret.oc1.phx.amaaaaaag3ylxbqaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "version": 1,
+                    },
+                    "remote_config": {
+                        "version": 3,
+                        "ingress": [
+                            {
+                                "hostname": runtime_bundle.CANARY_HOSTNAME,
+                                "service": runtime_bundle.CANARY_ORIGIN,
+                            },
+                            {"service": "http_status:404"},
+                        ],
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="ascii",
+        )
+        metadata.chmod(0o400)
+        runtime_bundle.stage_host_tools(release, self.fixture.source, self.fixture.cloudflared)
+        runtime_bundle.finalize_bundle(
+            release,
+            self.fixture.runtime,
+            self.fixture.pki,
+            SOURCE_SHA,
+            f"clixor-api:{release.name}",
+            IMAGE_ID,
+            self.fixture.state,
+        )
+        uid, gid = self.fixture.root.stat().st_uid, self.fixture.root.stat().st_gid
+        manifest = runtime_bundle.validate_runtime_bundle(
+            release, expected_uid=uid, expected_gid=gid
+        )
+        paths = {record["path"] for record in manifest["files"]}
+        self.assertIn(runtime_bundle.CANARY_CONNECTOR_METADATA, paths)
+        self.assertIn(runtime_bundle.CANARY_CONNECTOR_HELPER, paths)
+
     def test_source_tree_rejects_symlinks_and_manifest_rejects_extra_files(self) -> None:
         linked = self.fixture.source / "linked"
         linked.symlink_to(self.fixture.source / "go.mod")
@@ -1141,6 +1206,18 @@ class BootSelectionContractTests(unittest.TestCase):
         self.assertNotIn("restart: always", compose)
         self.assertIn("After=clixor-runtime-secrets.service docker.service", reconcile_unit)
         self.assertIn("Before=cloudflared.service", reconcile_unit)
+        credential_prepare = RECONCILER_PATH.read_text().index(
+            "_prepare_connector_credential(release, project_root, runner)"
+        )
+        connector_start = RECONCILER_PATH.read_text().index(
+            '["/usr/bin/systemctl", "start", "--no-block", "cloudflared.service"]',
+            credential_prepare,
+        )
+        self.assertLess(credential_prepare, connector_start)
+        self.assertIn(
+            "_connector_credential_matches(release, project_root, runner)",
+            RECONCILER_PATH.read_text(),
+        )
         self.assertIn("ConditionPathExists=/run/clixor/runtime-ready", cloud_unit)
         self.assertIn("runtime-reconciler.py watchdog", watchdog_unit)
         self.assertIn("flock -n 9", deploy)

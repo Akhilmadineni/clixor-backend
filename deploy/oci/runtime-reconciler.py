@@ -2097,6 +2097,72 @@ def _boot_bundle_validate(release: Path, runner: CommandRunner) -> None:
     )
 
 
+def _connector_credential_controller(release: Path) -> Path | None:
+    bundle = release / runtime_bundle.BUNDLE_DIRECTORY
+    helper = bundle / "host-tools" / "bin" / "cloudflare-canary-credential.py"
+    if helper.is_file() and not helper.is_symlink():
+        return helper
+    # Historical schema-2 releases used the complete selected secret cohort
+    # directly. They remain rollback-compatible; a release using the new
+    # unified path without its controller is never accepted.
+    unit = bundle / "host-tools" / "systemd" / "cloudflared.service"
+    try:
+        unit_text = unit.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        # The runtime bundle validator is the authority. This compatibility
+        # branch is also exercised by controller unit tests that replace that
+        # validator with an already-reviewed manifest fixture.
+        return None
+    if "/run/clixor/cloudflare-connector/token" in unit_text:
+        raise ReconcileError("selected release connector credential controller is missing")
+    return None
+
+
+def _prepare_connector_credential(
+    release: Path, project_root: Path, runner: CommandRunner
+) -> None:
+    helper = _connector_credential_controller(release)
+    if helper is None:
+        return
+    runner.run(
+        [
+            "/usr/bin/python3", str(helper), "prepare",
+            "--release", str(release), "--project-root", str(project_root),
+        ]
+    )
+
+
+def _connector_credential_matches(
+    release: Path, project_root: Path, runner: CommandRunner
+) -> bool:
+    del project_root
+    try:
+        helper = _connector_credential_controller(release)
+    except ReconcileError:
+        return False
+    if helper is None:
+        return True
+    verified = runner.run(
+        ["/usr/bin/python3", str(helper), "verify", "--release", str(release)],
+        check=False,
+    )
+    if verified.returncode != 0:
+        return False
+    canary_metadata = (
+        release / runtime_bundle.BUNDLE_DIRECTORY
+        / runtime_bundle.CANARY_CONNECTOR_METADATA
+    )
+    if canary_metadata.is_file() and not canary_metadata.is_symlink():
+        return runner.run(
+            [
+                "/usr/bin/python3", str(helper), "verify-remote",
+                "--release", str(release),
+            ],
+            check=False,
+        ).returncode == 0
+    return True
+
+
 def reconcile_current(
     project_root: Path,
     runner: CommandRunner,
@@ -2119,6 +2185,7 @@ def reconcile_current(
     # restore and verify current's exact staging/Vault cohort before any
     # mutable runtime file or container is recreated.
     _prepare_current_secrets(release, project_root, runner)
+    _prepare_connector_credential(release, project_root, runner)
     _restore_source(release, project_root, runner)
     _restore_runtime(release, project_root)
     _restore_host_tools(release, runner)
@@ -2162,6 +2229,8 @@ def _runtime_matches_current(project_root: Path, runner: CommandRunner) -> bool:
         if READY_MARKER.read_text(encoding="ascii") != str(release) + "\n":
             return False
         if not _secret_selection_matches_release(release, project_root, runner):
+            return False
+        if not _connector_credential_matches(release, project_root, runner):
             return False
         bundle = release / runtime_bundle.BUNDLE_DIRECTORY
 

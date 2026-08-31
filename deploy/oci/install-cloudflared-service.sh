@@ -2,9 +2,11 @@
 set -eu
 umask 077
 
-token_file=/run/clixor/secrets/active/cloudflare-token
+token_file=/run/clixor/cloudflare-connector/token
 unit_source=${1:-}
 reviewed_cloudflared_version=2026.7.3
+release_root=/srv/clixor/releases
+current_release=
 
 fail() {
   printf '[clixor-cloudflared] ERROR: %s\n' "$*" >&2
@@ -15,6 +17,25 @@ fail() {
 [ -n "${unit_source}" ] || fail "cloudflared service unit path is required"
 [ -f "${unit_source}" ] || fail "service unit does not exist: ${unit_source}"
 [ -x /usr/bin/cloudflared ] || fail "install the signed cloudflared package first"
+[ -L "${release_root}/current" ] || \
+  fail "a committed release must be selected before connector installation"
+current_release="$(readlink -- "${release_root}/current")"
+case "${current_release}" in
+  "${release_root}"/oci-*) ;;
+  *) fail "current release pointer is unsafe" ;;
+esac
+[ "${current_release%/*}" = "${release_root}" ] && \
+  [ "$(readlink -f -- "${release_root}/current")" = "${current_release}" ] || \
+  fail "current release must select an immediate release child"
+connector_controller="${current_release}/runtime-bundle/host-tools/bin/cloudflare-canary-credential.py"
+[ -f "${connector_controller}" ] && [ ! -L "${connector_controller}" ] || \
+  fail "selected release has no connector credential controller"
+/usr/bin/python3 /usr/local/libexec/clixor/runtime-reconciler.py validate-release \
+  --release "${current_release}" >/dev/null || \
+  fail "selected release runtime bundle is invalid"
+/usr/bin/python3 "${connector_controller}" verify \
+  --release "${current_release}" >/dev/null || \
+  fail "selected release connector credential is invalid"
 
 cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
   sed -n 's/^cloudflared version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
@@ -29,8 +50,10 @@ token_owner="$(stat -c '%u:%g' "${token_file}")"
 token_mode="$(stat -c '%a' "${token_file}")"
 [ "${token_owner}" = "0:0" ] || fail "${token_file} must be owned by root:root"
 [ "${token_mode}" = "600" ] || fail "${token_file} must have mode 0600"
-[ "$(readlink -- /run/clixor/secrets/active)" != "/srv/clixor/secrets" ] || \
-  fail "production connector credentials must be selected from a Vault tmpfs generation"
+[ -s /run/clixor/cloudflare-connector/selection.json ] && \
+  [ -f /run/clixor/cloudflare-connector/selection.json ] && \
+  [ ! -L /run/clixor/cloudflare-connector/selection.json ] || \
+  fail "release-bound connector selection is missing"
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
   [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || \
   fail "connector-only origin boundary is missing or unsafe"
