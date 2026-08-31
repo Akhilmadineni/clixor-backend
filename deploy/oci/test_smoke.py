@@ -787,6 +787,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertIn("--no-owner --no-privileges --exit-on-error", restore)
         self.assertIn("pg_amcheck --username restore_admin", restore)
         self.assertIn("checkable_index_count", restore)
+        self.assertIn("amcheck_installed", restore)
         self.assertIn("could not determine restored database index count", restore)
         self.assertIn("schema_migrations", restore)
         self.assertIn("RESTORE_DRILL_LAST_SUCCESS", restore)

@@ -206,7 +206,13 @@ checkable_index_count="$(docker exec "${container_name}" sh -ec \
 case "${checkable_index_count}" in
   ''|*[!0-9]*) fail "could not determine restored database index count" ;;
 esac
-if [ "${checkable_index_count}" -gt 0 ]; then
+amcheck_installed="$(docker exec "${container_name}" sh -ec \
+  'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username restore_admin --dbname restore_drill --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = \$\$amcheck\$\$);"')"
+case "${amcheck_installed}" in
+  t|f) ;;
+  *) fail "could not determine whether the restored database has amcheck installed" ;;
+esac
+if [ "${amcheck_installed}" = "t" ] && [ "${checkable_index_count}" -gt 0 ]; then
   docker exec "${container_name}" sh -ec \
     'PGPASSWORD="$POSTGRES_PASSWORD" exec pg_amcheck --username restore_admin --database restore_drill' \
     >/dev/null
