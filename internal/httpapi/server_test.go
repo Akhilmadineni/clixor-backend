@@ -426,6 +426,19 @@ func TestAuthRateLimitsUseSeparateOperationNamespaces(t *testing.T) {
 	}
 }
 
+func TestRealtimeSubscriptionDoesNotReuseUpgradeRequestContext(t *testing.T) {
+	source, err := os.ReadFile("realtime.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(source, []byte("context.WithTimeout(context.Background(), 5*time.Second)")) {
+		t.Fatal("realtime NATS subscription needs a bounded post-upgrade context")
+	}
+	if bytes.Contains(source, []byte("s.bus.Subscribe(r.Context(), id.UserID)")) {
+		t.Fatal("realtime NATS subscription must not reuse the canceled upgrade request context")
+	}
+}
+
 func TestRegistrationAllocatesAccountBoundDeviceIdentity(t *testing.T) {
 	t.Parallel()
 	server := newTestHTTPServer(t)

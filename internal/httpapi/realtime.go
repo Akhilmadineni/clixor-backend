@@ -56,7 +56,12 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 	_ = s.presence.Online(r.Context(), id.UserID, id.DeviceID)
 	defer s.presence.Offline(context.Background(), id.UserID, id.DeviceID)
 
-	subscription, err := s.bus.Subscribe(r.Context(), id.UserID)
+	// The HTTP request context may be canceled as soon as the upgrade completes.
+	// NATS subscription establishment must instead use a short, bounded context
+	// that remains valid for this post-upgrade operation.
+	subscriptionContext, cancelSubscription := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelSubscription()
+	subscription, err := s.bus.Subscribe(subscriptionContext, id.UserID)
 	if err != nil {
 		_ = connection.WriteJSON(errorResponse{Error: errorBody{Code: "unavailable", Message: "Realtime delivery is unavailable."}})
 		return
