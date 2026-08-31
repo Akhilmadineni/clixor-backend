@@ -50,6 +50,11 @@ resource "oci_email_sender" "password_reset" {
 }
 
 resource "oci_identity_user" "smtp_submitter" {
+  # The production SMTP principal predates Resource Manager state. Keep it
+  # external by default so routine infrastructure updates cannot recreate it.
+  # Adopt it with `terraform import` before deliberately enabling management.
+  count = var.manage_smtp_submitter_identity ? 1 : 0
+
   compartment_id = var.tenancy_ocid
   name           = "clixor-email-smtp"
   description    = "Non-interactive IAM user for Clixor OCI Email Delivery SMTP submission"
@@ -61,7 +66,8 @@ resource "oci_identity_user" "smtp_submitter" {
 }
 
 resource "oci_identity_user_capabilities_management" "smtp_submitter" {
-  user_id = oci_identity_user.smtp_submitter.id
+  count   = var.manage_smtp_submitter_identity ? 1 : 0
+  user_id = oci_identity_user.smtp_submitter[0].id
 
   can_use_api_keys             = false
   can_use_auth_tokens          = false
@@ -82,8 +88,9 @@ resource "oci_identity_group" "smtp_submitters" {
 }
 
 resource "oci_identity_user_group_membership" "smtp_submitter" {
+  count    = var.manage_smtp_submitter_identity ? 1 : 0
   group_id = oci_identity_group.smtp_submitters.id
-  user_id  = oci_identity_user.smtp_submitter.id
+  user_id  = oci_identity_user.smtp_submitter[0].id
 }
 
 resource "oci_identity_policy" "smtp_submission" {

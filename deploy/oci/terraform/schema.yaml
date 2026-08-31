@@ -34,6 +34,7 @@ variableGroups:
   - title: "Outbound email"
     variables:
       - create_mail_approved_sender
+      - manage_smtp_submitter_identity
 
 variables:
   tenancy_ocid:
@@ -143,6 +144,12 @@ variables:
     title: "Create approved mail sender"
     description: "Leave disabled for the first apply. Enable only after publishing the output DKIM CNAME and SPF TXT records in Cloudflare and OCI reports DKIM ACTIVE."
     default: false
+  manage_smtp_submitter_identity:
+    type: boolean
+    required: true
+    title: "Manage SMTP IAM identity"
+    description: "Leave disabled unless the existing SMTP user, capability, and membership have first been imported into Resource Manager state."
+    default: false
 
 outputs:
   instance_private_ip:
@@ -186,4 +193,4 @@ outputs:
     title: "Mail SMTP implicit-TLS endpoint"
   mail_smtp_user_id:
     type: copyableString
-    title: "Dedicated SMTP IAM user OCID"
+    title: "Managed SMTP IAM user OCID"

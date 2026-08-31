@@ -180,3 +180,9 @@ variable "create_mail_approved_sender" {
   type        = bool
   default     = false
 }
+
+variable "manage_smtp_submitter_identity" {
+  description = "Manage the dedicated OCI SMTP IAM user only after its pre-existing user, capability, and group membership have been imported into Resource Manager state."
+  type        = bool
+  default     = false
+}
