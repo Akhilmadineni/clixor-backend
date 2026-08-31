@@ -169,6 +169,15 @@ raise SystemExit(97)
         self.assertIn("create_host_path: false", mount[:300])
         self.assertIn("d /var/lib/clixor/origin-gate-public 0755 root root -", tmpfiles)
         self.assertIn("public-open 0400 root root", tmpfiles)
+        helper = (ROOT / "cloudflare-canary-credential.py").read_text(
+            encoding="utf-8"
+        )
+        deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        host_gate = "/var/lib/clixor/origin-gate-public/public-open"
+        self.assertIn(f'PRODUCTION_GATE = Path("{host_gate}")', helper)
+        self.assertGreaterEqual(deploy.count(host_gate), 4)
+        self.assertIn(f"test ! -e {host_gate}", readme)
         self.assertIn("cloudflare-promote.py initialize-gate", bootstrap)
         self.assertIn("ReadWritePaths=/var/lib/clixor", unit)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", unit)
@@ -222,6 +231,13 @@ raise SystemExit(97)
         self.assertIn("CLIXOR_PUBLIC_SMOKE_BASE_URL=https://clixor-oci-canary", actions)
         self.assertIn("production route ownership is a separate evidence-gated promotion", deploy)
         self.assertIn('verify_production_not_candidate "${source_sha}"', deploy)
+        negative_start = deploy.index("verify_production_not_candidate()")
+        negative_end = deploy.index("\n}\n", negative_start)
+        negative = deploy[negative_start:negative_end]
+        self.assertIn('"${connector_helper}" verify', negative)
+        self.assertIn('"${connector_helper}" verify-remote', negative)
+        self.assertIn("verify-canary-negative.py", negative)
+        self.assertNotIn("curl", negative)
 
     def test_release_bound_canary_connector_cannot_promote_or_hydrate_partial_cohort(self) -> None:
         deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
@@ -236,7 +252,9 @@ raise SystemExit(97)
         self.assertNotIn('print(token', helper)
         self.assertIn('/run/clixor/cloudflare-connector/current/token', unit)
         self.assertIn('--metrics 127.0.0.1:20241', unit)
-        self.assertIn("candidate connector unexpectedly owns the production hostname", deploy)
+        self.assertIn("candidate connector owns the production hostname", (
+            ROOT / "verify-canary-negative.py"
+        ).read_text(encoding="utf-8"))
         self.assertIn('run_disposable_public_smoke "${source_sha}"', deploy)
 
     def test_deploy_source_and_connector_transitions_are_fail_closed(self) -> None:

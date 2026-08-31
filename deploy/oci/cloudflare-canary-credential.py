@@ -45,7 +45,10 @@ TOKEN_NAME = "token"
 SELECTION_NAME = "selection.json"
 CURRENT_NAME = "current"
 GENERATION_PREFIX = "generation-"
-PRODUCTION_GATE = Path("/run/clixor-origin-gate/public-open")
+# This helper runs in the host namespace.  Nginx sees the same capability at
+# /run/clixor-origin-gate/public-open only because Compose bind-mounts this
+# persistent host directory into the gateway container.
+PRODUCTION_GATE = Path("/var/lib/clixor/origin-gate-public/public-open")
 
 # cloudflared's loopback /config endpoint serializes the effective (not merely
 # submitted) origin policy. Pin that complete default-expanded authority so a

@@ -23,6 +23,10 @@ import smoke  # noqa: E402
 import backup_manifest  # noqa: E402
 
 
+REVISION = "0123456789abcdef0123456789abcdef01234567"
+OTHER_REVISION = "f" * 40
+
+
 def server_frame(opcode: int, payload: bytes, *, final: bool = True) -> bytes:
     first = opcode | (0x80 if final else 0)
     if len(payload) < 126:
@@ -39,6 +43,41 @@ class FailingOpener:
     def open(self, request: object, timeout: float) -> object:
         del request, timeout
         raise urllib.error.URLError(f"upstream rejected {self.secret}")
+
+
+class StaticHeaders:
+    def __init__(self, fields: list[tuple[str, str]]) -> None:
+        self.fields = fields
+
+    def raw_items(self) -> list[tuple[str, str]]:
+        return self.fields
+
+    def items(self) -> list[tuple[str, str]]:
+        return [("x-clixor-revision", "incorrectly-folded")]
+
+
+class StaticResponse:
+    status = 200
+
+    def __init__(self, fields: list[tuple[str, str]], body: bytes = b"{}") -> None:
+        self.headers = StaticHeaders(fields)
+        self.body = body
+        self.closed = False
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StaticOpener:
+    def __init__(self, response: StaticResponse) -> None:
+        self.response = response
+
+    def open(self, request: object, timeout: float) -> StaticResponse:
+        del request, timeout
+        return self.response
 
 
 class FakeAPI:
@@ -68,6 +107,7 @@ class ValidationTests(unittest.TestCase):
             "--base-url", "https://clixor-oci-canary.atlanteanz.com",
             "--legal-base-url", "https://clixor.atlanteanz.com",
             "--expected-media-host", "namespace.objectstorage.us-phoenix-1.oci.customer-oci.com",
+            "--expected-revision", REVISION,
             "--confirm-disposable-writes", smoke.CONFIRMATION,
             "--canary-api-only",
         ]
@@ -132,10 +172,129 @@ class ValidationTests(unittest.TestCase):
                     "https://legal.example.com",
                     "--expected-media-host",
                     "objectstorage.example.com",
+                    "--expected-revision",
+                    REVISION,
                     "--confirm-disposable-writes",
                     "NO",
                 ]
             )
+
+    def test_expected_revision_is_required_and_canonical(self) -> None:
+        arguments = [
+            "--base-url", "https://api.example.com",
+            "--legal-base-url", "https://legal.example.com",
+            "--expected-media-host", "objectstorage.example.com",
+            "--confirm-disposable-writes", smoke.CONFIRMATION,
+        ]
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            smoke.parse_args(arguments)
+        for invalid in ("a" * 39, "A" * 40, "g" * 40, REVISION + "0"):
+            with self.subTest(invalid=invalid):
+                with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                    smoke.parse_args(
+                        arguments[:6]
+                        + ["--expected-revision", invalid]
+                        + arguments[6:]
+                    )
+        parsed = smoke.parse_args(
+            arguments[:6]
+            + ["--expected-revision", REVISION]
+            + arguments[6:]
+        )
+        self.assertEqual(parsed.expected_revision, REVISION)
+
+
+class ReadinessIdentityTests(unittest.TestCase):
+    @staticmethod
+    def result(
+        body: dict[str, object] | bytes,
+        revisions: tuple[str, ...] = (REVISION,),
+    ) -> smoke.HTTPResult:
+        payload = (
+            body
+            if isinstance(body, bytes)
+            else json.dumps(body, separators=(",", ":")).encode("utf-8")
+        )
+        headers = [("content-type", "application/json")]
+        headers.extend(("x-clixor-revision", value) for value in revisions)
+        return smoke.HTTPResult(status=200, headers=tuple(headers), body=payload)
+
+    def test_expected_body_and_single_header_are_accepted(self) -> None:
+        readiness = smoke.assert_readiness_identity(
+            self.result(
+                {"status": "ready", "revision": REVISION, "detail": "healthy"}
+            ),
+            REVISION,
+        )
+        self.assertEqual(readiness["revision"], REVISION)
+
+    def test_status_must_be_ready(self) -> None:
+        for body in (
+            {"revision": REVISION},
+            {"status": "ok", "revision": REVISION},
+            {"status": True, "revision": REVISION},
+        ):
+            with self.subTest(body=body), self.assertRaises(smoke.SmokeFailure):
+                smoke.assert_readiness_identity(self.result(body), REVISION)
+
+    def test_body_revision_must_be_present_canonical_and_expected(self) -> None:
+        for body_revision in (None, "a" * 39, "A" * 40, OTHER_REVISION):
+            body: dict[str, object] = {"status": "ready"}
+            if body_revision is not None:
+                body["revision"] = body_revision
+            with self.subTest(revision=body_revision), self.assertRaises(smoke.SmokeFailure):
+                smoke.assert_readiness_identity(self.result(body), REVISION)
+
+    def test_duplicate_body_members_are_rejected(self) -> None:
+        payload = (
+            b'{"status":"ready","revision":"'
+            + REVISION.encode("ascii")
+            + b'","revision":"'
+            + REVISION.encode("ascii")
+            + b'"}'
+        )
+        with self.assertRaises(smoke.SmokeFailure):
+            smoke.assert_readiness_identity(self.result(payload), REVISION)
+
+    def test_header_must_be_present_canonical_and_expected(self) -> None:
+        body = {"status": "ready", "revision": REVISION}
+        for revisions in ((), ("a" * 39,), ("A" * 40,), (OTHER_REVISION,)):
+            with self.subTest(revisions=revisions), self.assertRaises(smoke.SmokeFailure):
+                smoke.assert_readiness_identity(
+                    self.result(body, revisions), REVISION
+                )
+
+    def test_duplicate_revision_headers_are_rejected_case_insensitively(self) -> None:
+        body = {"status": "ready", "revision": REVISION}
+        for second in (REVISION, OTHER_REVISION):
+            result = self.result(body, ())
+            result = smoke.HTTPResult(
+                status=result.status,
+                headers=(
+                    ("content-type", "application/json"),
+                    ("X-Clixor-Revision", REVISION),
+                    ("x-clixor-revision", second),
+                ),
+                body=result.body,
+            )
+            with self.subTest(second=second), self.assertRaises(smoke.SmokeFailure):
+                smoke.assert_readiness_identity(result, REVISION)
+
+    def test_transport_preserves_duplicate_raw_header_fields(self) -> None:
+        response = StaticResponse(
+            [
+                ("X-Clixor-Revision", REVISION),
+                ("x-clixor-revision", OTHER_REVISION),
+            ]
+        )
+        transport = smoke.HTTPTransport(opener=StaticOpener(response))
+        result = transport.request("GET", "https://api.example.com/health/ready")
+        self.assertEqual(
+            result.header_values("x-clixor-revision"),
+            (REVISION, OTHER_REVISION),
+        )
+        self.assertEqual(result.header("x-clixor-revision"), "")
+        self.assertTrue(response.closed)
 
 
 class WebSocketTests(unittest.TestCase):
@@ -171,6 +330,7 @@ class CleanupTests(unittest.TestCase):
             "https://api.example.com",
             "https://legal.example.com",
             "objectstorage.example.com",
+            REVISION,
         )
         fake = FakeAPI()
         suite.api = fake  # type: ignore[assignment]
@@ -1149,6 +1309,14 @@ reject_active_promotion_journal
         self.assertIn('public readiness came from a different release', (
             self.oci_root / "validate-public-smoke.py"
         ).read_text(encoding="utf-8"))
+        disposable_start = deploy.index("run_disposable_public_smoke()")
+        disposable_end = deploy.index(
+            "verify_production_not_candidate()", disposable_start
+        )
+        self.assertIn(
+            '--expected-revision "${expected_public_revision}"',
+            deploy[disposable_start:disposable_end],
+        )
         self.assertIn('clixor-oci-canary.atlanteanz.com/health/ready', deploy)
         self.assertIn('[ "${#source_sha}" -eq 40 ]', deploy)
         dockerfile = (self.oci_root.parent.parent / "Dockerfile").read_text(
