@@ -537,3 +537,174 @@ func TestDeleteAccountDropsStaleAffectedVersionAndPreservesSafeCurrentEventAndPu
 		t.Fatalf("safe financial entity changed: %s", retained.Payload)
 	}
 }
+
+func TestDeleteAccountDropsOwnedReceiptMemberAndInvalidTransportRows(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "transport-delete@example.com", DisplayName: "A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "transport-remaining@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "transport-observer@example.com", DisplayName: "Observer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remainingDevice, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: remaining.ID, Name: "remaining", Platform: "ios",
+		PushToken: "transport-remaining-token", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID,
+		MemberIDs: []uuid.UUID{deleted.ID, observer.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendEvent := func(topic string, payload json.RawMessage) int64 {
+		t.Helper()
+		id := persistence.nextOutboxID
+		persistence.appendOutbox(topic, conversation.ID, payload)
+		return id
+	}
+	targetReceipt := appendEvent("receipt.updated", mustMemoryJSON(t, domain.Receipt{
+		ConversationID: conversation.ID, UserID: deleted.ID, DeliveredSeq: 2, ReadSeq: 1,
+	}))
+	safeReceipt := appendEvent("receipt.updated", mustMemoryJSON(t, domain.Receipt{
+		ConversationID: conversation.ID, UserID: remaining.ID, DeliveredSeq: 2, ReadSeq: 1,
+	}))
+	targetMember := appendEvent("conversation.member_added", mustMemoryJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: remaining.ID, UserID: deleted.ID,
+	}))
+	deletedActor := appendEvent("conversation.member_added", mustMemoryJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: deleted.ID, UserID: observer.ID,
+	}))
+	safeMember := appendEvent("conversation.member_added", mustMemoryJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: remaining.ID, UserID: observer.ID,
+	}))
+	wrongShape := appendEvent("entity.updated", json.RawMessage(`{"note":"no identity here"}`))
+	unknownField := appendEvent("receipt.updated", json.RawMessage(`{"conversation_id":"`+
+		conversation.ID.String()+`","user_id":"`+remaining.ID.String()+
+		`","delivered_seq":1,"read_seq":0,"updated_at":"0001-01-01T00:00:00Z","unknown":true}`))
+	malformed := appendEvent("entity.deleted", json.RawMessage(`{`))
+	validEntity := domain.Entity{
+		ConversationID: conversation.ID, Kind: "note", ID: uuid.New(), Version: 1,
+		Payload: json.RawMessage(`{"label":"A"}`), CreatedBy: remaining.ID,
+	}
+	safeEntity := appendEvent("entity.updated", mustMemoryJSON(t, validEntity))
+
+	dropped := map[int64]struct{}{
+		targetReceipt: {}, targetMember: {}, deletedActor: {}, wrongShape: {}, unknownField: {}, malformed: {},
+	}
+	retained := map[int64]struct{}{safeReceipt: {}, safeMember: {}, safeEntity: {}}
+	for id := range dropped {
+		inserted, err := persistence.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+			OutboxEventID: id, ConversationID: conversation.ID, EntityID: uuid.New(),
+			NotificationID: uuid.NewString(), Title: "generic", Body: "generic", Kind: "activity",
+		}, []uuid.UUID{remaining.ID})
+		if err != nil || inserted != 1 {
+			t.Fatalf("enqueue dropped source=%d inserted=%d err=%v", id, inserted, err)
+		}
+	}
+	for id := range retained {
+		inserted, err := persistence.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+			OutboxEventID: id, ConversationID: conversation.ID, EntityID: uuid.New(),
+			NotificationID: uuid.NewString(), Title: "generic", Body: "generic", Kind: "activity",
+		}, []uuid.UUID{remaining.ID})
+		if err != nil || inserted != 1 {
+			t.Fatalf("enqueue retained source=%d inserted=%d err=%v", id, inserted, err)
+		}
+	}
+
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[int64]struct{})
+	for _, event := range persistence.outbox {
+		seen[event.ID] = struct{}{}
+		if _, shouldDrop := dropped[event.ID]; shouldDrop {
+			t.Fatalf("owned/invalid transport row survived: %+v", event)
+		}
+	}
+	for id := range retained {
+		if _, ok := seen[id]; !ok {
+			t.Fatalf("valid unrelated transport row %d was removed", id)
+		}
+	}
+	for _, delivery := range persistence.pushDeliveries {
+		if _, shouldDrop := dropped[delivery.OutboxEventID]; shouldDrop {
+			t.Fatalf("derived push for removed source survived: %+v", delivery)
+		}
+		if _, shouldRetain := retained[delivery.OutboxEventID]; shouldRetain &&
+			delivery.DeviceID != remainingDevice.ID {
+			t.Fatalf("retained push changed owner: %+v", delivery)
+		}
+	}
+}
+
+func TestDeleteAccountMemoryPreflightRejectsMalformedDurableJSONAtomically(t *testing.T) {
+	for _, target := range []string{"metadata", "entity"} {
+		t.Run(target, func(t *testing.T) {
+			ctx := context.Background()
+			persistence := New()
+			deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+				Email: "malformed-" + target + "@example.com", DisplayName: "Delete",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+				Email: "remaining-" + target + "@example.com", DisplayName: "Remaining",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+				Kind: "group", CreatedBy: remaining.ID, MemberIDs: []uuid.UUID{deleted.ID},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if target == "metadata" {
+				value := persistence.conversations[conversation.ID]
+				value.Metadata = json.RawMessage(`{`)
+				persistence.conversations[conversation.ID] = value
+			} else {
+				persistence.entities["malformed"] = domain.Entity{
+					ConversationID: conversation.ID, Kind: "note", ID: uuid.New(), Version: 1,
+					CreatedBy: deleted.ID, Payload: json.RawMessage(`{`),
+				}
+			}
+			if err := persistence.DeleteAccount(ctx, deleted.ID); err == nil {
+				t.Fatal("malformed durable JSON did not fail closed")
+			}
+			if _, err := persistence.UserByID(ctx, deleted.ID); err != nil {
+				t.Fatalf("failed preflight partially deleted user: %v", err)
+			}
+			if _, member := persistence.members[conversation.ID][deleted.ID]; !member {
+				t.Fatal("failed preflight partially removed membership")
+			}
+		})
+	}
+}
+
+func mustMemoryJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}

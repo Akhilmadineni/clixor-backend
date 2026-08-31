@@ -11,7 +11,30 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestPostgresOutboxTopicDomainRejectsUnreviewedDrift(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	_, err = persistence.pool.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload)
+		VALUES('future.server_readable', $1, '{}'::jsonb)`, uuid.New())
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" ||
+		pgErr.ConstraintName != "outbox_events_topic_domain_check" {
+		t.Fatalf("unreviewed topic err=%v, want topic-domain check violation", err)
+	}
+}
 
 func TestPostgresRealtimeDeliveryLeaseSerializesAccountErasure(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -263,6 +286,69 @@ func TestPostgresPushDeliveryLeaseSerializesAccountErasure(t *testing.T) {
 	})
 }
 
+func TestPostgresPushDeliveryLeasePinsDeviceTokenOwnershipThroughCallback(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	persistence, _, delivery := postgresPushErasureFixture(t, ctx, databaseURL)
+	defer persistence.Close()
+	newOwner, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "New owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDevice := domain.Device{
+		ID: uuid.New(), UserID: newOwner.ID, Name: "new iPhone", Platform: "ios",
+		PushToken: delivery.PushToken, IdentityKey: "new-identity", CreatedAt: time.Now().UTC(),
+	}
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- persistence.WithPushDeliveryLease(
+			ctx, delivery.ID, delivery.LeaseToken,
+			func(callbackContext context.Context, leased domain.PushDelivery) error {
+				if leased.PushToken != delivery.PushToken {
+					return errors.New("push lease changed token")
+				}
+				close(callbackStarted)
+				select {
+				case <-callbackContext.Done():
+					return callbackContext.Err()
+				case <-releaseCallback:
+					return nil
+				}
+			},
+		)
+	}()
+	<-callbackStarted
+	transferDone := make(chan error, 1)
+	go func() {
+		_, transferErr := persistence.UpsertDevice(ctx, newDevice)
+		transferDone <- transferErr
+	}()
+	select {
+	case err := <-transferDone:
+		t.Fatalf("token ownership changed during APNs callback: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCallback)
+	if err := <-deliveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-transferDone; err != nil {
+		t.Fatal(err)
+	}
+	transferred, err := persistence.Device(ctx, newOwner.ID, newDevice.ID)
+	if err != nil || transferred.PushToken != delivery.PushToken {
+		t.Fatalf("token transfer after callback: device=%+v err=%v", transferred, err)
+	}
+}
+
 func TestPostgresAccountErasureRemovesOnlyDeletedRecipientPush(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -349,6 +435,144 @@ func TestPostgresAccountErasureRemovesOnlyDeletedRecipientPush(t *testing.T) {
 	}
 	if deletedCount != 0 || remainingCount != 1 || sourceCount != 1 {
 		t.Fatalf("deleted_push=%d remaining_push=%d source=%d", deletedCount, remainingCount, sourceCount)
+	}
+}
+
+func TestPostgresAccountErasureDropsOwnedAndInvalidTypedTransportRows(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "A",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "Remaining",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "Observer",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remainingDevice, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: remaining.ID, Name: "remaining", Platform: "ios",
+		PushToken: "typed-" + uuid.NewString(), IdentityKey: "identity", CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID,
+		MemberIDs: []uuid.UUID{deleted.ID, observer.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendEvent := func(topic string, payload json.RawMessage) int64 {
+		t.Helper()
+		var id int64
+		if err := persistence.pool.QueryRow(ctx, `
+			INSERT INTO outbox_events(topic,aggregate_id,payload)
+			VALUES($1,$2,$3) RETURNING id`, topic, conversation.ID, payload,
+		).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	targetReceipt := appendEvent("receipt.updated", mustPostgresJSON(t, domain.Receipt{
+		ConversationID: conversation.ID, UserID: deleted.ID, DeliveredSeq: 2, ReadSeq: 1,
+	}))
+	safeReceipt := appendEvent("receipt.updated", mustPostgresJSON(t, domain.Receipt{
+		ConversationID: conversation.ID, UserID: remaining.ID, DeliveredSeq: 2, ReadSeq: 1,
+	}))
+	targetMember := appendEvent("conversation.member_added", mustPostgresJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: remaining.ID, UserID: deleted.ID,
+	}))
+	deletedActor := appendEvent("conversation.member_added", mustPostgresJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: deleted.ID, UserID: observer.ID,
+	}))
+	safeMember := appendEvent("conversation.member_added", mustPostgresJSON(t, domain.ConversationMemberAdded{
+		ConversationID: conversation.ID, ActorID: remaining.ID, UserID: observer.ID,
+	}))
+	wrongShape := appendEvent("entity.updated", json.RawMessage(`{"note":"no identity here"}`))
+	unknownField := appendEvent("receipt.updated", json.RawMessage(`{"conversation_id":"`+
+		conversation.ID.String()+`","user_id":"`+remaining.ID.String()+
+		`","delivered_seq":1,"read_seq":0,"updated_at":"0001-01-01T00:00:00Z","unknown":true}`))
+	safeEntity := appendEvent("entity.updated", mustPostgresJSON(t, domain.Entity{
+		ConversationID: conversation.ID, Kind: "note", ID: uuid.New(), Version: 1,
+		Payload: json.RawMessage(`{"label":"A"}`), CreatedBy: remaining.ID,
+	}))
+	dropped := map[int64]struct{}{
+		targetReceipt: {}, targetMember: {}, deletedActor: {}, wrongShape: {}, unknownField: {},
+	}
+	retained := map[int64]struct{}{safeReceipt: {}, safeMember: {}, safeEntity: {}}
+	for id := range dropped {
+		inserted, err := persistence.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+			OutboxEventID: id, ConversationID: conversation.ID, EntityID: uuid.New(),
+			NotificationID: uuid.NewString(), Title: "generic", Body: "generic", Kind: "activity",
+		}, []uuid.UUID{remaining.ID})
+		if err != nil || inserted != 1 {
+			t.Fatalf("enqueue dropped source=%d inserted=%d err=%v", id, inserted, err)
+		}
+	}
+	for id := range retained {
+		inserted, err := persistence.EnqueuePushDeliveries(ctx, domain.PushDelivery{
+			OutboxEventID: id, ConversationID: conversation.ID, EntityID: uuid.New(),
+			NotificationID: uuid.NewString(), Title: "generic", Body: "generic", Kind: "activity",
+		}, []uuid.UUID{remaining.ID})
+		if err != nil || inserted != 1 {
+			t.Fatalf("enqueue retained source=%d inserted=%d err=%v", id, inserted, err)
+		}
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	for id := range dropped {
+		var sourceCount, pushCount int
+		if err := persistence.pool.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events WHERE id=$1`, id,
+		).Scan(&sourceCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := persistence.pool.QueryRow(ctx,
+			`SELECT count(*) FROM push_deliveries WHERE outbox_event_id=$1`, id,
+		).Scan(&pushCount); err != nil {
+			t.Fatal(err)
+		}
+		if sourceCount != 0 || pushCount != 0 {
+			t.Fatalf("dropped id=%d source=%d push=%d", id, sourceCount, pushCount)
+		}
+	}
+	for id := range retained {
+		var sourceCount, pushCount int
+		if err := persistence.pool.QueryRow(ctx,
+			`SELECT count(*) FROM outbox_events WHERE id=$1`, id,
+		).Scan(&sourceCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := persistence.pool.QueryRow(ctx, `
+			SELECT count(*) FROM push_deliveries
+			WHERE outbox_event_id=$1 AND device_id=$2`, id, remainingDevice.ID,
+		).Scan(&pushCount); err != nil {
+			t.Fatal(err)
+		}
+		if sourceCount != 1 || pushCount != 1 {
+			t.Fatalf("retained id=%d source=%d push=%d", id, sourceCount, pushCount)
+		}
 	}
 }
 
@@ -656,4 +880,13 @@ func postgresPushErasureFixture(
 		t.Fatalf("claim exact push: %v", err)
 	}
 	return persistence, user, delivery
+}
+
+func mustPostgresJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

@@ -158,6 +158,64 @@ func TestPushDeliveryLeaseSerializesAccountErasure(t *testing.T) {
 	})
 }
 
+func TestPushDeliveryLeasePinsDeviceTokenOwnershipThroughCallback(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	persistence, _, delivery := memoryPushErasureFixture(t, ctx)
+	newOwner, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", DisplayName: "New owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDevice := domain.Device{
+		ID: uuid.New(), UserID: newOwner.ID, Name: "new iPhone", Platform: "ios",
+		PushToken: delivery.PushToken, IdentityKey: "new-identity", CreatedAt: time.Now().UTC(),
+	}
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- persistence.WithPushDeliveryLease(
+			ctx, delivery.ID, delivery.LeaseToken,
+			func(callbackContext context.Context, leased domain.PushDelivery) error {
+				if leased.PushToken != delivery.PushToken {
+					return fmt.Errorf("leased token=%q want=%q", leased.PushToken, delivery.PushToken)
+				}
+				close(callbackStarted)
+				select {
+				case <-callbackContext.Done():
+					return callbackContext.Err()
+				case <-releaseCallback:
+					return nil
+				}
+			},
+		)
+	}()
+	<-callbackStarted
+	transferDone := make(chan error, 1)
+	go func() {
+		_, transferErr := persistence.UpsertDevice(ctx, newDevice)
+		transferDone <- transferErr
+	}()
+	select {
+	case err := <-transferDone:
+		t.Fatalf("token ownership changed during APNs callback: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseCallback)
+	if err := <-deliveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-transferDone; err != nil {
+		t.Fatal(err)
+	}
+	transferred, err := persistence.Device(ctx, newOwner.ID, newDevice.ID)
+	if err != nil || transferred.PushToken != delivery.PushToken {
+		t.Fatalf("token transfer after callback: device=%+v err=%v", transferred, err)
+	}
+}
+
 func memoryRealtimeErasureFixture(
 	t *testing.T,
 	ctx context.Context,

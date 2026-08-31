@@ -678,6 +678,97 @@ func TestSuccessfulRealtimeDeliveryIsAcknowledgedAndCannotBeReclaimed(t *testing
 	}
 }
 
+func TestRealtimeTransportTimeoutReleasesAccountErasureBarrier(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bus := &blockingBus{started: make(chan struct{})}
+	fixture.relay.bus = bus
+	fixture.relay.realtimeTimeout = 30 * time.Millisecond
+	flushDone := make(chan struct{})
+	go func() {
+		fixture.relay.flush(fixture.ctx)
+		close(flushDone)
+	}()
+	select {
+	case <-bus.started:
+	case <-time.After(time.Second):
+		t.Fatal("realtime callback did not start")
+	}
+	deletionDone := make(chan error, 1)
+	go func() { deletionDone <- fixture.store.DeleteAccount(fixture.ctx, fixture.actor.ID) }()
+	select {
+	case err := <-deletionDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("realtime timeout did not release account-erasure barrier")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(time.Second):
+		t.Fatal("realtime worker did not return after transport timeout")
+	}
+}
+
+func TestPushTransportTimeoutReleasesAccountErasureAndDeviceBarriers(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	message := domain.Message{
+		ID: uuid.New(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		Seq: 1, Ciphertext: "encrypted",
+	}
+	raw, _ := json.Marshal(message)
+	recipients, err := fixture.store.ConversationMemberIDs(fixture.ctx, fixture.conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.relay.enqueuePush(fixture.ctx, domain.OutboxEvent{
+		ID: 8001, Topic: "message.created", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := fixture.store.LockPushDeliveryBatch(fixture.ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim push: deliveries=%+v err=%v", claimed, err)
+	}
+	blocked := &blockingPush{started: make(chan struct{}), release: make(chan struct{})}
+	fixture.relay.push = blocked
+	fixture.relay.pushTimeout = 30 * time.Millisecond
+	deliveryDone := make(chan struct{})
+	go func() {
+		fixture.relay.deliverPush(fixture.ctx, claimed[0])
+		close(deliveryDone)
+	}()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("APNs callback did not start")
+	}
+	deletionDone := make(chan error, 1)
+	go func() { deletionDone <- fixture.store.DeleteAccount(fixture.ctx, fixture.recipient.ID) }()
+	select {
+	case err := <-deletionDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("APNs timeout did not release account-erasure barrier")
+	}
+	select {
+	case <-deliveryDone:
+	case <-time.After(time.Second):
+		t.Fatal("push worker did not return after transport timeout")
+	}
+}
+
 func TestPermanentConversationMissSkipsPushWithoutPoisoningOutbox(t *testing.T) {
 	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
 	drainFixtureOutbox(t, fixture)
@@ -1248,6 +1339,18 @@ func (*countingBus) FenceSessions(context.Context, uuid.UUID, *uuid.UUID) (event
 }
 
 func (*countingBus) Close() {}
+
+type blockingBus struct {
+	countingBus
+	startedOnce sync.Once
+	started     chan struct{}
+}
+
+func (b *blockingBus) Publish(ctx context.Context, _ []uuid.UUID, _ domain.RealtimeEvent) error {
+	b.startedOnce.Do(func() { close(b.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 type recordingMedia struct {
 	mu        sync.Mutex

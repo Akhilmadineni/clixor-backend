@@ -30,6 +30,8 @@ type Relay struct {
 	now                func() time.Time
 	lastPrune          time.Time
 	mediaDeleteTimeout time.Duration
+	realtimeTimeout    time.Duration
+	pushTimeout        time.Duration
 }
 
 type PushRetryPolicy struct {
@@ -48,6 +50,11 @@ const (
 	genericPushKind          = "activity"
 	mediaDeleteConcurrency   = 4
 	mediaDeleteObjectTimeout = 10 * time.Second
+	// Transport callbacks run while a database/memory erasure barrier is held.
+	// Keep them comfortably inside the 30-second realtime and 2-minute push
+	// claim leases so provider stalls cannot block account deletion indefinitely.
+	realtimeTransportTimeout = 10 * time.Second
+	pushTransportTimeout     = 60 * time.Second
 	retentionInterval        = time.Hour
 	retentionCatchUpInterval = time.Minute
 	retentionRunBudget       = 5 * time.Second
@@ -82,6 +89,8 @@ func NewWithPushRetryPolicy(
 		store: persistence, bus: bus, push: pushService, media: mediaService,
 		logger: logger, policy: policy, now: now, lastPrune: now().UTC(),
 		mediaDeleteTimeout: mediaDeleteObjectTimeout,
+		realtimeTimeout:    realtimeTransportTimeout,
+		pushTimeout:        pushTransportTimeout,
 	}
 }
 
@@ -163,7 +172,11 @@ func (r *Relay) flush(ctx context.Context) {
 					stage = "translate"
 					return errRealtimeTranslate
 				}
-				return r.bus.Publish(deliveryContext, recipients, event)
+				publishContext, cancelPublish := context.WithTimeout(
+					deliveryContext, r.realtimeTimeout,
+				)
+				defer cancelPublish()
+				return r.bus.Publish(publishContext, recipients, event)
 			},
 		)
 		if err != nil {
@@ -364,8 +377,10 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 			if strings.TrimSpace(delivery.PushToken) == "" {
 				return nil
 			}
+			sendContext, cancelSend := context.WithTimeout(deliveryContext, r.pushTimeout)
+			defer cancelSend()
 			sendErr = r.push.Send(
-				deliveryContext, delivery.PushToken, genericPushTitle, genericPushBody,
+				sendContext, delivery.PushToken, genericPushTitle, genericPushBody,
 				map[string]string{"type": genericPushKind},
 				delivery.NotificationID,
 			)

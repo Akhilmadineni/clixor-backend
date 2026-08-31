@@ -452,10 +452,11 @@ func sanitizeAccountOutbox(
 		return nil
 	}
 	topics := []string{
-		"conversation.created", "entity.updated", "entity.deleted",
+		"conversation.created", "conversation.member_added", "receipt.updated",
+		"entity.updated", "entity.deleted",
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT id,topic,payload
+		SELECT id,topic,aggregate_id,payload
 		FROM outbox_events
 		WHERE aggregate_id=ANY($1) AND topic=ANY($2)
 		ORDER BY id
@@ -464,14 +465,15 @@ func sanitizeAccountOutbox(
 		return err
 	}
 	type affectedEvent struct {
-		id      int64
-		topic   string
-		payload json.RawMessage
+		id          int64
+		topic       string
+		aggregateID uuid.UUID
+		payload     json.RawMessage
 	}
 	var events []affectedEvent
 	for rows.Next() {
 		var event affectedEvent
-		if err := rows.Scan(&event.id, &event.topic, &event.payload); err != nil {
+		if err := rows.Scan(&event.id, &event.topic, &event.aggregateID, &event.payload); err != nil {
 			rows.Close()
 			return err
 		}
@@ -487,18 +489,42 @@ func sanitizeAccountOutbox(
 		affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()] = struct{}{}
 	}
 	for _, event := range events {
-		if !store.AccountSanitizableOutboxTopic(event.topic) {
+		if !store.AccountErasureOutboxTopic(event.topic) {
 			return domain.ErrInvalid
 		}
-		authorized, err := store.AccountJSONReferencesIdentity(event.payload, identity)
-		if err == nil && (event.topic == "entity.updated" || event.topic == "entity.deleted") {
-			var entity domain.Entity
-			if json.Unmarshal(event.payload, &entity) == nil {
-				_, entityAffected := affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()]
-				authorized = authorized || entityAffected
+		typed, schemaErr := store.DecodeAccountOutboxPayload(
+			event.topic, event.aggregateID, event.payload,
+		)
+		if schemaErr != nil {
+			// Known-topic transport state is disposable. A row outside the exact
+			// service-owned schema cannot safely be replayed after erasure.
+			if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+				return err
 			}
+			continue
 		}
-		if err == nil && !authorized {
+		if (event.topic == "receipt.updated" || event.topic == "conversation.member_added") &&
+			(typed.UserID == identity.UserID || typed.ActorID == identity.UserID) {
+			if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if event.topic == "receipt.updated" || event.topic == "conversation.member_added" {
+			continue
+		}
+		authorized, err := store.AccountJSONReferencesIdentity(event.payload, identity)
+		if err != nil {
+			if _, deleteErr := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); deleteErr != nil {
+				return deleteErr
+			}
+			continue
+		}
+		if event.topic == "entity.updated" || event.topic == "entity.deleted" {
+			_, entityAffected := affectedEntities[typed.ConversationID.String()+"\x00"+typed.EntityKind+"\x00"+typed.EntityID.String()]
+			authorized = authorized || entityAffected
+		}
+		if !authorized {
 			continue
 		}
 		_, changed, err := store.AnonymizeAccountJSONWithAuthority(event.payload, identity)

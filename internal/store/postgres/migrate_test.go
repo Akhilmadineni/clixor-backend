@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,39 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	for want := int64(1); want <= maximum; want++ {
 		if _, exists := versions[want]; !exists {
 			t.Fatalf("missing migration version %d", want)
+		}
+	}
+}
+
+func TestOutboxTopicDomainMigrationFailsClosedOnDrift(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000021_outbox_topic_domain.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	expected := []string{
+		"conversation.created", "conversation.member_added", "message.created",
+		"receipt.updated", "entity.updated", "entity.deleted", "media.delete",
+	}
+	preflight := strings.Index(sql, "IF EXISTS")
+	constraint := strings.Index(sql, "ADD CONSTRAINT outbox_events_topic_domain_check")
+	if preflight < 0 || constraint < 0 || preflight > constraint ||
+		!strings.Contains(sql, "topic NOT IN") || !strings.Contains(sql, "CHECK (topic IN") {
+		t.Fatal("migration must reject existing drift before sealing the closed topic domain")
+	}
+	quotedTopic := regexp.MustCompile(`'([a-z_]+(?:\.[a-z_]+)+)'`)
+	preflightTopics := quotedTopic.FindAllStringSubmatch(sql[preflight:constraint], -1)
+	constraintTopics := quotedTopic.FindAllStringSubmatch(sql[constraint:], -1)
+	for name, matches := range map[string][][]string{
+		"preflight": preflightTopics, "constraint": constraintTopics,
+	} {
+		if len(matches) != len(expected) {
+			t.Fatalf("%s topic domain=%v, want exactly %v", name, matches, expected)
+		}
+		for index, topic := range expected {
+			if matches[index][1] != topic {
+				t.Fatalf("%s topic[%d]=%q, want %q", name, index, matches[index][1], topic)
+			}
 		}
 	}
 }

@@ -26,6 +26,10 @@ type Store struct {
 	// callbacks may call ordinary Store methods without recursively acquiring
 	// the data lock.
 	deliveryBarrier sync.RWMutex
+	// deviceDeliveryBarrier keeps APNs token ownership stable from the exact
+	// delivery/device re-fetch through the external send. Token registration,
+	// transfer, reset, and invalidation take the write side before mu.
+	deviceDeliveryBarrier sync.RWMutex
 
 	users                     map[uuid.UUID]domain.User
 	emailToUser               map[string]uuid.UUID
@@ -455,6 +459,13 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		UserID: userID, Email: user.Email, Phone: user.Phone,
 		DisplayName: user.DisplayName, Username: profileUsername(user.Profile),
 	}
+	// Memory has no transactional rollback. Validate every shared, durable JSON
+	// document before the first mutation so malformed metadata/entity payloads
+	// fail closed with the same behavior as PostgreSQL without leaving a partial
+	// account deletion behind.
+	if err := s.validateAccountDeletionJSONLocked(userID, identity); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	deletedConversations := make(map[uuid.UUID]struct{})
 	sharedConversations := make(map[uuid.UUID]struct{})
@@ -483,7 +494,9 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		if conversation.CreatedBy == userID {
 			conversation.CreatedBy = successor.UserID
 		}
-		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err == nil && changed {
+		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err != nil {
+			return err
+		} else if changed {
 			conversation.Metadata = metadata
 		}
 		conversation.UpdatedAt = now
@@ -518,7 +531,10 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 				continue
 			}
 			payload, changed, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity)
-			if err != nil || !changed {
+			if err != nil {
+				return err
+			}
+			if !changed {
 				continue
 			}
 			entity.Payload = payload
@@ -669,27 +685,40 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			continue
 		}
 		if _, shared := sharedConversations[event.AggregateID]; shared &&
-			store.AccountSanitizableOutboxTopic(event.Topic) {
-			authorized, err := store.AccountJSONReferencesIdentity(event.Payload, identity)
-			if err == nil && (event.Topic == "entity.updated" || event.Topic == "entity.deleted") {
-				var entity domain.Entity
-				if json.Unmarshal(event.Payload, &entity) == nil {
-					_, entityAffected := affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()]
-					authorized = authorized || entityAffected
-				}
+			store.AccountErasureOutboxTopic(event.Topic) {
+			typed, schemaErr := store.DecodeAccountOutboxPayload(
+				event.Topic, event.AggregateID, event.Payload,
+			)
+			if schemaErr != nil {
+				// Known-topic transport state is disposable. A row outside the
+				// exact service-owned schema cannot safely be replayed after erasure.
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
 			}
-			if err == nil && !authorized {
+			if (event.Topic == "receipt.updated" || event.Topic == "conversation.member_added") &&
+				(typed.UserID == userID || typed.ActorID == userID) {
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
+			if event.Topic == "receipt.updated" || event.Topic == "conversation.member_added" {
+				filtered = append(filtered, event)
+				continue
+			}
+			authorized, err := store.AccountJSONReferencesIdentity(event.Payload, identity)
+			if err != nil {
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
+			if event.Topic == "entity.updated" || event.Topic == "entity.deleted" {
+				_, entityAffected := affectedEntities[typed.ConversationID.String()+"\x00"+typed.EntityKind+"\x00"+typed.EntityID.String()]
+				authorized = authorized || entityAffected
+			}
+			if !authorized {
 				filtered = append(filtered, event)
 				continue
 			}
 			_, changed, err := store.AnonymizeAccountJSONWithAuthority(event.Payload, identity)
-			if err != nil {
-				// Transport rows are disposable. A malformed affected row cannot
-				// be proven free of erased identity, so fail closed by dropping it.
-				removedOutboxIDs[event.ID] = struct{}{}
-				continue
-			}
-			if changed {
+			if err != nil || changed {
 				removedOutboxIDs[event.ID] = struct{}{}
 				continue
 			}
@@ -717,6 +746,38 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	return nil
 }
 
+func (s *Store) validateAccountDeletionJSONLocked(
+	userID uuid.UUID,
+	identity store.AccountIdentity,
+) error {
+	for conversationID, members := range s.members {
+		if _, present := members[userID]; !present || len(members) < 2 {
+			continue
+		}
+		if _, _, err := store.AnonymizeAccountJSON(
+			s.conversations[conversationID].Metadata, identity,
+		); err != nil {
+			return err
+		}
+		for _, entity := range s.entities {
+			if entity.ConversationID != conversationID {
+				continue
+			}
+			referencesIdentity, err := store.AccountJSONReferencesIdentity(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if entity.CreatedBy != userID && !referencesIdentity {
+				continue
+			}
+			if _, _, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid.UUID) domain.ConversationMember {
 	var result domain.ConversationMember
 	for id, member := range members {
@@ -732,6 +793,8 @@ func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid
 }
 
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, live := s.users[device.UserID]
@@ -803,6 +866,8 @@ func (s *Store) ListDevices(_ context.Context, userID uuid.UUID) ([]domain.Devic
 }
 
 func (s *Store) ClearDevicePushToken(_ context.Context, userID, deviceID uuid.UUID) error {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	device, ok := s.devices[deviceID]
@@ -886,6 +951,8 @@ func (s *Store) IssueSession(
 		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
 		return domain.User{}, domain.Device{}, domain.ErrInvalid
 	}
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, ok := s.users[p.UserID]
@@ -2808,6 +2875,8 @@ func (s *Store) WithPushDeliveryLease(
 	}
 	s.deliveryBarrier.RLock()
 	defer s.deliveryBarrier.RUnlock()
+	s.deviceDeliveryBarrier.RLock()
+	defer s.deviceDeliveryBarrier.RUnlock()
 
 	s.mu.Lock()
 	leased, found := s.pushDeliveries[id]
@@ -2887,6 +2956,8 @@ func (s *Store) InvalidatePushDelivery(
 	leaseToken, userID, deviceID uuid.UUID,
 	pushToken string,
 ) error {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delivery, ok := s.pushDeliveries[id]

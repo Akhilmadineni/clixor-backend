@@ -129,6 +129,8 @@ func (s *Store) consumePasswordResetChallenge(
 	buildMail store.MailDeliveryBuilder,
 	fence store.PasswordResetFence,
 ) (store.PasswordResetCompletion, error) {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

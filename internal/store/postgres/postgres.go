@@ -3098,7 +3098,7 @@ func (s *Store) WithPushDeliveryLease(
 		FROM push_deliveries AS delivery
 		JOIN devices AS device ON device.id=delivery.device_id
 		WHERE delivery.id=$1 AND delivery.status='pending' AND delivery.lease_token=$2
-		FOR SHARE OF delivery`, id, leaseToken).Scan(
+		FOR SHARE OF delivery,device`, id, leaseToken).Scan(
 		&delivery.ID, &delivery.OutboxEventID, &delivery.DeviceID,
 		&delivery.UserID, &delivery.PushToken, &delivery.Title, &delivery.Body,
 		&delivery.Kind, &delivery.ConversationID, &delivery.EntityID,

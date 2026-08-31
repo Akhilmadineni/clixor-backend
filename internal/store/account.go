@@ -1,7 +1,9 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"regexp"
 	"sort"
 	"strings"
@@ -9,6 +11,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/google/uuid"
 )
 
@@ -27,6 +30,86 @@ func AccountSanitizableOutboxTopic(topic string) bool {
 	default:
 		return false
 	}
+}
+
+// AccountErasureOutboxTopic is the closed set of server-readable realtime
+// schemas account deletion may inspect. E2EE message envelopes are deliberately
+// absent. Receipt and membership events are decoded and removed only when their
+// typed user_id is the deleted account; the remaining topics may be sanitized.
+func AccountErasureOutboxTopic(topic string) bool {
+	return AccountSanitizableOutboxTopic(topic) ||
+		topic == "receipt.updated" || topic == "conversation.member_added"
+}
+
+// AccountOutboxPayload contains only the typed routing/identity fields needed
+// by account erasure. DecodeAccountOutboxPayload rejects a known topic whose
+// body does not have the service-owned schema or whose conversation ID does not
+// match the immutable outbox aggregate.
+type AccountOutboxPayload struct {
+	ConversationID uuid.UUID
+	UserID         uuid.UUID
+	ActorID        uuid.UUID
+	EntityKind     string
+	EntityID       uuid.UUID
+}
+
+func DecodeAccountOutboxPayload(
+	topic string,
+	aggregateID uuid.UUID,
+	raw json.RawMessage,
+) (AccountOutboxPayload, error) {
+	if aggregateID == uuid.Nil || !json.Valid(raw) {
+		return AccountOutboxPayload{}, domain.ErrInvalid
+	}
+	result := AccountOutboxPayload{ConversationID: aggregateID}
+	switch topic {
+	case "conversation.created":
+		var conversation domain.Conversation
+		if decodeAccountOutboxStrict(raw, &conversation) != nil || conversation.ID != aggregateID ||
+			conversation.CreatedBy == uuid.Nil || strings.TrimSpace(conversation.Kind) == "" {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+	case "entity.updated", "entity.deleted":
+		var entity domain.Entity
+		if decodeAccountOutboxStrict(raw, &entity) != nil || entity.ConversationID != aggregateID ||
+			entity.ID == uuid.Nil || entity.CreatedBy == uuid.Nil || entity.Version < 1 ||
+			strings.TrimSpace(entity.Kind) == "" || !json.Valid(entity.Payload) {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.EntityKind = entity.Kind
+		result.EntityID = entity.ID
+	case "receipt.updated":
+		var receipt domain.Receipt
+		if decodeAccountOutboxStrict(raw, &receipt) != nil || receipt.ConversationID != aggregateID ||
+			receipt.UserID == uuid.Nil || receipt.DeliveredSeq < 0 || receipt.ReadSeq < 0 {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.UserID = receipt.UserID
+	case "conversation.member_added":
+		var added domain.ConversationMemberAdded
+		if decodeAccountOutboxStrict(raw, &added) != nil || added.ConversationID != aggregateID ||
+			added.ActorID == uuid.Nil || added.UserID == uuid.Nil {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.UserID = added.UserID
+		result.ActorID = added.ActorID
+	default:
+		return AccountOutboxPayload{}, domain.ErrInvalid
+	}
+	return result, nil
+}
+
+func decodeAccountOutboxStrict(raw json.RawMessage, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return domain.ErrInvalid
+	}
+	return nil
 }
 
 // AccountIdentity contains the identifiers which must no longer be exposed after
@@ -76,6 +159,17 @@ func anonymizeAccountJSON(raw json.RawMessage, identity AccountIdentity, authori
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, false, err
+	}
+	// Strong identifiers in a scalar are still PII. Display names remain
+	// excluded here because a scalar such as "A" has no identity schema and may
+	// be ordinary application data.
+	if text, scalar := value.(string); scalar {
+		redacted, changed := redactAccountIdentityText(text, identity, false)
+		if !changed {
+			return raw, false, nil
+		}
+		encoded, err := json.Marshal(redacted)
+		return encoded, true, err
 	}
 	changed := anonymizeJSONValue(value, identity, authorized)
 	if !changed {

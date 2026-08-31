@@ -694,9 +694,15 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	unrelatedOutboxEntityID := uuid.New()
 	if _, err := persistence.pool.Exec(ctx, `
 		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES
-		('entity.updated',$1,jsonb_build_object('conversation_id',$1,'kind','expense','id',$2,'payload',jsonb_build_object('description',$3))),
-		('entity.updated',$1,jsonb_build_object('conversation_id',$1,'kind','note','id',$4,'payload',jsonb_build_object('description','keep unrelated')))`,
-		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID); err != nil {
+		('entity.updated',$1,jsonb_build_object(
+			'conversation_id',$1,'kind','expense','id',$2,'version',1,
+			'payload',jsonb_build_object('description',$3),'created_by',$5,
+			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')),
+		('entity.updated',$1,jsonb_build_object(
+			'conversation_id',$1,'kind','note','id',$4,'version',1,
+			'payload',jsonb_build_object('description','keep unrelated'),'created_by',$5,
+			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')))`,
+		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID, remainingUser.ID); err != nil {
 		t.Fatal(err)
 	}
 	choreID, rotationID, financialID := uuid.New(), uuid.New(), uuid.New()

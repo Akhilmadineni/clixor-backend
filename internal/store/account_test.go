@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/google/uuid"
 )
 
@@ -122,4 +123,92 @@ func TestAnonymizeAccountJSONDoesNotBlankCommonNameOutsideIdentitySchema(t *test
 	if value["settlementId"] != settlementID.String() || value["amount"] != 18.5 {
 		t.Fatalf("financial history changed: %s", anonymized)
 	}
+}
+
+func TestAnonymizeAccountJSONRedactsStrongScalarIdentity(t *testing.T) {
+	raw := json.RawMessage(`"deleted@example.com"`)
+	anonymized, changed, err := AnonymizeAccountJSONWithAuthority(raw, AccountIdentity{
+		Email: "deleted@example.com", DisplayName: "A",
+	})
+	if err != nil || !changed || string(anonymized) != `"Deleted user"` {
+		t.Fatalf("scalar anonymized=%s changed=%t err=%v", anonymized, changed, err)
+	}
+	common, changed, err := AnonymizeAccountJSONWithAuthority(
+		json.RawMessage(`"A"`), AccountIdentity{DisplayName: "A"},
+	)
+	if err != nil || changed || string(common) != `"A"` {
+		t.Fatalf("common scalar changed: value=%s changed=%t err=%v", common, changed, err)
+	}
+}
+
+func TestDecodeAccountOutboxPayloadValidatesOwnedSchemas(t *testing.T) {
+	conversationID := uuid.New()
+	userID := uuid.New()
+	actorID := uuid.New()
+	valid := []struct {
+		topic string
+		raw   json.RawMessage
+		user  uuid.UUID
+		actor uuid.UUID
+	}{
+		{
+			topic: "receipt.updated",
+			raw: mustAccountJSON(t, domain.Receipt{
+				ConversationID: conversationID, UserID: userID, DeliveredSeq: 1,
+			}),
+			user: userID,
+		},
+		{
+			topic: "conversation.member_added",
+			raw: mustAccountJSON(t, domain.ConversationMemberAdded{
+				ConversationID: conversationID, ActorID: actorID, UserID: userID,
+			}),
+			user: userID, actor: actorID,
+		},
+		{
+			topic: "entity.updated",
+			raw: mustAccountJSON(t, domain.Entity{
+				ConversationID: conversationID, Kind: "note", ID: uuid.New(), Version: 1,
+				Payload: json.RawMessage(`{}`), CreatedBy: actorID,
+			}),
+		},
+		{
+			topic: "conversation.created",
+			raw: mustAccountJSON(t, domain.Conversation{
+				ID: conversationID, Kind: "group", CreatedBy: actorID,
+			}),
+		},
+	}
+	for _, test := range valid {
+		decoded, err := DecodeAccountOutboxPayload(test.topic, conversationID, test.raw)
+		if err != nil || decoded.ConversationID != conversationID || decoded.UserID != test.user ||
+			decoded.ActorID != test.actor {
+			t.Fatalf("topic=%s decoded=%+v err=%v", test.topic, decoded, err)
+		}
+	}
+	for _, test := range []struct {
+		topic string
+		raw   json.RawMessage
+	}{
+		{"receipt.updated", json.RawMessage(`{"user_id":"` + userID.String() + `"}`)},
+		{"conversation.member_added", json.RawMessage(`{"conversation_id":"` + conversationID.String() + `"}`)},
+		{"entity.updated", json.RawMessage(`{"email":"deleted@example.com"}`)},
+		{"conversation.created", json.RawMessage(`"deleted@example.com"`)},
+		{"receipt.updated", json.RawMessage(`{"conversation_id":"` + conversationID.String() +
+			`","user_id":"` + userID.String() + `","delivered_seq":1,"read_seq":0,` +
+			`"updated_at":"0001-01-01T00:00:00Z","unknown":true}`)},
+	} {
+		if _, err := DecodeAccountOutboxPayload(test.topic, conversationID, test.raw); err == nil {
+			t.Fatalf("wrong-shaped %s payload was accepted: %s", test.topic, test.raw)
+		}
+	}
+}
+
+func mustAccountJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
