@@ -107,7 +107,7 @@ LEGACY_CONTROLLER_FILES = {
     "deploy/oci/compose.yaml": "98a7bc7c3cc8daec6cf4198d7db5a410530bf633b2e777e03a73a9b984eba3c3",
     "deploy/oci/hydrate-vault-secrets.py": "b0865ebc228f3a7a8a151b8f32c01211a910e534ce104fbb2be6de603ad1de29",
     "deploy/oci/prepare-runtime-secrets.sh": "bde732854eb1f6ebae4e877a59b7bf4ea1a9bebe9679508ac7a585131ccb0e21",
-    "deploy/oci/restore-drill.sh": "a2f11d9ecd5e7291ed217435ecdd5e9654aa2b7f9f4c018fbd52dc5119fca564",
+    "deploy/oci/restore-drill.sh": "107977248046f59f34579acd02ff739622c8755a08567ac3852593e884d0dc1c",
 }
 LEGACY_CONTROLLER_ID = hashlib.sha256(
     b"".join(
