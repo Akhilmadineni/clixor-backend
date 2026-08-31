@@ -117,6 +117,17 @@ class ValidationTests(unittest.TestCase):
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             smoke.parse_args(arguments)
 
+    def test_deploy_uses_the_exact_destructive_smoke_confirmation(self) -> None:
+        deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "--confirm-disposable-writes DELETE-ALL-SMOKE-DATA", deploy
+        )
+        self.assertNotIn(
+            "--confirm-disposable-writes DELETE_ALL_SMOKE_DATA", deploy
+        )
+
     def test_https_origin_validation(self) -> None:
         self.assertEqual(
             smoke.validate_origin("https://API.Example.com/", "test"),

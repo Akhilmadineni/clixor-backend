@@ -207,7 +207,7 @@ run_disposable_public_smoke() {
     --expected-media-host "${media_host}" \
     --expected-revision "${expected_public_revision}" \
     ${smoke_scope} \
-    --confirm-disposable-writes DELETE_ALL_SMOKE_DATA > "${smoke_partial}"
+    --confirm-disposable-writes DELETE-ALL-SMOKE-DATA > "${smoke_partial}"
   grep -Eq '^smoke=passed prefix=clixor-smoke-[^ ]+ checks=[1-9][0-9]* cleanup=passed$' \
     "${smoke_partial}" || fail "disposable public smoke evidence is invalid"
   {
