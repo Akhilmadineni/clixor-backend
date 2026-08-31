@@ -123,6 +123,10 @@ jobs:
         run: terraform validate -no-color
       - name: Check OCI deployment entrypoints
         run: sh -n ../actions-deploy.sh ../manual-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../prepare-runtime-secrets.sh ../quarantine-staging-secrets.sh ../test_secret_split.sh ../install-cloudflared-package.sh install-cloudflared-package.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh ../test-origin-boundary.sh ../test-origin-gate-nginx.sh ../test-cloudflare-promote-service.sh
+      - name: Compile OCI Python entrypoints
+        run: |
+          git -C ../../.. ls-files --error-unmatch deploy/oci/verify-canary-negative.py >/dev/null
+          python3 -m py_compile ../*.py
       - name: Test least-privilege secret split and Compose exposure
         run: sh ../test_secret_split.sh
       - name: Test OCI Vault hydration and atomic rotation

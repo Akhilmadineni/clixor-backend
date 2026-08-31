@@ -953,7 +953,7 @@ From the root-owned, commit-authenticated source directory, deploy only after
 the production origin capability is absent:
 
 ```sh
-test ! -e /run/clixor-origin-gate/public-open
+test ! -e /var/lib/clixor/origin-gate-public/public-open
 revision='<full-reviewed-40-hex-commit>'
 sudo env \
   CLIXOR_ENABLE_CANARY_CONNECTOR=true \
@@ -986,7 +986,16 @@ Before public smoke, deployment reads cloudflared's loopback-only `/config`
 endpoint and requires the exact reviewed config version, the single canary
 hostname, terminal 404, and disabled private routing. Nginx independently
 returns 503 for both production hostnames while the root-owned production gate
-is absent. The disposable canary still exercises the complete API write,
+is absent. Immediately before disposable writes, deployment repeats the exact
+credential/account/tunnel and remote-config verification, then resolves the
+real production hostname through public DNS with authenticated TLS and no
+redirects. That negative proof accepts only a healthy 2xx response carrying one
+different canonical Clixor revision, or the observed Cloudflare Tunnel outage
+shape `530`, one Cloudflare Ray ID, no Clixor revision, and the exact bounded
+`error code: 1033` body. Candidate revision headers, arbitrary 530s, 404/503,
+redirects, malformed or duplicate headers, DNS/TLS failure, and oversized
+responses all fail closed. The evidence is retained mode 0600 in the candidate
+release. The disposable canary still exercises the complete API write,
 realtime, media, cleanup, and legal-redirect contract; while the retired NAS
 route is unavailable it deliberately does not fetch the external production
 legal HTML documents. Those documents remain a separate pre-production gate.

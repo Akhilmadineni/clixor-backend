@@ -221,20 +221,23 @@ run_disposable_public_smoke() {
 
 verify_production_not_candidate() {
   candidate_revision=${1:-}
-  negative_headers="${release_dir}/production-negative.headers"
-  rm -f -- "${negative_headers}.partial"
-  curl --fail --silent --show-error --retry 3 --retry-all-errors \
-    --retry-delay 2 --max-time 10 --proto '=https' --tlsv1.2 \
-    --header 'Cache-Control: no-cache' --dump-header "${negative_headers}.partial" \
-    --output /dev/null \
-    "https://clustr-api.atlanteanz.com/health/ready?candidate-negative=${candidate_revision}" || \
+  connector_helper="${host_tool_stage}/bin/cloudflare-canary-credential.py"
+  # Rebind this proof immediately to the selected token/account/tunnel and the
+  # complete effective remote configuration.  The following HTTPS verifier
+  # then resolves the real production hostname, authenticates TLS, never
+  # follows redirects, and accepts only a different healthy revision or the
+  # reviewed Cloudflare 1033 outage response.
+  /usr/bin/python3 "${connector_helper}" verify \
+    --release "${release_dir}" || \
+    fail "candidate connector credential changed before the production negative proof"
+  /usr/bin/python3 "${connector_helper}" verify-remote \
+    --release "${release_dir}" || \
+    fail "candidate tunnel configuration changed before the production negative proof"
+  /usr/bin/python3 \
+    "${source_root}/deploy/oci/verify-canary-negative.py" \
+    --expected-revision "${candidate_revision}" \
+    --evidence-root "${release_dir}" || \
     fail "production ownership is ambiguous; refusing canary writes"
-  if grep -Eiq "^x-clixor-revision:[[:space:]]*${candidate_revision}[[:space:]]*$" \
-    "${negative_headers}.partial"; then
-    fail "candidate connector unexpectedly owns the production hostname"
-  fi
-  chmod 0600 "${negative_headers}.partial"
-  mv -f -- "${negative_headers}.partial" "${negative_headers}"
 }
 
 require_unsigned_integer() {
@@ -1305,8 +1308,8 @@ if [ "${canary_connector_enabled}" = "true" ]; then
     uninitialized|pre-cutover-old) ;;
     *) fail "canary connector is forbidden after OCI owns production traffic" ;;
   esac
-  [ ! -e /run/clixor-origin-gate/public-open ] && \
-    [ ! -L /run/clixor-origin-gate/public-open ] || \
+  [ ! -e /var/lib/clixor/origin-gate-public/public-open ] && \
+    [ ! -L /var/lib/clixor/origin-gate-public/public-open ] || \
     fail "production origin gate must remain closed during canary"
 fi
 install -d -m 0700 -o 0 -g 0 "${pending_release_root}"
@@ -2034,8 +2037,8 @@ if [ "${canary_connector_enabled}" = "true" ]; then
     fail "canary connector must keep the application on its complete staging cohort"
   grep -qx 'CLUSTER_ENV=staging' "${api_env}" || \
     fail "canary connector requires the staging application environment"
-  [ ! -e /run/clixor-origin-gate/public-open ] && \
-    [ ! -L /run/clixor-origin-gate/public-open ] || \
+  [ ! -e /var/lib/clixor/origin-gate-public/public-open ] && \
+    [ ! -L /var/lib/clixor/origin-gate-public/public-open ] || \
     fail "production origin gate opened during canary deployment"
   grep -Fq 'server_name clustr-api.atlanteanz.com clixor.atlanteanz.com;' \
     "${source_root}/deploy/oci/api-gateway-nginx.conf" && \
