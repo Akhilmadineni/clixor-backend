@@ -908,6 +908,7 @@ reject_active_promotion_journal
             bootstrap,
         )
         self.assertIn('stable_launcher_installed=false', bootstrap)
+
         self.assertNotIn(
             "/usr/local/libexec/clixor/hydrate-vault-secrets.py", bootstrap
         )
@@ -923,6 +924,21 @@ reject_active_promotion_journal
             "ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py",
             unit,
         )
+
+    def test_deferred_bootstrap_does_not_replace_prepared_runtime_secrets(self) -> None:
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        split_call = 'sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"'
+        split_at = bootstrap.index(split_call)
+        staging_guard = bootstrap.rfind(
+            'if [ "${selected_secret_mode}" = "staging" ]', 0, split_at
+        )
+        preparation_guard = bootstrap.rfind(
+            '[ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]',
+            0,
+            split_at,
+        )
+        self.assertGreater(preparation_guard, staging_guard)
+        self.assertLess(preparation_guard, split_at)
 
     def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
         raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")

@@ -479,7 +479,8 @@ fi
 # The helper publishes files atomically, is idempotent, and never evaluates or
 # prints their values. runtime.env remains only as a non-consumed migration
 # checkpoint for unknown legacy entries.
-if [ "${selected_secret_mode}" = "staging" ]; then
+if [ "${selected_secret_mode}" = "staging" ] && \
+  [ "${CLIXOR_SKIP_SECRET_PREPARATION:-false}" = "false" ]; then
   sh "${script_root}/split-runtime-secrets.sh" "${runtime_env}" "${secret_root}"
 fi
 
