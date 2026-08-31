@@ -753,7 +753,7 @@ else
   }
 fi
 
-install -m 0400 -o 99 -g 99 "${script_root}/haproxy.cfg" \
+install -m 0440 -o 99 -g 99 "${script_root}/haproxy.cfg" \
   "${runtime_root}/dependency-tls/haproxy.cfg"
 install -m 0400 -o 986 -g 987 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"

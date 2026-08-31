@@ -1739,7 +1739,7 @@ rollback() {
         rollback_failed=1
       fi
       if [ "${rollback_failed}" -eq 0 ]; then
-        if ! install -m 0400 -o 99 -g 99 \
+        if ! install -m 0440 -o 99 -g 99 \
           "${previous_runtime_root}/dependency-tls/haproxy.cfg" \
           "${project_root}/runtime/dependency-tls/haproxy.cfg" || \
           ! install -m 0400 -o 986 -g 987 \

@@ -14,4 +14,4 @@ TimeoutStartSec=15m
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=full
-ReadWritePaths=/srv/clixor /run/clixor /etc/systemd/system /usr/local/libexec/clixor /usr/bin
+ReadWritePaths=/srv/clixor /run/clixor /etc/systemd/system /etc/tmpfiles.d /usr/local/libexec/clixor /usr/bin

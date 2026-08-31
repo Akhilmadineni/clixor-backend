@@ -311,7 +311,7 @@ RUNTIME_ARTIFACTS = (
         "/srv/clixor/runtime/dependency-tls/haproxy.cfg",
         0,
         99,
-        0o400,
+        0o440,
     ),
     RuntimeArtifact(
         "runtime/dependency-tls/server.pem",
