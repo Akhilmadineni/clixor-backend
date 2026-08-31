@@ -114,13 +114,32 @@ systemctl enable --now docker
 docker compose version >/dev/null
 docker buildx version >/dev/null
 
-if ! command -v oci >/dev/null 2>&1; then
+oci_binary=/usr/local/bin/oci
+if [ ! -e "${oci_binary}" ] && [ ! -L "${oci_binary}" ]; then
   [ "${CLIXOR_SKIP_PACKAGES:-false}" != "true" ] || {
     echo "OCI CLI is missing; run ${script_root}/install-oci-cli.sh before deploying." >&2
     exit 1
   }
   sh "${script_root}/install-oci-cli.sh"
 fi
+
+# The root entrypoints deliberately exclude /usr/local/bin from PATH. Select
+# the one pinned installer location explicitly and reject a replaced or
+# writable executable before any instance-principal request.
+[ -d /usr/local/bin ] && [ ! -L /usr/local/bin ] && \
+  [ "$(stat -c %u /usr/local/bin)" -eq 0 ] && \
+  [ -z "$(find /usr/local/bin -maxdepth 0 -perm /022 -print -quit)" ] || {
+  echo "OCI CLI parent directory is unsafe." >&2
+  exit 1
+}
+oci_resolved="$(readlink -f -- "${oci_binary}" 2>/dev/null || true)"
+[ -n "${oci_resolved}" ] && [ -f "${oci_resolved}" ] && \
+  [ ! -L "${oci_resolved}" ] && [ -x "${oci_resolved}" ] && \
+  [ "$(stat -c %u "${oci_resolved}")" -eq 0 ] && \
+  [ -z "$(find "${oci_resolved}" -maxdepth 0 -perm /022 -print -quit)" ] || {
+  echo "OCI CLI ownership, type, or mode is unsafe." >&2
+  exit 1
+}
 
 backup_config_root=/etc/clixor
 backup_config="${backup_config_root}/offsite-backup.env"
@@ -181,13 +200,13 @@ if [ "${#oci_backup_prefix}" -gt 63 ]; then
   echo "CLIXOR_OCI_BACKUP_PREFIX is longer than 63 characters." >&2
   exit 1
 fi
-backup_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get \
+backup_namespace="$(OCI_CLI_AUTH=instance_principal "${oci_binary}" os ns get \
   --query data --raw-output)"
 [ -n "${backup_namespace}" ] || {
   echo "Could not resolve the OCI Object Storage namespace for backups." >&2
   exit 1
 }
-OCI_CLI_AUTH=instance_principal oci os bucket get \
+OCI_CLI_AUTH=instance_principal "${oci_binary}" os bucket get \
   --namespace-name "${backup_namespace}" \
   --name "${oci_backup_bucket}" >/dev/null || {
   echo "Instance principal cannot read OCI backup bucket ${oci_backup_bucket}." >&2
@@ -371,7 +390,7 @@ if [ ! -f "${runtime_env}" ] && [ "${selected_secret_mode}" = "vault" ]; then
     "${runtime_env}"
   chmod 0600 "${runtime_env}"
 elif [ ! -f "${runtime_env}" ]; then
-  oci_namespace="$(OCI_CLI_AUTH=instance_principal oci os ns get --query data --raw-output)"
+  oci_namespace="$(OCI_CLI_AUTH=instance_principal "${oci_binary}" os ns get --query data --raw-output)"
   oci_region="$(curl --fail --silent --show-error \
     --connect-timeout 5 --max-time 30 --retry 3 --retry-all-errors --retry-delay 1 \
     --header 'Authorization: Bearer Oracle' \
@@ -395,7 +414,7 @@ elif [ ! -f "${runtime_env}" ]; then
       exit 1
       ;;
   esac
-  OCI_CLI_AUTH=instance_principal oci os bucket get \
+  OCI_CLI_AUTH=instance_principal "${oci_binary}" os bucket get \
     --namespace-name "${oci_namespace}" \
     --name "${oci_media_bucket}" >/dev/null || {
     echo "Instance principal cannot read OCI media bucket ${oci_media_bucket}." >&2

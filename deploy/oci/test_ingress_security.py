@@ -107,6 +107,27 @@ raise SystemExit(97)
         )
         self.assertIn("sh -n ../actions-deploy.sh ../manual-deploy.sh", workflow)
 
+    def test_bootstrap_uses_the_fixed_trusted_oci_cli_path(self) -> None:
+        bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "install-oci-cli.sh").read_text(encoding="utf-8")
+        manual = (ROOT / "manual-deploy.sh").read_text(encoding="utf-8")
+        actions = (ROOT / "actions-deploy.sh").read_text(encoding="utf-8")
+        restricted_path = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+
+        self.assertIn(restricted_path, manual)
+        self.assertIn(restricted_path, actions)
+        self.assertIn("oci_binary=/usr/local/bin/oci", bootstrap)
+        self.assertNotIn("command -v oci", bootstrap)
+        self.assertEqual(
+            bootstrap.count(
+                'OCI_CLI_AUTH=instance_principal "${oci_binary}" os'
+            ),
+            4,
+        )
+        self.assertNotIn("instance_principal oci os", bootstrap)
+        self.assertIn("--exec-dir /usr/local/bin", installer)
+        self.assertIn("/usr/local/bin/oci --version", installer)
+
     def test_tcp_listener_cannot_proxy_forged_cloudflare_identity(self) -> None:
         nginx = (ROOT / "api-gateway-nginx.conf").read_text(encoding="utf-8")
         self.assertIn("listen unix:/run/clixor-origin/gateway.sock default_server;", nginx)

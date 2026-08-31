@@ -855,10 +855,8 @@ restore_cloudflared() {
   # Never rewrite the executable, unit, or credential beneath a running
   # connector.  More importantly, a failed prior-credential restore must have
   # no path to the enable/restart block below.
-  systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
-  if [ "${saved_enabled}" != "enabled" ]; then
-    systemctl disable cloudflared.service >/dev/null 2>&1 || restore_status=1
-  fi
+  /bin/sh "${source_root}/deploy/oci/quiesce-cloudflared-rollback.sh" \
+    "${saved_fragment}" "${saved_enabled}" "${saved_active}" || return 1
 
   case "${saved_fragment}" in
     absent)

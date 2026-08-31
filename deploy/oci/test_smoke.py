@@ -774,7 +774,9 @@ class ReleaseHardeningTests(unittest.TestCase):
             bootstrap.index("apt-get update"),
             bootstrap.index("systemctl enable --now docker"),
             bootstrap.index('sh "${script_root}/install-oci-cli.sh"'),
-            bootstrap.index("OCI_CLI_AUTH=instance_principal oci os ns get"),
+            bootstrap.index(
+                'OCI_CLI_AUTH=instance_principal "${oci_binary}" os ns get'
+            ),
         ):
             self.assertLess(early_acquire, mutable_boundary)
             self.assertLess(early_guard, mutable_boundary)
