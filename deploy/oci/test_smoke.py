@@ -134,6 +134,10 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("returned_email!r", source)
         self.assertNotIn("account.email!r", source)
 
+    def test_disposable_smoke_emails_are_canonical_before_registration(self) -> None:
+        source = inspect.getsource(smoke.SmokeSuite.account)
+        self.assertIn('email=f"{self.prefix}-{role}@example.com".lower()', source)
+
     def test_deploy_uses_the_exact_destructive_smoke_confirmation(self) -> None:
         deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(
             encoding="utf-8"

@@ -643,7 +643,9 @@ class SmokeSuite:
     def account(self, role: str) -> DisposableAccount:
         account = DisposableAccount(
             role=role,
-            email=f"{self.prefix}-{role}@example.com",
+            # The API canonicalizes emails to lowercase. Keep generated smoke
+            # identities canonical too, so the response round-trip is exact.
+            email=f"{self.prefix}-{role}@example.com".lower(),
             password=secrets.token_urlsafe(32),
         )
         self.accounts.append(account)
