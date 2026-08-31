@@ -202,7 +202,7 @@ done
 # first-production backup). Run it whenever there is an index to examine, while
 # retaining the restored-schema and core-table checks above for every backup.
 checkable_index_count="$(docker exec "${container_name}" sh -ec \
-  'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username restore_admin --dbname restore_drill --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN (\047pg_catalog\047, \047information_schema\047);"')"
+  'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username restore_admin --dbname restore_drill --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname !~ $$^pg_$$ AND n.nspname <> $$information_schema$$;"')"
 case "${checkable_index_count}" in
   ''|*[!0-9]*) fail "could not determine restored database index count" ;;
 esac
