@@ -41,11 +41,66 @@ fi
 
 script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
+project_root=/srv/clixor
+runtime_root="${project_root}/runtime"
+current_release_link="${project_root}/releases/current"
+shared_deploy_lock="${runtime_root}/deploy.lock"
+cloudflare_promotion_journal=/var/lib/clixor/cloudflare-promotion.json
+bootstrap_interlock_held=false
+
+acquire_bootstrap_interlock() {
+  if [ "${bootstrap_interlock_held}" = "true" ]; then
+    return
+  fi
+  [ -d "${runtime_root}" ] && [ ! -L "${runtime_root}" ] || {
+    echo "Existing Clixor runtime directory is missing or unsafe." >&2
+    exit 1
+  }
+  if [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ]; then
+    [ -f "${shared_deploy_lock}" ] && [ ! -L "${shared_deploy_lock}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${shared_deploy_lock}")" = "0:0:600" ] || {
+      echo "Shared deploy lock is unsafe." >&2
+      exit 1
+    }
+  else
+    install -m 0600 -o 0 -g 0 /dev/null "${shared_deploy_lock}"
+  fi
+  exec 8<>"${shared_deploy_lock}"
+  flock -n 8 || {
+    echo "A deployment or promotion is active; refusing bootstrap." >&2
+    exit 1
+  }
+  bootstrap_interlock_held=true
+}
+
+reject_active_promotion_journal() {
+  if [ -e "${cloudflare_promotion_journal}" ] || \
+    [ -L "${cloudflare_promotion_journal}" ]; then
+    echo "An active Cloudflare promotion journal must be resumed and archived before bootstrap." >&2
+    exit 1
+  fi
+}
+
 cpu_count="$(getconf _NPROCESSORS_ONLN)"
 memory_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
 if [ "${cpu_count}" -lt 2 ] || [ "${memory_kb}" -lt 10000000 ]; then
   echo "Use VM.Standard.A1.Flex with 2 OCPUs and 12 GB RAM or larger." >&2
   exit 1
+fi
+
+# A deployed host already has at least one of these durable authority objects.
+# Interlock before apt, Docker, OCI network access, or any other mutable setup so
+# an operator bootstrap cannot disturb a running or resumable promotion. A
+# fresh host has no promotion authority and acquires the same lock after package
+# prerequisites create its runtime directories.
+if [ "${defer_host_tool_activation}" = "false" ] && { \
+  [ -e "${current_release_link}" ] || [ -L "${current_release_link}" ] || \
+  [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ] || \
+  [ -e "${cloudflare_promotion_journal}" ] || \
+  [ -L "${cloudflare_promotion_journal}" ];
+}; then
+  acquire_bootstrap_interlock
+  reject_active_promotion_journal
 fi
 
 if [ "${CLIXOR_SKIP_PACKAGES:-false}" != "true" ]; then
@@ -139,14 +194,10 @@ OCI_CLI_AUTH=instance_principal oci os bucket get \
   exit 1
 }
 
-project_root=/srv/clixor
 secret_root="${project_root}/secrets"
 pki_root="${secret_root}/pki"
 apns_root="${secret_root}/apns"
 runtime_env="${secret_root}/runtime.env"
-runtime_root="${project_root}/runtime"
-shared_deploy_lock="${runtime_root}/deploy.lock"
-cloudflare_promotion_journal=/var/lib/clixor/cloudflare-promotion.json
 backup_tool_root=/usr/local/libexec/clixor
 systemd_unit_root=/etc/systemd/system
 
@@ -162,25 +213,10 @@ install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
 # bootstrap is invoked only by deploy.sh, which already owns this same lock and
 # performs the same journal check before calling us.
 if [ "${defer_host_tool_activation}" = "false" ]; then
-  if [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ]; then
-    [ -f "${shared_deploy_lock}" ] && [ ! -L "${shared_deploy_lock}" ] && \
-      [ "$(stat -c '%u:%g:%a' "${shared_deploy_lock}")" = "0:0:600" ] || {
-      echo "Shared deploy lock is unsafe." >&2
-      exit 1
-    }
-  else
-    install -m 0600 -o 0 -g 0 /dev/null "${shared_deploy_lock}"
-  fi
-  exec 8<>"${shared_deploy_lock}"
-  flock -n 8 || {
-    echo "A deployment or promotion is active; refusing bootstrap." >&2
-    exit 1
-  }
-  if [ -e "${cloudflare_promotion_journal}" ] || \
-    [ -L "${cloudflare_promotion_journal}" ]; then
-    echo "An active Cloudflare promotion journal must be resumed and archived before bootstrap." >&2
-    exit 1
-  fi
+  acquire_bootstrap_interlock
+  # Keep this definitive check immediately before stable-authority setup even
+  # when the existing-host preflight has held the lock since process start.
+  reject_active_promotion_journal
 fi
 # A fresh host has no selected release to preserve, so bootstrap may install the
 # authenticated connector directly. An existing host deliberately does not

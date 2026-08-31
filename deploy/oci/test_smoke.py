@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import socket
 import struct
@@ -582,6 +583,107 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(bootstrap_lock, bootstrap_guard)
         self.assertLess(bootstrap_guard, extension_install)
         self.assertLess(extension_install, stable_promoter_install)
+
+        existing_preflight = bootstrap.index(
+            "# A deployed host already has at least one of these durable authority objects."
+        )
+        early_acquire = bootstrap.index(
+            "  acquire_bootstrap_interlock", existing_preflight
+        )
+        early_guard = bootstrap.index(
+            "  reject_active_promotion_journal", early_acquire
+        )
+        for mutable_boundary in (
+            bootstrap.index("apt-get update"),
+            bootstrap.index("systemctl enable --now docker"),
+            bootstrap.index('sh "${script_root}/install-oci-cli.sh"'),
+            bootstrap.index("OCI_CLI_AUTH=instance_principal oci os ns get"),
+        ):
+            self.assertLess(early_acquire, mutable_boundary)
+            self.assertLess(early_guard, mutable_boundary)
+        definitive_comment = bootstrap.index(
+            "# Keep this definitive check immediately before stable-authority setup"
+        )
+        definitive_guard = bootstrap.index(
+            "  reject_active_promotion_journal", definitive_comment
+        )
+        self.assertLess(definitive_guard, extension_install)
+        self.assertEqual(bootstrap.count("  reject_active_promotion_journal"), 2)
+
+    def test_existing_host_bootstrap_preflight_aborts_before_side_effect(self) -> None:
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        helper_start = bootstrap.index("bootstrap_interlock_held=false")
+        helper_end = bootstrap.index('\ncpu_count="', helper_start)
+        helpers = bootstrap[helper_start:helper_end]
+        harness = f"""set -eu
+runtime_root=$1
+shared_deploy_lock=$2
+cloudflare_promotion_journal=$3
+side_effect=$4
+{helpers}
+acquire_bootstrap_interlock
+reject_active_promotion_journal
+: > "${{side_effect}}"
+"""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "runtime"
+            runtime.mkdir(mode=0o700)
+            lock = runtime / "deploy.lock"
+            lock.write_bytes(b"")
+            lock.chmod(0o600)
+            journal = root / "cloudflare-promotion.json"
+            journal.write_text("terminal journal remains active\n", encoding="utf-8")
+            marker = root / "side-effect"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '0:0:600'\n", encoding="utf-8"
+            )
+            fake_stat.chmod(0o755)
+            fake_flock = fake_bin / "flock"
+            fake_flock.write_text(
+                '#!/bin/sh\nexit "${FAKE_FLOCK_STATUS:-0}"\n', encoding="utf-8"
+            )
+            fake_flock.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+            environment["FAKE_FLOCK_STATUS"] = "0"
+            arguments = [
+                "/bin/sh",
+                "-c",
+                harness,
+                "bootstrap-interlock-test",
+                str(runtime),
+                str(lock),
+                str(journal),
+                str(marker),
+            ]
+
+            journal_block = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(journal_block.returncode, 0)
+            self.assertIn("must be resumed and archived", journal_block.stderr)
+            self.assertFalse(marker.exists())
+
+            journal.unlink()
+            environment["FAKE_FLOCK_STATUS"] = "1"
+            lock_block = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(lock_block.returncode, 0)
+            self.assertIn("deployment or promotion is active", lock_block.stderr)
+            self.assertFalse(marker.exists())
 
     def test_boot_secret_tooling_is_release_local_and_bootstrap_is_deferred(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
