@@ -664,10 +664,17 @@ class SmokeSuite:
         )
         auth = json_object(result, "register")
         session = account.add_session(auth, "register")
-        self.check(
-            required_dict(auth, "user", "register").get("email") == account.email,
-            "register returned the wrong email",
+        returned_email = required_string(
+            required_dict(auth, "user", "register"), "email", "register"
         )
+        if not hmac.compare_digest(returned_email, account.email):
+            raise SmokeFailure(
+                "register email mismatch "
+                f"(returned_length={len(returned_email)} "
+                f"expected_length={len(account.email)} "
+                f"casefold_match={returned_email.casefold() == account.email.casefold()})"
+            )
+        self.check(True, "register email round-trip failed")
         return session
 
     def login(self, account: DisposableAccount) -> Session:

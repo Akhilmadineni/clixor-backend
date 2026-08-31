@@ -127,6 +127,13 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Privacy Policy &amp; Terms of Use", source)
         self.assertIn("redirect.status != 308", source)
 
+    def test_registration_email_mismatch_diagnostic_does_not_expose_email(self) -> None:
+        source = inspect.getsource(smoke.SmokeSuite.register)
+        self.assertIn("hmac.compare_digest(returned_email, account.email)", source)
+        self.assertIn("returned_length=", source)
+        self.assertNotIn("returned_email!r", source)
+        self.assertNotIn("account.email!r", source)
+
     def test_deploy_uses_the_exact_destructive_smoke_confirmation(self) -> None:
         deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(
             encoding="utf-8"
