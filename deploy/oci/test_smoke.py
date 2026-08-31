@@ -107,7 +107,7 @@ class ValidationTests(unittest.TestCase):
         arguments = [
             "--base-url", "https://clixor-oci-canary.atlanteanz.com",
             "--legal-base-url", "https://clixor.atlanteanz.com",
-            "--expected-media-host", "namespace.objectstorage.us-phoenix-1.oci.customer-oci.com",
+            "--expected-media-host", "objectstorage.us-phoenix-1.oraclecloud.com",
             "--expected-revision", REVISION,
             "--confirm-disposable-writes", smoke.CONFIRMATION,
             "--canary-api-only",
@@ -157,6 +157,15 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn(
             "--confirm-disposable-writes DELETE_ALL_SMOKE_DATA", deploy
         )
+
+    def test_canary_media_smoke_uses_the_oci_par_endpoint(self) -> None:
+        deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'media_host="objectstorage.${media_region}.oraclecloud.com"', deploy
+        )
+        self.assertNotIn(".oci.customer-oci.com", deploy)
 
     def test_https_origin_validation(self) -> None:
         self.assertEqual(

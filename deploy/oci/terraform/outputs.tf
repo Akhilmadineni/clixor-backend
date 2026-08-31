@@ -65,7 +65,7 @@ output "object_storage_region" {
 
 output "object_storage_native_endpoint" {
   description = "Namespace-specific native Object Storage endpoint used by OCI SDK calls and returned PAR URLs."
-  value       = "https://${data.oci_objectstorage_namespace.tenancy.namespace}.objectstorage.${var.region}.oci.customer-oci.com"
+  value       = "https://objectstorage.${var.region}.oraclecloud.com"
 }
 
 output "vault_id" {

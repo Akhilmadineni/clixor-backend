@@ -194,7 +194,7 @@ run_disposable_public_smoke() {
   media_region="$(sed -n 's/^CLUSTER_OCI_OBJECT_STORAGE_REGION=//p' "${api_env}" | tail -n 1)"
   [ -n "${media_namespace}" ] && [ -n "${media_region}" ] || \
     fail "OCI media identity is unavailable for public smoke"
-  media_host="${media_namespace}.objectstorage.${media_region}.oci.customer-oci.com"
+  media_host="objectstorage.${media_region}.oraclecloud.com"
   smoke_evidence="${release_dir}/canary-public-smoke.txt"
   smoke_partial="${smoke_evidence}.partial"
   smoke_scope=
