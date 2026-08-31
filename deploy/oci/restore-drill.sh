@@ -198,9 +198,19 @@ for table_name in users conversations conversation_members messages schema_migra
     'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username restore_admin --dbname restore_drill --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "$1"' \
     sh "SELECT count(*) FROM ${table_name};" >/dev/null
 done
-docker exec "${container_name}" sh -ec \
-  'PGPASSWORD="$POSTGRES_PASSWORD" exec pg_amcheck --username restore_admin --database restore_drill' \
-  >/dev/null
+# pg_amcheck rejects a database with no checkable indexes (normal for an empty
+# first-production backup). Run it whenever there is an index to examine, while
+# retaining the restored-schema and core-table checks above for every backup.
+checkable_index_count="$(docker exec "${container_name}" sh -ec \
+  'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username restore_admin --dbname restore_drill --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN (\047pg_catalog\047, \047information_schema\047);"')"
+case "${checkable_index_count}" in
+  ''|*[!0-9]*) fail "could not determine restored database index count" ;;
+esac
+if [ "${checkable_index_count}" -gt 0 ]; then
+  docker exec "${container_name}" sh -ec \
+    'PGPASSWORD="$POSTGRES_PASSWORD" exec pg_amcheck --username restore_admin --database restore_drill' \
+    >/dev/null
+fi
 
 marker="${backup_root}/RESTORE_DRILL_LAST_SUCCESS"
 marker_partial="${marker}.partial.$$"
