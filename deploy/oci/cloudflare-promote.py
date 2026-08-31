@@ -26,6 +26,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import runtime_bundle
+
 PRODUCTION_HOSTS = ("clustr-api.atlanteanz.com", "clixor.atlanteanz.com")
 CANARY_HOST = "clixor-oci-canary.atlanteanz.com"
 ORIGIN = "unix:/run/clixor-origin/gateway.sock"
@@ -723,7 +725,7 @@ def validate_extension_controller(
         raise RuntimeError("promotion extension controller checksum is invalid")
     return controller_sha256
 
-def validate_controller_binding(options: argparse.Namespace) -> None:
+def validate_controller_binding(options: argparse.Namespace) -> dict[str,Any]:
     release = Path(options.controller_release)
     current = options.current_release_link
     installed = options.installed_controller
@@ -752,8 +754,12 @@ def validate_controller_binding(options: argparse.Namespace) -> None:
             or installed_metadata.st_uid != ROOT_UID
             or stat.S_IMODE(installed_metadata.st_mode) != 0o555):
         raise RuntimeError("installed promotion controller metadata is unsafe")
-    manifest_path = release / "runtime-bundle" / "manifest.json"
-    manifest = strict_json(secure_read(manifest_path, ROOT_UID, 0o400, 4 * 1024 * 1024))
+    try:
+        manifest = dict(runtime_bundle.validate_runtime_bundle(
+            release, expected_uid=ROOT_UID, expected_gid=ROOT_GID
+        ))
+    except runtime_bundle.BundleError as error:
+        raise RuntimeError(f"controller runtime bundle is invalid: {error}") from None
     if (not isinstance(manifest, dict) or manifest.get("release") != release.name
             or manifest.get("source_sha") != options.revision
             or release_match.group(1) != options.revision[:12]
@@ -774,6 +780,17 @@ def validate_controller_binding(options: argparse.Namespace) -> None:
     if (selected_sha != options.controller_sha256
             or file_sha256(installed) != options.controller_sha256):
         raise RuntimeError("installed promotion controller is not the selected release controller")
+    return manifest
+
+def validate_production_eligibility(options: argparse.Namespace) -> None:
+    """Prove the exact selected release is safe to inherit production routes."""
+    manifest = validate_controller_binding(options)
+    release = Path(options.controller_release)
+    if secure_read(release / "secret-mode", ROOT_UID, 0o400, 16) != b"vault\n":
+        raise RuntimeError("current release is not committed to Vault secret mode")
+    paths = {str(record["path"]) for record in manifest["files"]}
+    if runtime_bundle.CANARY_CONNECTOR_METADATA in paths:
+        raise RuntimeError("current release still contains canary connector authority")
 
 def topology_binding(options: argparse.Namespace) -> dict[str,Any]:
     return {"account":options.account, "zone":options.zone,
@@ -1086,10 +1103,10 @@ def forward(api: API, options: argparse.Namespace, state: dict[str,Any]) -> None
     checkpoint(options.state, state, "promoted", "terminal:promoted")
 
 def promote(api: API, options: argparse.Namespace) -> None:
+    validate_production_eligibility(options)
     if evidence_digest(options.evidence, options.revision) != options.evidence_sha:
         raise RuntimeError("evidence digest mismatch")
     validate_request(options)
-    validate_controller_binding(options)
     if options.state.exists() or options.state.is_symlink():
         state = read_state(options.state); validate_bound(options, state)
     else:
@@ -1118,6 +1135,7 @@ def archive_path(options: argparse.Namespace) -> Path:
             / f"{options.revision}-{digest(authority(options))}.json")
 
 def archive_terminal(api: API, options: argparse.Namespace) -> None:
+    validate_production_eligibility(options)
     if evidence_digest(options.evidence, options.revision) != options.evidence_sha:
         raise RuntimeError("evidence digest mismatch")
     path = archive_path(options)
@@ -1125,7 +1143,6 @@ def archive_terminal(api: API, options: argparse.Namespace) -> None:
         state = read_state(options.state); validate_bound(options, state)
         if state.get("phase") != "promoted":
             raise RuntimeError("only a terminal transfer can be archived")
-        validate_controller_binding(options)
         require_topology_state(options, "oci-live")
         validate_final_authority(api, options, "disabled", "open", state); verify_public(options.revision)
         raw = canonical(state) + b"\n"
@@ -1143,7 +1160,6 @@ def archive_terminal(api: API, options: argparse.Namespace) -> None:
     state = read_state(path); validate_bound(options, state)
     if state.get("phase") != "promoted":
         raise RuntimeError("archive is not terminal")
-    validate_controller_binding(options)
     require_topology_state(options, "oci-live")
     validate_final_authority(api, options, "disabled", "open", state); verify_public(options.revision)
 
@@ -1163,6 +1179,9 @@ def parse_request(request_file: Path, token_file: Path, state: Path,
                                  installed_controller=installed_controller)
     options.evidence = Path(options.evidence)
     validate_request(options)
+    # This runs before main acquires (and may create) the private journal lock,
+    # reads the Cloudflare credential, or constructs any control-plane client.
+    validate_production_eligibility(options)
     return options, API(read_token(token_file))
 
 def acquire_lock(path: Path) -> int:

@@ -8,12 +8,15 @@ import json
 import multiprocessing
 import os
 import signal
+import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 SPEC = importlib.util.spec_from_file_location("cloudflare_promote", ROOT / "cloudflare-promote.py")
 module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -159,6 +162,9 @@ def options(root: Path, api: FakeAPI):
     controller.chmod(0o555)
     release.mkdir(mode=0o700)
     bundle.mkdir(mode=0o700)
+    secret_mode = release / "secret-mode"
+    secret_mode.write_bytes(b"vault\n")
+    secret_mode.chmod(0o400)
     release_evidence = release / evidence.name
     evidence.replace(release_evidence); evidence = release_evidence
     controller_sha = hashlib.sha256(controller.read_bytes()).hexdigest()
@@ -339,8 +345,22 @@ class Tests(unittest.TestCase):
         module.ROOT_GID = os.getgid()
         self.parent_patch = mock.patch.object(module, "validate_parent_chain")
         self.parent_patch.start()
+        self.bundle_patch = mock.patch.object(
+            module.runtime_bundle,
+            "validate_runtime_bundle",
+            side_effect=lambda release, **_: module.strict_json(
+                module.secure_read(
+                    release / "runtime-bundle/manifest.json",
+                    module.ROOT_UID,
+                    0o400,
+                    4 * 1024 * 1024,
+                )
+            ),
+        )
+        self.bundle_validator = self.bundle_patch.start()
 
     def tearDown(self):
+        self.bundle_patch.stop()
         self.parent_patch.stop()
         module.ROOT_UID, module.ROOT_GID = self.root_uid, self.root_gid
 
@@ -350,6 +370,154 @@ class Tests(unittest.TestCase):
              mock.patch.object(module,"verify_edge_reaches_closed_gate"), \
              mock.patch.object(module,"verify_public"):
             module.promote(api, value)
+
+    def local_snapshot(self, root: Path):
+        result = []
+        for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+            current = Path(directory)
+            for name in sorted(names + files):
+                path = current / name
+                metadata = path.lstat()
+                relative = path.relative_to(root).as_posix()
+                if stat.S_ISLNK(metadata.st_mode):
+                    payload = ("symlink", os.readlink(path))
+                elif stat.S_ISREG(metadata.st_mode):
+                    payload = ("file", hashlib.sha256(path.read_bytes()).hexdigest())
+                else:
+                    payload = ("directory", "")
+                result.append(
+                    (
+                        relative,
+                        metadata.st_uid,
+                        metadata.st_gid,
+                        stat.S_IMODE(metadata.st_mode),
+                        payload,
+                    )
+                )
+        return result
+
+    def remote_snapshot(self, api: FakeAPI):
+        return copy.deepcopy(
+            (
+                api.configs,
+                api.records,
+                api.rule,
+                api.versions,
+                api.connectors,
+                api.remote_writes,
+            )
+        )
+
+    def assert_refused_without_mutation(self, api, value, root, reason):
+        local_before = self.local_snapshot(root)
+        remote_before = self.remote_snapshot(api)
+        with self.assertRaisesRegex(RuntimeError, reason):
+            module.promote(api, value)
+        self.assertEqual(api.calls, [])
+        self.assertEqual(self.remote_snapshot(api), remote_before)
+        self.assertEqual(self.local_snapshot(root), local_before)
+        self.assertFalse(value.state.exists())
+        self.assertFalse(value.topology_state.exists())
+        self.assertEqual(module.marker_state(value.gate_directory), "closed")
+
+    def test_staging_secret_mode_is_refused_before_api_journal_or_local_mutation(self):
+        for content, mode, reason in (
+            (b"staging\n", 0o400, "Vault secret mode"),
+            (b"vault", 0o400, "Vault secret mode"),
+            (b"vault\n", 0o600, "authority file metadata is unsafe"),
+        ):
+            with self.subTest(content=content, mode=oct(mode)), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                api = FakeAPI(); value = options(root, api)
+                secret_mode = Path(value.controller_release) / "secret-mode"
+                secret_mode.chmod(0o600)
+                secret_mode.write_bytes(content)
+                secret_mode.chmod(mode)
+                self.assert_refused_without_mutation(api, value, root, reason)
+                self.bundle_validator.assert_called_with(
+                    Path(value.controller_release),
+                    expected_uid=module.ROOT_UID,
+                    expected_gid=module.ROOT_GID,
+                )
+
+    def test_validated_canary_bundle_is_refused_before_api_waf_dns_or_local_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            api = FakeAPI(); value = options(root, api)
+            manifest_path = Path(value.controller_release) / "runtime-bundle/manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"].append(
+                {
+                    "path": module.runtime_bundle.CANARY_CONNECTOR_METADATA,
+                    "sha256": "e" * 64,
+                    "size": 1,
+                    "mode": 0o400,
+                }
+            )
+            manifest_path.chmod(0o600)
+            manifest_path.write_text(json.dumps(manifest))
+            manifest_path.chmod(0o400)
+            self.assert_refused_without_mutation(
+                api, value, root, "still contains canary connector authority"
+            )
+            self.bundle_validator.assert_called_with(
+                Path(value.controller_release),
+                expected_uid=module.ROOT_UID,
+                expected_gid=module.ROOT_GID,
+            )
+
+    def test_main_refuses_staging_release_before_private_lock_or_credential_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            api = FakeAPI(); value = options(root, api)
+            secret_mode = Path(value.controller_release) / "secret-mode"
+            secret_mode.chmod(0o600)
+            secret_mode.write_bytes(b"staging\n")
+            secret_mode.chmod(0o400)
+            request = root / "promotion-request.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "mode": "promote",
+                        "evidence": str(value.evidence),
+                        **module.authority(value),
+                    }
+                )
+            )
+            request.chmod(0o400)
+            token = root / "cloudflare-control-token"
+            token.write_text("x" * 30)
+            token.chmod(0o400)
+            deploy_lock = root / "deploy.lock"
+            deploy_lock.write_bytes(b"")
+            deploy_lock.chmod(0o600)
+            private_lock = Path(str(value.state) + ".lock")
+            with mock.patch.object(
+                module.sys,
+                "argv",
+                [
+                    "cloudflare-promote.py",
+                    "execute",
+                    "--request-file", str(request),
+                    "--token-file", str(token),
+                    "--state", str(value.state),
+                    "--gate-directory", str(value.gate_directory),
+                    "--gate-state", str(value.gate_state),
+                    "--topology-state", str(value.topology_state),
+                    "--deploy-lock", str(deploy_lock),
+                    "--current-release-link", str(value.current_release_link),
+                    "--installed-controller", str(value.installed_controller),
+                ],
+            ), mock.patch.object(module.os, "geteuid", return_value=0), \
+                    mock.patch.object(module, "read_token") as read_token, \
+                    mock.patch("builtins.print"):
+                self.assertEqual(module.main(), 1)
+            read_token.assert_not_called()
+            self.assertFalse(private_lock.exists())
+            self.assertFalse(value.state.exists())
+            self.assertFalse(value.topology_state.exists())
+            self.assertEqual(api.calls, [])
 
     def test_success_is_one_way_edge_safe_and_never_has_dual_route_authority(self):
         with tempfile.TemporaryDirectory() as directory:

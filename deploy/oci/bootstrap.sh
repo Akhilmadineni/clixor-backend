@@ -682,7 +682,6 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
   if [ -L "${project_root}/releases/current" ]; then
     systemctl restart clixor-runtime-reconcile.service
     systemctl start clixor-runtime-watchdog.timer
-    systemctl try-restart cloudflared.service >/dev/null 2>&1 || true
   fi
 fi
 

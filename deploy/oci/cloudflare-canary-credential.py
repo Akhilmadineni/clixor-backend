@@ -18,6 +18,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import tempfile
@@ -42,7 +43,35 @@ DEFAULT_OCI = Path("/usr/local/bin/oci")
 METADATA_NAME = "cloudflare-canary-connector.json"
 TOKEN_NAME = "token"
 SELECTION_NAME = "selection.json"
+CURRENT_NAME = "current"
+GENERATION_PREFIX = "generation-"
 PRODUCTION_GATE = Path("/run/clixor-origin-gate/public-open")
+
+# cloudflared's loopback /config endpoint serializes the effective (not merely
+# submitted) origin policy. Pin that complete default-expanded authority so a
+# path matcher, Access handler, TLS bypass, proxy mode, or timeout drift cannot
+# hide behind the same hostname/service projection.
+DEFAULT_ORIGIN_REQUEST: Mapping[str, Any] = {
+    "connectTimeout": 30,
+    "tlsTimeout": 10,
+    "tcpKeepAlive": 30,
+    "noHappyEyeballs": False,
+    "keepAliveTimeout": 90,
+    "keepAliveConnections": 100,
+    "httpHostHeader": "",
+    "originServerName": "",
+    "matchSNItoHost": False,
+    "caPool": "",
+    "noTLSVerify": False,
+    "disableChunkedEncoding": False,
+    "bastionMode": False,
+    "proxyAddress": "127.0.0.1",
+    "proxyPort": 0,
+    "proxyType": "",
+    "ipRules": None,
+    "http2Origin": False,
+    "access": {"teamName": "", "audTag": None},
+}
 
 
 class CredentialError(RuntimeError):
@@ -382,7 +411,86 @@ def _selection(document: Mapping[str, Any], release: Path) -> bytes:
     return (json.dumps(selected, ensure_ascii=True, sort_keys=True) + "\n").encode("ascii")
 
 
+def _current_generation(runtime_root: Path) -> Path | None:
+    selector = runtime_root / CURRENT_NAME
+    if not selector.exists() and not selector.is_symlink():
+        return None
+    if not selector.is_symlink():
+        raise CredentialError("connector credential selector is unsafe")
+    try:
+        target = os.readlink(selector)
+    except OSError:
+        raise CredentialError("connector credential selector cannot be read") from None
+    if (
+        not target.startswith(GENERATION_PREFIX)
+        or "/" in target
+        or target in {"", ".", ".."}
+    ):
+        raise CredentialError("connector credential selector target is invalid")
+    generation = runtime_root / target
+    try:
+        metadata = generation.lstat()
+        root_metadata = runtime_root.lstat()
+    except OSError:
+        raise CredentialError("selected connector credential generation is unavailable") from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or (metadata.st_uid, metadata.st_gid)
+        != (root_metadata.st_uid, root_metadata.st_gid)
+    ):
+        raise CredentialError("selected connector credential generation is unsafe")
+    return generation
+
+
+def _remove_generation(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise CredentialError("connector credential generation is unsafe")
+    names = {entry.name for entry in path.iterdir()}
+    if not names.issubset({TOKEN_NAME, SELECTION_NAME}):
+        raise CredentialError("connector credential generation contains unexpected state")
+    for name in names:
+        child = path / name
+        if child.is_symlink() or not child.is_file():
+            raise CredentialError("connector credential generation contains unsafe state")
+        child.unlink()
+    path.rmdir()
+
+
+def _clean_unselected_generations(
+    runtime_root: Path, selected: Path | None
+) -> None:
+    if not runtime_root.exists() and not runtime_root.is_symlink():
+        return
+    if runtime_root.is_symlink() or not runtime_root.is_dir():
+        raise CredentialError("connector credential directory is unsafe")
+    for entry in list(runtime_root.iterdir()):
+        if entry.name in {CURRENT_NAME, TOKEN_NAME, SELECTION_NAME}:
+            continue
+        if entry.name.startswith(f".{CURRENT_NAME}.") and entry.is_symlink():
+            entry.unlink()
+            continue
+        if entry.name.startswith(GENERATION_PREFIX):
+            if selected is None or entry != selected:
+                _remove_generation(entry)
+            continue
+        raise CredentialError("connector credential directory contains unexpected state")
+
+
 def _clean(runtime_root: Path) -> None:
+    if not runtime_root.exists() and not runtime_root.is_symlink():
+        return
+    if runtime_root.is_symlink() or not runtime_root.is_dir():
+        raise CredentialError("connector credential directory is unsafe")
+    selector = runtime_root / CURRENT_NAME
+    selected = _current_generation(runtime_root)
+    if selector.is_symlink():
+        selector.unlink()
     for name in (TOKEN_NAME, SELECTION_NAME):
         path = runtime_root / name
         if path.is_symlink():
@@ -391,12 +499,68 @@ def _clean(runtime_root: Path) -> None:
             path.unlink()
         except FileNotFoundError:
             pass
+    _clean_unselected_generations(runtime_root, None)
+    if selected is not None:
+        _remove_generation(selected)
     try:
         runtime_root.rmdir()
     except FileNotFoundError:
         pass
     except OSError:
         raise CredentialError("connector credential directory contains unexpected state") from None
+
+
+def _publish_cohort(
+    runtime_root: Path,
+    token: bytes,
+    selection: bytes,
+    *,
+    enforce_tmpfs: bool,
+) -> None:
+    _prepare_directory(runtime_root, enforce_tmpfs=enforce_tmpfs)
+    selected = _current_generation(runtime_root)
+    _clean_unselected_generations(runtime_root, selected)
+    for name in (TOKEN_NAME, SELECTION_NAME):
+        legacy = runtime_root / name
+        if legacy.is_symlink():
+            raise CredentialError("legacy connector credential path is unsafe")
+    generation = runtime_root / f"{GENERATION_PREFIX}{secrets.token_hex(16)}"
+    selector_temporary = runtime_root / f".{CURRENT_NAME}.{secrets.token_hex(16)}"
+    generation.mkdir(mode=0o700)
+    published = False
+    try:
+        _atomic_write(generation / TOKEN_NAME, token, 0o600)
+        _atomic_write(generation / SELECTION_NAME, selection, 0o600)
+        directory_descriptor = os.open(generation, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        os.symlink(generation.name, selector_temporary)
+        os.replace(selector_temporary, runtime_root / CURRENT_NAME)
+        published = True
+        directory_descriptor = os.open(runtime_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except BaseException:
+        try:
+            selector_temporary.unlink()
+        except FileNotFoundError:
+            pass
+        if not published:
+            _remove_generation(generation)
+        raise
+    for name in (TOKEN_NAME, SELECTION_NAME):
+        legacy = runtime_root / name
+        if legacy.is_symlink():
+            raise CredentialError("legacy connector credential path is unsafe")
+        try:
+            legacy.unlink()
+        except FileNotFoundError:
+            pass
+    _clean_unselected_generations(runtime_root, generation)
 
 
 def prepare(
@@ -417,6 +581,10 @@ def prepare(
             raise CredentialError("staging connector state requires canary metadata")
         _clean(runtime_root)
         return
+    if runtime_root.exists() or runtime_root.is_symlink():
+        _prepare_directory(runtime_root, enforce_tmpfs=enforce_tmpfs)
+        selected_generation = _current_generation(runtime_root)
+        _clean_unselected_generations(runtime_root, selected_generation)
     if metadata is not None:
         if mode != "staging" or not active:
             raise CredentialError("canary metadata is valid only for an active staging connector")
@@ -442,9 +610,12 @@ def prepare(
             owner=(0, 0) if enforce_tmpfs else None,
         )
         selection = (json.dumps({"schema": 1, "release": release.name, "mode": "vault"}, sort_keys=True) + "\n").encode("ascii")
-    _prepare_directory(runtime_root, enforce_tmpfs=enforce_tmpfs)
-    _atomic_write(runtime_root / TOKEN_NAME, token, 0o600)
-    _atomic_write(runtime_root / SELECTION_NAME, selection, 0o600)
+    _publish_cohort(
+        runtime_root,
+        token,
+        selection,
+        enforce_tmpfs=enforce_tmpfs,
+    )
 
 
 def verify(
@@ -455,21 +626,31 @@ def verify(
 ) -> None:
     mode = _release_mode(release)
     metadata = load_metadata(release)
-    active = _runtime_state(release).get("active") is True
+    service_state = _runtime_state(release)
+    active = (
+        service_state.get("enabled") is True
+        and service_state.get("active") is True
+    )
     if not active:
-        if any(
-            (runtime_root / name).exists() or (runtime_root / name).is_symlink()
-            for name in (TOKEN_NAME, SELECTION_NAME)
-        ):
+        if runtime_root.exists() or runtime_root.is_symlink():
             raise CredentialError("disabled connector retains a credential")
         return
     _prepare_directory(runtime_root, enforce_tmpfs=enforce_tmpfs)
+    generation = _current_generation(runtime_root)
+    if generation is None:
+        raise CredentialError("connector credential cohort is not selected")
+    # A crash before selector publication is harmless, but it must be repaired
+    # before the runtime can be considered healthy so abandoned secret-bearing
+    # generations never accumulate.
+    entries = {entry.name for entry in runtime_root.iterdir()}
+    if entries != {CURRENT_NAME, generation.name}:
+        raise CredentialError("connector credential directory contains stale state")
     runtime_owner = (0, 0) if enforce_tmpfs else None
     token = _regular_bytes(
-        runtime_root / TOKEN_NAME, MAX_TOKEN_BYTES, mode=0o600, owner=runtime_owner
+        generation / TOKEN_NAME, MAX_TOKEN_BYTES, mode=0o600, owner=runtime_owner
     )
     selection = _regular_bytes(
-        runtime_root / SELECTION_NAME, MAX_DOCUMENT_BYTES,
+        generation / SELECTION_NAME, MAX_DOCUMENT_BYTES,
         mode=0o600, owner=runtime_owner,
     )
     if metadata is not None:
@@ -504,21 +685,48 @@ def _verify_remote_config_once(
     response = _load_json_bytes(raw, "cloudflared remote configuration")
     remote = metadata["remote_config"]
     assert isinstance(remote, dict)
+    if set(response) != {"version", "config"}:
+        raise CredentialError("cloudflared remote response fields are invalid")
     config = response.get("config")
-    if response.get("version") != remote["version"] or not isinstance(config, dict):
+    version = response.get("version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != remote["version"]
+        or not isinstance(config, dict)
+    ):
         raise CredentialError("cloudflared applied another configuration version")
+    if set(config) != {"ingress", "warp-routing", "originRequest"}:
+        raise CredentialError("cloudflared remote configuration fields are invalid")
     ingress = config.get("ingress")
     if not isinstance(ingress, list) or len(ingress) != 2:
         raise CredentialError("cloudflared remote ingress is not canary-only")
-    projected = []
-    for rule in ingress:
-        if not isinstance(rule, dict):
-            raise CredentialError("cloudflared remote ingress is invalid")
-        projected.append({key: rule[key] for key in ("hostname", "service") if key in rule})
-    if projected != remote["ingress"]:
-        raise CredentialError("cloudflared remote ingress differs from the reviewed canary")
+    expected_ingress = [
+        {
+            "hostname": CANARY_HOSTNAME,
+            "path": None,
+            "service": CANARY_ORIGIN,
+            "Handlers": None,
+            "originRequest": DEFAULT_ORIGIN_REQUEST,
+        },
+        {
+            "hostname": "",
+            "path": None,
+            "service": "http_status:404",
+            "Handlers": None,
+            "originRequest": DEFAULT_ORIGIN_REQUEST,
+        },
+    ]
+    if ingress != expected_ingress:
+        raise CredentialError(
+            "cloudflared remote ingress differs from the reviewed canary"
+        )
+    if config.get("originRequest") != DEFAULT_ORIGIN_REQUEST:
+        raise CredentialError(
+            "cloudflared global origin policy differs from reviewed defaults"
+        )
     warp = config.get("warp-routing")
-    if warp not in (None, {}, {"enabled": False}):
+    if warp != {}:
         raise CredentialError("cloudflared remote private routing must be disabled")
 
 
@@ -561,6 +769,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if action == "prepare":
             command.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
             command.add_argument("--oci-binary", type=Path, default=DEFAULT_OCI)
+    clean = subparsers.add_parser("clean-runtime")
+    clean.add_argument("--runtime-root", type=Path, default=DEFAULT_RUNTIME_ROOT)
     options = parser.parse_args(arguments)
     try:
         if options.action == "stage-metadata":
@@ -584,11 +794,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.release, runtime_root=options.runtime_root,
                 enforce_tmpfs=options.runtime_root == DEFAULT_RUNTIME_ROOT,
             )
-        else:
+        elif options.action == "verify-remote":
             metadata = load_metadata(options.release)
             if metadata is None:
                 raise CredentialError("release is not a canary connector release")
             verify_remote_config(metadata)
+        else:
+            if os.geteuid() != 0 and options.runtime_root == DEFAULT_RUNTIME_ROOT:
+                raise CredentialError("connector credential cleanup must run as root")
+            _clean(options.runtime_root)
     except (CredentialError, OSError) as error:
         print(f"Clixor connector credential refused: {error}", file=os.sys.stderr)
         return 1

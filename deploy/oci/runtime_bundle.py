@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,223 @@ CANARY_HOSTNAME = "clixor-oci-canary.atlanteanz.com"
 CANARY_ORIGIN = "unix:/run/clixor-origin/gateway.sock"
 
 SOURCE_EXCLUDES = frozenset({".git", ".DS_Store", ".build", "coverage.out"})
+
+
+def _trusted_git(git_directory: Path, *arguments: str) -> bytes:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/root",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", f"--git-dir={git_directory}", *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+            check=False,
+        )
+    except OSError:
+        raise BundleError("trusted Git is unavailable") from None
+    if result.returncode != 0:
+        raise BundleError("trusted Git object verification failed")
+    return result.stdout
+
+
+def _validate_trusted_git_directory(
+    git_directory: Path, *, expected_uid: int, expected_gid: int
+) -> None:
+    if not git_directory.is_absolute():
+        raise BundleError("trusted Git object directory must be absolute")
+    try:
+        metadata = git_directory.lstat()
+        resolved = git_directory.resolve(strict=True)
+    except OSError:
+        raise BundleError("trusted Git object directory is unavailable") from None
+    if (
+        resolved != git_directory
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise BundleError("trusted Git object directory is unsafe")
+    alternates = git_directory / "objects" / "info" / "alternates"
+    if alternates.exists() or alternates.is_symlink():
+        raise BundleError("trusted Git object directory uses external alternates")
+    for directory, names, files in os.walk(
+        git_directory, topdown=True, followlinks=False
+    ):
+        current = Path(directory)
+        current_metadata = current.lstat()
+        if (
+            not stat.S_ISDIR(current_metadata.st_mode)
+            or stat.S_ISLNK(current_metadata.st_mode)
+            or (current_metadata.st_uid, current_metadata.st_gid)
+            != (expected_uid, expected_gid)
+            or stat.S_IMODE(current_metadata.st_mode) & 0o022
+        ):
+            raise BundleError("trusted Git object directory contains unsafe state")
+        for name in [*names, *files]:
+            path = current / name
+            child = path.lstat()
+            if stat.S_ISLNK(child.st_mode) or (
+                not stat.S_ISDIR(child.st_mode)
+                and not stat.S_ISREG(child.st_mode)
+            ):
+                raise BundleError("trusted Git object directory contains unsafe state")
+            if (child.st_uid, child.st_gid) != (expected_uid, expected_gid) or (
+                stat.S_IMODE(child.st_mode) & 0o022
+            ):
+                raise BundleError("trusted Git object directory contains unsafe state")
+
+
+def _git_blob_oid(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise BundleError("approved source file cannot be opened") from None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_FILE_BYTES:
+            raise BundleError("approved source file is unsafe")
+        digest = hashlib.sha1(f"blob {before.st_size}\0".encode("ascii"))
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise BundleError("approved source file changed during verification")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise BundleError("approved source file changed during verification")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_uid,
+            after.st_gid,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise BundleError("approved source file changed during verification")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def validate_approved_source(
+    source_root: Path,
+    source_sha: str,
+    git_directory: Path,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> None:
+    """Bind a locked source tree to one root-owned Git commit object."""
+
+    if SOURCE_SHA_RE.fullmatch(source_sha) is None:
+        raise BundleError("approved source revision is invalid")
+    _validate_trusted_git_directory(
+        git_directory, expected_uid=expected_uid, expected_gid=expected_gid
+    )
+    if _trusted_git(git_directory, "cat-file", "-t", source_sha) != b"commit\n":
+        raise BundleError("approved source revision is not a commit")
+    _trusted_git(git_directory, "fsck", "--full", "--strict", source_sha)
+    raw_tree = _trusted_git(
+        git_directory, "ls-tree", "-r", "-z", "--full-tree", source_sha
+    )
+    expected: dict[str, tuple[int, str]] = {}
+    for record in raw_tree.split(b"\0"):
+        if not record:
+            continue
+        header, separator, raw_name = record.partition(b"\t")
+        fields = header.split(b" ")
+        try:
+            name = raw_name.decode("utf-8", errors="strict")
+        except UnicodeError:
+            raise BundleError("approved Git tree contains a non-UTF-8 path") from None
+        if (
+            not separator
+            or len(fields) != 3
+            or fields[0] not in {b"100644", b"100755"}
+            or fields[1] != b"blob"
+            or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
+            or not name
+            or name.startswith("/")
+            or ".." in Path(name).parts
+            or name in expected
+        ):
+            raise BundleError("approved Git tree contains unsupported state")
+        expected[name] = (
+            0o500 if fields[0] == b"100755" else 0o400,
+            fields[2].decode("ascii"),
+        )
+
+    if not source_root.is_absolute():
+        raise BundleError("approved source root must be absolute")
+    try:
+        root_metadata = source_root.lstat()
+        resolved = source_root.resolve(strict=True)
+    except OSError:
+        raise BundleError("approved source root is unavailable") from None
+    if (
+        resolved != source_root
+        or not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or (root_metadata.st_uid, root_metadata.st_gid)
+        != (expected_uid, expected_gid)
+        or stat.S_IMODE(root_metadata.st_mode) != 0o500
+    ):
+        raise BundleError("approved source root is not locked and owned")
+
+    actual: dict[str, tuple[int, str]] = {}
+    for directory, names, files in os.walk(
+        source_root, topdown=True, followlinks=False
+    ):
+        current = Path(directory)
+        directory_metadata = current.lstat()
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or stat.S_ISLNK(directory_metadata.st_mode)
+            or (directory_metadata.st_uid, directory_metadata.st_gid)
+            != (expected_uid, expected_gid)
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o500
+        ):
+            raise BundleError("approved source contains a writable directory")
+        for name in names:
+            if (current / name).is_symlink():
+                raise BundleError("approved source contains a symbolic link")
+        for name in files:
+            path = current / name
+            relative = path.relative_to(source_root).as_posix()
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+                or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o500}
+            ):
+                raise BundleError("approved source contains a writable or unsafe file")
+            actual[relative] = (stat.S_IMODE(metadata.st_mode), _git_blob_oid(path))
+    if actual != expected:
+        raise BundleError("approved source tree does not match the supplied Git commit")
 
 
 @dataclass(frozen=True)
@@ -402,6 +620,7 @@ def stage_source(
     source_root: Path,
     source_sha: str,
     compose_source: Path | None = None,
+    git_directory: Path | None = None,
 ) -> Path:
     """Create the immutable source half of a pending release bundle."""
 
@@ -410,6 +629,8 @@ def stage_source(
         raise BundleError("runtime source revision is invalid")
     if release.name[4:16] != source_sha[:12]:
         raise BundleError("runtime release name does not match its source revision")
+    if git_directory is not None:
+        validate_approved_source(source_root, source_sha, git_directory)
     bundle = release / BUNDLE_DIRECTORY
     if bundle.exists() or bundle.is_symlink():
         raise BundleError("runtime bundle already exists")
@@ -1054,6 +1275,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     stage.add_argument("--source", required=True, type=Path)
     stage.add_argument("--source-sha", required=True)
     stage.add_argument("--compose-source", type=Path)
+    stage.add_argument("--git-dir", type=Path)
+    verify_source = subparsers.add_parser("verify-approved-source")
+    verify_source.add_argument("--source", required=True, type=Path)
+    verify_source.add_argument("--source-sha", required=True)
+    verify_source.add_argument("--git-dir", required=True, type=Path)
     host_tools = subparsers.add_parser("stage-host-tools")
     host_tools.add_argument("--release", required=True, type=Path)
     host_tools.add_argument("--source", required=True, type=Path)
@@ -1081,6 +1307,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.source,
                 options.source_sha,
                 options.compose_source,
+                options.git_dir,
+            )
+        elif options.action == "verify-approved-source":
+            validate_approved_source(
+                options.source, options.source_sha, options.git_dir
             )
         elif options.action == "stage-host-tools":
             stage_host_tools(

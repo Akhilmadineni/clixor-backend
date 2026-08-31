@@ -384,6 +384,72 @@ class RuntimeBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(runtime_bundle.BundleError, "symbolic link"):
             runtime_bundle.stage_source(release, self.fixture.source, SOURCE_SHA)
 
+    def test_approved_source_is_exact_locked_root_owned_git_commit(self) -> None:
+        repository = self.fixture.root / "source-repository"
+        repository.mkdir(mode=0o700)
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "config", "user.name", "Clixor Test"],
+            check=True,
+        )
+        (repository / "go.mod").write_text("module example.invalid/approved\n", encoding="ascii")
+        script = repository / "deploy.sh"
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        script.chmod(0o755)
+        subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-m", "approved"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        source_sha = subprocess.check_output(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True
+        ).strip()
+        trusted = self.fixture.root / "trusted.git"
+        subprocess.run(
+            ["git", "clone", "--bare", str(repository), str(trusted)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+        trusted.chmod(0o700)
+        approved = self.fixture.root / "locked-source"
+        approved.mkdir(mode=0o700)
+        shutil.copy2(repository / "go.mod", approved / "go.mod")
+        shutil.copy2(script, approved / "deploy.sh")
+        (approved / "go.mod").chmod(0o400)
+        (approved / "deploy.sh").chmod(0o500)
+        approved.chmod(0o500)
+        uid, gid = self.fixture.root.stat().st_uid, self.fixture.root.stat().st_gid
+
+        runtime_bundle.validate_approved_source(
+            approved,
+            source_sha,
+            trusted,
+            expected_uid=uid,
+            expected_gid=gid,
+        )
+        (approved / "go.mod").chmod(0o600)
+        (approved / "go.mod").write_text("dirty\n", encoding="ascii")
+        (approved / "go.mod").chmod(0o400)
+        with self.assertRaisesRegex(runtime_bundle.BundleError, "does not match"):
+            runtime_bundle.validate_approved_source(
+                approved,
+                source_sha,
+                trusted,
+                expected_uid=uid,
+                expected_gid=gid,
+            )
+        (approved / "go.mod").chmod(0o600)
+        approved.chmod(0o700)
+
     def test_existing_release_gets_atomic_validated_promotion_extension(self) -> None:
         release = self.fixture.finalized_release()
         _remove_historical_promotion_cohort(release)
@@ -1047,6 +1113,127 @@ class LegacyBaselineTests(unittest.TestCase):
 
 
 class BootSelectionContractTests(unittest.TestCase):
+    def test_started_canary_connector_verifies_exact_remote_config_synchronously(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="clixor-connector-authority-", dir=TEMP_ROOT
+        ) as temporary:
+            release = Path(temporary) / "oci-0123456789ab-canary"
+            helper = (
+                release
+                / runtime_bundle.BUNDLE_DIRECTORY
+                / "host-tools/bin/cloudflare-canary-credential.py"
+            )
+            helper.parent.mkdir(parents=True)
+            helper.write_text("fixture helper\n", encoding="ascii")
+            metadata = (
+                release
+                / runtime_bundle.BUNDLE_DIRECTORY
+                / runtime_bundle.CANARY_CONNECTOR_METADATA
+            )
+            metadata.write_text("{}\n", encoding="ascii")
+            runner = FakeRunner()
+
+            RECONCILER._verify_started_connector(release, release.parent, runner)
+
+            active = (
+                "/usr/bin/systemctl",
+                "is-active",
+                "--quiet",
+                "cloudflared.service",
+            )
+            local = (
+                "/usr/bin/python3",
+                str(helper),
+                "verify",
+                "--release",
+                str(release),
+            )
+            remote = (
+                "/usr/bin/python3",
+                str(helper),
+                "verify-remote",
+                "--release",
+                str(release),
+            )
+            self.assertLess(runner.calls.index(active), runner.calls.index(local))
+            self.assertLess(runner.calls.index(local), runner.calls.index(remote))
+
+    def test_reconcile_remote_config_failure_stops_everything_before_raising(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="clixor-connector-refusal-", dir=TEMP_ROOT
+        ) as temporary:
+            root = Path(temporary)
+            root.chmod(0o700)
+            release = root / "releases" / "oci-aaaaaaaaaaaa-old"
+            release.mkdir(parents=True, mode=0o700)
+            (release.parent / "current").symlink_to(release)
+            manifest = {
+                "source_sha": "a" * 40,
+                "state": {
+                    "cloudflared": {"enabled": True, "active": True},
+                    "observability": {"prometheus": False, "grafana": False},
+                    "timers": {
+                        "clixor-offsite-backup.timer": False,
+                        "clixor-restore-drill.timer": False,
+                        "clixor-backup-health.timer": False,
+                    },
+                },
+            }
+            runner = FakeRunner()
+            with mock.patch.object(
+                RECONCILER, "_validate_bundle", return_value=manifest
+            ), mock.patch.object(
+                RECONCILER, "_boot_bundle_validate"
+            ), mock.patch.object(
+                RECONCILER,
+                "_validate_image",
+                return_value=(f"clixor-api:{release.name}", IMAGE_ID),
+            ), mock.patch.object(
+                RECONCILER, "_prepare_current_secrets"
+            ), mock.patch.object(
+                RECONCILER, "_prepare_connector_credential"
+            ), mock.patch.object(
+                RECONCILER, "_restore_source"
+            ), mock.patch.object(
+                RECONCILER, "_restore_runtime"
+            ), mock.patch.object(
+                RECONCILER, "_restore_host_tools"
+            ), mock.patch.object(
+                RECONCILER, "_set_service_selection"
+            ), mock.patch.object(
+                RECONCILER, "_compose_up"
+            ), mock.patch.object(
+                RECONCILER, "_wait_ready"
+            ), mock.patch.object(
+                RECONCILER, "_clear_emergency_network_cut"
+            ), mock.patch.object(
+                RECONCILER, "_publish_ready_marker"
+            ), mock.patch.object(
+                RECONCILER,
+                "_verify_started_connector",
+                side_effect=RECONCILER.ReconcileError("remote configuration drift"),
+            ), mock.patch.object(
+                RECONCILER, "_stop_ingress_and_containers"
+            ) as stopped:
+                with self.assertRaisesRegex(
+                    RECONCILER.ReconcileError, "remote configuration drift"
+                ):
+                    RECONCILER.reconcile_current(
+                        root, runner, boot=False, stop_first=False
+                    )
+            stopped.assert_called_once_with(runner)
+            start = (
+                "/usr/bin/systemctl",
+                "start",
+                "--no-block",
+                "cloudflared.service",
+            )
+            self.assertIn(start, runner.calls)
+            self.assertFalse(
+                any(call[:2] == ("/usr/bin/systemctl", "start") and call[-1].endswith(".timer")
+                    for call in runner.calls)
+            )
+
     def test_network_cut_clears_between_two_readiness_checks_before_ingress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="clixor-cut-order-", dir=TEMP_ROOT) as temporary:
             root = Path(temporary)

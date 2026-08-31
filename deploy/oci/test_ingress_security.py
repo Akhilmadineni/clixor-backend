@@ -106,7 +106,7 @@ class IngressBoundaryTests(unittest.TestCase):
         installer = (ROOT / "install-cloudflared-service.sh").read_text(encoding="utf-8")
         retirement = (ROOT / "quarantine-staging-secrets.sh").read_text(encoding="utf-8")
         self.assertNotIn("/etc/cloudflared/token", installer)
-        self.assertIn("/run/clixor/cloudflare-connector/token", installer)
+        self.assertIn("/run/clixor/cloudflare-connector/current/token", installer)
         self.assertIn("selected release connector credential", installer)
         self.assertIn("runtime-reconciler.py validate-release", installer)
         self.assertIn("revoke and remove the retired Cloudflare connector token", retirement)
@@ -132,10 +132,84 @@ class IngressBoundaryTests(unittest.TestCase):
         self.assertIn('--version-number', helper)
         self.assertIn('OCI_CLI_AUTH": "instance_principal"', helper)
         self.assertNotIn('print(token', helper)
-        self.assertIn('/run/clixor/cloudflare-connector/token', unit)
+        self.assertIn('/run/clixor/cloudflare-connector/current/token', unit)
         self.assertIn('--metrics 127.0.0.1:20241', unit)
         self.assertIn("candidate connector unexpectedly owns the production hostname", deploy)
         self.assertIn('run_disposable_public_smoke "${source_sha}"', deploy)
+
+    def test_deploy_source_and_connector_transitions_are_fail_closed(self) -> None:
+        deploy = (ROOT / "deploy.sh").read_text(encoding="utf-8")
+        wrapper = (ROOT / "actions-deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "install-cloudflared-service.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("CLIXOR_APPROVED_GIT_DIR is required", deploy)
+        self.assertIn("verify-approved-source", deploy)
+        self.assertIn('--git-dir "${approved_git_directory}"', deploy)
+        self.assertIn('stat -c \'%u:%g:%a\' "${source_root}"', deploy)
+        self.assertIn('CLIXOR_APPROVED_GIT_DIR="${mirror_root}"', wrapper)
+        self.assertIn('-type d -exec /usr/bin/chmod 0500', wrapper)
+
+        disabled = deploy.index("deactivate_cloudflared()")
+        stopped = deploy.index("systemctl stop cloudflared.service", disabled)
+        disabled_unit = deploy.index("systemctl disable cloudflared.service", stopped)
+        credential_clean = deploy.index(
+            '"${host_tool_stage}/bin/cloudflare-canary-credential.py" prepare',
+            disabled_unit,
+        )
+        credential_verify = deploy.index(
+            '"${host_tool_stage}/bin/cloudflare-canary-credential.py" verify',
+            credential_clean,
+        )
+        self.assertLess(stopped, disabled_unit)
+        self.assertLess(disabled_unit, credential_clean)
+        self.assertLess(credential_clean, credential_verify)
+        candidate_else = deploy.index(
+            "else\n  deactivate_cloudflared\nfi", credential_verify
+        )
+        publication = deploy.index("journal_phase publishing", candidate_else)
+        self.assertLess(candidate_else, publication)
+
+        restore = deploy.index("restore_cloudflared()")
+        credential_restore = deploy.index(
+            "if restore_previous_connector_credential; then", restore
+        )
+        refusal = deploy.index(
+            'if [ "${previous_connector_credential_restored}" != "true" ]',
+            credential_restore,
+        )
+        prior_restart = deploy.index(
+            "systemctl restart --no-block cloudflared.service", refusal
+        )
+        self.assertLess(credential_restore, refusal)
+        self.assertLess(refusal, prior_restart)
+        refusal_block = deploy[refusal:prior_restart]
+        self.assertIn("systemctl stop cloudflared.service", refusal_block)
+        self.assertIn("systemctl disable cloudflared.service", refusal_block)
+        self.assertIn("return 1", refusal_block)
+        self.assertIn(
+            'if [ "${cloudflare_rollback_failed}" -ne 0 ]; then', deploy
+        )
+        self.assertIn(
+            "skipping selected-release reconciliation after connector credential restoration failed",
+            deploy,
+        )
+        self.assertEqual(deploy.count("cloudflare_rollback_failed=0"), 1)
+
+        # No bootstrap-side restart may bypass the reconciler's synchronous
+        # local and remote authority checks.  The standalone installer has the
+        # same start -> verify -> fail-closed contract.
+        self.assertNotIn("try-restart cloudflared.service", bootstrap)
+        install_start = installer.index("systemctl enable --now cloudflared.service")
+        install_remote = installer.index("verify-remote", install_start)
+        install_refusal = installer.index("rm -f -- /run/clixor/runtime-ready", install_remote)
+        install_stop = installer.index("systemctl stop cloudflared.service", install_refusal)
+        install_disable = installer.index("systemctl disable cloudflared.service", install_stop)
+        self.assertLess(install_start, install_remote)
+        self.assertLess(install_remote, install_refusal)
+        self.assertLess(install_refusal, install_stop)
+        self.assertLess(install_stop, install_disable)
 
     def test_promoter_is_immutable_installed_and_hardened(self) -> None:
         bootstrap=(ROOT/"bootstrap.sh").read_text()

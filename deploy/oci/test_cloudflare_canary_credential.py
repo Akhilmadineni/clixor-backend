@@ -124,17 +124,24 @@ class CredentialTests(unittest.TestCase):
                 oci_binary=fake,
                 enforce_tmpfs=False,
             )
-        selected = self.runtime / CREDENTIAL.TOKEN_NAME
+        selected = self.runtime / CREDENTIAL.CURRENT_NAME / CREDENTIAL.TOKEN_NAME
         self.assertEqual(selected.read_bytes(), token + b"\n")
         self.assertEqual(stat.S_IMODE(selected.stat().st_mode), 0o600)
         self.assertFalse(any(token in path.read_bytes() for path in self.release.rglob("*") if path.is_file()))
         CREDENTIAL.verify(self.release, runtime_root=self.runtime, enforce_tmpfs=False)
 
     def test_wrong_exact_version_preserves_previous_selection_and_redacts_token(self) -> None:
-        self.runtime.mkdir(parents=True, mode=0o700)
-        old = b"previous-safe-selection\n"
-        (self.runtime / CREDENTIAL.TOKEN_NAME).write_bytes(old)
-        (self.runtime / CREDENTIAL.TOKEN_NAME).chmod(0o600)
+        token = tunnel_token()
+        with mock.patch.object(CREDENTIAL, "PRODUCTION_GATE", self.gate):
+            CREDENTIAL.prepare(
+                self.release,
+                runtime_root=self.runtime,
+                oci_binary=self.fake_oci(token),
+                enforce_tmpfs=False,
+            )
+        selected = self.runtime / CREDENTIAL.CURRENT_NAME / CREDENTIAL.TOKEN_NAME
+        old = selected.read_bytes()
+        old_generation = os.readlink(self.runtime / CREDENTIAL.CURRENT_NAME)
         bad_token = tunnel_token(account="0" * 32)
         fake = self.fake_oci(bad_token, version=8)
         with mock.patch.object(CREDENTIAL, "PRODUCTION_GATE", self.gate):
@@ -145,8 +152,46 @@ class CredentialTests(unittest.TestCase):
                     oci_binary=fake,
                     enforce_tmpfs=False,
                 )
-        self.assertEqual((self.runtime / CREDENTIAL.TOKEN_NAME).read_bytes(), old)
+        self.assertEqual(selected.read_bytes(), old)
+        self.assertEqual(os.readlink(self.runtime / CREDENTIAL.CURRENT_NAME), old_generation)
         self.assertNotIn(bad_token.decode("ascii"), str(caught.exception))
+
+    def test_token_and_selection_publish_as_one_atomic_generation(self) -> None:
+        token = tunnel_token()
+        fake = self.fake_oci(token)
+        with mock.patch.object(CREDENTIAL, "PRODUCTION_GATE", self.gate):
+            CREDENTIAL.prepare(
+                self.release,
+                runtime_root=self.runtime,
+                oci_binary=fake,
+                enforce_tmpfs=False,
+            )
+        old_generation = os.readlink(self.runtime / CREDENTIAL.CURRENT_NAME)
+        original_write = CREDENTIAL._atomic_write
+
+        def fail_between_cohort_files(path: Path, content: bytes, mode: int) -> None:
+            if path.name == CREDENTIAL.SELECTION_NAME and path.parent.name.startswith(
+                CREDENTIAL.GENERATION_PREFIX
+            ):
+                raise OSError("injected selection publication failure")
+            original_write(path, content, mode)
+
+        with mock.patch.object(CREDENTIAL, "PRODUCTION_GATE", self.gate), mock.patch.object(
+            CREDENTIAL, "_atomic_write", side_effect=fail_between_cohort_files
+        ):
+            with self.assertRaisesRegex(OSError, "injected"):
+                CREDENTIAL.prepare(
+                    self.release,
+                    runtime_root=self.runtime,
+                    oci_binary=fake,
+                    enforce_tmpfs=False,
+                )
+        self.assertEqual(os.readlink(self.runtime / CREDENTIAL.CURRENT_NAME), old_generation)
+        self.assertEqual(
+            {entry.name for entry in self.runtime.iterdir()},
+            {CREDENTIAL.CURRENT_NAME, old_generation},
+        )
+        CREDENTIAL.verify(self.release, runtime_root=self.runtime, enforce_tmpfs=False)
 
     def test_account_tunnel_and_production_gate_are_fail_closed(self) -> None:
         with self.assertRaisesRegex(CREDENTIAL.CredentialError, "another account"):
@@ -184,10 +229,23 @@ class CredentialTests(unittest.TestCase):
                 "version": 19,
                 "config": {
                     "ingress": [
-                        {"hostname": CREDENTIAL.CANARY_HOSTNAME, "service": CREDENTIAL.CANARY_ORIGIN},
-                        {"service": "http_status:404"},
+                        {
+                            "hostname": CREDENTIAL.CANARY_HOSTNAME,
+                            "path": None,
+                            "service": CREDENTIAL.CANARY_ORIGIN,
+                            "Handlers": None,
+                            "originRequest": CREDENTIAL.DEFAULT_ORIGIN_REQUEST,
+                        },
+                        {
+                            "hostname": "",
+                            "path": None,
+                            "service": "http_status:404",
+                            "Handlers": None,
+                            "originRequest": CREDENTIAL.DEFAULT_ORIGIN_REQUEST,
+                        },
                     ],
-                    "warp-routing": {"enabled": False},
+                    "originRequest": CREDENTIAL.DEFAULT_ORIGIN_REQUEST,
+                    "warp-routing": {},
                 },
             }
         ).encode("ascii")
@@ -202,6 +260,36 @@ class CredentialTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(CREDENTIAL.CredentialError, "differs"):
                 CREDENTIAL.verify_remote_config(self.metadata, attempts=1)
+
+        mutations = []
+        for label, mutate in (
+            ("path", lambda value: value["config"]["ingress"][0].update({"path": "/admin"})),
+            (
+                "per-rule originRequest",
+                lambda value: value["config"]["ingress"][0].update(
+                    {"originRequest": {"noTLSVerify": True}}
+                ),
+            ),
+            (
+                "global originRequest",
+                lambda value: value["config"].update(
+                    {"originRequest": {"connectTimeout": "30s"}}
+                ),
+            ),
+            ("unknown config", lambda value: value["config"].update({"retries": 3})),
+            ("unknown response", lambda value: value.update({"status": "ok"})),
+        ):
+            candidate = json.loads(body)
+            mutate(candidate)
+            mutations.append((label, candidate))
+        for label, candidate in mutations:
+            with self.subTest(label=label), mock.patch.object(
+                CREDENTIAL.urllib.request,
+                "urlopen",
+                return_value=FakeResponse(json.dumps(candidate).encode("ascii")),
+            ):
+                with self.assertRaises(CREDENTIAL.CredentialError):
+                    CREDENTIAL.verify_remote_config(self.metadata, attempts=1)
 
     def test_disabled_staging_release_removes_only_owned_runtime_files(self) -> None:
         (self.release / "runtime-bundle" / CREDENTIAL.METADATA_NAME).unlink()

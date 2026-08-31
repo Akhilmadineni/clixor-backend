@@ -114,7 +114,7 @@ grep -q '\[ "${legacy_dependency_scope}" = "true" \]' "${script_root}/deploy.sh"
   fail "deploy does not route legacy containers through forced reconciliation"
 grep -q -- '--force-recreate "${dependency_service}"' "${script_root}/deploy.sh" || \
   fail "deploy does not replace legacy data containers"
-grep -Fq 'trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true' \
+grep -Fq 'trusted_env CLIXOR_APPROVED_GIT_DIR="${mirror_root}"' \
   "${script_root}/actions-deploy.sh" || \
   fail "production Actions do not require Vault hydration"
 grep -Fq 'CLIXOR_INITIAL_VAULT_CUTOVER=false' \
@@ -156,7 +156,7 @@ grep -Fq 'prepare-runtime-secrets-launcher.py' \
 grep -Fq 'if [ "${defer_host_tool_activation}" = "false" ]; then' \
   "${script_root}/bootstrap.sh" || \
   fail "normal deferred bootstrap can overwrite boot-critical host artifacts"
-grep -q 'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token' \
+grep -q 'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/current/token' \
   "${script_root}/cloudflared.service" || fail "cloudflared does not use the release-bound tmpfs credential"
 grep -q 'cloudflare-canary-credential.py' \
   "${script_root}/install-cloudflared-service.sh" && \

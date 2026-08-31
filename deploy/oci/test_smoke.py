@@ -357,7 +357,7 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertNotIn("credentials-file:", local_config)
         self.assertNotIn("/etc/cloudflared/token", installer)
         self.assertIn(
-            "LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token",
+            "LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/current/token",
             unit,
         )
         self.assertIn("--metrics 127.0.0.1:20241", unit)
@@ -818,7 +818,7 @@ reject_active_promotion_journal
         self.assertIn("archive", wrapper)
         self.assertIn("approved_source", wrapper)
         self.assertIn('/usr/bin/env -i PATH="${PATH}" HOME="${HOME}"', wrapper)
-        self.assertIn("trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true", wrapper)
+        self.assertIn('trusted_env CLIXOR_APPROVED_GIT_DIR="${mirror_root}"', wrapper)
         self.assertNotIn("GITHUB_WORKSPACE", wrapper)
         self.assertNotIn("canonical_source_root", wrapper)
         self.assertIn("CLUSTER_ENV=production", wrapper)

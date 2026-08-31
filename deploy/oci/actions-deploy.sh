@@ -40,7 +40,7 @@ trusted_env() {
   fail "expected source revision, source CI run, deploy run, and deploy attempt"
 
 for command_path in \
-  /usr/bin/chmod /usr/bin/env /usr/bin/git /usr/bin/install /usr/bin/mktemp \
+  /usr/bin/chmod /usr/bin/env /usr/bin/find /usr/bin/git /usr/bin/install /usr/bin/mktemp \
   /usr/bin/python3 /usr/bin/readlink /usr/bin/rm /usr/bin/stat /usr/bin/tar \
   /usr/bin/tr /usr/bin/wc
 do
@@ -172,7 +172,18 @@ trusted_env /usr/bin/tar --extract --file="${source_archive}" --directory="${app
 [ -f "${approved_source}/deploy/oci/deploy.sh" ] || \
   fail "approved archive has no OCI deployment entrypoint"
 
-trusted_env CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true \
+# Freeze every Git-archived pathname before any approved program executes as
+# root. deploy.sh independently compares every blob and executable bit with the
+# root-owned Git object, so a dirty checkout or runner-side race cannot
+# masquerade as source_sha.
+/usr/bin/find "${approved_source}" -type d -exec /usr/bin/chmod 0500 {} +
+/usr/bin/find "${approved_source}" -type f -perm /111 \
+  -exec /usr/bin/chmod 0500 {} +
+/usr/bin/find "${approved_source}" -type f ! -perm /111 \
+  -exec /usr/bin/chmod 0400 {} +
+
+trusted_env CLIXOR_APPROVED_GIT_DIR="${mirror_root}" \
+  CLIXOR_REQUIRE_PUBLIC_SMOKE=true CLIXOR_REQUIRE_VAULT_HYDRATION=true \
   CLIXOR_INGRESS_STAGE=canary \
   CLIXOR_PUBLIC_API_READINESS_URL=https://clixor-oci-canary.atlanteanz.com/health/ready \
   CLIXOR_PUBLIC_ASSOCIATION_URL=https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association \

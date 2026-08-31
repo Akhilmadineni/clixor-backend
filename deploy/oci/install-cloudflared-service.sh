@@ -2,7 +2,7 @@
 set -eu
 umask 077
 
-token_file=/run/clixor/cloudflare-connector/token
+token_file=/run/clixor/cloudflare-connector/current/token
 unit_source=${1:-}
 reviewed_cloudflared_version=2026.7.3
 release_root=/srv/clixor/releases
@@ -50,9 +50,9 @@ token_owner="$(stat -c '%u:%g' "${token_file}")"
 token_mode="$(stat -c '%a' "${token_file}")"
 [ "${token_owner}" = "0:0" ] || fail "${token_file} must be owned by root:root"
 [ "${token_mode}" = "600" ] || fail "${token_file} must have mode 0600"
-[ -s /run/clixor/cloudflare-connector/selection.json ] && \
-  [ -f /run/clixor/cloudflare-connector/selection.json ] && \
-  [ ! -L /run/clixor/cloudflare-connector/selection.json ] || \
+[ -s /run/clixor/cloudflare-connector/current/selection.json ] && \
+  [ -f /run/clixor/cloudflare-connector/current/selection.json ] && \
+  [ ! -L /run/clixor/cloudflare-connector/current/selection.json ] || \
   fail "release-bound connector selection is missing"
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
   [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || \
@@ -60,7 +60,21 @@ token_mode="$(stat -c '%a' "${token_file}")"
 
 install -m 0644 -o 0 -g 0 "${unit_source}" /etc/systemd/system/cloudflared.service
 systemctl daemon-reload
-systemctl enable --now cloudflared.service
-systemctl is-active --quiet cloudflared.service || fail "cloudflared did not become active"
+if ! systemctl enable --now cloudflared.service || \
+  ! systemctl is-active --quiet cloudflared.service || \
+  ! /usr/bin/python3 "${connector_controller}" verify \
+    --release "${current_release}" >/dev/null || \
+  { [ ! -f "${current_release}/runtime-bundle/cloudflare-canary-connector.json" ] || \
+    /usr/bin/python3 "${connector_controller}" verify-remote \
+      --release "${current_release}" >/dev/null; }
+then
+  # A started process is not a successful installation until its local
+  # credential and, for a canary, complete effective remote configuration are
+  # synchronously bound to the selected release.
+  rm -f -- /run/clixor/runtime-ready
+  systemctl stop cloudflared.service >/dev/null 2>&1 || true
+  systemctl disable cloudflared.service >/dev/null 2>&1 || true
+  fail "cloudflared did not start with the selected release authority"
+fi
 
 printf '[clixor-cloudflared] connector service is active\n'

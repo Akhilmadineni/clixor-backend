@@ -52,6 +52,7 @@ reviewed_cloudflared_version=2026.7.3
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
+approved_git_directory=${CLIXOR_APPROVED_GIT_DIR:-}
 
 journal_phase() {
   /usr/bin/python3 "${stable_runtime_controller}" journal-phase --phase "$1"
@@ -419,7 +420,7 @@ stage_host_tooling() {
     sha256sum --check SHA256SUMS >/dev/null
   ) || fail "staged host backup tooling failed checksum verification"
   grep -Fxq \
-    'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/token' \
+    'LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/current/token' \
     "${host_tool_stage}/systemd/cloudflared.service" || \
     fail "staged cloudflared unit does not use the approved credential path"
   grep -Fq -- '--metrics 127.0.0.1:20241' \
@@ -698,10 +699,58 @@ activate_cloudflared() {
   else
     log "cloudflared already uses the reviewed unit and credential"
   fi
+
+  # Service activation is not a success boundary.  A process can be active
+  # while it is still consuming a stale remotely-managed configuration.  Keep
+  # this check inside the activation primitive so every start/restart path is
+  # synchronously bound to the selected release before the transaction may
+  # continue.
+  /usr/bin/python3 \
+    "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify \
+    --release "${release_dir}"
+  if [ "${canary_connector_enabled}" = "true" ]; then
+    /usr/bin/python3 \
+      "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify-remote \
+      --release "${release_dir}"
+  fi
+}
+
+deactivate_cloudflared() {
+  # This mutation is rollback-owned before the first stop.  In particular, a
+  # canary -> connector-disabled staging transition must not commit while the
+  # old connector or its tmpfs credential remains usable.
+  cloudflare_state_activated=true
+  log "stopping and disabling cloudflared for the connector-disabled release"
+  cloudflare_load_state="$(systemctl show cloudflared.service \
+    --property=LoadState --value 2>/dev/null || true)"
+  case "${cloudflare_load_state}" in
+    loaded|masked)
+      systemctl stop cloudflared.service
+      systemctl disable cloudflared.service >/dev/null
+      ;;
+    not-found|'')
+      ;;
+    *) fail "cloudflared has an unsafe load state during deactivation" ;;
+  esac
+  ! systemctl is-active --quiet cloudflared.service || \
+    fail "cloudflared remained active after synchronous stop"
+  ! systemctl is-enabled --quiet cloudflared.service || \
+    fail "cloudflared remained enabled after synchronous disable"
+
+  /usr/bin/python3 \
+    "${host_tool_stage}/bin/cloudflare-canary-credential.py" prepare \
+    --release "${release_dir}" \
+    --project-root "${project_root}"
+  /usr/bin/python3 \
+    "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify \
+    --release "${release_dir}"
 }
 
 restore_previous_connector_credential() {
   previous_connector_helper=
+  /usr/bin/python3 \
+    "${host_tool_stage}/bin/cloudflare-canary-credential.py" clean-runtime || \
+    return 1
   case "${previous_release:-}" in
     "${release_root}"/oci-*)
       previous_connector_helper="${previous_release}/runtime-bundle/host-tools/bin/cloudflare-canary-credential.py"
@@ -718,19 +767,21 @@ restore_previous_connector_credential() {
   # Historical reviewed units load directly from the complete Vault/staging
   # cohort. They neither need nor own this new release-bound tmpfs selection.
   if [ -f "${previous_cloudflare_root}/cloudflared.service" ] && \
-    grep -Fq '/run/clixor/cloudflare-connector/token' \
+    grep -Fq '/run/clixor/cloudflare-connector/' \
       "${previous_cloudflare_root}/cloudflared.service"; then
     return 1
   fi
   rm -f -- \
     /run/clixor/cloudflare-connector/token \
-    /run/clixor/cloudflare-connector/selection.json || return 1
+    /run/clixor/cloudflare-connector/selection.json \
+    /run/clixor/cloudflare-connector/current || return 1
   rmdir /run/clixor/cloudflare-connector 2>/dev/null || \
     [ ! -e /run/clixor/cloudflare-connector ]
 }
 
 restore_cloudflared() {
   restore_status=0
+  previous_connector_credential_restored=false
   saved_binary="$(sed -n '1p' \
     "${previous_cloudflare_root}/binary-state" 2>/dev/null || true)"
   saved_fragment="$(sed -n '1p' \
@@ -755,9 +806,10 @@ restore_cloudflared() {
   log "restoring the exact prior cloudflared executable, unit, and service state"
   rm -f -- "${cloudflare_unit_path}.pending.${release_tag}" || restore_status=1
   rm -f -- "/usr/bin/cloudflared.pending.${release_tag}" || restore_status=1
-  if [ "${saved_active}" = "inactive" ]; then
-    systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
-  fi
+  # Never rewrite the executable, unit, or credential beneath a running
+  # connector.  More importantly, a failed prior-credential restore must have
+  # no path to the enable/restart block below.
+  systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
   if [ "${saved_enabled}" != "enabled" ]; then
     systemctl disable cloudflared.service >/dev/null 2>&1 || restore_status=1
   fi
@@ -840,7 +892,20 @@ restore_cloudflared() {
   esac
   systemctl daemon-reload || restore_status=1
 
-  restore_previous_connector_credential || restore_status=1
+  if restore_previous_connector_credential; then
+    previous_connector_credential_restored=true
+  else
+    restore_status=1
+  fi
+
+  if [ "${previous_connector_credential_restored}" != "true" ]; then
+    rm -f -- /run/clixor/runtime-ready || restore_status=1
+    systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
+    systemctl disable cloudflared.service >/dev/null 2>&1 || restore_status=1
+    systemctl is-active --quiet cloudflared.service && restore_status=1
+    systemctl is-enabled --quiet cloudflared.service && restore_status=1
+    return 1
+  fi
 
   if [ "${saved_enabled}" = "enabled" ]; then
     systemctl enable cloudflared.service >/dev/null 2>&1 || restore_status=1
@@ -848,8 +913,24 @@ restore_cloudflared() {
   if [ "${saved_active}" = "active" ]; then
     systemctl restart --no-block cloudflared.service || restore_status=1
     wait_cloudflared_active || restore_status=1
+    if [ "${restore_status}" -eq 0 ] && \
+      [ -n "${previous_connector_helper:-}" ]; then
+      /usr/bin/python3 "${previous_connector_helper}" verify \
+        --release "${previous_release}" || restore_status=1
+      if [ -f "${previous_release}/runtime-bundle/cloudflare-canary-connector.json" ] && \
+        [ ! -L "${previous_release}/runtime-bundle/cloudflare-canary-connector.json" ]; then
+        /usr/bin/python3 "${previous_connector_helper}" verify-remote \
+          --release "${previous_release}" || restore_status=1
+      fi
+    fi
   else
     systemctl is-active --quiet cloudflared.service && restore_status=1
+  fi
+
+  if [ "${restore_status}" -ne 0 ]; then
+    rm -f -- /run/clixor/runtime-ready || true
+    systemctl stop cloudflared.service >/dev/null 2>&1 || true
+    systemctl disable cloudflared.service >/dev/null 2>&1 || true
   fi
 
   restored_fragment="$(systemctl show --property=FragmentPath --value \
@@ -1132,6 +1213,16 @@ prune_release_history() {
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 [ -n "${source_root}" ] || fail "source workspace argument is required"
+[ -n "${approved_git_directory}" ] || \
+  fail "CLIXOR_APPROVED_GIT_DIR is required for commit-authenticated source"
+case "${approved_git_directory}" in
+  /*) ;;
+  *) fail "CLIXOR_APPROVED_GIT_DIR must be absolute" ;;
+esac
+[ -d "${source_root}" ] && [ ! -L "${source_root}" ] && \
+  [ "$(readlink -f -- "${source_root}")" = "${source_root}" ] && \
+  [ "$(stat -c '%u:%g:%a' "${source_root}")" = "0:0:500" ] || \
+  fail "source workspace must be canonical, root-owned, and mode 0500"
 [ -f "${source_root}/go.mod" ] || fail "source workspace does not contain go.mod"
 [ -f "${source_root}/deploy/oci/compose.yaml" ] || fail "source workspace does not contain the OCI Compose model"
 [ -f "${source_root}/deploy/oci/release_retention.py" ] || \
@@ -1151,12 +1242,18 @@ esac
 [ "${#run_id}" -le 160 ] || fail "run ID is too long"
 
 for command_name in \
-  awk cmp curl df docker du find findmnt flock grep install mktemp mv python3 \
+  awk cmp curl df docker du find findmnt flock git grep install mktemp mv python3 \
   readlink rm rsync sed sha256sum sort stat systemctl systemd-analyze touch tr wc
 do
   command -v "${command_name}" >/dev/null 2>&1 || fail "missing command: ${command_name}"
 done
 docker buildx version >/dev/null 2>&1 || fail "missing Docker Buildx plugin"
+/usr/bin/python3 "${source_root}/deploy/oci/runtime_bundle.py" \
+  verify-approved-source \
+  --source "${source_root}" \
+  --source-sha "${source_sha}" \
+  --git-dir "${approved_git_directory}" || \
+  fail "source workspace is not the exact locked Git commit"
 
 for stable_runtime_file in \
   "${stable_runtime_controller}" "${stable_runtime_bundle}"
@@ -1320,7 +1417,8 @@ mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
   --release "${release_dir}" \
   --source "${source_root}" \
   --source-sha "${source_sha}" \
-  --compose-source "${source_root}/deploy/oci/compose.yaml"
+  --compose-source "${source_root}/deploy/oci/compose.yaml" \
+  --git-dir "${approved_git_directory}"
 if [ "${canary_connector_enabled}" = "true" ]; then
   /usr/bin/python3 "${source_root}/deploy/oci/cloudflare-canary-credential.py" \
     stage-metadata \
@@ -1714,10 +1812,18 @@ rollback() {
       # The stable reconciler is the final rollback authority. It restores the
       # selected release's exact source, Compose model, PKI, host tools and
       # service state; it never restores or deletes database files.
-      if [ "${rollback_failed}" -eq 0 ] && \
-        ! /usr/bin/python3 "${stable_runtime_controller}" reconcile; then
-        log "ERROR: selected-release reconciliation failed during rollback" >&2
-        rollback_failed=1
+      if [ "${rollback_failed}" -eq 0 ]; then
+        if [ "${cloudflare_rollback_failed}" -ne 0 ]; then
+          # The stable reconciler owns connector activation too.  Do not call
+          # it after exact credential restoration failed, because doing so
+          # would create a second path that could enable/start the unsafe
+          # prior connector during the same rollback.
+          log "ERROR: skipping selected-release reconciliation after connector credential restoration failed" >&2
+          rollback_failed=1
+        elif ! /usr/bin/python3 "${stable_runtime_controller}" reconcile; then
+          log "ERROR: selected-release reconciliation failed during rollback" >&2
+          rollback_failed=1
+        fi
       fi
 
       rollback_attempt=1
@@ -1738,11 +1844,11 @@ rollback() {
       fi
       if [ "${rollback_failed}" -eq 0 ] && \
         [ "${rollback_ready}" = "true" ] && \
+        [ "${cloudflare_rollback_failed}" -eq 0 ] && \
         [ "${previous_cloudflare_active}" = "true" ] && \
         [ "${public_smoke_required}" = "true" ]; then
         if verify_public_ingress "${previous_revision}"; then
           log "verified public ingress after connector rollback"
-          cloudflare_rollback_failed=0
         else
           log "ERROR: public ingress did not recover after connector rollback" >&2
           cloudflare_rollback_failed=1
@@ -1761,6 +1867,14 @@ rollback() {
         fi
       fi
     fi
+  fi
+  if [ "${status}" -ne 0 ] && [ "${cloudflare_rollback_failed}" -ne 0 ]; then
+    # Preserve the rollback's fail-closed verdict even if later application
+    # restoration made progress.  Nothing after a credential-restore failure
+    # may reopen ingress or republish readiness.
+    rm -f -- /run/clixor/runtime-ready || true
+    systemctl stop cloudflared.service >/dev/null 2>&1 || true
+    systemctl disable cloudflared.service >/dev/null 2>&1 || true
   fi
   if [ "${status}" -ne 0 ]; then
     if [ "${secret_rollback_failed}" -eq 0 ] && \
@@ -2223,13 +2337,8 @@ if [ "${candidate_cloudflared}" = "true" ]; then
   [ "${canary_connector_enabled}" = "false" ] || cloudflare_secret_changed=true
   validate_cloudflared_runtime
   activate_cloudflared
-  if [ "${canary_connector_enabled}" = "true" ]; then
-    /usr/bin/python3 \
-      "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify-remote \
-      --release "${release_dir}"
-  fi
 else
-  log "cloudflared unit activation is deferred for this connector-disabled staging deployment"
+  deactivate_cloudflared
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"

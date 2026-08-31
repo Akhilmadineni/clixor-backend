@@ -101,7 +101,7 @@ LEGACY_CONTROLLER_FILES = {
     "deploy/oci/clixor-restore-drill.service": "775fd13e967a423ceb70c3196a0903ec31129646a85442beb8310cb957a05f9a",
     "deploy/oci/clixor-restore-drill.timer": "d4758ed25878071de8ebe8ad091cb1171191c57c22fb4777f5bfda9c195baf72",
     "deploy/oci/cloudflared.service": "64aecc58b03879642f0052db54e3a2924ae95e826f72e9dfc28ec7e88d3207bf",
-    "deploy/oci/cloudflare-promote.py": "c9047963c84135f82c55a344b4c43234f14e10845d7b5eb63edf5a9a49144a58",
+    "deploy/oci/cloudflare-promote.py": "d772d3acba5d771d10a74867d676469fb33811790c3965fcb75777983a41655c",
     "deploy/oci/clixor-cloudflare-promote.service": "db3382e7f4bba5b9feaf89d77479ee04d8a0c1a6a9ec76b869d072dd986b2dcc",
     "deploy/oci/clixor-cloudflare-origin-gate.conf": "386da33cef8cb76bf4359c2137015d7bc01c8c20ccca612ddbc2d084ea0c7b04",
     "deploy/oci/compose.yaml": "98a7bc7c3cc8daec6cf4198d7db5a410530bf633b2e777e03a73a9b984eba3c3",
@@ -2113,7 +2113,7 @@ def _connector_credential_controller(release: Path) -> Path | None:
         # branch is also exercised by controller unit tests that replace that
         # validator with an already-reviewed manifest fixture.
         return None
-    if "/run/clixor/cloudflare-connector/token" in unit_text:
+    if "/run/clixor/cloudflare-connector/" in unit_text:
         raise ReconcileError("selected release connector credential controller is missing")
     return None
 
@@ -2163,6 +2163,58 @@ def _connector_credential_matches(
     return True
 
 
+def _verify_started_connector(
+    release: Path, project_root: Path, runner: CommandRunner
+) -> None:
+    """Synchronously bind a started connector to the selected release.
+
+    systemd ``--no-block`` only queues the start.  It is not evidence that the
+    connector consumed the exact reviewed remote configuration, so wait for
+    the unit and then run both the local credential and canary configuration
+    authorities before returning from a repair.
+    """
+
+    helper = _connector_credential_controller(release)
+    if helper is None:
+        return
+    for attempt in range(45):
+        active = runner.run(
+            ["/usr/bin/systemctl", "is-active", "--quiet", "cloudflared.service"],
+            check=False,
+        )
+        if active.returncode == 0:
+            break
+        if attempt + 1 == 45:
+            raise ReconcileError("selected cloudflared service did not become active")
+        time.sleep(2)
+    verified = runner.run(
+        ["/usr/bin/python3", str(helper), "verify", "--release", str(release)],
+        check=False,
+    )
+    if verified.returncode != 0:
+        raise ReconcileError("selected cloudflared credential did not verify")
+    canary_metadata = (
+        release
+        / runtime_bundle.BUNDLE_DIRECTORY
+        / runtime_bundle.CANARY_CONNECTOR_METADATA
+    )
+    if canary_metadata.is_file() and not canary_metadata.is_symlink():
+        remote = runner.run(
+            [
+                "/usr/bin/python3",
+                str(helper),
+                "verify-remote",
+                "--release",
+                str(release),
+            ],
+            check=False,
+        )
+        if remote.returncode != 0:
+            raise ReconcileError(
+                "selected cloudflared remote configuration did not verify"
+            )
+
+
 def reconcile_current(
     project_root: Path,
     runner: CommandRunner,
@@ -2205,9 +2257,18 @@ def reconcile_current(
     # --no-block avoids a boot-order cycle: cloudflared Requires this oneshot,
     # while still guaranteeing its condition marker exists before it can run.
     if cloudflared["active"]:
-        runner.run(
-            ["/usr/bin/systemctl", "start", "--no-block", "cloudflared.service"]
-        )
+        try:
+            runner.run(
+                ["/usr/bin/systemctl", "start", "--no-block", "cloudflared.service"]
+            )
+            _verify_started_connector(release, project_root, runner)
+        except (OSError, ReconcileError):
+            # Do not let the watchdog report a repaired runtime after it has
+            # reopened a connector with unknown authority.  The shared stop
+            # primitive removes the readiness marker, disables ingress, and
+            # stops the application before the error escapes.
+            _stop_ingress_and_containers(runner)
+            raise
     else:
         runner.run(["/usr/bin/systemctl", "stop", "cloudflared.service"])
     for timer, enabled in timers.items():
