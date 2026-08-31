@@ -169,6 +169,191 @@ func TestPostgresMembershipPathsRejectBackendUUIDReservedAsAnotherLocalID(t *tes
 	})
 }
 
+func TestPostgresMigrationRunnerRejectsRecordedLegacy16WithoutBridge(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	schema := "legacy_16_gate_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := base.pool.Exec(ctx, "CREATE SCHEMA "+identifier); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = base.pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+identifier+" CASCADE")
+	}()
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	isolated, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer isolated.Close()
+	if _, err := isolated.Exec(ctx, `
+		CREATE TABLE schema_migrations(
+			version bigint PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now()
+		);
+		INSERT INTO schema_migrations(version) VALUES(16)`); err != nil {
+		t.Fatal(err)
+	}
+	err = Migrate(ctx, isolated)
+	if err == nil || !strings.Contains(err.Error(), "migration 16 is recorded without") {
+		t.Fatalf("version-only legacy-16 ledger was not rejected: %v", err)
+	}
+	var advanced bool
+	if err := isolated.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version>16)`,
+	).Scan(&advanced); err != nil {
+		t.Fatal(err)
+	}
+	if advanced {
+		t.Fatal("migration runner durably advanced beyond an unsafe recorded migration 16")
+	}
+}
+
+func TestPostgresRollingBridgeCoversExactOldInsertDeleteAndNewDeletionPaths(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyMember, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountDeleteMember, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: uuid.NewString() + "@example.com", PasswordHash: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: owner.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyLocal, accountDeleteLocal := uuid.New(), uuid.New()
+	metadata := json.RawMessage(`{"members":[` +
+		`{"id":"` + legacyLocal.String() + `","backendUserId":"` + legacyMember.ID.String() + `"},` +
+		`{"id":"` + accountDeleteLocal.String() + `","backendUserId":"` + accountDeleteMember.ID.String() + `"}]}`)
+	if _, err := persistence.pool.Exec(ctx, `
+		UPDATE conversations SET metadata=$2 WHERE id=$1`, conversation.ID, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	runBehindMigrationFence := func(t *testing.T, sql string, args ...any) {
+		t.Helper()
+		migration, err := persistence.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migration.Exec(ctx, `
+			LOCK TABLE users IN EXCLUSIVE MODE;
+			LOCK TABLE conversations IN EXCLUSIVE MODE;
+			LOCK TABLE conversation_members, conversation_member_local_ids,
+				conversation_member_tombstones
+				IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			_ = migration.Rollback(ctx)
+			t.Fatal(err)
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, writeErr := persistence.pool.Exec(ctx, sql, args...)
+			result <- writeErr
+		}()
+		select {
+		case writeErr := <-result:
+			_ = migration.Rollback(ctx)
+			t.Fatalf("exact previous-binary write bypassed migration fence: %v", writeErr)
+		case <-time.After(150 * time.Millisecond):
+		}
+		if err := migration.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-result; err != nil {
+			t.Fatalf("exact previous-binary write failed after bridge commit: %v", err)
+		}
+	}
+
+	// These statements are copied from the b218/production writer: it knows
+	// neither immutable local mappings nor tombstones.
+	legacyInsert := `
+		INSERT INTO conversation_members(conversation_id,user_id,role,joined_at)
+		VALUES($1,$2,$3,now())
+		ON CONFLICT(conversation_id,user_id) DO UPDATE SET role=EXCLUDED.role`
+	legacyDelete := `DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`
+	runBehindMigrationFence(t, legacyInsert, conversation.ID, legacyMember.ID, "member")
+	var gotLocal uuid.UUID
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT local_id FROM conversation_member_local_ids
+		WHERE conversation_id=$1 AND user_id=$2`, conversation.ID, legacyMember.ID,
+	).Scan(&gotLocal); err != nil || gotLocal != legacyLocal {
+		t.Fatalf("old INSERT did not reserve legacy local ID: got=%s err=%v want=%s", gotLocal, err, legacyLocal)
+	}
+	runBehindMigrationFence(t, legacyDelete, conversation.ID, legacyMember.ID)
+	var gotTombstone uuid.UUID
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT local_id FROM conversation_member_tombstones
+		WHERE conversation_id=$1 AND user_id=$2`, conversation.ID, legacyMember.ID,
+	).Scan(&gotTombstone); err != nil || gotTombstone != legacyLocal {
+		t.Fatalf("old DELETE did not preserve tombstone: got=%s err=%v want=%s", gotTombstone, err, legacyLocal)
+	}
+
+	// Rejoin with the old writer and remove with the new path. Immutable history
+	// must remain identical rather than being re-derived.
+	runBehindMigrationFence(t, legacyInsert, conversation.ID, legacyMember.ID, "member")
+	// Keep the second old-writer member active while the new removal projects
+	// metadata, proving its trigger-created mapping survives that projection.
+	runBehindMigrationFence(t, legacyInsert, conversation.ID, accountDeleteMember.ID, "member")
+	if err := persistence.RemoveConversationMember(ctx, conversation.ID, owner.ID, legacyMember.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT local_id FROM conversation_member_tombstones
+		WHERE conversation_id=$1 AND user_id=$2`, conversation.ID, legacyMember.ID,
+	).Scan(&gotTombstone); err != nil || gotTombstone != legacyLocal {
+		t.Fatalf("new removal changed old identity history: got=%s err=%v", gotTombstone, err)
+	}
+
+	// The account-deletion path uses the same bridge and must leave the correct
+	// immutable tombstone while preserving the owner's shared conversation.
+	if err := persistence.DeleteAccount(ctx, accountDeleteMember.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT local_id FROM conversation_member_tombstones
+		WHERE conversation_id=$1 AND user_id=$2`, conversation.ID, accountDeleteMember.ID,
+	).Scan(&gotTombstone); err != nil || gotTombstone != accountDeleteLocal {
+		t.Fatalf("account deletion lost old-writer identity: got=%s err=%v want=%s", gotTombstone, err, accountDeleteLocal)
+	}
+}
+
 func TestPostgresIdentityNamespaceMigrationLockFencesOldWritersAndPreservesHistory(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

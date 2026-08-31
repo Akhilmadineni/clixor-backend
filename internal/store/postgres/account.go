@@ -11,6 +11,7 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -20,6 +21,8 @@ type accountConversation struct {
 	metadata    json.RawMessage
 	role        string
 	successorID pgtype.UUID
+	ownerID     pgtype.UUID
+	active      bool
 }
 
 // DeleteAccount irreversibly removes every authentication and discovery
@@ -27,6 +30,20 @@ type accountConversation struct {
 // non-loginable tombstones where shared messages and financial entities still
 // require their foreign keys.
 func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := s.deleteAccount(ctx, userID)
+		if !isAccountDeletionRetryable(err) || attempt == maxAttempts-1 {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) deleteAccount(ctx context.Context, userID uuid.UUID) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return err
@@ -38,12 +55,23 @@ func (s *Store) DeleteAccount(ctx context.Context, userID uuid.UUID) error {
 	return tx.Commit(ctx)
 }
 
+func isAccountDeletionRetryable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
 func (s *Store) deleteAccountTx(
 	ctx context.Context,
 	tx pgx.Tx,
 	userID uuid.UUID,
 	beforeMutation store.AccountDeletionFence,
 ) error {
+	// This must be the first lock in every account-erasure transaction. Active
+	// delivery callbacks hold the shared form, so erasure cannot take user or
+	// transport row locks while a callback uses another pooled Store method.
+	if err := lockAccountDeliveryBarrierExclusive(ctx, tx); err != nil {
+		return err
+	}
 	if err := lockMediaQuota(ctx, tx, "user", userID); err != nil {
 		return err
 	}
@@ -70,19 +98,34 @@ func (s *Store) deleteAccountTx(
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT c.id,c.created_by,c.metadata,m.role,successor.user_id
-		FROM conversation_members m
-		JOIN conversations c ON c.id=m.conversation_id
+		WITH account_conversations AS MATERIALIZED (
+			SELECT conversation_id FROM conversation_members WHERE user_id=$1
+			UNION
+			SELECT conversation_id FROM conversation_member_tombstones WHERE user_id=$1
+		)
+		SELECT c.id,c.created_by,c.metadata,COALESCE(m.role,''),successor.user_id,
+		       owner.user_id,(m.user_id IS NOT NULL)
+		FROM account_conversations account
+		JOIN conversations c ON c.id=account.conversation_id
+		LEFT JOIN conversation_members m
+		  ON m.conversation_id=c.id AND m.user_id=$1
 		LEFT JOIN LATERAL (
 			SELECT other.user_id
 			FROM conversation_members other
-			WHERE other.conversation_id=m.conversation_id AND other.user_id<>m.user_id
+			WHERE other.conversation_id=c.id AND other.user_id<>$1
 			ORDER BY other.joined_at,other.user_id
 			LIMIT 1
 		) successor ON true
-		WHERE m.user_id=$1
+		LEFT JOIN LATERAL (
+			SELECT current_owner.user_id
+			FROM conversation_members current_owner
+			WHERE current_owner.conversation_id=c.id
+			  AND current_owner.user_id<>$1 AND current_owner.role='owner'
+			ORDER BY current_owner.joined_at,current_owner.user_id
+			LIMIT 1
+		) owner ON true
 		ORDER BY c.id
-		FOR UPDATE OF c,m`, userID)
+		FOR UPDATE OF c`, userID)
 	if err != nil {
 		return err
 	}
@@ -91,7 +134,8 @@ func (s *Store) deleteAccountTx(
 		var conversation accountConversation
 		if err := rows.Scan(
 			&conversation.id, &conversation.createdBy, &conversation.metadata,
-			&conversation.role, &conversation.successorID,
+			&conversation.role, &conversation.successorID, &conversation.ownerID,
+			&conversation.active,
 		); err != nil {
 			rows.Close()
 			return err
@@ -131,6 +175,34 @@ func (s *Store) deleteAccountTx(
 		return err
 	}
 	profileMediaRows.Close()
+	// Ready conversation ciphertext is shared history and remains available to
+	// the other members. Pending uploads are private capabilities owned by the
+	// departing account, so revoke them and schedule their staging objects for
+	// deletion before the user tombstone is committed.
+	pendingMediaRows, err := tx.Query(ctx, `
+		DELETE FROM media_objects
+		WHERE owner_id=$1 AND status='pending'
+		RETURNING object_key,upload_valid_until`, userID)
+	if err != nil {
+		return err
+	}
+	for pendingMediaRows.Next() {
+		var key string
+		var uploadValidUntil time.Time
+		if err := pendingMediaRows.Scan(&key, &uploadValidUntil); err != nil {
+			pendingMediaRows.Close()
+			return err
+		}
+		objectKeys = append(objectKeys, key)
+		if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+			deleteNotBefore = candidate
+		}
+	}
+	if err := pendingMediaRows.Err(); err != nil {
+		pendingMediaRows.Close()
+		return err
+	}
+	pendingMediaRows.Close()
 	for _, conversation := range conversations {
 		if !conversation.successorID.Valid {
 			mediaRows, err := tx.Query(ctx, `
@@ -173,42 +245,52 @@ func (s *Store) deleteAccountTx(
 		createdBy := conversation.createdBy
 		if createdBy == userID {
 			createdBy = conversation.successorID.Bytes
+			if conversation.ownerID.Valid {
+				createdBy = conversation.ownerID.Bytes
+			}
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE conversations SET created_by=$2,metadata=$3,updated_at=now() WHERE id=$1`,
 			conversation.id, createdBy, metadata); err != nil {
 			return err
 		}
-		if conversation.role == "owner" {
+		promoteSuccessor := (conversation.active && conversation.role == "owner") ||
+			(!conversation.ownerID.Valid && conversation.createdBy == userID)
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM receipts WHERE conversation_id=$1 AND user_id=$2`,
+			conversation.id, userID); err != nil {
+			return err
+		}
+		if conversation.active {
+			tombstone := store.ConversationMemberTombstone{UserID: userID}
+			if err := tx.QueryRow(ctx, `
+				SELECT local_id FROM conversation_member_local_ids
+				WHERE conversation_id=$1 AND user_id=$2`, conversation.id, userID,
+			).Scan(&tombstone.LocalID); err != nil {
+				return mapError(err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
+				VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
+				conversation.id, userID, tombstone.LocalID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
+				conversation.id, userID); err != nil {
+				return err
+			}
+		}
+		// The unique owner index is immediate. Remove the departing owner before
+		// promoting the successor so the invariant is never violated by two
+		// simultaneously visible owner rows inside this transaction.
+		if promoteSuccessor {
 			if _, err := tx.Exec(ctx, `
 				UPDATE conversation_members SET role='owner'
 				WHERE conversation_id=$1 AND user_id=$2`,
 				conversation.id, conversation.successorID.Bytes); err != nil {
 				return err
 			}
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM receipts WHERE conversation_id=$1 AND user_id=$2`,
-			conversation.id, userID); err != nil {
-			return err
-		}
-		tombstone := store.ConversationMemberTombstone{UserID: userID}
-		if err := tx.QueryRow(ctx, `
-			SELECT local_id FROM conversation_member_local_ids
-			WHERE conversation_id=$1 AND user_id=$2`, conversation.id, userID,
-		).Scan(&tombstone.LocalID); err != nil {
-			return mapError(err)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
-			VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
-			conversation.id, userID, tombstone.LocalID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
-			conversation.id, userID); err != nil {
-			return err
 		}
 		metadata, err = projectConversationMetadata(ctx, tx, conversation.id, metadata)
 		if err != nil {
@@ -249,7 +331,14 @@ func (s *Store) deleteAccountTx(
 		}
 		entityRows.Close()
 		for _, entity := range entities {
-			payload, changed, err := store.AnonymizeAccountJSON(entity.Payload, identity)
+			referencesIdentity, err := store.AccountJSONReferencesIdentity(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if entity.CreatedBy != userID && !referencesIdentity {
+				continue
+			}
+			payload, changed, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity)
 			if err != nil {
 				return err
 			}
@@ -268,6 +357,85 @@ func (s *Store) deleteAccountTx(
 			}
 			updatedEntities = append(updatedEntities, entity)
 		}
+
+		// Idempotent chore commands retain their complete response for 90 days.
+		// Those response snapshots are externally replayable and therefore need
+		// the same erasure treatment as the live chore/feed entities.
+		rotationRows, err := tx.Query(ctx, `
+			SELECT operation_id,chore_result,feed_result
+			FROM chore_rotation_operations
+			WHERE conversation_id=ANY($1)
+			FOR UPDATE`, sharedConversationIDs)
+		if err != nil {
+			return err
+		}
+		type rotationSnapshot struct {
+			operationID uuid.UUID
+			choreResult json.RawMessage
+			feedResult  json.RawMessage
+		}
+		var snapshots []rotationSnapshot
+		for rotationRows.Next() {
+			var snapshot rotationSnapshot
+			if err := rotationRows.Scan(
+				&snapshot.operationID, &snapshot.choreResult, &snapshot.feedResult,
+			); err != nil {
+				rotationRows.Close()
+				return err
+			}
+			snapshots = append(snapshots, snapshot)
+		}
+		if err := rotationRows.Err(); err != nil {
+			rotationRows.Close()
+			return err
+		}
+		rotationRows.Close()
+		for _, snapshot := range snapshots {
+			choreResult, choreChanged, err := store.AnonymizeAccountJSON(
+				snapshot.choreResult, identity,
+			)
+			if err != nil {
+				return err
+			}
+			feedResult, feedChanged, err := store.AnonymizeAccountJSON(
+				snapshot.feedResult, identity,
+			)
+			if err != nil {
+				return err
+			}
+			if !choreChanged && !feedChanged {
+				continue
+			}
+			if !choreChanged {
+				choreResult = snapshot.choreResult
+			}
+			if !feedChanged {
+				feedResult = snapshot.feedResult
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE chore_rotation_operations
+				SET chore_result=$2,feed_result=$3
+				WHERE operation_id=$1`,
+				snapshot.operationID, choreResult, feedResult); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Establish transport-row ownership before clearing device credentials.
+	// Realtime/APNs delivery leases hold row-share locks while their external
+	// callback runs. These exact deletes/updates therefore serialize erasure:
+	// publication first is allowed to finish, while erasure first makes the
+	// later callback re-fetch observe no deliverable row.
+	if err := sanitizeAccountOutbox(
+		ctx, tx, identity, deletedConversationIDs, sharedConversationIDs, updatedEntities,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM push_deliveries
+		WHERE device_id IN (SELECT id FROM devices WHERE user_id=$1)`, userID); err != nil {
+		return err
 	}
 
 	statements := []struct {
@@ -291,20 +459,6 @@ func (s *Store) deleteAccountTx(
 		if _, err := tx.Exec(ctx, statement.query, statement.args...); err != nil {
 			return err
 		}
-	}
-
-	// The outbox is transport state, not an audit log. Remove stale copies of
-	// identity data before enqueueing the sanitized entity updates below.
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM outbox_events
-		WHERE aggregate_id=ANY($5)
-		   OR position($1 in payload::text)>0
-		   OR ($2<>'' AND position(lower($2) in lower(payload::text))>0)
-		   OR ($3<>'' AND position($3 in payload::text)>0)
-		   OR ($4<>'' AND position(lower($4) in lower(payload::text))>0)`,
-		userID.String(), identity.Email, identity.Phone, identity.Username,
-		deletedConversationIDs); err != nil {
-		return err
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -332,6 +486,117 @@ func (s *Store) deleteAccountTx(
 			); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func sanitizeAccountOutbox(
+	ctx context.Context,
+	tx pgx.Tx,
+	identity store.AccountIdentity,
+	deletedConversationIDs, sharedConversationIDs []uuid.UUID,
+	updatedEntities []domain.Entity,
+) error {
+	if len(deletedConversationIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM outbox_events WHERE aggregate_id=ANY($1)`, deletedConversationIDs); err != nil {
+			return err
+		}
+	}
+	if len(sharedConversationIDs) == 0 {
+		return nil
+	}
+	topics := []string{
+		"conversation.created", "conversation.updated", "conversation.member_added", "receipt.updated",
+		"entity.updated", "entity.deleted",
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id,topic,aggregate_id,payload
+		FROM outbox_events
+		WHERE aggregate_id=ANY($1) AND topic=ANY($2)
+		ORDER BY id
+		FOR UPDATE`, sharedConversationIDs, topics)
+	if err != nil {
+		return err
+	}
+	type affectedEvent struct {
+		id          int64
+		topic       string
+		aggregateID uuid.UUID
+		payload     json.RawMessage
+	}
+	var events []affectedEvent
+	for rows.Next() {
+		var event affectedEvent
+		if err := rows.Scan(&event.id, &event.topic, &event.aggregateID, &event.payload); err != nil {
+			rows.Close()
+			return err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	affectedEntities := make(map[string]struct{}, len(updatedEntities))
+	for _, entity := range updatedEntities {
+		affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()] = struct{}{}
+	}
+	for _, event := range events {
+		if !store.AccountErasureOutboxTopic(event.topic) {
+			return domain.ErrInvalid
+		}
+		typed, schemaErr := store.DecodeAccountOutboxPayload(
+			event.topic, event.aggregateID, event.payload,
+		)
+		if schemaErr != nil {
+			// Known-topic transport state is disposable. A row outside the exact
+			// service-owned schema cannot safely be replayed after erasure.
+			if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if (event.topic == "receipt.updated" || event.topic == "conversation.member_added") &&
+			(typed.UserID == identity.UserID || typed.ActorID == identity.UserID) {
+			if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if event.topic == "receipt.updated" || event.topic == "conversation.member_added" {
+			continue
+		}
+		authorized, err := store.AccountJSONReferencesIdentity(event.payload, identity)
+		if err != nil {
+			if _, deleteErr := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); deleteErr != nil {
+				return deleteErr
+			}
+			continue
+		}
+		if event.topic == "entity.updated" || event.topic == "entity.deleted" {
+			_, entityAffected := affectedEntities[typed.ConversationID.String()+"\x00"+typed.EntityKind+"\x00"+typed.EntityID.String()]
+			authorized = authorized || entityAffected
+		}
+		if !authorized {
+			continue
+		}
+		_, changed, err := store.AnonymizeAccountJSONWithAuthority(event.payload, identity)
+		if err != nil {
+			// JSONB itself is valid, but a structurally unsupported value must not
+			// retain erased identity in disposable transport state.
+			if _, deleteErr := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); deleteErr != nil {
+				return deleteErr
+			}
+			continue
+		}
+		if !changed {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
+			return err
 		}
 	}
 	return nil

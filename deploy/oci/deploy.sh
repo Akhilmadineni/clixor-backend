@@ -340,6 +340,48 @@ preflight_disk_capacity() {
   log "capacity preflight passed for snapshots, restore workspace, and image build"
 }
 
+postgres_scalar_query() {
+  query=$1
+  if docker inspect clixor-oci-postgres \
+    --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | \
+    grep -q '^POSTGRES_PASSWORD='; then
+    docker exec clixor-oci-postgres sh -ec \
+      'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "$1"' \
+      sh "${query}"
+  else
+    docker exec clixor-oci-postgres sh -ec \
+      'PGPASSFILE=/run/secrets/postgres.pgpass exec psql --host=postgres.clixor.internal --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 --command "$1"' \
+      sh "${query}"
+  fi
+}
+
+preflight_membership_bridge_rollout() {
+  migration_table="$(postgres_scalar_query \
+    "SELECT COALESCE(to_regclass('public.schema_migrations')::text,'')" | tr -d '[:space:]')" || \
+    fail "could not inspect the migration ledger before rollout"
+  [ -n "${migration_table}" ] || {
+    log "membership bridge preflight passed for an unmigrated database"
+    return
+  }
+  ledger_state="$(postgres_scalar_query \
+    "SELECT CASE WHEN EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=20) THEN 'sealed' WHEN EXISTS(SELECT 1 FROM public.schema_migrations WHERE version=16) THEN 'bridge-required' ELSE 'fresh' END" | tr -d '[:space:]')" || \
+    fail "could not inspect membership bridge migration versions"
+  case "${ledger_state}" in
+    fresh)
+      log "membership bridge migration-ledger preflight passed (${ledger_state})"
+      return
+      ;;
+    sealed|bridge-required) ;;
+    *) fail "membership bridge migration-ledger preflight returned an invalid state" ;;
+  esac
+  bridge_state="$(postgres_scalar_query \
+    "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_trigger trigger JOIN pg_proc function ON function.oid=trigger.tgfoid WHERE trigger.tgrelid=to_regclass('public.conversation_members') AND trigger.tgname='conversation_members_bridge_identity_insert' AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D' AND function.proname='reserve_conversation_member_bridge_identity') AND EXISTS (SELECT 1 FROM pg_trigger trigger JOIN pg_proc function ON function.oid=trigger.tgfoid WHERE trigger.tgrelid=to_regclass('public.conversation_members') AND trigger.tgname='conversation_members_bridge_tombstone_delete' AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D' AND function.proname='preserve_conversation_member_bridge_tombstone') AND NOT EXISTS (SELECT 1 FROM public.conversation_members member WHERE NOT EXISTS (SELECT 1 FROM public.conversation_member_local_ids mapping WHERE mapping.conversation_id=member.conversation_id AND mapping.user_id=member.user_id)) THEN 'bridged' ELSE 'unsafe' END" | tr -d '[:space:]')" || \
+    fail "migration 16 is recorded but its compatibility bridge cannot be validated"
+  [ "${bridge_state}" = "bridged" ] || \
+    fail "migration 16 is recorded without its compatibility bridge; restore the pre-rollout snapshot or perform an explicitly reviewed repair"
+  log "membership bridge migration-ledger preflight passed (${ledger_state}, bridge validated)"
+}
+
 stage_release_boot_tooling() {
   install -d -m 0700 -o 0 -g 0 "${boot_secret_stage}"
   : > "${boot_secret_stage}/SHA256SUMS.partial"
@@ -1314,6 +1356,11 @@ if [ -L "${release_root}/current" ]; then
   /usr/bin/python3 "${stable_runtime_controller}" validate-release \
     --release "$(readlink -- "${release_root}/current")" || \
     fail "current release lacks a complete crash-consistent runtime baseline; run explicit bootstrap"
+fi
+if docker inspect clixor-oci-postgres >/dev/null 2>&1; then
+  [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
+    fail "existing PostgreSQL is not running; repair it before deployment"
+  preflight_membership_bridge_rollout
 fi
 preflight_disk_capacity
 read_effective_secret_mode

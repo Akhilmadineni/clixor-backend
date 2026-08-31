@@ -107,6 +107,91 @@ func TestPostgresMailClaimsNeverReturnExpiredOrConsumedResetCodes(t *testing.T) 
 	}
 }
 
+func TestPostgresMailDeliveryLeaseSerializesAccountErasure(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(persistence.Close)
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "mail-erasure-" + uuid.NewString() + "@example.com", PasswordHash: "existing-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = persistence.pool.Exec(context.Background(), `DELETE FROM users WHERE id=$1`, user.ID)
+	})
+	challenge := domain.PasswordResetChallenge{
+		ID: uuid.New(), UserID: user.ID, CodeHash: bytes.Repeat([]byte{0x61}, 32),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), CreatedAt: time.Now().UTC(),
+	}
+	deliveryID := uuid.New()
+	if err := persistence.CreatePasswordResetChallengeWithMail(
+		ctx, challenge, func(string) (domain.MailDelivery, error) {
+			return postgresTestMailDelivery(
+				deliveryID, challenge.ID, domain.MailDeliveryPasswordReset,
+			), nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := persistence.LockMailDeliveryBatch(ctx, 1)
+	if err != nil || len(batch) != 1 || batch[0].ID != deliveryID {
+		t.Fatalf("claim mail: batch=%+v err=%v", batch, err)
+	}
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	deliveryDone := make(chan error, 1)
+	go func() {
+		deliveryDone <- persistence.WithMailDeliveryLease(
+			ctx, deliveryID, batch[0].LeaseToken,
+			func(callbackContext context.Context, leased domain.MailDelivery) error {
+				if leased.ID != deliveryID {
+					return errors.New("wrong mail lease row")
+				}
+				close(callbackStarted)
+				select {
+				case <-callbackContext.Done():
+					return callbackContext.Err()
+				case <-releaseCallback:
+					return nil
+				}
+			},
+		)
+	}()
+	<-callbackStarted
+	deletionDone := make(chan error, 1)
+	go func() { deletionDone <- persistence.DeleteAccount(ctx, user.ID) }()
+	select {
+	case err := <-deletionDone:
+		t.Fatalf("account erasure crossed active mail callback: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCallback)
+	if err := <-deliveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-deletionDone; err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = persistence.WithMailDeliveryLease(
+		ctx, deliveryID, batch[0].LeaseToken,
+		func(context.Context, domain.MailDelivery) error { called = true; return nil },
+	)
+	if !errors.Is(err, domain.ErrNotFound) || called {
+		t.Fatalf("mail after erasure: called=%t err=%v", called, err)
+	}
+}
+
 func TestPostgresPasswordChangedMailCascadesWithResetChallenge(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

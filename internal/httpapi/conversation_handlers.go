@@ -121,12 +121,6 @@ func (s *Server) updateConversation(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	payload, _ := json.Marshal(conversation)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: uuid.NewString(), Type: "conversation.updated", ConversationID: &conversationID,
-		Payload: payload, OccurredAt: time.Now().UTC(),
-	})
 	writeJSON(w, http.StatusOK, conversation)
 }
 
@@ -425,7 +419,7 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	message, recipients, err := s.store.CreateMessage(r.Context(), store.CreateMessageParams{
+	message, _, err := s.store.CreateMessage(r.Context(), store.CreateMessageParams{
 		ID: request.ID, ClientMessageID: request.ClientMessageID, ConversationID: conversationID,
 		SenderID: id.UserID, SenderDeviceID: id.DeviceID, ContentType: request.ContentType,
 		Ciphertext: request.Ciphertext, Envelope: request.Envelope, ReplyToID: request.ReplyToID,
@@ -437,11 +431,6 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 	if production05bTransition {
 		observability.LegacyTransitionMessages.Inc()
 	}
-	eventPayload, _ := json.Marshal(message)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: message.ID.String(), Type: "message.created", ConversationID: &conversationID,
-		Seq: message.Seq, Payload: eventPayload, OccurredAt: time.Now().UTC(),
-	})
 	writeJSON(w, http.StatusCreated, message)
 }
 
@@ -625,12 +614,6 @@ func (s *Server) putReceipt(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	payload, _ := json.Marshal(receipt)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: uuid.NewString(), Type: "receipt.updated", ConversationID: &conversationID,
-		Seq: max(request.DeliveredSeq, request.ReadSeq), Payload: payload, OccurredAt: time.Now().UTC(),
-	})
 	writeJSON(w, http.StatusOK, receipt)
 }
 

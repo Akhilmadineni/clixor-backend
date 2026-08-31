@@ -68,6 +68,13 @@ func (s *Store) ExecuteAccountDeletionIntent(
 		return err
 	}
 	defer tx.Rollback(ctx)
+	// ExecuteAccountDeletionIntent is itself an account-erasure transaction.
+	// Acquire the global erasure side of the delivery barrier before resolving
+	// or locking any account-owned row. deleteAccountTx reacquires the same
+	// transaction lock defensively for callers that enter through DeleteAccount.
+	if err := lockAccountDeliveryBarrierExclusive(ctx, tx); err != nil {
+		return err
+	}
 	// Resolve the immutable binding without a lock, then acquire the shared
 	// account lock order (media-quota -> user -> intent). The binding is checked
 	// again under the intent lock before the capability is trusted.

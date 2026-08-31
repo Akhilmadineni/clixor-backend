@@ -26,8 +26,10 @@ type workerStore struct {
 	pruneCount   int64
 	pruneArgs    []time.Time
 	lockErr      error
+	leaseErr     error
 	finishErr    error
 	retentionErr error
+	claimed      map[uuid.UUID]domain.MailDelivery
 }
 
 type workerFinish struct {
@@ -45,7 +47,35 @@ func (s *workerStore) LockMailDeliveryBatch(context.Context, int) ([]domain.Mail
 	}
 	batch := append([]domain.MailDelivery(nil), s.batch...)
 	s.batch = nil
+	if s.claimed == nil {
+		s.claimed = make(map[uuid.UUID]domain.MailDelivery)
+	}
+	for _, delivery := range batch {
+		s.claimed[delivery.ID] = delivery
+	}
 	return batch, nil
+}
+
+func (s *workerStore) WithMailDeliveryLease(
+	ctx context.Context,
+	id uuid.UUID,
+	lease uuid.UUID,
+	deliver func(context.Context, domain.MailDelivery) error,
+) error {
+	s.mu.Lock()
+	if s.leaseErr != nil {
+		err := s.leaseErr
+		s.mu.Unlock()
+		return err
+	}
+	delivery, found := s.claimed[id]
+	if !found || delivery.LeaseToken != lease {
+		s.mu.Unlock()
+		return domain.ErrNotFound
+	}
+	delivery.Ciphertext = append([]byte(nil), delivery.Ciphertext...)
+	s.mu.Unlock()
+	return deliver(ctx, delivery)
 }
 
 func (s *workerStore) FinishMailDelivery(
@@ -189,6 +219,34 @@ func TestWorkerDeadLettersInvalidCiphertextWithoutSending(t *testing.T) {
 	if len(persistence.finishes) != 1 || persistence.finishes[0].result != domain.MailDeliveryDeadLetter ||
 		persistence.finishes[0].class != "payload_invalid" {
 		t.Fatalf("invalid-payload finish=%+v", persistence.finishes)
+	}
+}
+
+func TestWorkerDropsInvalidatedLeaseBeforeDecryptingOrSending(t *testing.T) {
+	cipher := testQueueCipher(t)
+	delivery, err := cipher.SealPasswordReset(
+		uuid.New(), "erased@example.com", "12345678", 10*time.Minute,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery.Ciphertext[len(delivery.Ciphertext)-1] ^= 0xff
+	delivery.LeaseToken = uuid.New()
+	delivery.Attempts = 1
+	persistence := &workerStore{
+		batch: []domain.MailDelivery{delivery}, leaseErr: domain.ErrNotFound,
+	}
+	sender := &workerSender{}
+	worker := NewWorker(
+		persistence, sender, cipher,
+		slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), DefaultDeliveryPolicy(),
+	)
+	worker.flush(context.Background())
+	if sender.resets != 0 || sender.changes != 0 {
+		t.Fatal("invalidated mail lease reached the SMTP sender")
+	}
+	if len(persistence.finishes) != 0 {
+		t.Fatalf("invalidated mail lease was acknowledged: %+v", persistence.finishes)
 	}
 }
 

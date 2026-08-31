@@ -29,6 +29,10 @@ func (s *Store) createPasswordResetChallenge(
 	challenge domain.PasswordResetChallenge,
 	buildMail store.MailDeliveryBuilder,
 ) error {
+	// Replacing a challenge cancels its pending mail. Serialize that cancellation
+	// with an active external mail callback before taking the data lock.
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -74,6 +78,8 @@ func (s *Store) createPasswordResetChallenge(
 }
 
 func (s *Store) CancelPasswordResetChallenge(_ context.Context, id uuid.UUID) error {
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -129,6 +135,13 @@ func (s *Store) consumePasswordResetChallenge(
 	buildMail store.MailDeliveryBuilder,
 	fence store.PasswordResetFence,
 ) (store.PasswordResetCompletion, error) {
+	// Mail delivery holds the shared side through provider acceptance. Take the
+	// exclusive side before canceling the one-time reset-code delivery, then the
+	// device barrier before clearing APNs tokens. This matches callback ordering.
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -39,6 +40,148 @@ func TestEmbeddedMigrationVersionsAreUnique(t *testing.T) {
 	for want := int64(1); want <= maximum; want++ {
 		if _, exists := versions[want]; !exists {
 			t.Fatalf("missing migration version %d", want)
+		}
+	}
+}
+
+func TestOutboxTopicDomainMigrationFailsClosedOnDrift(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000021_outbox_topic_domain.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	expected := []string{
+		"conversation.created", "conversation.updated", "conversation.member_added", "message.created",
+		"receipt.updated", "entity.updated", "entity.deleted", "media.delete",
+	}
+	preflight := strings.Index(sql, "IF EXISTS")
+	constraint := strings.Index(sql, "ADD CONSTRAINT outbox_events_topic_domain_check")
+	if preflight < 0 || constraint < 0 || preflight > constraint ||
+		!strings.Contains(sql, "topic NOT IN") || !strings.Contains(sql, "CHECK (topic IN") {
+		t.Fatal("migration must reject existing drift before sealing the closed topic domain")
+	}
+	quotedTopic := regexp.MustCompile(`'([a-z_]+(?:\.[a-z_]+)+)'`)
+	preflightTopics := quotedTopic.FindAllStringSubmatch(sql[preflight:constraint], -1)
+	constraintTopics := quotedTopic.FindAllStringSubmatch(sql[constraint:], -1)
+	for name, matches := range map[string][][]string{
+		"preflight": preflightTopics, "constraint": constraintTopics,
+	} {
+		if len(matches) != len(expected) {
+			t.Fatalf("%s topic domain=%v, want exactly %v", name, matches, expected)
+		}
+		for index, topic := range expected {
+			if matches[index][1] != topic {
+				t.Fatalf("%s topic[%d]=%q, want %q", name, index, matches[index][1], topic)
+			}
+		}
+	}
+}
+
+func TestOutboxTopicDomainMigrationScrubsLegacyPushAndEnforcesOwnership(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000021_outbox_topic_domain.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"SET LOCAL statement_timeout = '30s'",
+		"UPDATE push_deliveries",
+		"title='Clixor'",
+		"body='You have new activity. Open the app to view it.'",
+		"kind='activity'",
+		"outbox_account_erasure_idx",
+		"conversation_member_tombstones_user_idx",
+		"SELECT count(*) FROM conversation_members owner",
+		") <> 1",
+		"owner.user_id=conversation.created_by",
+		"CREATE UNIQUE INDEX conversation_members_single_owner_idx",
+		"WHERE role='owner'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("migration 21 is missing %q", required)
+		}
+	}
+	if scrub, seal := strings.Index(sql, "UPDATE push_deliveries"),
+		strings.Index(sql, "ADD CONSTRAINT outbox_events_topic_domain_check"); scrub < 0 || seal < 0 || scrub > seal {
+		t.Fatal("legacy push rows must be genericized before the outbox topic domain is sealed")
+	}
+	if ownerGate, ownerIndex := strings.Index(sql, "conversation must have exactly one owner"),
+		strings.Index(sql, "CREATE UNIQUE INDEX conversation_members_single_owner_idx"); ownerGate < 0 || ownerIndex < 0 || ownerGate > ownerIndex {
+		t.Fatal("migration must reject ownership drift before creating the unique owner index")
+	}
+}
+
+func TestVersionOnlyMigrationRunnerCannotSkipAmendedMembershipBridge(t *testing.T) {
+	migration17, err := migrationFiles.ReadFile("migrations/000017_account_deletion_intents.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migration20, err := migrationFiles.ReadFile("migrations/000020_legacy_membership_write_bridge.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string][]byte{"migration 17": migration17, "migration 20": migration20} {
+		sql := string(raw)
+		for _, required := range []string{
+			"conversation_members_bridge_identity_insert",
+			"reserve_conversation_member_bridge_identity",
+			"conversation_members_bridge_tombstone_delete",
+			"preserve_conversation_member_bridge_tombstone",
+			"ERRCODE='55000'",
+		} {
+			if !strings.Contains(sql, required) {
+				t.Fatalf("%s lacks version-only bridge gate %q", name, required)
+			}
+		}
+	}
+	gate := strings.Index(string(migration17), "DO $$")
+	firstMutation := strings.Index(string(migration17), "CREATE TABLE account_deletion_intents")
+	if gate < 0 || firstMutation < 0 || gate > firstMutation {
+		t.Fatal("migration 17 must reject a skipped migration-16 bridge before its first durable mutation")
+	}
+	gate = strings.Index(string(migration20), "DO $$")
+	firstRepair := strings.Index(string(migration20), "CREATE OR REPLACE FUNCTION")
+	if gate < 0 || firstRepair < 0 || gate > firstRepair {
+		t.Fatal("migration 20 must validate the migration-16 bridge before attempting a repair")
+	}
+}
+
+func TestConversationMemberLegacyBridgeIsRollingCompatible(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000016_conversation_member_local_ids.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"SET LOCAL statement_timeout = '30s'",
+		"LOCK TABLE users IN EXCLUSIVE MODE",
+		"LOCK TABLE conversations IN EXCLUSIVE MODE",
+		"IN SHARE ROW EXCLUSIVE MODE",
+		"resolve_conversation_member_bridge_local_id",
+		"conversation_members_bridge_identity_insert",
+		"AFTER INSERT ON conversation_members",
+		"conversation_members_bridge_tombstone_delete",
+		"BEFORE DELETE ON conversation_members",
+		"conversation member tombstone disagrees with immutable local identity",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("legacy membership bridge is missing %q", required)
+		}
+	}
+	backfill := strings.Index(sql, "INSERT INTO conversation_member_local_ids")
+	insertTrigger := strings.Index(sql, "CREATE TRIGGER conversation_members_bridge_identity_insert")
+	deleteTrigger := strings.Index(sql, "CREATE TRIGGER conversation_members_bridge_tombstone_delete")
+	if backfill < 0 || insertTrigger < backfill || deleteTrigger < backfill {
+		t.Fatal("legacy bridge triggers must be installed after the fenced initial backfill")
+	}
+	for _, forbidden := range []string{
+		"UPDATE conversation_member_local_ids SET",
+		"ON CONFLICT (conversation_id,user_id) DO UPDATE",
+	} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("legacy membership bridge can rewrite immutable history via %q", forbidden)
 		}
 	}
 }

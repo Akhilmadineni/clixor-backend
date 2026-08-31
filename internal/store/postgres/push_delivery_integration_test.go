@@ -187,7 +187,7 @@ func TestPostgresRetentionPrunesTerminalPushBeforePublishedSource(t *testing.T) 
 	var outboxID int64
 	if err := persistence.pool.QueryRow(ctx, `
 		INSERT INTO outbox_events(topic,aggregate_id,payload,created_at,published_at)
-		VALUES('retention.fixture',$1,'{}'::jsonb,$2,$2)
+		VALUES('message.created',$1,'{}'::jsonb,$2,$2)
 		RETURNING id`, uuid.New(), old).Scan(&outboxID); err != nil {
 		t.Fatal(err)
 	}

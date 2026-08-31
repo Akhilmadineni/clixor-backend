@@ -1,71 +1,39 @@
--- Immutable server-owned mapping from account IDs to the UUIDs embedded by
--- legacy iOS clients in expense/task/chore payloads. Two uniqueness constraints
--- prevent metadata from remapping an account or assigning one local UUID to
--- multiple identities in a conversation.
+-- Migration 16 installs this bridge for a fresh rollout. Migration 17 already
+-- fails a version-only runner if an older copy of 16 was recorded. Revalidate
+-- the prerequisite here before sealing the final function definitions so a
+-- custom runner cannot apply this file alone as an unsafe historical repair.
 SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '30s';
-
-CREATE TABLE conversation_member_local_ids (
-    conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    user_id uuid NOT NULL REFERENCES users(id),
-    local_id uuid NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (conversation_id, user_id),
-    UNIQUE (conversation_id, local_id)
-);
-
--- Fence the exact production-05b writer shapes before the one-time backfill.
--- A writer already holding user/conversation authority commits first and is
--- included below; a later writer resumes only after the compatibility triggers
--- are committed. Migration 20 repeats this bridge for databases that applied an
--- earlier copy of migration 16 before the bridge existed.
 LOCK TABLE users IN EXCLUSIVE MODE;
 LOCK TABLE conversations IN EXCLUSIVE MODE;
 LOCK TABLE conversation_members, conversation_member_local_ids,
     conversation_member_tombstones
     IN SHARE ROW EXCLUSIVE MODE;
 
--- Preserve a legacy UUID only when there is exactly one valid proposal for the
--- user, exactly one owner of that UUID, and it is not another member's backend
--- UUID. Every other row uses its backend UUID as a collision-free baseline.
-WITH raw_candidates AS (
-    SELECT c.id AS conversation_id,
-           m.user_id,
-           (entry.value->>'id')::uuid AS local_id
-    FROM conversations c
-    JOIN conversation_members m ON m.conversation_id=c.id
-    CROSS JOIN LATERAL jsonb_array_elements(
-        CASE WHEN jsonb_typeof(c.metadata->'members')='array'
-             THEN c.metadata->'members' ELSE '[]'::jsonb END
-    ) AS entry(value)
-    WHERE lower(entry.value->>'backendUserId')=m.user_id::text
-      AND (entry.value->>'id') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-), ranked_candidates AS (
-    SELECT raw_candidates.*,
-           count(*) OVER (PARTITION BY conversation_id,user_id) AS user_candidates,
-           count(*) OVER (PARTITION BY conversation_id,local_id) AS local_owners
-    FROM raw_candidates
-), safe_candidates AS (
-    SELECT r.conversation_id,r.user_id,r.local_id
-    FROM ranked_candidates r
-    WHERE r.user_candidates=1 AND r.local_owners=1
-      AND NOT EXISTS (
-          SELECT 1 FROM conversation_members collision
-          WHERE collision.conversation_id=r.conversation_id
-            AND collision.user_id=r.local_id
-            AND collision.user_id<>r.user_id
-      )
-)
-INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)
-SELECT m.conversation_id,m.user_id,COALESCE(s.local_id,m.user_id)
-FROM conversation_members m
-LEFT JOIN safe_candidates s
-  ON s.conversation_id=m.conversation_id AND s.user_id=m.user_id;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger trigger
+        JOIN pg_proc function ON function.oid=trigger.tgfoid
+        WHERE trigger.tgrelid='conversation_members'::regclass
+          AND trigger.tgname='conversation_members_bridge_identity_insert'
+          AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+          AND function.proname='reserve_conversation_member_bridge_identity'
+    ) OR NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger trigger
+        JOIN pg_proc function ON function.oid=trigger.tgfoid
+        WHERE trigger.tgrelid='conversation_members'::regclass
+          AND trigger.tgname='conversation_members_bridge_tombstone_delete'
+          AND NOT trigger.tgisinternal AND trigger.tgenabled<>'D'
+          AND function.proname='preserve_conversation_member_bridge_tombstone'
+    ) THEN
+        RAISE EXCEPTION 'migration 16 compatibility bridge is absent; refusing unsafe historical repair'
+            USING ERRCODE='55000';
+    END IF;
+END $$;
 
--- Resolve the same conservative legacy metadata proposal used by the backfill.
--- Ambiguous proposals fall back to the backend UUID; a fallback that is itself
--- reserved by another metadata identity fails closed instead of reinterpreting
--- financial history.
 CREATE OR REPLACE FUNCTION resolve_conversation_member_bridge_local_id(
     target_conversation_id uuid,
     target_user_id uuid
@@ -205,8 +173,6 @@ AS $$
 DECLARE
     reserved_local_id uuid;
 BEGIN
-    -- A parent conversation delete needs no historical identity because every
-    -- associated entity is being deleted and the tombstone would be cascaded.
     IF NOT EXISTS (
         SELECT 1 FROM conversations WHERE id=OLD.conversation_id
     ) THEN
@@ -238,10 +204,44 @@ BEGIN
 END;
 $$;
 
+-- Repair active members committed by an old replica after the original
+-- one-time backfill. The authority locks make this deterministic and ensure no
+-- writer can slip between repair and trigger installation.
+INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id)
+SELECT member.conversation_id,member.user_id,
+       resolve_conversation_member_bridge_local_id(member.conversation_id,member.user_id)
+FROM conversation_members member
+WHERE NOT EXISTS (
+    SELECT 1 FROM conversation_member_local_ids mapping
+    WHERE mapping.conversation_id=member.conversation_id
+      AND mapping.user_id=member.user_id
+)
+ORDER BY member.conversation_id,member.user_id;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM conversation_members member
+        WHERE NOT EXISTS (
+            SELECT 1 FROM conversation_member_local_ids mapping
+            WHERE mapping.conversation_id=member.conversation_id
+              AND mapping.user_id=member.user_id
+        )
+    ) THEN
+        RAISE EXCEPTION 'active conversation member has no immutable local identity'
+            USING ERRCODE='23514',
+                  CONSTRAINT='conversation_member_backend_local_disjoint';
+    END IF;
+END $$;
+
+DROP TRIGGER IF EXISTS conversation_members_bridge_identity_insert
+ON conversation_members;
 CREATE TRIGGER conversation_members_bridge_identity_insert
 AFTER INSERT ON conversation_members
 FOR EACH ROW EXECUTE FUNCTION reserve_conversation_member_bridge_identity();
 
+DROP TRIGGER IF EXISTS conversation_members_bridge_tombstone_delete
+ON conversation_members;
 CREATE TRIGGER conversation_members_bridge_tombstone_delete
 BEFORE DELETE ON conversation_members
 FOR EACH ROW EXECUTE FUNCTION preserve_conversation_member_bridge_tombstone();

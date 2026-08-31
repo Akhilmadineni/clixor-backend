@@ -123,25 +123,22 @@ func TestReassignedPushTokenNeverReceivesPreviousAccountMetadata(t *testing.T) {
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim delivery: items=%d error=%v", len(claimed), err)
 	}
+	if claimed[0].Title != genericPushTitle || claimed[0].Body != genericPushBody ||
+		claimed[0].Kind != genericPushKind {
+		t.Fatalf("durable push retained account metadata: %+v", claimed[0])
+	}
 
 	// Simulate account switching after the worker copied the token but before
-	// APNs accepted the request. The old delivery may still race through, so its
-	// visible copy and routing data must be account-agnostic.
+	// APNs accepted the request. The delivery lease re-fetches the device and
+	// must suppress the now-ownerless old delivery entirely.
 	reassigned := fixture.outsiderDevices[0]
 	reassigned.PushToken = claimed[0].PushToken
 	if _, err := fixture.store.UpsertDevice(fixture.ctx, reassigned); err != nil {
 		t.Fatal(err)
 	}
 	fixture.relay.deliverPush(fixture.ctx, claimed[0])
-	if got := fixture.push.callCount(); got != 1 {
-		t.Fatalf("push calls = %d, want 1", got)
-	}
-	call := fixture.push.calls[0]
-	if call.title != genericPushTitle || call.body != genericPushBody {
-		t.Fatalf("reassigned token received account metadata: title=%q body=%q", call.title, call.body)
-	}
-	if len(call.data) != 1 || call.data["type"] != genericPushKind {
-		t.Fatalf("reassigned token received routing metadata: %#v", call.data)
+	if got := fixture.push.callCount(); got != 0 {
+		t.Fatalf("reassigned token received %d stale pushes", got)
 	}
 }
 
@@ -251,6 +248,33 @@ func TestSubscriptionCreateSendsOneNotificationAndSuppressesInitialCharge(t *tes
 	notification = notificationForEntity(t, fixture, initialCharge, recipients)
 	if notification.kind != "expense" {
 		t.Fatalf("later subscription expense kind = %q", notification.kind)
+	}
+}
+
+func TestConversationUpdatedIsTranslatedDurablyWithoutPush(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Subscriptions"}`))
+	conversation := fixture.conversation
+	conversation.Title = "Updated title"
+	conversation.UpdatedAt = conversation.UpdatedAt.Add(time.Second)
+	raw, err := json.Marshal(conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := domain.OutboxEvent{
+		ID: 991, Topic: "conversation.updated", AggregateID: conversation.ID,
+		Payload: raw, CreatedAt: conversation.UpdatedAt,
+	}
+	event, recipients, ok := fixture.relay.translate(fixture.ctx, item)
+	if !ok {
+		t.Fatal("conversation.updated was treated as an unknown outbox topic")
+	}
+	if event.Type != item.Topic || event.ConversationID == nil ||
+		*event.ConversationID != conversation.ID || !bytes.Equal(event.Payload, raw) ||
+		len(recipients) == 0 {
+		t.Fatalf("unexpected translated update: event=%+v recipients=%v", event, recipients)
+	}
+	if _, notify, err := fixture.relay.notificationFor(fixture.ctx, item, recipients); err != nil || notify {
+		t.Fatalf("conversation update generated a push: notify=%t err=%v", notify, err)
 	}
 }
 
@@ -647,6 +671,128 @@ func TestTransientPushRetriesDurablyWithoutRepublishingRealtime(t *testing.T) {
 		if call.notificationID != message.ID.String() {
 			t.Fatalf("retry notification ID = %q, want %s", call.notificationID, message.ID)
 		}
+	}
+}
+
+func TestSuccessfulRealtimeDeliveryIsAcknowledgedAndCannotBeReclaimed(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bus := &countingBus{}
+	fixture.relay.bus = bus
+
+	fixture.relay.flush(fixture.ctx)
+	if got := bus.publishCount.Load(); got != 1 {
+		t.Fatalf("successful realtime publishes=%d, want 1", got)
+	}
+	reclaimed, err := fixture.store.LockRealtimeOutboxBatch(fixture.ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 0 {
+		t.Fatalf("successful realtime event was reclaimable: %+v", reclaimed)
+	}
+
+	fixture.relay.flush(fixture.ctx)
+	if got := bus.publishCount.Load(); got != 1 {
+		t.Fatalf("acknowledged realtime event was redelivered: publishes=%d", got)
+	}
+}
+
+func TestRealtimeTransportTimeoutReleasesAccountErasureBarrier(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	drainFixtureOutbox(t, fixture)
+	if _, _, err := fixture.store.CreateMessage(fixture.ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		ContentType: "text", Ciphertext: "encrypted",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bus := &blockingBus{started: make(chan struct{})}
+	fixture.relay.bus = bus
+	fixture.relay.realtimeTimeout = 30 * time.Millisecond
+	flushDone := make(chan struct{})
+	go func() {
+		fixture.relay.flush(fixture.ctx)
+		close(flushDone)
+	}()
+	select {
+	case <-bus.started:
+	case <-time.After(time.Second):
+		t.Fatal("realtime callback did not start")
+	}
+	deletionDone := make(chan error, 1)
+	go func() { deletionDone <- fixture.store.DeleteAccount(fixture.ctx, fixture.actor.ID) }()
+	select {
+	case err := <-deletionDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("realtime timeout did not release account-erasure barrier")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(time.Second):
+		t.Fatal("realtime worker did not return after transport timeout")
+	}
+}
+
+func TestPushTransportTimeoutReleasesAccountErasureAndDeviceBarriers(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	message := domain.Message{
+		ID: uuid.New(), ConversationID: fixture.conversation.ID,
+		SenderID: fixture.actor.ID, SenderDeviceID: fixture.actorDevices[0].ID,
+		Seq: 1, Ciphertext: "encrypted",
+	}
+	raw, _ := json.Marshal(message)
+	recipients, err := fixture.store.ConversationMemberIDs(fixture.ctx, fixture.conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.relay.enqueuePush(fixture.ctx, domain.OutboxEvent{
+		ID: 8001, Topic: "message.created", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := fixture.store.LockPushDeliveryBatch(fixture.ctx, 1)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim push: deliveries=%+v err=%v", claimed, err)
+	}
+	blocked := &blockingPush{started: make(chan struct{}), release: make(chan struct{})}
+	fixture.relay.push = blocked
+	fixture.relay.pushTimeout = 30 * time.Millisecond
+	deliveryDone := make(chan struct{})
+	go func() {
+		fixture.relay.deliverPush(fixture.ctx, claimed[0])
+		close(deliveryDone)
+	}()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("APNs callback did not start")
+	}
+	deletionDone := make(chan error, 1)
+	go func() { deletionDone <- fixture.store.DeleteAccount(fixture.ctx, fixture.recipient.ID) }()
+	select {
+	case err := <-deletionDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("APNs timeout did not release account-erasure barrier")
+	}
+	select {
+	case <-deliveryDone:
+	case <-time.After(time.Second):
+		t.Fatal("push worker did not return after transport timeout")
 	}
 }
 
@@ -1220,6 +1366,18 @@ func (*countingBus) FenceSessions(context.Context, uuid.UUID, *uuid.UUID) (event
 }
 
 func (*countingBus) Close() {}
+
+type blockingBus struct {
+	countingBus
+	startedOnce sync.Once
+	started     chan struct{}
+}
+
+func (b *blockingBus) Publish(ctx context.Context, _ []uuid.UUID, _ domain.RealtimeEvent) error {
+	b.startedOnce.Do(func() { close(b.started) })
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 type recordingMedia struct {
 	mu        sync.Mutex

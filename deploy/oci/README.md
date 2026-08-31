@@ -712,9 +712,41 @@ Ship those contract changes only in a later release after every old replica has
 drained. The post-migration old-release readiness check catches gross
 incompatibility but does not replace migration review.
 
-Migration 18 has a bounded write-fence budget: relation-lock acquisition fails
-after 5 seconds and every validation/backfill/DDL statement fails after 30
-seconds. Before deploying it, query the production primary for
+Migration 21 is an explicit forward-only application boundary. It admits the
+durable `conversation.updated` topic and the accompanying API can begin writing
+that topic as soon as it serves an update request. The immediately preceding
+binary does not understand that topic and repeatedly defers the unknown row
+without delivering it, so it must not be restored after the candidate has
+admitted user traffic. Before
+opening ingress, drain the old replicas and verify the candidate relay against a
+synthetic `conversation.updated` row. After ingress opens, recovery must keep a
+migration-21-aware API running; restoring the pre-migration database dump is a
+manual outage procedure, not an application rollback. A future rollout that
+needs ordinary binary rollback must first ship topic-read support as a separate
+expand release before any writer or constraint can emit the topic.
+
+Migration 21 also rewrites all historical push-delivery copy to the generic
+privacy-safe title/body/kind, validates exactly one owner matching
+`conversations.created_by`, and creates the partial unique owner index. Its
+5-second lock timeout and 30-second statement timeout are release gates: test
+the push rewrite and index builds on a production-sized restored backup, and
+repair any ownership preflight exception by reviewed data investigation rather
+than weakening or bypassing the check.
+
+Migration 16 was strengthened before its first production rollout so the exact
+previous API binary's membership `INSERT` and `DELETE` statements reserve an
+immutable local-ID mapping and tombstone. The deployment controller checks the
+migration ledger before creating a release: it accepts a database where 16 has
+not yet run, one sealed by migration 20, or an interrupted amended-16 rollout
+whose two enabled bridge triggers and active-member mappings validate exactly.
+It rejects a recorded older copy of 16 before release mutation. Do not use
+migration 20 as a speculative repair for that state: deleted membership history
+cannot be reconstructed safely. Restore the pre-rollout snapshot or perform a
+separately reviewed, evidence-backed repair.
+
+Migrations 16, 18, 20, and 21 have a bounded write-fence budget: relation-lock
+acquisition fails after 5 seconds and every validation/backfill/DDL statement
+fails after 30 seconds. Before deploying them, query the production primary for
 `count(*)` on `conversation_members`, `conversation_member_local_ids`, and
 `conversation_member_tombstones`, and review `pg_stat_activity` for non-idle
 transactions with an old `xact_start` that touch user/conversation membership.
@@ -728,7 +760,8 @@ If either timeout fires, the migration transaction, backfill, functions, and
 triggers roll back together and the prior API remains authoritative. Cancel or
 drain the identified long transaction, or schedule a maintenance window after
 the restored-backup load gate passes, then retry the normal deployment. Do not
-manually mark migration 18 applied and do not partially replay its SQL.
+manually mark migrations 16, 18, 20, or 21 applied and do not partially replay their
+SQL.
 
 The first digest-pinned and per-service-PKI rollout intentionally recreates
 PostgreSQL, Redis, NATS, and HAProxy once. Schedule that transition in a

@@ -30,6 +30,8 @@ type Relay struct {
 	now                func() time.Time
 	lastPrune          time.Time
 	mediaDeleteTimeout time.Duration
+	realtimeTimeout    time.Duration
+	pushTimeout        time.Duration
 }
 
 type PushRetryPolicy struct {
@@ -48,6 +50,11 @@ const (
 	genericPushKind          = "activity"
 	mediaDeleteConcurrency   = 4
 	mediaDeleteObjectTimeout = 10 * time.Second
+	// Transport callbacks run while a database/memory erasure barrier is held.
+	// Keep them comfortably inside the 30-second realtime and 2-minute push
+	// claim leases so provider stalls cannot block account deletion indefinitely.
+	realtimeTransportTimeout = 10 * time.Second
+	pushTransportTimeout     = 60 * time.Second
 	retentionInterval        = time.Hour
 	retentionCatchUpInterval = time.Minute
 	retentionRunBudget       = 5 * time.Second
@@ -63,6 +70,7 @@ func DefaultPushRetryPolicy() PushRetryPolicy {
 }
 
 var errMediaDeleteNotDue = errors.New("media deletion is not due")
+var errRealtimeTranslate = errors.New("realtime outbox translation failed")
 
 func New(store store.Store, bus events.Bus, pushService push.Service, mediaService media.Service, logger *slog.Logger) *Relay {
 	return NewWithPushRetryPolicy(store, bus, pushService, mediaService, logger, DefaultPushRetryPolicy())
@@ -81,6 +89,8 @@ func NewWithPushRetryPolicy(
 		store: persistence, bus: bus, push: pushService, media: mediaService,
 		logger: logger, policy: policy, now: now, lastPrune: now().UTC(),
 		mediaDeleteTimeout: mediaDeleteObjectTimeout,
+		realtimeTimeout:    realtimeTransportTimeout,
+		pushTimeout:        pushTransportTimeout,
 	}
 }
 
@@ -137,34 +147,59 @@ func (r *Relay) flush(ctx context.Context) {
 		r.logger.Error("outbox_lock_failed", "error", err)
 		return
 	}
-	published := make([]int64, 0, len(batch))
 	for _, item := range batch {
-		event, recipients, ok := r.translate(ctx, item)
+		_, pushRecipients, ok := r.translate(ctx, item)
 		if !ok {
 			observability.OutboxEvents.WithLabelValues("translate_failed").Inc()
 			r.releaseOutbox(ctx, item, time.Second)
 			continue
 		}
-		if err := r.enqueuePush(ctx, item, recipients); err != nil {
+		// Queueing is durable and idempotent, but it may lock recipient rows.
+		// Do it before the realtime row-share lease so account deletion cannot
+		// deadlock on user -> outbox while this worker holds outbox -> user.
+		if err := r.enqueuePush(ctx, item, pushRecipients); err != nil {
 			observability.PushDeliveries.WithLabelValues("queue_failed").Inc()
 			r.logger.Error("push_queue_failed", "error", err, "outbox_id", item.ID)
 			r.releaseOutbox(ctx, item, time.Second)
 			continue
 		}
-		if err := r.bus.Publish(ctx, recipients, event); err != nil {
-			observability.OutboxEvents.WithLabelValues("publish_failed").Inc()
-			r.logger.Error("outbox_publish_failed", "error", err, "outbox_id", item.ID)
+		stage := "publish"
+		err := r.store.DeliverRealtimeOutbox(
+			ctx, item.ID, item.Attempts,
+			func(deliveryContext context.Context, leased domain.OutboxEvent) error {
+				event, recipients, ok := r.translate(deliveryContext, leased)
+				if !ok {
+					stage = "translate"
+					return errRealtimeTranslate
+				}
+				publishContext, cancelPublish := context.WithTimeout(
+					deliveryContext, r.realtimeTimeout,
+				)
+				defer cancelPublish()
+				return r.bus.Publish(publishContext, recipients, event)
+			},
+		)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrConflict) {
+				// Account erasure or another valid owner won the exact row.
+				continue
+			}
+			switch stage {
+			case "translate":
+				observability.OutboxEvents.WithLabelValues("translate_failed").Inc()
+			default:
+				observability.OutboxEvents.WithLabelValues("publish_failed").Inc()
+				r.logger.Error("outbox_publish_failed", "error", err, "outbox_id", item.ID)
+			}
 			r.releaseOutbox(ctx, item, time.Second)
+			continue
+		}
+		if err := r.store.MarkOutboxPublished(ctx, []int64{item.ID}); err != nil {
+			r.logger.Error("outbox_ack_failed", "error", err, "outbox_id", item.ID)
 			continue
 		}
 		observability.OutboxEvents.WithLabelValues("published").Inc()
 		observability.OutboxLag.Observe(time.Since(item.CreatedAt).Seconds())
-		published = append(published, item.ID)
-	}
-	if len(published) > 0 {
-		if err := r.store.MarkOutboxPublished(ctx, published); err != nil {
-			r.logger.Error("outbox_ack_failed", "error", err)
-		}
 	}
 }
 
@@ -287,7 +322,11 @@ func (r *Relay) enqueuePush(ctx context.Context, item domain.OutboxEvent, recipi
 	}
 	inserted, err := r.store.EnqueuePushDeliveries(ctx, domain.PushDelivery{
 		OutboxEventID: item.ID,
-		Title:         notification.title, Body: notification.body, Kind: notification.kind,
+		// Durable push rows are intentionally account-agnostic. The richer
+		// notification is used only to decide eligibility/identity; APNs receives
+		// the same generic values below, so persisted retry state contains no
+		// display name, group title, expense description, or message metadata.
+		Title: genericPushTitle, Body: genericPushBody, Kind: genericPushKind,
 		ConversationID: notification.conversationID, EntityID: notification.entityID,
 		NotificationID: notification.entityID.String(),
 	}, pushRecipients)
@@ -330,6 +369,42 @@ func (r *Relay) flushPush(ctx context.Context) {
 }
 
 func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
+	var sendErr error
+	err := r.store.WithPushDeliveryLease(
+		ctx, delivery.ID, delivery.LeaseToken,
+		func(deliveryContext context.Context, leased domain.PushDelivery) error {
+			delivery = leased
+			if strings.TrimSpace(delivery.PushToken) == "" {
+				return nil
+			}
+			sendContext, cancelSend := context.WithTimeout(deliveryContext, r.pushTimeout)
+			defer cancelSend()
+			sendErr = r.push.Send(
+				sendContext, delivery.PushToken, genericPushTitle, genericPushBody,
+				map[string]string{"type": genericPushKind},
+				delivery.NotificationID,
+			)
+			return nil
+		},
+	)
+	if err != nil {
+		if ctx.Err() != nil {
+			releaseContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = r.store.FinishPushDelivery(
+				releaseContext, delivery.ID, delivery.LeaseToken,
+				domain.PushDeliveryPending, r.now().UTC(), "shutdown",
+			)
+			return
+		}
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrConflict) {
+			// The account-erasure transaction (or another lease owner) removed
+			// the exact durable row before the external callback could begin.
+			return
+		}
+		r.logger.Error("push_delivery_lease_failed", "error", err, "delivery_id", delivery.ID)
+		return
+	}
 	if strings.TrimSpace(delivery.PushToken) == "" {
 		if err := r.store.FinishPushDelivery(
 			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryCanceled,
@@ -341,12 +416,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 		observability.PushDeliveries.WithLabelValues("canceled").Inc()
 		return
 	}
-	err := r.push.Send(
-		ctx, delivery.PushToken, genericPushTitle, genericPushBody,
-		map[string]string{"type": genericPushKind},
-		delivery.NotificationID,
-	)
-	if err == nil {
+	if sendErr == nil {
 		if finishErr := r.store.FinishPushDelivery(
 			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryDelivered,
 			time.Time{}, "",
@@ -360,7 +430,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 	}
 
 	observability.PushFailures.Inc()
-	errorClass := push.ErrorClass(err)
+	errorClass := push.ErrorClass(sendErr)
 	observability.PushDeliveryFailures.WithLabelValues(errorClass).Inc()
 	// Never log a token or APNs response body; the bounded error class and
 	// identifiers are sufficient to operate the retry queue.
@@ -369,7 +439,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 		"delivery_id", delivery.ID, "device_id", delivery.DeviceID,
 		"attempt", delivery.Attempts,
 	)
-	if push.IsInvalidToken(err) {
+	if push.IsInvalidToken(sendErr) {
 		if invalidateErr := r.store.InvalidatePushDelivery(
 			ctx, delivery.ID, delivery.LeaseToken, delivery.UserID,
 			delivery.DeviceID, delivery.PushToken,
@@ -395,7 +465,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 		)
 		return
 	}
-	if !push.IsRetryable(err) || delivery.Attempts >= r.policy.MaxAttempts {
+	if !push.IsRetryable(sendErr) || delivery.Attempts >= r.policy.MaxAttempts {
 		if finishErr := r.store.FinishPushDelivery(
 			ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryDeadLetter,
 			time.Time{}, errorClass,
@@ -799,14 +869,18 @@ func (r *Relay) translate(ctx context.Context, item domain.OutboxEvent) (domain.
 			Type: item.Topic, ConversationID: &entity.ConversationID, Seq: entity.Version,
 			Payload: item.Payload, OccurredAt: item.CreatedAt,
 		}
-	case "conversation.created":
+	case "conversation.created", "conversation.updated":
 		var conversation domain.Conversation
 		if err := json.Unmarshal(item.Payload, &conversation); err != nil {
 			r.logger.Error("outbox_payload_invalid", "error", err, "outbox_id", item.ID)
 			return domain.RealtimeEvent{}, nil, false
 		}
+		eventID := conversation.ID.String()
+		if item.Topic == "conversation.updated" {
+			eventID = fmt.Sprintf("conversation-updated:%s:%d", conversation.ID, conversation.UpdatedAt.UnixNano())
+		}
 		event = domain.RealtimeEvent{
-			ID: conversation.ID.String(), Type: item.Topic, ConversationID: &conversation.ID,
+			ID: eventID, Type: item.Topic, ConversationID: &conversation.ID,
 			Payload: item.Payload, OccurredAt: item.CreatedAt,
 		}
 	case "conversation.member_added":

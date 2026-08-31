@@ -108,6 +108,54 @@ func (s *Store) LockMailDeliveryBatch(
 	return deliveries, rows.Err()
 }
 
+func (s *Store) WithMailDeliveryLease(
+	ctx context.Context,
+	id uuid.UUID,
+	leaseToken uuid.UUID,
+	deliver func(context.Context, domain.MailDelivery) error,
+) error {
+	if id == uuid.Nil || leaseToken == uuid.Nil || deliver == nil {
+		return domain.ErrInvalid
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// Keep the process-independent shared erasure barrier and the leased row
+	// lock through SMTP acceptance. Account deletion takes the exclusive form
+	// before cascading reset/mail rows, while challenge consumption must update
+	// this row, so either mutation completes before delivery starts or waits
+	// until this callback has returned.
+	if err := lockAccountDeliveryBarrierShared(ctx, tx); err != nil {
+		return err
+	}
+	var delivery domain.MailDelivery
+	err = tx.QueryRow(ctx, `
+		SELECT id,password_reset_challenge_id,purpose,encrypted_payload,status,
+		       attempts,next_attempt_at,lease_token,locked_until,created_at,
+		       delivered_at,dead_lettered_at,canceled_at,last_error_class
+		FROM mail_deliveries
+		WHERE id=$1 AND status='pending' AND lease_token=$2
+		FOR SHARE`, id, leaseToken).Scan(
+		&delivery.ID, &delivery.ChallengeID, &delivery.Purpose,
+		&delivery.Ciphertext, &delivery.Status, &delivery.Attempts,
+		&delivery.NextAttemptAt, &delivery.LeaseToken, &delivery.LockedUntil,
+		&delivery.CreatedAt, &delivery.DeliveredAt, &delivery.DeadLetteredAt,
+		&delivery.CanceledAt, &delivery.LastErrorClass,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := deliver(ctx, delivery); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) FinishMailDelivery(
 	ctx context.Context,
 	id uuid.UUID,

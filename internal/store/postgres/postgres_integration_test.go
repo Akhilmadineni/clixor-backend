@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -626,15 +627,17 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	defer persistence.Close()
 
 	email := "pg-delete-" + uuid.NewString() + "@example.com"
+	phone := "+1312" + time.Now().UTC().Format("150405")
+	username := "@pg_delete_" + uuid.NewString()[:8]
 	deletedUser, err := persistence.CreateUser(ctx, store.CreateUserParams{
-		Email: email, Phone: "+1312" + time.Now().UTC().Format("150405"),
+		Email: email, Phone: phone,
 		DisplayName: "Postgres Delete", PasswordHash: "secret-hash",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	deletedUser, err = persistence.UpdateUserProfile(ctx, deletedUser.ID, json.RawMessage(`{
-		"display_name":"Postgres Delete","username":"@pg_delete_`+uuid.NewString()[:8]+`"
+		"display_name":"Postgres Delete","username":"`+username+`"
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -688,6 +691,51 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	}, &expected); err != nil {
 		t.Fatal(err)
 	}
+	unrelatedOutboxEntityID := uuid.New()
+	if _, err := persistence.pool.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES
+		('entity.updated',$1,jsonb_build_object(
+			'conversation_id',$1,'kind','expense','id',$2,'version',1,
+			'payload',jsonb_build_object('description',$3),'created_by',$5,
+			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')),
+		('entity.updated',$1,jsonb_build_object(
+			'conversation_id',$1,'kind','note','id',$4,'version',1,
+			'payload',jsonb_build_object('description','keep unrelated'),'created_by',$5,
+			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')))`,
+		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID, remainingUser.ID); err != nil {
+		t.Fatal(err)
+	}
+	choreID, rotationID, financialID := uuid.New(), uuid.New(), uuid.New()
+	baseChore := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` +
+		shared.ID.String() + `","createdBy":"` + deletedUser.ID.String() +
+		`","assignedTo":"` + remainingUser.ID.String() + `"}`)
+	chore, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: shared.ID, Kind: "chore", ID: choreID,
+		CreatedBy: deletedUser.ID, Payload: baseChore,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedChore := json.RawMessage(`{"id":"` + choreID.String() + `","groupId":"` +
+		shared.ID.String() + `","createdBy":"` + deletedUser.ID.String() +
+		`","assignedTo":"` + remainingUser.ID.String() +
+		`","creatorName":"Postgres Delete","createdByDisplayName":"Postgres Delete",` +
+		`"description":"Postgres Delete (` + username + `) ` + email + ` ` + phone + `",` +
+		`"financialId":"` + financialID.String() + `","amount":91.5}`)
+	rotationFeed := json.RawMessage(`{"id":"` + rotationID.String() + `","groupId":"` +
+		shared.ID.String() + `","createdBy":"` + deletedUser.ID.String() +
+		`","relatedId":"` + choreID.String() + `","type":"note",` +
+		`"creatorDisplayName":"Postgres Delete","createdByName":"Postgres Delete",` +
+		`"description":"Postgres Delete <` + email + `> ` + username + ` ` + phone + `",` +
+		`"financialId":"` + financialID.String() + `","amount":91.5}`)
+	rotationHash := sha256.Sum256(append(append([]byte(nil), rotatedChore...), rotationFeed...))
+	if _, err := persistence.RotateChore(ctx, store.RotateChoreParams{
+		OperationID: rotationID, ConversationID: shared.ID, ChoreID: choreID,
+		ActorID: deletedUser.ID, ExpectedChoreVersion: chore.Version,
+		ChorePayload: rotatedChore, FeedPayload: rotationFeed, RequestHash: rotationHash[:],
+	}); err != nil {
+		t.Fatal(err)
+	}
 	personal, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
 		Kind: "group", Title: "Personal", CreatedBy: deletedUser.ID,
 	})
@@ -704,6 +752,13 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 
 	if err := persistence.DeleteAccount(ctx, deletedUser.ID); err != nil {
 		t.Fatal(err)
+	}
+	var staleNameCount, unrelatedEventCount int
+	if err := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE position(lower($1) in lower(payload::text))>0`, "Postgres Delete").Scan(&staleNameCount); err != nil || staleNameCount != 0 {
+		t.Fatalf("display-name-only stale outbox survived: count=%d err=%v", staleNameCount, err)
+	}
+	if err := persistence.pool.QueryRow(ctx, `SELECT count(*) FROM outbox_events WHERE payload->>'id'=$1`, unrelatedOutboxEntityID.String()).Scan(&unrelatedEventCount); err != nil || unrelatedEventCount != 1 {
+		t.Fatalf("unrelated shared-conversation outbox was not preserved: count=%d err=%v", unrelatedEventCount, err)
 	}
 	var resetCount int
 	if err := persistence.pool.QueryRow(ctx,
@@ -745,6 +800,41 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 	entities, err := persistence.ListEntities(ctx, shared.ID, remainingUser.ID, "expense", time.Time{}, 10)
 	if err != nil || len(entities) != 1 || entities[0].Version != 2 {
 		t.Fatalf("shared entity history is invalid: entities=%+v err=%v", entities, err)
+	}
+	chores, err := persistence.ListEntities(ctx, shared.ID, remainingUser.ID, "chore", time.Time{}, 10)
+	if err != nil || len(chores) != 1 {
+		t.Fatalf("shared chore history is invalid: entities=%+v err=%v", chores, err)
+	}
+	feeds, err := persistence.ListEntities(ctx, shared.ID, remainingUser.ID, "feed_item", time.Time{}, 10)
+	if err != nil || len(feeds) != 1 {
+		t.Fatalf("shared feed history is invalid: entities=%+v err=%v", feeds, err)
+	}
+	var replayChore, replayFeed json.RawMessage
+	if err := persistence.pool.QueryRow(ctx, `
+		SELECT chore_result,feed_result FROM chore_rotation_operations
+		WHERE operation_id=$1 AND expires_at>now()+interval '89 days'`, rotationID,
+	).Scan(&replayChore, &replayFeed); err != nil {
+		t.Fatalf("90-day rotation replay row was not retained: %v", err)
+	}
+	for label, raw := range map[string][]byte{
+		"live chore":            chores[0].Payload,
+		"live feed":             feeds[0].Payload,
+		"rotation chore replay": replayChore,
+		"rotation feed replay":  replayFeed,
+	} {
+		text := string(raw)
+		for _, forbidden := range []string{"Postgres Delete", email, phone, username} {
+			if strings.Contains(strings.ToLower(text), strings.ToLower(forbidden)) {
+				t.Fatalf("%s retained %q: %s", label, forbidden, text)
+			}
+		}
+		for _, retainedValue := range []string{
+			deletedUser.ID.String(), financialID.String(), "91.5",
+		} {
+			if !strings.Contains(text, retainedValue) {
+				t.Fatalf("%s removed shared value %q: %s", label, retainedValue, text)
+			}
+		}
 	}
 	if _, err := persistence.Conversation(ctx, personal.ID, remainingUser.ID); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("personal conversation returned %v, want not found", err)

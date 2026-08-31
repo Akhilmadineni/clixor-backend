@@ -368,6 +368,58 @@ func TestPublishedProfileMediaAccountDeletionRestoresStagingCleanup(t *testing.T
 	}
 }
 
+func TestFormerMemberDeletionRevokesPendingUploadAndKeepsReadySharedMedia(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	owner, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "media-former-owner@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "media-former-delete@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: owner.ID, MemberIDs: []uuid.UUID{deleted.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := persistence.CreateMedia(
+		ctx, testConversationMedia(deleted.ID, conversation.ID, 3), store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.PersistMediaUploadCapability(ctx, pending.ID, deleted.ID, "pending-capability"); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := persistence.CreateMedia(
+		ctx, testConversationMedia(deleted.ID, conversation.ID, 3), store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markMemoryMediaReady(t, ctx, persistence, ready, deleted.ID)
+	if err := persistence.RemoveConversationMember(ctx, conversation.ID, owner.ID, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.Media(ctx, pending.ID, owner.ID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("pending former-member media returned %v, want not found", err)
+	}
+	if _, exists := persistence.mediaUploadCapabilities[pending.ID]; exists {
+		t.Fatal("former-member upload capability survived account deletion")
+	}
+	shared, err := persistence.Media(ctx, ready.ID, owner.ID)
+	if err != nil || shared.Status != "ready" {
+		t.Fatalf("ready shared media was not retained: media=%+v err=%v", shared, err)
+	}
+	assertMediaDeleteDeadline(t, persistence, pending.ObjectKey, pending.UploadValidUntil)
+}
+
 func TestTransientVerificationReleaseAllowsImmediateRetry(t *testing.T) {
 	ctx := context.Background()
 	persistence := New()

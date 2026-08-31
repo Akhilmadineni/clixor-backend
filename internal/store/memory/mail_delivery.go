@@ -67,6 +67,38 @@ func (s *Store) LockMailDeliveryBatch(
 	return candidates, nil
 }
 
+func (s *Store) WithMailDeliveryLease(
+	ctx context.Context,
+	id uuid.UUID,
+	leaseToken uuid.UUID,
+	deliver func(context.Context, domain.MailDelivery) error,
+) error {
+	if id == uuid.Nil || leaseToken == uuid.Nil || deliver == nil {
+		return domain.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Account deletion takes the exclusive side before deleting reset and mail
+	// rows. Re-fetch only after taking the shared side, then retain it through
+	// SMTP acceptance so a cached ciphertext can never escape after erasure.
+	s.deliveryBarrier.RLock()
+	defer s.deliveryBarrier.RUnlock()
+
+	s.mu.RLock()
+	delivery, found := s.mailDeliveries[id]
+	if found && (delivery.Status != domain.MailDeliveryPending ||
+		delivery.LeaseToken != leaseToken) {
+		found = false
+	}
+	delivery.Ciphertext = append([]byte(nil), delivery.Ciphertext...)
+	s.mu.RUnlock()
+	if !found {
+		return domain.ErrNotFound
+	}
+	return deliver(ctx, delivery)
+}
+
 func (s *Store) FinishMailDelivery(
 	_ context.Context,
 	id uuid.UUID,

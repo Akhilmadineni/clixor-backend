@@ -27,14 +27,22 @@ type DeliveryPolicy struct {
 }
 
 type Worker struct {
-	store     store.Store
-	sender    Service
-	cipher    *QueueCipher
-	logger    *slog.Logger
-	policy    DeliveryPolicy
-	now       func() time.Time
-	lastPrune time.Time
+	store           store.Store
+	sender          Service
+	cipher          *QueueCipher
+	logger          *slog.Logger
+	policy          DeliveryPolicy
+	now             func() time.Time
+	lastPrune       time.Time
+	deliveryTimeout time.Duration
 }
+
+const mailDeliveryTimeout = 15 * time.Second
+
+var (
+	errMailPayloadInvalid = errors.New("mail payload invalid")
+	errMailPurposeInvalid = errors.New("mail purpose invalid")
+)
 
 func DefaultDeliveryPolicy() DeliveryPolicy {
 	return DeliveryPolicy{
@@ -54,7 +62,7 @@ func NewWorker(
 	now := time.Now
 	return &Worker{
 		store: persistence, sender: sender, cipher: cipher, logger: logger,
-		policy: policy, now: now, lastPrune: now().UTC(),
+		policy: policy, now: now, lastPrune: now().UTC(), deliveryTimeout: mailDeliveryTimeout,
 	}
 }
 
@@ -96,19 +104,43 @@ func (w *Worker) flush(ctx context.Context) {
 }
 
 func (w *Worker) deliver(ctx context.Context, delivery domain.MailDelivery) {
-	payload, err := w.cipher.open(delivery)
-	if err != nil {
+	callbackInvoked := false
+	err := w.store.WithMailDeliveryLease(
+		ctx, delivery.ID, delivery.LeaseToken,
+		func(leaseContext context.Context, leased domain.MailDelivery) error {
+			callbackInvoked = true
+			delivery = leased
+			payload, err := w.cipher.open(leased)
+			if err != nil {
+				return errMailPayloadInvalid
+			}
+			sendContext, cancel := context.WithTimeout(leaseContext, w.deliveryTimeout)
+			defer cancel()
+			switch payload.Purpose {
+			case domain.MailDeliveryPasswordReset:
+				return w.sender.SendPasswordReset(
+					sendContext, payload.Recipient, payload.Code,
+					time.Duration(payload.TTLSeconds)*time.Second,
+				)
+			case domain.MailDeliveryPasswordChanged:
+				return w.sender.SendPasswordChanged(sendContext, payload.Recipient)
+			default:
+				return errMailPurposeInvalid
+			}
+		},
+	)
+	// A batch claim is only a scheduling hint. Cancellation, challenge
+	// consumption, or account erasure may remove the exact row before the
+	// delivery barrier is acquired; never decrypt or send that stale payload.
+	if !callbackInvoked && (errors.Is(err, domain.ErrNotFound) ||
+		errors.Is(err, domain.ErrConflict)) {
+		return
+	}
+	if errors.Is(err, errMailPayloadInvalid) {
 		w.finishDeadLetter(ctx, delivery, "payload_invalid")
 		return
 	}
-	switch payload.Purpose {
-	case domain.MailDeliveryPasswordReset:
-		err = w.sender.SendPasswordReset(
-			ctx, payload.Recipient, payload.Code, time.Duration(payload.TTLSeconds)*time.Second,
-		)
-	case domain.MailDeliveryPasswordChanged:
-		err = w.sender.SendPasswordChanged(ctx, payload.Recipient)
-	default:
+	if errors.Is(err, errMailPurposeInvalid) {
 		w.finishDeadLetter(ctx, delivery, "purpose_invalid")
 		return
 	}

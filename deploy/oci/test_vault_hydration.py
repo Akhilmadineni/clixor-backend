@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -25,8 +26,64 @@ assert SPEC is not None and SPEC.loader is not None
 HYDRATOR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(HYDRATOR)
 
+REPOSITORY_ROOT = SCRIPT_ROOT.parents[1]
+OCI_NON_VAULT_RUNTIME_KEYS = frozenset(
+    {
+        # OCI uses the native Object Storage provider. Static S3 credentials are
+        # deliberately unavailable to its production Vault document.
+        "CLUSTER_S3_ACCESS_KEY",
+        "CLUSTER_S3_BUCKET",
+        "CLUSTER_S3_ENDPOINT",
+        "CLUSTER_S3_PUBLIC_ENDPOINT",
+        "CLUSTER_S3_REGION",
+        "CLUSTER_S3_SECRET_KEY",
+        "CLUSTER_S3_USE_TLS",
+        # Compose supplies the immutable gateway /32 outside api.env so a Vault
+        # editor cannot widen the trusted-proxy boundary.
+        "CLUSTER_TRUSTED_PROXY_CIDRS",
+    }
+)
+
 
 class VaultHydrationTest(unittest.TestCase):
+    def test_api_template_is_the_exact_vault_runtime_contract(self) -> None:
+        template = (SCRIPT_ROOT / "api.env.example").read_bytes()
+        assignments = []
+        rendered_lines = []
+        for line in template.splitlines():
+            match = HYDRATOR.ENV_LINE_RE.fullmatch(line)
+            if match is None:
+                rendered_lines.append(line)
+                continue
+            assignments.append(match.group(1).decode("ascii"))
+            # Exercise the hydrator's actual parser without treating checked-in
+            # placeholders as production values.
+            rendered_lines.append(match.group(1) + b"=contract-test-value")
+        rendered = b"\n".join(rendered_lines) + b"\n"
+
+        self.assertEqual(len(assignments), len(set(assignments)))
+        self.assertEqual(set(assignments), set(HYDRATOR.API_ALLOWED_KEYS))
+        parsed = HYDRATOR._parse_env(
+            rendered,
+            "api.env.example",
+            HYDRATOR.API_ALLOWED_KEYS,
+            HYDRATOR.API_ALLOWED_KEYS,
+        )
+        self.assertEqual(set(parsed), set(HYDRATOR.API_ALLOWED_KEYS))
+
+    def test_go_runtime_configuration_cannot_drift_from_vault_contract(self) -> None:
+        config_source = (REPOSITORY_ROOT / "internal/config/config.go").read_text(
+            encoding="utf-8"
+        )
+        runtime_keys = frozenset(
+            re.findall(r'"(CLUSTER_[A-Z0-9_]+)"', config_source)
+        )
+        self.assertEqual(
+            runtime_keys,
+            HYDRATOR.API_ALLOWED_KEYS | OCI_NON_VAULT_RUNTIME_KEYS,
+        )
+        self.assertFalse(HYDRATOR.API_ALLOWED_KEYS & OCI_NON_VAULT_RUNTIME_KEYS)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
             prefix="clixor-vault-test-", dir="/private/tmp" if Path("/private/tmp").is_dir() else None

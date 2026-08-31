@@ -20,6 +20,16 @@ import (
 
 type Store struct {
 	mu sync.RWMutex
+	// deliveryBarrier serializes account erasure with the small interval in
+	// which a claimed realtime/APNs row is revalidated and handed to an
+	// external transport.  It is deliberately separate from mu: delivery
+	// callbacks may call ordinary Store methods without recursively acquiring
+	// the data lock.
+	deliveryBarrier sync.RWMutex
+	// deviceDeliveryBarrier keeps APNs token ownership stable from the exact
+	// delivery/device re-fetch through the external send. Token registration,
+	// transfer, reset, and invalidation take the write side before mu.
+	deviceDeliveryBarrier sync.RWMutex
 
 	users                     map[uuid.UUID]domain.User
 	emailToUser               map[string]uuid.UUID
@@ -49,9 +59,11 @@ type Store struct {
 	mediaUploadCapabilities   map[uuid.UUID]string
 	outbox                    []domain.OutboxEvent
 	nextOutboxID              int64
+	activeRealtimeDeliveries  map[int64]int
 	pushDeliveries            map[int64]domain.PushDelivery
 	pushDeliveryByEventDevice map[string]int64
 	nextPushDeliveryID        int64
+	activePushDeliveries      map[int64]uuid.UUID
 }
 
 func New() *Store {
@@ -83,9 +95,11 @@ func New() *Store {
 		media:                     make(map[uuid.UUID]domain.MediaObject),
 		mediaUploadCapabilities:   make(map[uuid.UUID]string),
 		nextOutboxID:              1,
+		activeRealtimeDeliveries:  make(map[int64]int),
 		pushDeliveries:            make(map[int64]domain.PushDelivery),
 		pushDeliveryByEventDevice: make(map[string]int64),
 		nextPushDeliveryID:        1,
+		activePushDeliveries:      make(map[int64]uuid.UUID),
 	}
 }
 
@@ -370,6 +384,8 @@ func (s *Store) UpdateUserPhone(_ context.Context, id uuid.UUID, phone string) (
 }
 
 func (s *Store) DeleteAccount(_ context.Context, userID uuid.UUID) error {
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.deleteAccountLocked(userID)
@@ -407,6 +423,8 @@ func (s *Store) ExecuteAccountDeletionIntent(
 	if requestID == uuid.Nil || len(tokenHash) != 32 || fence == nil {
 		return domain.ErrNotFound
 	}
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	intent, found := s.accountDeletionIntents[requestID]
@@ -441,17 +459,27 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		UserID: userID, Email: user.Email, Phone: user.Phone,
 		DisplayName: user.DisplayName, Username: profileUsername(user.Profile),
 	}
+	// Memory has no transactional rollback. Validate every shared, durable JSON
+	// document before the first mutation so malformed metadata/entity payloads
+	// fail closed with the same behavior as PostgreSQL without leaving a partial
+	// account deletion behind.
+	if err := s.validateAccountDeletionJSONLocked(userID, identity); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	deletedConversations := make(map[uuid.UUID]struct{})
+	sharedConversations := make(map[uuid.UUID]struct{})
 	var objectKeys []string
 	mediaDeleteNotBefore := now.Add(store.MediaDeleteGrace)
 	var updatedEntities []domain.Entity
 
-	for conversationID, members := range s.members {
-		if _, present := members[userID]; !present {
+	for _, conversationID := range s.accountConversationScopeLocked(userID) {
+		members, exists := s.members[conversationID]
+		if !exists {
 			continue
 		}
-		if len(members) == 1 {
+		member, activeMember := members[userID]
+		if len(members) == 0 || (activeMember && len(members) == 1) {
 			deletedConversations[conversationID] = struct{}{}
 			delete(s.conversations, conversationID)
 			delete(s.members, conversationID)
@@ -461,32 +489,39 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			delete(s.messages, conversationID)
 			continue
 		}
+		sharedConversations[conversationID] = struct{}{}
 
 		successor := oldestMember(members, userID)
 		conversation := s.conversations[conversationID]
 		if conversation.CreatedBy == userID {
-			conversation.CreatedBy = successor.UserID
+			conversation.CreatedBy = conversationAuthorityMember(members, userID).UserID
 		}
-		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err == nil && changed {
+		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err != nil {
+			return err
+		} else if changed {
 			conversation.Metadata = metadata
 		}
 		conversation.UpdatedAt = now
 		s.conversations[conversationID] = conversation
-		if members[userID].Role == "owner" {
+		if activeMember && member.Role == "owner" {
 			successor.Role = "owner"
 			members[successor.UserID] = successor
+			conversation.CreatedBy = successor.UserID
+			s.conversations[conversationID] = conversation
 		}
-		if s.memberTombstones[conversationID] == nil {
-			s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+		if activeMember {
+			if s.memberTombstones[conversationID] == nil {
+				s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+			}
+			localID := s.memberLocalIDs[conversationID][userID]
+			if localID == uuid.Nil {
+				localID = userID
+			}
+			s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
+				UserID: userID, LocalID: localID,
+			}
+			delete(members, userID)
 		}
-		localID := s.memberLocalIDs[conversationID][userID]
-		if localID == uuid.Nil {
-			localID = userID
-		}
-		s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
-			UserID: userID, LocalID: localID,
-		}
-		delete(members, userID)
 		s.projectConversationMembersLocked(conversationID)
 		delete(s.receipts, conversationID.String()+":"+userID.String())
 
@@ -494,8 +529,18 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			if entity.ConversationID != conversationID {
 				continue
 			}
-			payload, changed, err := store.AnonymizeAccountJSON(entity.Payload, identity)
-			if err != nil || !changed {
+			referencesIdentity, err := store.AccountJSONReferencesIdentity(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if entity.CreatedBy != userID && !referencesIdentity {
+				continue
+			}
+			payload, changed, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if !changed {
 				continue
 			}
 			entity.Payload = payload
@@ -522,9 +567,43 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			delete(s.entities, key)
 		}
 	}
+	for operationID, operation := range s.choreRotations {
+		if _, deleted := deletedConversations[operation.ConversationID]; deleted {
+			delete(s.choreRotations, operationID)
+			continue
+		}
+		if _, shared := sharedConversations[operation.ConversationID]; !shared {
+			continue
+		}
+		chorePayload, choreChanged, choreErr := store.AnonymizeAccountJSON(
+			operation.Result.Chore.Payload, identity,
+		)
+		feedPayload, feedChanged, feedErr := store.AnonymizeAccountJSON(
+			operation.Result.FeedItem.Payload, identity,
+		)
+		// An operation result is a replay cache, not the source of financial
+		// truth. Fail closed by discarding an unexpectedly malformed snapshot
+		// instead of retaining identity data account deletion cannot inspect.
+		if choreErr != nil || feedErr != nil {
+			delete(s.choreRotations, operationID)
+			continue
+		}
+		if choreChanged {
+			operation.Result.Chore.Payload = chorePayload
+		}
+		if feedChanged {
+			operation.Result.FeedItem.Payload = feedPayload
+		}
+		if choreChanged || feedChanged {
+			s.choreRotations[operationID] = operation
+		}
+	}
 	for id, mediaObject := range s.media {
 		_, conversationDeleted := deletedConversations[mediaObject.ConversationID]
-		if conversationDeleted || (mediaObject.Scope == domain.MediaScopeProfile && mediaObject.OwnerID == userID) {
+		ownedProfile := mediaObject.Scope == domain.MediaScopeProfile && mediaObject.OwnerID == userID
+		ownedPending := mediaObject.Scope == domain.MediaScopeConversation &&
+			mediaObject.OwnerID == userID && mediaObject.Status == "pending"
+		if conversationDeleted || ownedProfile || ownedPending {
 			objectKeys = append(objectKeys, mediaObject.ObjectKey)
 			if candidate := memoryMediaDeleteNotBefore(mediaObject.UploadValidUntil); candidate.After(mediaDeleteNotBefore) {
 				mediaDeleteNotBefore = candidate
@@ -576,10 +655,12 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 			delete(s.sessions, sessionID)
 		}
 	}
+	deletedDeviceIDs := make(map[uuid.UUID]struct{})
 	for deviceID, device := range s.devices {
 		if device.UserID != userID {
 			continue
 		}
+		deletedDeviceIDs[deviceID] = struct{}{}
 		delete(s.preKeys, deviceID)
 		device.Name = "Deleted device"
 		device.PushToken = ""
@@ -602,17 +683,62 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 
 	filtered := s.outbox[:0]
 	removedOutboxIDs := make(map[int64]struct{})
-	needles := [][]byte{[]byte(userID.String()), []byte(identity.Email), []byte(identity.Phone), []byte(identity.Username)}
+	affectedEntities := make(map[string]struct{}, len(updatedEntities))
+	for _, entity := range updatedEntities {
+		affectedEntities[entity.ConversationID.String()+"\x00"+entity.Kind+"\x00"+entity.ID.String()] = struct{}{}
+	}
 	for _, event := range s.outbox {
-		if _, deleted := deletedConversations[event.AggregateID]; deleted || containsAny(event.Payload, needles) {
+		_, deleted := deletedConversations[event.AggregateID]
+		if deleted {
 			removedOutboxIDs[event.ID] = struct{}{}
 			continue
+		}
+		if _, shared := sharedConversations[event.AggregateID]; shared &&
+			store.AccountErasureOutboxTopic(event.Topic) {
+			typed, schemaErr := store.DecodeAccountOutboxPayload(
+				event.Topic, event.AggregateID, event.Payload,
+			)
+			if schemaErr != nil {
+				// Known-topic transport state is disposable. A row outside the
+				// exact service-owned schema cannot safely be replayed after erasure.
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
+			if (event.Topic == "receipt.updated" || event.Topic == "conversation.member_added") &&
+				(typed.UserID == userID || typed.ActorID == userID) {
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
+			if event.Topic == "receipt.updated" || event.Topic == "conversation.member_added" {
+				filtered = append(filtered, event)
+				continue
+			}
+			authorized, err := store.AccountJSONReferencesIdentity(event.Payload, identity)
+			if err != nil {
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
+			if event.Topic == "entity.updated" || event.Topic == "entity.deleted" {
+				_, entityAffected := affectedEntities[typed.ConversationID.String()+"\x00"+typed.EntityKind+"\x00"+typed.EntityID.String()]
+				authorized = authorized || entityAffected
+			}
+			if !authorized {
+				filtered = append(filtered, event)
+				continue
+			}
+			_, changed, err := store.AnonymizeAccountJSONWithAuthority(event.Payload, identity)
+			if err != nil || changed {
+				removedOutboxIDs[event.ID] = struct{}{}
+				continue
+			}
 		}
 		filtered = append(filtered, event)
 	}
 	s.outbox = filtered
 	for deliveryID, delivery := range s.pushDeliveries {
-		if _, removed := removedOutboxIDs[delivery.OutboxEventID]; !removed {
+		_, removedSource := removedOutboxIDs[delivery.OutboxEventID]
+		_, deletedRecipient := deletedDeviceIDs[delivery.DeviceID]
+		if !removedSource && !deletedRecipient {
 			continue
 		}
 		delete(s.pushDeliveries, deliveryID)
@@ -629,6 +755,72 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	return nil
 }
 
+func (s *Store) validateAccountDeletionJSONLocked(
+	userID uuid.UUID,
+	identity store.AccountIdentity,
+) error {
+	for _, conversationID := range s.accountConversationScopeLocked(userID) {
+		members := s.members[conversationID]
+		_, active := members[userID]
+		if len(members) == 0 || (active && len(members) < 2) {
+			continue
+		}
+		if _, _, err := store.AnonymizeAccountJSON(
+			s.conversations[conversationID].Metadata, identity,
+		); err != nil {
+			return err
+		}
+		for _, entity := range s.entities {
+			if entity.ConversationID != conversationID {
+				continue
+			}
+			referencesIdentity, err := store.AccountJSONReferencesIdentity(entity.Payload, identity)
+			if err != nil {
+				return err
+			}
+			if entity.CreatedBy != userID && !referencesIdentity {
+				continue
+			}
+			if _, _, err := store.AnonymizeAccountJSONWithAuthority(entity.Payload, identity); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) accountConversationScopeLocked(userID uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{})
+	for conversationID, members := range s.members {
+		if _, active := members[userID]; active {
+			seen[conversationID] = struct{}{}
+		}
+	}
+	for conversationID, tombstones := range s.memberTombstones {
+		if _, former := tombstones[userID]; former {
+			seen[conversationID] = struct{}{}
+		}
+	}
+	result := make([]uuid.UUID, 0, len(seen))
+	for conversationID := range seen {
+		result = append(result, conversationID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].String() < result[j].String() })
+	return result
+}
+
+func conversationAuthorityMember(
+	members map[uuid.UUID]domain.ConversationMember,
+	excluded uuid.UUID,
+) domain.ConversationMember {
+	for id, member := range members {
+		if id != excluded && member.Role == "owner" {
+			return member
+		}
+	}
+	return oldestMember(members, excluded)
+}
+
 func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid.UUID) domain.ConversationMember {
 	var result domain.ConversationMember
 	for id, member := range members {
@@ -643,16 +835,9 @@ func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid
 	return result
 }
 
-func containsAny(payload []byte, needles [][]byte) bool {
-	for _, needle := range needles {
-		if len(needle) > 0 && bytes.Contains(payload, needle) {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.Device, error) {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, live := s.users[device.UserID]
@@ -724,6 +909,8 @@ func (s *Store) ListDevices(_ context.Context, userID uuid.UUID) ([]domain.Devic
 }
 
 func (s *Store) ClearDevicePushToken(_ context.Context, userID, deviceID uuid.UUID) error {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	device, ok := s.devices[deviceID]
@@ -741,6 +928,14 @@ func (s *Store) ClearDevicePushToken(_ context.Context, userID, deviceID uuid.UU
 func (s *Store) PutOneTimePreKeys(_ context.Context, deviceID uuid.UUID, keys []domain.OneTimePreKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	user, ok := s.users[device.UserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
 	existing := make(map[uint32]struct{}, len(s.preKeys[deviceID]))
 	for _, key := range s.preKeys[deviceID] {
 		existing[key.KeyID] = struct{}{}
@@ -759,6 +954,10 @@ func (s *Store) PutOneTimePreKeys(_ context.Context, deviceID uuid.UUID, keys []
 func (s *Store) ClaimPreKeys(_ context.Context, targetUserID uuid.UUID) ([]domain.PreKeyBundle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	user, ok := s.users[targetUserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return nil, domain.ErrNotFound
+	}
 	var result []domain.PreKeyBundle
 	for _, device := range s.devices {
 		if device.UserID != targetUserID || device.IdentityKey == "" {
@@ -807,6 +1006,8 @@ func (s *Store) IssueSession(
 		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
 		return domain.User{}, domain.Device{}, domain.ErrInvalid
 	}
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, ok := s.users[p.UserID]
@@ -1039,6 +1240,8 @@ func (s *Store) UpdateConversation(_ context.Context, conversationID, actorID uu
 	}
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	payload, _ := json.Marshal(conversation)
+	s.appendOutbox("conversation.updated", conversationID, payload)
 	return conversation, nil
 }
 
@@ -1704,6 +1907,7 @@ func (s *Store) TransferConversationOwnership(_ context.Context, conversationID,
 	members[actorID] = actor
 	members[targetID] = target
 	conversation := s.conversations[conversationID]
+	conversation.CreatedBy = targetID
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
 	return nil
@@ -2054,6 +2258,9 @@ func (s *Store) PersistMediaUploadCapability(
 	if media.OwnerID != actorID {
 		return domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return err
+	}
 	if media.Status != "pending" {
 		return domain.ErrConflict
 	}
@@ -2077,7 +2284,23 @@ func (s *Store) MediaUploadCapability(
 	if media.OwnerID != actorID {
 		return "", domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return "", err
+	}
 	return s.mediaUploadCapabilities[id], nil
+}
+
+func (s *Store) authorizeMediaMutationLocked(media domain.MediaObject, actorID uuid.UUID) error {
+	user, ok := s.users[actorID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
+	if media.Scope == domain.MediaScopeConversation {
+		if _, member := s.members[media.ConversationID][actorID]; !member {
+			return domain.ErrForbidden
+		}
+	}
+	return nil
 }
 
 func (s *Store) createMediaLocked(media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
@@ -2178,6 +2401,9 @@ func (s *Store) ClaimMediaVerification(
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
 	if media.Status == "ready" {
 		return media, nil
 	}
@@ -2217,6 +2443,9 @@ func (s *Store) MarkMediaReady(
 	}
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
+	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
 	}
 	if media.Status == "ready" {
 		return media, nil
@@ -2284,6 +2513,9 @@ func (s *Store) ReleaseMediaVerification(
 	if media.OwnerID != actorID {
 		return domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return err
+	}
 	if media.Status != "pending" || leaseToken == uuid.Nil ||
 		media.VerificationLeaseToken == nil || *media.VerificationLeaseToken != leaseToken {
 		return domain.ErrConflict
@@ -2319,6 +2551,9 @@ func (s *Store) rejectPendingMedia(
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
 	if media.Status != "pending" {
 		return domain.MediaObject{}, domain.ErrConflict
 	}
@@ -2349,6 +2584,9 @@ func (s *Store) DeleteMedia(_ context.Context, id, actorID uuid.UUID) (domain.Me
 	}
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
+	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
 	}
 	now := time.Now().UTC()
 	deleteNotBefore := memoryMediaDeleteNotBefore(media.UploadValidUntil)
@@ -2506,6 +2744,54 @@ func (s *Store) LockMediaDeleteOutboxBatch(_ context.Context, limit int) ([]doma
 	return s.lockOutboxBatch(limit, "media.delete")
 }
 
+func (s *Store) DeliverRealtimeOutbox(
+	ctx context.Context,
+	id int64,
+	attempt int,
+	deliver func(context.Context, domain.OutboxEvent) error,
+) error {
+	if id < 1 || attempt < 1 || deliver == nil {
+		return domain.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.deliveryBarrier.RLock()
+	defer s.deliveryBarrier.RUnlock()
+
+	s.mu.Lock()
+	var leased domain.OutboxEvent
+	found := false
+	for _, event := range s.outbox {
+		if event.ID == id && event.PublishedAt == nil && event.Topic != "media.delete" &&
+			event.Attempts == attempt && event.LockedUntil != nil {
+			if _, active := s.activeRealtimeDeliveries[id]; active {
+				break
+			}
+			leased = event
+			leased.Payload = append(json.RawMessage(nil), event.Payload...)
+			s.activeRealtimeDeliveries[id] = attempt
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return domain.ErrNotFound
+	}
+	defer func() {
+		s.mu.Lock()
+		if s.activeRealtimeDeliveries[id] == attempt {
+			delete(s.activeRealtimeDeliveries, id)
+		}
+		s.mu.Unlock()
+	}()
+	if err := deliver(ctx, leased); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 func (s *Store) lockOutboxBatch(limit int, claim string) ([]domain.OutboxEvent, error) {
 	if limit < 1 {
 		return nil, domain.ErrInvalid
@@ -2522,6 +2808,9 @@ func (s *Store) lockOutboxBatch(limit int, claim string) ([]domain.OutboxEvent, 
 		}
 		if (claim == "realtime" && event.Topic == "media.delete") ||
 			(claim == "media.delete" && event.Topic != "media.delete") {
+			continue
+		}
+		if _, active := s.activeRealtimeDeliveries[event.ID]; active {
 			continue
 		}
 		lockDuration := 30 * time.Second
@@ -2632,6 +2921,9 @@ func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.Pu
 		if delivery.Status == domain.PushDeliveryPending &&
 			!delivery.NextAttemptAt.After(now) &&
 			(delivery.LockedUntil.IsZero() || !delivery.LockedUntil.After(now)) {
+			if _, active := s.activePushDeliveries[id]; active {
+				continue
+			}
 			ids = append(ids, id)
 		}
 	}
@@ -2659,6 +2951,55 @@ func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.Pu
 		claimed = append(claimed, delivery)
 	}
 	return claimed, nil
+}
+
+func (s *Store) WithPushDeliveryLease(
+	ctx context.Context,
+	id int64,
+	leaseToken uuid.UUID,
+	deliver func(context.Context, domain.PushDelivery) error,
+) error {
+	if id < 1 || leaseToken == uuid.Nil || deliver == nil {
+		return domain.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.deliveryBarrier.RLock()
+	defer s.deliveryBarrier.RUnlock()
+	s.deviceDeliveryBarrier.RLock()
+	defer s.deviceDeliveryBarrier.RUnlock()
+
+	s.mu.Lock()
+	leased, found := s.pushDeliveries[id]
+	if found && (leased.Status != domain.PushDeliveryPending || leased.LeaseToken != leaseToken) {
+		found = false
+	}
+	if _, active := s.activePushDeliveries[id]; active {
+		found = false
+	}
+	if found {
+		device, deviceFound := s.devices[leased.DeviceID]
+		if !deviceFound {
+			found = false
+		} else {
+			leased.UserID = device.UserID
+			leased.PushToken = device.PushToken
+			s.activePushDeliveries[id] = leaseToken
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return domain.ErrNotFound
+	}
+	defer func() {
+		s.mu.Lock()
+		if s.activePushDeliveries[id] == leaseToken {
+			delete(s.activePushDeliveries, id)
+		}
+		s.mu.Unlock()
+	}()
+	return deliver(ctx, leased)
 }
 
 func (s *Store) FinishPushDelivery(
@@ -2707,6 +3048,8 @@ func (s *Store) InvalidatePushDelivery(
 	leaseToken, userID, deviceID uuid.UUID,
 	pushToken string,
 ) error {
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delivery, ok := s.pushDeliveries[id]
