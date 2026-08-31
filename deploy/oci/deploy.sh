@@ -1498,7 +1498,8 @@ first_deploy=false
 previous_compose_uses_scoped=false
 previous_revision=
 
-if [ -z "${previous_image}" ] && [ ! -e "${compose_file}" ] && [ -z "${previous_postgres_id}" ]; then
+if [ -z "${previous_image}" ] && [ -z "${previous_postgres_id}" ] && \
+  [ -z "${previous_release}" ]; then
   first_deploy=true
   log "no previous OCI application state found; preparing a first deployment"
 else
@@ -1521,6 +1522,8 @@ else
     fail "partial previous deployment: stable Compose model is missing"
   [ -n "${previous_postgres_id}" ] || \
     fail "partial previous deployment: PostgreSQL container is missing"
+  [ -n "${previous_release}" ] || \
+    fail "partial previous deployment: current release pointer is missing"
   [ "$(docker inspect clixor-oci-postgres --format '{{.State.Running}}' 2>/dev/null || true)" = "true" ] || \
     fail "existing PostgreSQL is not running; repair it before deployment"
 

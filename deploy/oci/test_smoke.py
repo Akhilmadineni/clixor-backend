@@ -951,6 +951,21 @@ reject_active_promotion_journal
         self.assertGreater(preparation_guard, staging_guard)
         self.assertLess(preparation_guard, split_at)
 
+    def test_failed_first_deploy_repo_sync_does_not_create_phantom_runtime(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        first_deploy_guard = (
+            'if [ -z "${previous_image}" ] && [ -z "${previous_postgres_id}" ] && \\\n'
+            '  [ -z "${previous_release}" ]; then'
+        )
+        self.assertIn(first_deploy_guard, deploy)
+        self.assertNotIn(
+            '[ -z "${previous_image}" ] && [ ! -e "${compose_file}" ]', deploy
+        )
+        self.assertIn(
+            'fail "partial previous deployment: current release pointer is missing"',
+            deploy,
+        )
+
     def test_gateway_logs_never_persist_invite_query_tokens(self) -> None:
         raw = (self.oci_root / "api-gateway-nginx.conf").read_text(encoding="utf-8")
         config = "\n".join(line.split("#", 1)[0] for line in raw.splitlines())
