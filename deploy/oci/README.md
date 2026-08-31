@@ -162,6 +162,10 @@ change only `mode` to `archive`: a collision-safe authority-hash filename is
 created with no overwrite, the active journal is fsynced away, and repeated
 archive runs verify the same terminal authority idempotently. That makes the
 active slot available for the next separately reviewed change window.
+While the active journal exists, including after a terminal promotion but before
+archive, both application deploy and explicit bootstrap refuse under the shared
+deploy lock. This durable interlock prevents a later release from replacing the
+exact controller authority required to resume or archive a crashed transfer.
 
 The topology state is separate from application rollout. Before cutover,
 ordinary deploys require the production hostnames *not* to serve the candidate.

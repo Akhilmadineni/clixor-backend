@@ -551,6 +551,38 @@ class ReleaseHardeningTests(unittest.TestCase):
         self.assertLess(pointer_journal, journal_archive)
         self.assertLess(journal_archive, success_disarm)
 
+    def test_promotion_journal_interlocks_deploy_and_explicit_bootstrap(self) -> None:
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        journal_path = "/var/lib/clixor/cloudflare-promotion.json"
+
+        deploy_lock = deploy.index("flock -n 9")
+        deploy_guard = deploy.index(
+            "an active Cloudflare promotion journal must be resumed and archived",
+            deploy_lock,
+        )
+        topology_read = deploy.index("topology-mode", deploy_guard)
+        self.assertIn(journal_path, deploy)
+        self.assertLess(deploy_lock, deploy_guard)
+        self.assertLess(deploy_guard, topology_read)
+
+        bootstrap_lock = bootstrap.index("flock -n 8")
+        bootstrap_guard = bootstrap.index(
+            "An active Cloudflare promotion journal must be resumed and archived",
+            bootstrap_lock,
+        )
+        extension_install = bootstrap.index(
+            "install-promotion-extension", bootstrap_guard
+        )
+        stable_promoter_install = bootstrap.index(
+            "/usr/local/libexec/clixor/cloudflare-promote.py", extension_install
+        )
+        self.assertIn(journal_path, bootstrap)
+        self.assertEqual(bootstrap.count("flock -n 8"), 1)
+        self.assertLess(bootstrap_lock, bootstrap_guard)
+        self.assertLess(bootstrap_guard, extension_install)
+        self.assertLess(extension_install, stable_promoter_install)
+
     def test_boot_secret_tooling_is_release_local_and_bootstrap_is_deferred(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
         bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")

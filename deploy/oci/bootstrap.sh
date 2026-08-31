@@ -145,6 +145,8 @@ pki_root="${secret_root}/pki"
 apns_root="${secret_root}/apns"
 runtime_env="${secret_root}/runtime.env"
 runtime_root="${project_root}/runtime"
+shared_deploy_lock="${runtime_root}/deploy.lock"
+cloudflare_promotion_journal=/var/lib/clixor/cloudflare-promotion.json
 backup_tool_root=/usr/local/libexec/clixor
 systemd_unit_root=/etc/systemd/system
 
@@ -154,6 +156,32 @@ install -d -m 0750 "${project_root}" "${project_root}/repo" \
 install -d -m 0700 -o 0 -g 0 "${project_root}/restore-drills"
 install -d -m 0755 -o 0 -g 0 "${backup_tool_root}" "${backup_config_root}"
 install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
+# Explicit bootstrap replaces stable boot and promotion authority. Serialize the
+# whole replacement with deploy/promotion and honor the promotion journal as the
+# durable lease left behind by a stopped or crashed controller. Deferred
+# bootstrap is invoked only by deploy.sh, which already owns this same lock and
+# performs the same journal check before calling us.
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  if [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ]; then
+    [ -f "${shared_deploy_lock}" ] && [ ! -L "${shared_deploy_lock}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${shared_deploy_lock}")" = "0:0:600" ] || {
+      echo "Shared deploy lock is unsafe." >&2
+      exit 1
+    }
+  else
+    install -m 0600 -o 0 -g 0 /dev/null "${shared_deploy_lock}"
+  fi
+  exec 8<>"${shared_deploy_lock}"
+  flock -n 8 || {
+    echo "A deployment or promotion is active; refusing bootstrap." >&2
+    exit 1
+  }
+  if [ -e "${cloudflare_promotion_journal}" ] || \
+    [ -L "${cloudflare_promotion_journal}" ]; then
+    echo "An active Cloudflare promotion journal must be resumed and archived before bootstrap." >&2
+    exit 1
+  fi
+fi
 # A fresh host has no selected release to preserve, so bootstrap may install the
 # authenticated connector directly. An existing host deliberately does not
 # mutate /usr/bin/cloudflared here: deploy.sh stages the exact package, captures
@@ -517,21 +545,6 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
   # source/image/PKI mismatch.
   install -d -m 0700 -o 0 -g 0 "${project_root}/releases/pending"
   if [ -L "${project_root}/releases/current" ]; then
-    shared_deploy_lock="${project_root}/runtime/deploy.lock"
-    if [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ]; then
-      [ -f "${shared_deploy_lock}" ] && [ ! -L "${shared_deploy_lock}" ] && \
-        [ "$(stat -c '%u:%g:%a' "${shared_deploy_lock}")" = "0:0:600" ] || {
-        echo "Shared deploy lock is unsafe." >&2
-        exit 1
-      }
-    else
-      install -m 0600 -o 0 -g 0 /dev/null "${shared_deploy_lock}"
-    fi
-    exec 8<>"${shared_deploy_lock}"
-    flock -n 8 || {
-      echo "A deployment is active; refusing the runtime-controller transition." >&2
-      exit 1
-    }
     [ "$(readlink -- "${project_root}/releases/current")" = \
       "${selected_boot_release}" ] || {
       echo "Current release changed before the runtime-controller lock was acquired." >&2

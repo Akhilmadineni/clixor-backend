@@ -18,6 +18,7 @@ grafana_env="${active_secret_root}/grafana.env"
 backup_env="${active_secret_root}/backup.env"
 migrate_env="${active_secret_root}/migrate.env"
 lock_file="${project_root}/runtime/deploy.lock"
+cloudflare_promotion_journal=/var/lib/clixor/cloudflare-promotion.json
 compose_file="${stable_root}/deploy/oci/compose.yaml"
 stable_runtime_controller=/usr/local/libexec/clixor/runtime-reconciler.py
 stable_runtime_bundle=/usr/local/libexec/clixor/runtime_bundle.py
@@ -1108,6 +1109,15 @@ else
 fi
 exec 9<>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
+# The promotion flock protects only a running controller. Its fsynced journal is
+# the durable ownership lease between retries, including the crash window after
+# topology becomes OCI-live but before the transfer is marked terminal. Never
+# change releases/current (and therefore controller authority) until that exact
+# journal has been resumed and archived by its bound controller.
+if [ -e "${cloudflare_promotion_journal}" ] || \
+  [ -L "${cloudflare_promotion_journal}" ]; then
+  fail "an active Cloudflare promotion journal must be resumed and archived before deployment"
+fi
 topology_state_file=/var/lib/clixor/cloudflare-topology-authority.json
 if [ -e "${topology_state_file}" ] || [ -L "${topology_state_file}" ]; then
   topology_ownership_state="$(/usr/local/libexec/clixor/cloudflare-promote.py \

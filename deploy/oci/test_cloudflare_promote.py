@@ -678,6 +678,40 @@ class Tests(unittest.TestCase):
             self.assertEqual(module.marker_state(value.gate_directory), "open")
             self.assertEqual(json.loads(value.state.read_text())["phase"], "promoted")
 
+    def test_crash_after_topology_write_keeps_durable_interlock_until_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            api = FakeAPI(); value = options(Path(directory), api)
+            real_set_topology_live = module.set_topology_live
+
+            def die_after_topology_write(current):
+                real_set_topology_live(current)
+                raise SystemExit(137)
+
+            with mock.patch.object(
+                module, "set_topology_live", side_effect=die_after_topology_write
+            ):
+                with self.assertRaises(SystemExit):
+                    self.run_promote(api, value)
+
+            self.assertTrue(value.state.is_file())
+            self.assertEqual(
+                json.loads(value.state.read_text())["phase"],
+                "before-topology-oci-live",
+            )
+            self.assertEqual(
+                module.read_topology_state(value.topology_state)["state"], "oci-live"
+            )
+
+            # Only the same release-bound controller may resume this journal.
+            # Deploy/bootstrap keep releases/current fixed until terminal evidence
+            # has been archived and the active interlock disappears.
+            self.run_promote(api, value)
+            self.assertEqual(json.loads(value.state.read_text())["phase"], "promoted")
+            with mock.patch.object(module, "verify_local_gate"), \
+                 mock.patch.object(module, "verify_public"):
+                module.archive_terminal(api, value)
+            self.assertFalse(value.state.exists())
+
     def test_concurrent_controller_lock_is_nonblocking_and_exclusive(self):
         if "fork" not in multiprocessing.get_all_start_methods():
             self.skipTest("fork is required for lock test")
