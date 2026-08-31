@@ -5,9 +5,11 @@ import hashlib
 import re
 import socket
 import struct
+import subprocess
 import sys
 import unittest
 import urllib.error
+import zipfile
 from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from io import StringIO
@@ -330,8 +332,10 @@ class ReleaseHardeningTests(unittest.TestCase):
         local_config = (self.oci_root / "cloudflared-config.yml.example").read_text(
             encoding="utf-8"
         )
-        self.assertIn("minimum_cloudflared_version=2025.4.0", installer)
-        self.assertIn("dpkg --compare-versions", installer)
+        self.assertIn("reviewed_cloudflared_version=2026.7.3", installer)
+        self.assertIn(
+            'cloudflared_version}" = "${reviewed_cloudflared_version}', installer
+        )
         self.assertIn("--protocol auto", unit)
         self.assertNotIn("--protocol quic", unit)
         self.assertIn("service: unix:/run/clixor-origin/gateway.sock", local_config)
@@ -341,6 +345,115 @@ class ReleaseHardeningTests(unittest.TestCase):
             "LoadCredential=cloudflare-token:/run/clixor/secrets/active/cloudflare-token",
             unit,
         )
+
+    def test_cloudflared_package_install_is_pinned_and_release_transactional(self) -> None:
+        canonical = (
+            self.oci_root / "terraform" / "install-cloudflared-package.sh"
+        ).read_text(encoding="utf-8")
+        wrapper = (self.oci_root / "install-cloudflared-package.sh").read_text(
+            encoding="utf-8"
+        )
+        bootstrap = (self.oci_root / "bootstrap.sh").read_text(encoding="utf-8")
+        deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
+        cloud_init = (
+            self.oci_root / "terraform" / "cloud-init.yaml.tftpl"
+        ).read_text(encoding="utf-8")
+        compute = (self.oci_root / "terraform" / "compute.tf").read_text(
+            encoding="utf-8"
+        )
+        package = (
+            self.oci_root / "terraform" / "package-stack.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("reviewed_cloudflared_version=2026.7.3", canonical)
+        self.assertIn(
+            "releases/download/2026.7.3/cloudflared-linux-arm64.deb", canonical
+        )
+        self.assertIn(
+            "d3ea7d22dd337b465da33d6bc1c4b3cfd381407447a2a7d29542c19783430db3",
+            canonical,
+        )
+        self.assertNotIn("releases/latest", canonical)
+        self.assertNotIn("2026.8.0/cloudflared", canonical)
+        verify = canonical.index("sha256sum --check --strict")
+        inspect_package = canonical.index("dpkg-deb --field", verify)
+        extract = canonical.index("dpkg-deb --extract", inspect_package)
+        publish = canonical.index("publish_binary", extract)
+        self.assertLess(verify, inspect_package)
+        self.assertLess(inspect_package, extract)
+        self.assertLess(extract, publish)
+        self.assertNotIn("dpkg -i", canonical)
+        self.assertIn('[ ! -L "${binary_path}" ]', canonical)
+        self.assertIn("candidate path must be canonical", canonical)
+        self.assertIn("target parent path must be canonical", canonical)
+        self.assertIn("must not be group/world writable", canonical)
+        self.assertIn("terraform/install-cloudflared-package.sh", wrapper)
+
+        # Fresh bootstrap may install directly. An existing host never changes
+        # the executable in this operator path; the release deploy owns it.
+        fresh_guard = bootstrap.index(
+            'if [ ! -e "${project_root}/releases/current" ]'
+        )
+        bootstrap_install = bootstrap.index(
+            'sh "${script_root}/install-cloudflared-package.sh" install', fresh_guard
+        )
+        self.assertLess(fresh_guard, bootstrap_install)
+        self.assertIn(
+            "existing host deliberately does not\n# mutate /usr/bin/cloudflared here",
+            bootstrap,
+        )
+
+        # Download/authentication is pre-mutation; publication occurs only after
+        # the journal and rollback boundary. Both prior-present and prior-absent
+        # states are captured and restored by the exit path.
+        staged = deploy.index('stage "${cloudflared_candidate}"')
+        capture = deploy.index("capture_cloudflared_state", staged)
+        armed = deploy.index("rollback_needed=1", capture)
+        publish_deploy = deploy.index(
+            'install-from "${host_tool_stage}/bin/cloudflared"', armed
+        )
+        self.assertLess(staged, capture)
+        self.assertLess(capture, armed)
+        self.assertLess(armed, publish_deploy)
+        self.assertIn("printf 'present\\n'", deploy)
+        self.assertIn("printf 'absent\\n'", deploy)
+        restore = deploy[deploy.index("restore_cloudflared() {"):
+                         deploy.index("activate_host_tooling() {")]
+        self.assertIn('case "${saved_binary}"', restore)
+        self.assertIn("rm -f -- /usr/bin/cloudflared", restore)
+        self.assertIn("cloudflared.sha256", restore)
+        self.assertIn("/usr/bin/cloudflared.pending.${release_tag}", restore)
+        self.assertIn('[ "${cloudflare_binary_changed}" = "true" ]', deploy)
+
+        self.assertIn("cloudflared_package_installer", cloud_init)
+        self.assertIn(
+            "[sh, /usr/local/sbin/clixor-install-cloudflared-package, install]",
+            cloud_init,
+        )
+        self.assertIn(
+            'file("${path.module}/install-cloudflared-package.sh")', compute
+        )
+        self.assertIn("install-cloudflared-package.sh", package)
+
+    def test_resource_manager_archive_contains_cloudflared_installer(self) -> None:
+        package_script = self.oci_root / "terraform" / "package-stack.sh"
+        with TemporaryDirectory() as directory:
+            archive = Path(directory) / "stack.zip"
+            subprocess.run(
+                ["bash", str(package_script), str(archive)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertIn("install-cloudflared-package.sh", bundle.namelist())
+                installer = bundle.read("install-cloudflared-package.sh")
+                self.assertIn(b"reviewed_cloudflared_version=2026.7.3", installer)
+                self.assertIn(
+                    b"d3ea7d22dd337b465da33d6bc1c4b3cfd381407447a2a7d29542c19783430db3",
+                    installer,
+                )
 
     def test_cloudflared_unit_and_state_are_release_transactional(self) -> None:
         deploy = (self.oci_root / "deploy.sh").read_text(encoding="utf-8")
@@ -363,7 +476,7 @@ class ReleaseHardeningTests(unittest.TestCase):
             deploy,
         )
         restart_guard = deploy.index(
-            'if [ "${cloudflare_secret_changed}" = "true" ] ||'
+            'if [ "${cloudflare_binary_changed}" = "true" ] ||'
         )
         restart = deploy.index(
             "systemctl restart --no-block cloudflared.service", restart_guard

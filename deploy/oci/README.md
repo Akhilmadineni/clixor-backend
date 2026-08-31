@@ -30,12 +30,19 @@ This is a **one-way NAS-to-OCI ownership transfer**. The NAS database is retired
 and OCI is authoritative, so there is deliberately no route rollback that could
 create split brain. A failure leaves production fenced and resumes the same
 forward journal. Do not construct a request until a read-only Cloudflare review
-has captured the full old and candidate tunnel configurations, the complete zone
-custom-rules ruleset, and both exact DNS records. A shared old tunnel is allowed
-only when every unrelated ordered rule (for example a tradingbot route) appears
-unchanged in both `old_config` and `old_retired_config`. The latter must differ
-only by removing the one unique exact rule for each Clixor production hostname;
-duplicates, wildcard ambiguity, or unreviewed live drift fail closed.
+has captured the full old and candidate tunnel configuration documents (including
+their outer versions), every active connector ID/version, the complete zone
+custom-rules ruleset, and both exact DNS records.
+
+**Hard live prerequisite:** the old/source tunnel must first be dedicated to
+Clixor. Its ingress inventory must contain exactly the two production Clixor
+hostnames followed by the terminal 404. The currently shared tunnel containing
+TradingBot is not eligible: move TradingBot to a separate tunnel in its own
+reviewed maintenance change, verify that service independently, and only then
+build this request. This controller never edits, preserves, or PUTs a shared
+TradingBot tunnel. Any unrelated, wildcard, duplicate, or extra route fails
+before a journal, gate transition, WAF mutation, or Cloudflare write. This
+runbook does not assert that the prerequisite move has happened.
 
 Use this exact request inventory (objects are examples; substitute the complete
 reviewed Cloudflare responses):
@@ -46,13 +53,19 @@ reviewed Cloudflare responses):
   "change_window": "FROZEN-CHANGE-1234",
   "account": "ACCOUNT_ID",
   "zone": "ZONE_ID",
+  "controller_release": "/srv/clixor/releases/oci-EXACT-TAG",
+  "controller_sha256": "SELECTED_RELEASE_PROMOTER_SHA256",
   "old_tunnel": "OLD_TUNNEL_UUID",
   "candidate_tunnel": "OCI_TUNNEL_UUID",
+  "old_config_version": 7,
+  "candidate_config_version": 11,
+  "old_connector_ids": [],
+  "candidate_connector_ids": ["REVIEWED_ACTIVE_CONNECTOR_UUID"],
   "old_target": "OLD_TUNNEL_UUID.cfargotunnel.com",
   "candidate_target": "OCI_TUNNEL_UUID.cfargotunnel.com",
   "revision": "NEW_40_CHAR_SHA",
-  "old_config": {"ingress": [{"hostname": "tradingbot.atlanteanz.com", "service": "REVIEWED_UNRELATED_SERVICE"}, {"hostname": "clustr-api.atlanteanz.com", "service": "REVIEWED_OLD_SERVICE"}, {"hostname": "clixor.atlanteanz.com", "service": "REVIEWED_OLD_SERVICE"}, {"service": "http_status:404"}]},
-  "old_retired_config": {"ingress": [{"hostname": "tradingbot.atlanteanz.com", "service": "REVIEWED_UNRELATED_SERVICE"}, {"service": "http_status:404"}]},
+  "old_config": {"ingress": [{"hostname": "clustr-api.atlanteanz.com", "service": "REVIEWED_OLD_SERVICE"}, {"hostname": "clixor.atlanteanz.com", "service": "REVIEWED_OLD_SERVICE"}, {"service": "http_status:404"}]},
+  "old_retired_config": {"ingress": [{"service": "http_status:404"}]},
   "candidate_config": {"ingress": [{"hostname": "clixor-oci-canary.atlanteanz.com", "service": "unix:/run/clixor-origin/gateway.sock"}, {"service": "http_status:404"}]},
   "candidate_live_config": {"ingress": [{"hostname": "clixor-oci-canary.atlanteanz.com", "service": "unix:/run/clixor-origin/gateway.sock"}, {"hostname": "clustr-api.atlanteanz.com", "service": "unix:/run/clixor-origin/gateway.sock"}, {"hostname": "clixor.atlanteanz.com", "service": "unix:/run/clixor-origin/gateway.sock"}, {"service": "http_status:404"}]},
   "evidence": "/srv/clixor/releases/oci-EXACT-TAG/canary-public-smoke.txt",
@@ -77,9 +90,23 @@ expression, description, ref, enabled). The selected rule must be uniquely first
 in `http_request_firewall_custom`; the controller never calls a nonexistent
 individual-rule GET. Each individual PATCH must return a complete ruleset, which
 is validated immediately and then compared with another full GET.
+`controller_release` must be the exact immediate target of
+`/srv/clixor/releases/current`; its manifest source SHA must equal `revision`,
+and either its base runtime manifest or its one-time exact promotion extension
+must inventory `controller_sha256`. The installed controller must have that
+digest, and the evidence must be a direct child of that release.
+The tunnel versions are the outer `version` fields from each configuration GET.
+Connector IDs are the complete reviewed active inventory returned by each
+`/connections` GET (an empty old inventory is valid only when it is actually
+empty). After each config PUT, the controller polls until every and only those
+IDs reports the exact new `config_version`, journals the version/ID map, and
+times out fenced if convergence is incomplete.
 
-Give the separate control token only Tunnel Configuration Edit, DNS Edit, and
-Zone WAF Write for this account/zone. Install the request as
+Give the separate control token only **DNS Write**, **Zone WAF Write**, and the
+narrowest tunnel-config write permission offered for this account: **Cloudflare
+One Connector: cloudflared Write**, **Cloudflare One Connectors Write**, or
+**Cloudflare Tunnel Write**. Those are the current documented permission names;
+do not broaden the token to account administration. Install the request as
 `/run/operator/cloudflare-promotion-request.json` and the token as
 `/run/operator/cloudflare-control-token`, both `root:root` mode 0400. They are
 systemd credentials, never environment, argv, shell history, logs, persistent
@@ -106,10 +133,14 @@ The forward sequence is:
 2. enable a block-all version of the first custom rule and prove the OCI probe
    sees Cloudflare's 403;
 3. close and verify the independent OCI origin gate;
-4. retire only the two reviewed Clixor routes from the old tunnel;
-5. add the production routes to the candidate, so no write boundary ever has
-   both tunnels serving them;
-6. transactionally batch both exact DNS records to the candidate;
+4. retire the two reviewed Clixor routes from the dedicated old tunnel and wait
+   for every reviewed old connector to consume the exact outer config version;
+5. add the production routes to the candidate and wait for every reviewed OCI
+   connector to consume that exact version, so no write boundary ever has both
+   tunnels serving them;
+6. batch both exact DNS records to the candidate. Cloudflare's batch can be
+   partially applied, so a retry accepts only bound old/candidate values and
+   reapplies the complete reviewed candidate set;
 7. patch block-all to block-except the exact Terraform OCI NAT `/32` and prove
    the OCI probe reaches the closed 503 gate. Both old and new enabled edge rule
    versions block every external client, so safety does not assume global WAF
@@ -118,7 +149,9 @@ The forward sequence is:
 9. create the local capability, validate the exact API and AASA revision through
    Cloudflare without following redirects, then repeat the complete authority
    read immediately before disabling WAF; and
-10. disable the WAF rule last and durably mark the transfer terminal.
+10. disable the WAF rule last, atomically change the root-owned exact topology
+    ownership state from `pre-cutover-old` to `oci-live`, and durably mark the
+    transfer terminal.
 
 Every remote mutation has an fsynced before/after journal entry. A SIGKILL after
 the final disable is recognized from the exact remote state and finalized without
@@ -130,12 +163,29 @@ created with no overwrite, the active journal is fsynced away, and repeated
 archive runs verify the same terminal authority idempotently. That makes the
 active slot available for the next separately reviewed change window.
 
+The topology state is separate from application rollout. Before cutover,
+ordinary deploys require the production hostnames *not* to serve the candidate.
+After the one-time transfer records `oci-live`, ordinary deploys instead require
+both production hostnames to serve the exact candidate revision before commit.
+Neither deploy nor rollback changes topology ownership, and no NAS route rollback
+exists.
+
 The remotely managed canary route must point to
 `unix:/run/clixor-origin/gateway.sock`; the checked-in example is the reviewed
 route shape. The connector token exists only in the Vault-selected tmpfs cohort.
 The promoter is installed from the authenticated release at mode 0555, checked by
 a root-owned checksum, and uses systemd `StateDirectory=clixor`; never execute a
 copy from `/srv/clixor/repo` or an Actions checkout with the control credential.
+For an existing pre-controller release, run the already documented explicit
+root bootstrap transition once from this reviewed source before automated deploy.
+That transition extends the selected legacy runtime bundle with the checksummed
+promoter, checksum, unit, and gate tmpfiles policy in an exact root-owned
+extension manifest bound to the current release SHA and controller SHA, then
+reloads systemd. That extension is valid current-release promotion authority;
+it is not an Actions-checkout authority. Automated deploys then defer bootstrap
+publication, capture the active files before any swap, restore them in the exit
+rollback, and let the common-lock watchdog restore the exact
+`releases/current` copies after SIGKILL or power loss.
 
 ## Security and availability boundaries
 
@@ -189,7 +239,12 @@ sudo sh deploy/oci/bootstrap.sh
 ```
 
 The script verifies ARM64, 2 OCPUs, and approximately 12 GB RAM; installs Docker,
-its Compose plugin, and OCI CLI 3.91.0 through a checksum-pinned official installer; creates the
+its Compose plugin, OCI CLI 3.91.0 through a checksum-pinned official installer,
+and, on a fresh host with no selected release, exactly cloudflared 2026.7.3 from
+Cloudflare's official ARM64 `.deb` pinned
+to SHA-256
+`d3ea7d22dd337b465da33d6bc1c4b3cfd381407447a2a7d29542c19783430db3`;
+creates the
 data/runtime tree; resolves Object Storage namespace/region through the instance
 principal and OCI metadata; generates an internal CA; and creates root-owned
 scoped files under `/srv/clixor/secrets` with random local staging credentials.
@@ -507,8 +562,10 @@ The deploy script:
 3. stages the candidate only under `releases/pending`; writes its secret mode;
    snapshots the exact approved source and no-auto-restart Compose model; stages
    and checksums its boot worker, Vault hydrator, backup/restore/health programs,
-   systemd units, connector unit, and the exact installed `cloudflared`
-   executable; and captures the previous host state for the synchronous
+   systemd units and connector unit; downloads and authenticates the exact
+   reviewed cloudflared ARM64 package into the pending candidate without
+   changing the host; snapshots that executable into the runtime bundle; and
+   captures the previous executable, unit, and service state for the synchronous
    exit-trap rollback;
 4. for an upgrade, captures the previous Compose model, API image, release
    pointer, and a mode-0600 PostgreSQL custom dump that passes `pg_restore
@@ -558,7 +615,7 @@ The deploy script:
     non-boundary migration dumps, and removes unused non-boundary API image tags.
 
 A failed upgrade restores the prior Vault selection, the exact captured
-cloudflared unit checksum plus enabled/active state, the captured host programs,
+cloudflared executable and unit checksums plus enabled/active state, the captured host programs,
 systemd units, and timer state, then its Compose model, API image, and captured
 startup configuration. The stable reconciler then restores the selected
 release's exact source, runtime files, PKI, host tools, Compose model, and service
@@ -824,9 +881,22 @@ specific.
 
 ## 5. Move Cloudflare ingress
 
-Install the cloudflared binary **2025.4.0 or newer** from Cloudflare's signed
-package repository; `--token-file` is unavailable in older releases and deploy
-rejects older binaries. Create a new, remotely managed tunnel for this VM; do not
+Do not install a moving cloudflared package manually. Terraform cloud-init and a
+fresh-host `bootstrap.sh` install exactly **2026.7.3** by downloading Cloudflare's
+official `cloudflared-linux-arm64.deb`, verifying the pinned SHA-256 before
+extracting it, checking the package architecture/version, and atomically
+publishing only its binary at mode 0555. The deploy path repeats that
+authentication into the pending release before rollback is armed, then publishes
+the release-local copy inside the transaction. Both deploy and the connector
+service reject every other version, including 2026.8.0. A failed deploy restores
+the exact captured prior executable; the crash watchdog restores the committed
+release's executable. This requires no connector token or other secret and works
+for new cloud-init instances. On an existing host with a selected release,
+explicit bootstrap deliberately leaves the active executable untouched; the next
+normal `deploy.sh` performs the same pinned install inside its shared-lock,
+release-bound rollback transaction.
+
+Create a new, remotely managed tunnel for this VM; do not
 reuse a NAS connector connected to a different database. Before ownership
 transfer its remotely managed configuration must be exactly the canary route
 followed by the terminal 404 rule:
@@ -842,14 +912,21 @@ After selecting the production Vault generation, run the normal immutable
 release. `deploy.sh` checksum-stages and systemd-validates the hardened unit,
 captures the exact effective old fragment and state, atomically publishes the
 candidate, and reloads systemd. It loads the token from the same atomic `active`
-generation. It enables the unit but restarts it only if the reviewed unit or
-token changed, using a bounded 90-second readiness gate:
+generation. It enables the unit but restarts it only if the reviewed executable,
+unit, or token changed, using a bounded 90-second readiness gate:
 
 ```sh
 revision="$(git rev-parse HEAD)"
 sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-cloudflare-cutover
 sudo systemctl status --no-pager cloudflared.service
 ```
+
+An executable change requires a restart so the running process matches the
+committed bundle. Its four outbound connections re-establish automatically, but
+this single-VM topology can have a brief ingress interruption during that
+restart; schedule the first pinned-version transition inside the maintenance
+window. Exit rollback restarts the captured prior binary, and crash recovery
+keeps ingress closed until the committed release is restored.
 
 The token stays root-owned at mode `0600`; systemd exposes it to the dynamic
 connector identity only through `LoadCredential`. Do not place it in

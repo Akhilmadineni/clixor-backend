@@ -122,7 +122,7 @@ jobs:
       - name: Validate the OCI Resource Manager stack
         run: terraform validate -no-color
       - name: Check OCI deployment entrypoints
-        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../prepare-runtime-secrets.sh ../quarantine-staging-secrets.sh ../test_secret_split.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh ../test-origin-boundary.sh ../test-origin-gate-nginx.sh ../test-cloudflare-promote-service.sh
+        run: sh -n ../actions-deploy.sh ../bootstrap.sh ../deploy.sh ../split-runtime-secrets.sh ../prepare-runtime-secrets.sh ../quarantine-staging-secrets.sh ../test_secret_split.sh ../install-cloudflared-package.sh install-cloudflared-package.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh ../test-origin-boundary.sh ../test-origin-gate-nginx.sh ../test-cloudflare-promote-service.sh
       - name: Test least-privilege secret split and Compose exposure
         run: sh ../test_secret_split.sh
       - name: Test OCI Vault hydration and atomic rotation

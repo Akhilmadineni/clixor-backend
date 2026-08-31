@@ -35,6 +35,7 @@ JOURNAL_SCHEMA = 2
 PROJECT_ROOT = Path("/srv/clixor")
 HOST_TOOL_ROOT = Path("/usr/local/libexec/clixor")
 SYSTEMD_ROOT = Path("/etc/systemd/system")
+TMPFILES_ROOT = Path("/etc/tmpfiles.d")
 CLOUDFLARED_BINARY = Path("/usr/bin/cloudflared")
 READY_MARKER = Path("/run/clixor/runtime-ready")
 RUNTIME_SECRET_ROOT = Path("/run/clixor/secrets")
@@ -85,6 +86,10 @@ SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 # content-addressed controller cohort.  This allowlist is deliberately data in
 # the installed controller: mutable /srv/clixor/repo content is never an input.
 LEGACY_CONTROLLER_REVISION = "cd94bac4a47e786670aa0f87972203938dace7c9"
+# The three Cloudflare promotion artifacts below are an independently
+# content-addressed extension to the historical Git cohort (they did not exist
+# at LEGACY_CONTROLLER_REVISION). LEGACY_CONTROLLER_ID binds the union, and the
+# one-time transition rejects any mutable-source drift before staging it.
 LEGACY_CONTROLLER_FILES = {
     "deploy/oci/backup-health.sh": "0f0faf1a077b78bec4d0305aaba3f606cd76906a205155c3ba2373f028c23d02",
     "deploy/oci/backup_manifest.py": "e569004d5c6357e5a8e78bd85cd1091fce7fb768f05f743c8f9f5936dfbebecc",
@@ -96,6 +101,9 @@ LEGACY_CONTROLLER_FILES = {
     "deploy/oci/clixor-restore-drill.service": "775fd13e967a423ceb70c3196a0903ec31129646a85442beb8310cb957a05f9a",
     "deploy/oci/clixor-restore-drill.timer": "d4758ed25878071de8ebe8ad091cb1171191c57c22fb4777f5bfda9c195baf72",
     "deploy/oci/cloudflared.service": "64aecc58b03879642f0052db54e3a2924ae95e826f72e9dfc28ec7e88d3207bf",
+    "deploy/oci/cloudflare-promote.py": "c9047963c84135f82c55a344b4c43234f14e10845d7b5eb63edf5a9a49144a58",
+    "deploy/oci/clixor-cloudflare-promote.service": "db3382e7f4bba5b9feaf89d77479ee04d8a0c1a6a9ec76b869d072dd986b2dcc",
+    "deploy/oci/clixor-cloudflare-origin-gate.conf": "386da33cef8cb76bf4359c2137015d7bc01c8c20ccca612ddbc2d084ea0c7b04",
     "deploy/oci/compose.yaml": "98a7bc7c3cc8daec6cf4198d7db5a410530bf633b2e777e03a73a9b984eba3c3",
     "deploy/oci/hydrate-vault-secrets.py": "b0865ebc228f3a7a8a151b8f32c01211a910e534ce104fbb2be6de603ad1de29",
     "deploy/oci/prepare-runtime-secrets.sh": "bde732854eb1f6ebae4e877a59b7bf4ea1a9bebe9679508ac7a585131ccb0e21",
@@ -1892,9 +1900,19 @@ def _restore_runtime(release: Path, project_root: Path) -> None:
 
 def _restore_host_tools(release: Path, runner: CommandRunner) -> None:
     root = release / runtime_bundle.BUNDLE_DIRECTORY / "host-tools"
+    release_metadata = release.lstat()
+    promotion_root = runtime_bundle.promotion_host_tools_root(
+        release,
+        expected_uid=release_metadata.st_uid,
+        expected_gid=release_metadata.st_gid,
+    )
     HOST_TOOL_ROOT.mkdir(parents=True, exist_ok=True)
     for tool in ("offsite-backup.sh", "backup-health.sh", "restore-drill.sh", "backup_manifest.py"):
         _atomic_install(root / "bin" / tool, HOST_TOOL_ROOT / tool, 0, 0, 0o500)
+    _atomic_install(promotion_root / "bin" / "cloudflare-promote.py",
+                    HOST_TOOL_ROOT / "cloudflare-promote.py", 0, 0, 0o555)
+    _atomic_install(promotion_root / "bin" / "cloudflare-promote.py.sha256",
+                    HOST_TOOL_ROOT / "cloudflare-promote.py.sha256", 0, 0, 0o444)
     _atomic_install(
         root / "bin" / "cloudflared", CLOUDFLARED_BINARY, 0, 0, 0o555
     )
@@ -1908,6 +1926,12 @@ def _restore_host_tools(release: Path, runner: CommandRunner) -> None:
         "cloudflared.service",
     ):
         _atomic_install(root / "systemd" / unit, SYSTEMD_ROOT / unit, 0, 0, 0o644)
+    _atomic_install(promotion_root / "systemd" / "clixor-cloudflare-promote.service",
+                    SYSTEMD_ROOT / "clixor-cloudflare-promote.service", 0, 0, 0o644)
+    _atomic_install(promotion_root / "tmpfiles" / "clixor-cloudflare-origin-gate.conf",
+                    TMPFILES_ROOT / "clixor-cloudflare-origin-gate.conf", 0, 0, 0o644)
+    runner.run(["/usr/bin/systemd-tmpfiles", "--create",
+                str(TMPFILES_ROOT / "clixor-cloudflare-origin-gate.conf")])
     runner.run(["/usr/bin/systemctl", "daemon-reload"])
 
 
@@ -2196,6 +2220,12 @@ def _runtime_matches_current(project_root: Path, runner: CommandRunner) -> bool:
                 return False
 
         host_root = bundle / "host-tools"
+        project_metadata = project_root.lstat()
+        promotion_root = runtime_bundle.promotion_host_tools_root(
+            release,
+            expected_uid=project_metadata.st_uid,
+            expected_gid=project_metadata.st_gid,
+        )
         if not same_content(host_root / "bin" / "cloudflared", CLOUDFLARED_BINARY):
             return False
         cloudflared_metadata = CLOUDFLARED_BINARY.stat()
@@ -2223,6 +2253,29 @@ def _runtime_matches_current(project_root: Path, runner: CommandRunner) -> bool:
         ):
             if not same_content(host_root / "systemd" / unit, SYSTEMD_ROOT / unit):
                 return False
+        for tool in ("cloudflare-promote.py", "cloudflare-promote.py.sha256"):
+            if not same_content(promotion_root / "bin" / tool, HOST_TOOL_ROOT / tool):
+                return False
+        for path, mode in (
+            (HOST_TOOL_ROOT / "cloudflare-promote.py", 0o555),
+            (HOST_TOOL_ROOT / "cloudflare-promote.py.sha256", 0o444),
+            (SYSTEMD_ROOT / "clixor-cloudflare-promote.service", 0o644),
+            (TMPFILES_ROOT / "clixor-cloudflare-origin-gate.conf", 0o644),
+        ):
+            metadata = path.stat()
+            if ((metadata.st_uid, metadata.st_gid) != (0, 0)
+                    or stat.S_IMODE(metadata.st_mode) != mode):
+                return False
+        if not same_content(
+            promotion_root / "systemd" / "clixor-cloudflare-promote.service",
+            SYSTEMD_ROOT / "clixor-cloudflare-promote.service",
+        ):
+            return False
+        if not same_content(
+            promotion_root / "tmpfiles" / "clixor-cloudflare-origin-gate.conf",
+            TMPFILES_ROOT / "clixor-cloudflare-origin-gate.conf",
+        ):
+            return False
 
         image = manifest["image"]
         assert isinstance(image, dict)
@@ -2317,8 +2370,15 @@ def _archive_after_recovery(project_root: Path, current: Path | None) -> None:
 def watchdog(project_root: Path, runner: CommandRunner) -> str:
     lock = project_root / "runtime" / "deploy.lock"
     lock.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+    project_metadata = project_root.lstat()
+    expected_uid, expected_gid = project_metadata.st_uid, project_metadata.st_gid
+    descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+                or stat.S_IMODE(metadata.st_mode) != 0o600):
+            raise ReconcileError("shared deploy lock metadata is unsafe")
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

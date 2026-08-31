@@ -15,6 +15,7 @@ rm -f -- "$output_file"
     .terraform.lock.hcl \
     clixor-data-volume.service \
     clixor-mount-data.sh \
+    install-cloudflared-package.sh \
     cloud-init.yaml.tftpl \
     compute.tf \
     email.tf \

@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=15min
 User=root
 Group=root
 StateDirectory=clixor
@@ -22,7 +23,7 @@ ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadWritePaths=/var/lib/clixor
+ReadWritePaths=/var/lib/clixor /srv/clixor/runtime/deploy.lock
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes

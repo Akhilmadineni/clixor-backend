@@ -41,6 +41,7 @@ approved_mapping_name=vault-secrets.map
 minimum_data_headroom_kb=8388608
 minimum_docker_headroom_kb=6291456
 retained_audit_releases=3
+reviewed_cloudflared_version=2026.7.3
 source_root=${1:-}
 source_sha=${2:-}
 run_id=${3:-manual}
@@ -95,6 +96,8 @@ public_smoke_required=false
 
 verify_public_ingress() {
   expected_public_revision=${1:-}
+  verification_api_url=${2:-${public_api_readiness_url}}
+  verification_association_url=${3:-${public_association_url}}
   case "${expected_public_revision}" in
     ''|*[!0-9a-f]*) return 1 ;;
   esac
@@ -114,7 +117,7 @@ verify_public_ingress() {
     --max-filesize 65536 --header 'Cache-Control: no-cache' \
     --header 'Pragma: no-cache' --dump-header "${api_headers}.partial" \
     --output "${api_body}.partial" \
-    "${public_api_readiness_url}?release=${expected_public_revision}" || \
+    "${verification_api_url}?release=${expected_public_revision}" || \
     return 1
   curl --fail --silent --show-error --retry 6 --retry-all-errors \
     --retry-delay 5 --max-time 10 --proto '=https' --tlsv1.2 \
@@ -122,7 +125,7 @@ verify_public_ingress() {
     --header 'Pragma: no-cache' \
     --dump-header "${association_headers}.partial" \
     --output "${association_body}.partial" \
-    "${public_association_url}?release=${expected_public_revision}" || return 1
+    "${verification_association_url}?release=${expected_public_revision}" || return 1
   chmod 0600 \
     "${api_headers}.partial" "${api_body}.partial" \
     "${association_headers}.partial" "${association_body}.partial"
@@ -136,6 +139,13 @@ verify_public_ingress() {
     --association-headers "${association_headers}" \
     --association-body "${association_body}" \
     --expected-revision "${expected_public_revision}"
+}
+
+verify_production_candidate() {
+  verify_public_ingress "$1" \
+    https://clustr-api.atlanteanz.com/health/ready \
+    https://clixor.atlanteanz.com/.well-known/apple-app-site-association || \
+    fail "OCI-live production hostnames do not serve the exact candidate revision"
 }
 
 run_disposable_public_smoke() {
@@ -319,7 +329,7 @@ stage_host_tooling() {
     stage-host-tools \
     --release "${release_dir}" \
     --source "${source_root}" \
-    --cloudflared-binary /usr/bin/cloudflared
+    --cloudflared-binary "${cloudflared_candidate}"
   install -m 0500 -o 0 -g 0 \
     "${source_root}/deploy/oci/release_retention.py" \
     "${release_dir}/release_retention.py"
@@ -331,7 +341,8 @@ stage_host_tooling() {
   )
   : > "${host_tool_stage}/SHA256SUMS.partial"
   for tool_name in \
-    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py cloudflared
+    offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py \
+    cloudflare-promote.py cloudflare-promote.py.sha256 cloudflared
   do
     (
       cd "${host_tool_stage}"
@@ -344,7 +355,8 @@ stage_host_tooling() {
     clixor-backup-health.service \
     clixor-backup-health.timer \
     clixor-restore-drill.service \
-    clixor-restore-drill.timer
+    clixor-restore-drill.timer \
+    clixor-cloudflare-promote.service
   do
     (
       cd "${host_tool_stage}"
@@ -354,6 +366,10 @@ stage_host_tooling() {
   (
     cd "${host_tool_stage}"
     sha256sum systemd/cloudflared.service
+  ) >> "${host_tool_stage}/SHA256SUMS.partial"
+  (
+    cd "${host_tool_stage}"
+    sha256sum tmpfiles/clixor-cloudflare-origin-gate.conf
   ) >> "${host_tool_stage}/SHA256SUMS.partial"
   chmod 0600 "${host_tool_stage}/SHA256SUMS.partial"
   mv "${host_tool_stage}/SHA256SUMS.partial" \
@@ -369,11 +385,48 @@ stage_host_tooling() {
   grep -Fq -- '--token-file %d/cloudflare-token' \
     "${host_tool_stage}/systemd/cloudflared.service" || \
     fail "staged cloudflared unit does not use systemd credentials"
+  grep -Fxq \
+    'ExecStartPre=/usr/bin/sha256sum --check --strict /usr/local/libexec/clixor/cloudflare-promote.py.sha256' \
+    "${host_tool_stage}/systemd/clixor-cloudflare-promote.service" || \
+    fail "staged Cloudflare promotion unit lacks controller integrity verification"
   printf 'staged\n' > "${release_dir}/host-tools-state"
 }
 
 capture_cloudflared_state() {
   install -d -m 0700 -o 0 -g 0 "${previous_cloudflare_root}"
+  cloudflare_binary_changed=true
+  if [ -e /usr/bin/cloudflared ] || [ -L /usr/bin/cloudflared ]; then
+    [ -f /usr/bin/cloudflared ] && [ ! -L /usr/bin/cloudflared ] || \
+      fail "existing cloudflared executable is not a regular file"
+    cloudflared_binary_metadata="$(stat -c '%u:%g:%a' /usr/bin/cloudflared)"
+    cloudflared_binary_uid=${cloudflared_binary_metadata%%:*}
+    cloudflared_binary_remainder=${cloudflared_binary_metadata#*:}
+    cloudflared_binary_gid=${cloudflared_binary_remainder%%:*}
+    cloudflared_binary_mode=${cloudflared_binary_metadata##*:}
+    [ "${cloudflared_binary_uid}:${cloudflared_binary_gid}" = "0:0" ] || \
+      fail "existing cloudflared executable must be root-owned"
+    case "${cloudflared_binary_mode}" in
+      [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+      *) fail "existing cloudflared executable mode is invalid" ;;
+    esac
+    case "${cloudflared_binary_mode}" in
+      *[2367][0-7]|*[0-7][2367]) \
+        fail "existing cloudflared executable must not be group/world writable" ;;
+    esac
+    install -m 0500 -o 0 -g 0 /usr/bin/cloudflared \
+      "${previous_cloudflare_root}/cloudflared"
+    sha256sum "${previous_cloudflare_root}/cloudflared" > \
+      "${previous_cloudflare_root}/cloudflared.sha256"
+    printf '%s\n' "${cloudflared_binary_metadata}" > \
+      "${previous_cloudflare_root}/binary-metadata"
+    printf 'present\n' > "${previous_cloudflare_root}/binary-state"
+    if cmp -s /usr/bin/cloudflared "${cloudflared_candidate}" && \
+      [ "${cloudflared_binary_metadata}" = "0:0:555" ]; then
+      cloudflare_binary_changed=false
+    fi
+  else
+    printf 'absent\n' > "${previous_cloudflare_root}/binary-state"
+  fi
   previous_cloudflare_fragment="$(systemctl show \
     --property=FragmentPath --value cloudflared.service 2>/dev/null || true)"
   case "${previous_cloudflare_fragment}" in
@@ -413,6 +466,10 @@ capture_cloudflared_state() {
   previous_cloudflare_active=false
   [ "${previous_cloudflare_active_state}" = "active" ] && \
     previous_cloudflare_active=true
+  if [ "${previous_cloudflare_active}" = "true" ] && \
+    [ "$(sed -n '1p' "${previous_cloudflare_root}/binary-state")" != "present" ]; then
+    fail "active cloudflared has no recoverable executable"
+  fi
   printf '%s\n' "${previous_cloudflare_enabled_state}" > \
     "${previous_cloudflare_root}/enabled-state"
   printf '%s\n' "${previous_cloudflare_active_state}" > \
@@ -422,14 +479,16 @@ capture_cloudflared_state() {
 
 capture_host_tooling() {
   install -d -m 0700 -o 0 -g 0 \
-    "${previous_host_tool_root}/bin" "${previous_host_tool_root}/systemd"
+    "${previous_host_tool_root}/bin" "${previous_host_tool_root}/systemd" \
+    "${previous_host_tool_root}/tmpfiles"
   : > "${previous_host_tool_root}/file-state"
   for tool_name in \
     offsite-backup.sh backup-health.sh restore-drill.sh backup_manifest.py
   do
     active_path="${backup_tool_root}/${tool_name}"
     if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
-      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] || \
+      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] && \
+        [ "$(stat -c '%u:%g:%a' "${active_path}")" = "0:0:500" ] || \
         fail "active host tool is not a regular file: ${active_path}"
       install -m 0500 -o 0 -g 0 "${active_path}" \
         "${previous_host_tool_root}/bin/${tool_name}"
@@ -440,17 +499,42 @@ capture_host_tooling() {
         "${previous_host_tool_root}/file-state"
     fi
   done
+  (cd / && sha256sum --check --strict \
+    "${backup_tool_root}/cloudflare-promote.py.sha256" >/dev/null) || \
+    fail "active promotion controller checksum is invalid"
+  for promotion_spec in \
+    'cloudflare-promote.py:555' \
+    'cloudflare-promote.py.sha256:444'
+  do
+    promotion_name=${promotion_spec%%:*}
+    promotion_mode=${promotion_spec##*:}
+    active_path="${backup_tool_root}/${promotion_name}"
+    if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
+      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] && \
+        [ "$(stat -c '%u:%g:%a' "${active_path}")" = "0:0:${promotion_mode}" ] || \
+        fail "active promotion host tool is unsafe: ${active_path}"
+      install -m "0${promotion_mode}" -o 0 -g 0 "${active_path}" \
+        "${previous_host_tool_root}/bin/${promotion_name}"
+      printf 'bin/%s=present\n' "${promotion_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    else
+      printf 'bin/%s=absent\n' "${promotion_name}" >> \
+        "${previous_host_tool_root}/file-state"
+    fi
+  done
   for unit_name in \
     clixor-offsite-backup.service \
     clixor-offsite-backup.timer \
     clixor-backup-health.service \
     clixor-backup-health.timer \
     clixor-restore-drill.service \
-    clixor-restore-drill.timer
+    clixor-restore-drill.timer \
+    clixor-cloudflare-promote.service
   do
     active_path="${systemd_unit_root}/${unit_name}"
     if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
-      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] || \
+      [ -f "${active_path}" ] && [ ! -L "${active_path}" ] && \
+        [ "$(stat -c '%u:%g:%a' "${active_path}")" = "0:0:644" ] || \
         fail "active systemd unit is not a regular file: ${active_path}"
       install -m 0644 -o 0 -g 0 "${active_path}" \
         "${previous_host_tool_root}/systemd/${unit_name}"
@@ -461,6 +545,19 @@ capture_host_tooling() {
         "${previous_host_tool_root}/file-state"
     fi
   done
+  active_path=/etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
+  if [ -e "${active_path}" ] || [ -L "${active_path}" ]; then
+    [ -f "${active_path}" ] && [ ! -L "${active_path}" ] && \
+      [ "$(stat -c '%u:%g:%a' "${active_path}")" = "0:0:644" ] || \
+      fail "active Cloudflare gate tmpfiles policy is unsafe"
+    install -m 0644 -o 0 -g 0 "${active_path}" \
+      "${previous_host_tool_root}/tmpfiles/clixor-cloudflare-origin-gate.conf"
+    printf 'tmpfiles/clixor-cloudflare-origin-gate.conf=present\n' >> \
+      "${previous_host_tool_root}/file-state"
+  else
+    printf 'tmpfiles/clixor-cloudflare-origin-gate.conf=absent\n' >> \
+      "${previous_host_tool_root}/file-state"
+  fi
   : > "${previous_host_tool_root}/timer-state"
   for timer_name in \
     clixor-offsite-backup.timer \
@@ -508,12 +605,10 @@ validate_cloudflared_runtime() {
     fail "production requires the signed cloudflared package"
   cmp -s "${host_tool_stage}/bin/cloudflared" /usr/bin/cloudflared || \
     fail "cloudflared changed after the release-local runtime snapshot"
-  [ -x /usr/bin/dpkg ] || fail "dpkg is required to validate cloudflared"
   cloudflared_version="$(LC_ALL=C /usr/bin/cloudflared --version 2>/dev/null | \
     sed -n 's/^cloudflared version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
-  [ -n "${cloudflared_version}" ] || fail "could not parse cloudflared --version"
-  /usr/bin/dpkg --compare-versions "${cloudflared_version}" ge 2025.4.0 || \
-    fail "cloudflared 2025.4.0 or newer is required for --token-file"
+  [ "${cloudflared_version}" = "${reviewed_cloudflared_version}" ] || \
+    fail "cloudflared must be exactly ${reviewed_cloudflared_version}"
   systemd-analyze verify \
     "${host_tool_stage}/systemd/cloudflared.service" >/dev/null || \
     fail "staged cloudflared unit failed systemd verification"
@@ -541,9 +636,10 @@ activate_cloudflared() {
   fi
   systemctl enable cloudflared.service >/dev/null
 
-  if [ "${cloudflare_secret_changed}" = "true" ] || \
+  if [ "${cloudflare_binary_changed}" = "true" ] || \
+    [ "${cloudflare_secret_changed}" = "true" ] || \
     [ "${cloudflare_unit_changed}" = "true" ]; then
-    log "restarting cloudflared for its changed credential or reviewed unit"
+    log "restarting cloudflared for its changed executable, credential, or reviewed unit"
     systemctl restart --no-block cloudflared.service
     wait_cloudflared_active || \
       fail "cloudflared did not report readiness within 90 seconds"
@@ -563,6 +659,8 @@ activate_cloudflared() {
 
 restore_cloudflared() {
   restore_status=0
+  saved_binary="$(sed -n '1p' \
+    "${previous_cloudflare_root}/binary-state" 2>/dev/null || true)"
   saved_fragment="$(sed -n '1p' \
     "${previous_cloudflare_root}/unit-state" 2>/dev/null || true)"
   saved_enabled="$(sed -n '1p' \
@@ -577,9 +675,14 @@ restore_cloudflared() {
     active|inactive) ;;
     *) return 1 ;;
   esac
+  case "${saved_binary}" in
+    present|absent) ;;
+    *) return 1 ;;
+  esac
 
-  log "restoring the exact prior cloudflared unit and service state"
+  log "restoring the exact prior cloudflared executable, unit, and service state"
   rm -f -- "${cloudflare_unit_path}.pending.${release_tag}" || restore_status=1
+  rm -f -- "/usr/bin/cloudflared.pending.${release_tag}" || restore_status=1
   if [ "${saved_active}" = "inactive" ]; then
     systemctl stop cloudflared.service >/dev/null 2>&1 || restore_status=1
   fi
@@ -625,6 +728,44 @@ restore_cloudflared() {
       ;;
     *) restore_status=1 ;;
   esac
+
+  case "${saved_binary}" in
+    absent)
+      rm -f -- /usr/bin/cloudflared || restore_status=1
+      ;;
+    present)
+      binary_restore_invalid=0
+      saved_binary_metadata="$(sed -n '1p' \
+        "${previous_cloudflare_root}/binary-metadata" 2>/dev/null || true)"
+      saved_binary_uid=${saved_binary_metadata%%:*}
+      binary_metadata_remainder=${saved_binary_metadata#*:}
+      saved_binary_gid=${binary_metadata_remainder%%:*}
+      saved_binary_mode=${saved_binary_metadata##*:}
+      case "${saved_binary_uid}:${saved_binary_gid}" in
+        0:0) ;;
+        *) binary_restore_invalid=1 ;;
+      esac
+      case "${saved_binary_mode}" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+        *) binary_restore_invalid=1 ;;
+      esac
+      case "${saved_binary_mode}" in
+        *[2367][0-7]|*[0-7][2367]) binary_restore_invalid=1 ;;
+      esac
+      (cd "${previous_cloudflare_root}" && \
+        sha256sum --check --strict cloudflared.sha256 >/dev/null) || \
+        binary_restore_invalid=1
+      if [ "${binary_restore_invalid}" -eq 0 ]; then
+        pending_path="/usr/bin/cloudflared.pending.${release_tag}"
+        install -m "${saved_binary_mode}" -o 0 -g 0 \
+          "${previous_cloudflare_root}/cloudflared" \
+          "${pending_path}" || restore_status=1
+        mv -Tf "${pending_path}" /usr/bin/cloudflared || restore_status=1
+      else
+        restore_status=1
+      fi
+      ;;
+  esac
   systemctl daemon-reload || restore_status=1
 
   if [ "${saved_enabled}" = "enabled" ]; then
@@ -651,6 +792,20 @@ restore_cloudflared() {
     else
       restore_status=1
     fi
+  fi
+  if [ "${saved_binary}" = "absent" ]; then
+    [ ! -e /usr/bin/cloudflared ] && [ ! -L /usr/bin/cloudflared ] || \
+      restore_status=1
+  elif [ -f /usr/bin/cloudflared ] && [ ! -L /usr/bin/cloudflared ]; then
+    restored_binary_checksum="$(sha256sum /usr/bin/cloudflared | awk '{print $1}')"
+    saved_binary_checksum="$(awk 'NR == 1 {print $1}' \
+      "${previous_cloudflare_root}/cloudflared.sha256")"
+    [ "${restored_binary_checksum}" = "${saved_binary_checksum}" ] || \
+      restore_status=1
+    [ "$(stat -c '%u:%g:%a' /usr/bin/cloudflared)" = \
+      "${saved_binary_metadata}" ] || restore_status=1
+  else
+    restore_status=1
   fi
   restored_enabled_state="$(systemctl is-enabled \
     cloudflared.service 2>/dev/null || true)"
@@ -689,18 +844,29 @@ activate_host_tooling() {
       "${host_tool_stage}/bin/${tool_name}" \
       "${backup_tool_root}/${tool_name}" 0500
   done
+  publish_host_file \
+    "${host_tool_stage}/bin/cloudflare-promote.py" \
+    "${backup_tool_root}/cloudflare-promote.py" 0555
+  publish_host_file \
+    "${host_tool_stage}/bin/cloudflare-promote.py.sha256" \
+    "${backup_tool_root}/cloudflare-promote.py.sha256" 0444
   for unit_name in \
     clixor-offsite-backup.service \
     clixor-offsite-backup.timer \
     clixor-backup-health.service \
     clixor-backup-health.timer \
     clixor-restore-drill.service \
-    clixor-restore-drill.timer
+    clixor-restore-drill.timer \
+    clixor-cloudflare-promote.service
   do
     publish_host_file \
       "${host_tool_stage}/systemd/${unit_name}" \
       "${systemd_unit_root}/${unit_name}" 0644
   done
+  publish_host_file \
+    "${host_tool_stage}/tmpfiles/clixor-cloudflare-origin-gate.conf" \
+    /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf 0644
+  systemd-tmpfiles --create /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
   systemctl daemon-reload
 }
 
@@ -723,13 +889,32 @@ restore_host_tooling() {
         restore_status=1
     fi
   done
+  for promotion_spec in \
+    'cloudflare-promote.py:0555' \
+    'cloudflare-promote.py.sha256:0444'
+  do
+    promotion_name=${promotion_spec%%:*}
+    promotion_mode=${promotion_spec##*:}
+    target_path="${backup_tool_root}/${promotion_name}"
+    rm -f -- "${target_path}.pending.${release_tag}" || restore_status=1
+    if grep -qx "bin/${promotion_name}=present" \
+      "${previous_host_tool_root}/file-state"; then
+      publish_host_file \
+        "${previous_host_tool_root}/bin/${promotion_name}" \
+        "${target_path}" "${promotion_mode}" || restore_status=1
+    else
+      rm -f -- "${target_path}" || restore_status=1
+      [ ! -e "${target_path}" ] && [ ! -L "${target_path}" ] || restore_status=1
+    fi
+  done
   for unit_name in \
     clixor-offsite-backup.service \
     clixor-offsite-backup.timer \
     clixor-backup-health.service \
     clixor-backup-health.timer \
     clixor-restore-drill.service \
-    clixor-restore-drill.timer
+    clixor-restore-drill.timer \
+    clixor-cloudflare-promote.service
   do
     target_path="${systemd_unit_root}/${unit_name}"
     rm -f -- "${target_path}.pending.${release_tag}" || restore_status=1
@@ -744,6 +929,20 @@ restore_host_tooling() {
         restore_status=1
     fi
   done
+  target_path=/etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
+  rm -f -- "${target_path}.pending.${release_tag}" || restore_status=1
+  if grep -qx 'tmpfiles/clixor-cloudflare-origin-gate.conf=present' \
+    "${previous_host_tool_root}/file-state"; then
+    publish_host_file \
+      "${previous_host_tool_root}/tmpfiles/clixor-cloudflare-origin-gate.conf" \
+      "${target_path}" 0644 || restore_status=1
+  else
+    rm -f -- "${target_path}" || restore_status=1
+    [ ! -e "${target_path}" ] && [ ! -L "${target_path}" ] || restore_status=1
+  fi
+  if [ -f "${target_path}" ]; then
+    systemd-tmpfiles --create "${target_path}" || restore_status=1
+  fi
   systemctl daemon-reload || restore_status=1
   while read -r timer_name timer_enabled timer_active; do
     case "${timer_name}" in
@@ -900,8 +1099,27 @@ done
   fail "stable runtime controller lacks staging integrity support; rerun the explicit bootstrap transition"
 
 mkdir -p "${project_root}/runtime"
-exec 9>"${lock_file}"
+if [ -e "${lock_file}" ] || [ -L "${lock_file}" ]; then
+  [ -f "${lock_file}" ] && [ ! -L "${lock_file}" ] && \
+    [ "$(stat -c '%u:%g:%a' "${lock_file}")" = "0:0:600" ] || \
+    fail "shared deploy lock is unsafe"
+else
+  install -m 0600 -o 0 -g 0 /dev/null "${lock_file}"
+fi
+exec 9<>"${lock_file}"
 flock -n 9 || fail "another deployment holds ${lock_file}"
+topology_state_file=/var/lib/clixor/cloudflare-topology-authority.json
+if [ -e "${topology_state_file}" ] || [ -L "${topology_state_file}" ]; then
+  topology_ownership_state="$(/usr/local/libexec/clixor/cloudflare-promote.py \
+    topology-mode --topology-state "${topology_state_file}")" || \
+    fail "Cloudflare topology ownership state is unsafe"
+else
+  topology_ownership_state=uninitialized
+fi
+case "${topology_ownership_state}" in
+  uninitialized|pre-cutover-old|oci-live) ;;
+  *) fail "Cloudflare topology ownership state is unknown" ;;
+esac
 install -d -m 0700 -o 0 -g 0 "${pending_release_root}"
 if [ -L "${release_root}/current" ]; then
   /usr/bin/python3 "${stable_runtime_controller}" validate-release \
@@ -983,6 +1201,7 @@ previous_runtime_root="${release_dir}/previous-runtime"
 runtime_bundle_root="${release_dir}/runtime-bundle"
 deployment_compose_file="${runtime_bundle_root}/compose.yaml"
 host_tool_stage="${runtime_bundle_root}/host-tools"
+cloudflared_candidate="${release_dir}/cloudflared-candidate"
 boot_secret_stage="${release_dir}/boot-secrets"
 previous_host_tool_root="${release_dir}/previous-host-tools"
 previous_cloudflare_root="${release_dir}/previous-cloudflared"
@@ -1011,7 +1230,10 @@ mv "${release_dir}/secret-mode.partial" "${release_dir}/secret-mode"
   --source-sha "${source_sha}" \
   --compose-source "${source_root}/deploy/oci/compose.yaml"
 stage_release_boot_tooling
+sh "${source_root}/deploy/oci/install-cloudflared-package.sh" \
+  stage "${cloudflared_candidate}"
 stage_host_tooling
+rm -f -- "${cloudflared_candidate}"
 capture_host_tooling
 capture_cloudflared_state
 if [ "${candidate_secret_mode}" = "staging" ]; then
@@ -1565,7 +1787,12 @@ rollback_needed=1
 journal_phase runtime-mutating
 
 # Idempotently refresh permissions, certificates and checked-in runtime config.
-# Package installation belongs to the explicit first bootstrap, not every deploy.
+# The exact connector executable was downloaded, checksum-verified, and staged
+# before rollback was armed. Publish only that release-local copy now; no network
+# or mutable "latest" package selection is permitted inside the transaction.
+cloudflare_state_activated=true
+sh "${source_root}/deploy/oci/install-cloudflared-package.sh" \
+  install-from "${host_tool_stage}/bin/cloudflared"
 CLIXOR_SKIP_PACKAGES=true CLIXOR_SKIP_SECRET_PREPARATION=true \
   CLIXOR_DEFER_HOST_TOOL_ACTIVATION=true \
   sh "${source_root}/deploy/oci/bootstrap.sh"
@@ -1877,7 +2104,16 @@ else
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"
-  [ "${ingress_stage}" != "canary" ] || verify_production_not_candidate "${source_sha}"
+  if [ "${ingress_stage}" = "canary" ]; then
+    case "${topology_ownership_state}" in
+      uninitialized|pre-cutover-old)
+        verify_production_not_candidate "${source_sha}"
+        ;;
+      oci-live)
+        verify_production_candidate "${source_sha}"
+        ;;
+    esac
+  fi
   run_disposable_public_smoke "${source_sha}"
 else
   log "public ingress smoke is deferred for this non-production staging deployment"

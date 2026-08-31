@@ -39,6 +39,8 @@ if [ ! -r /etc/os-release ] || ! grep -q '^ID=ubuntu$' /etc/os-release; then
   exit 1
 fi
 
+script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
 cpu_count="$(getconf _NPROCESSORS_ONLN)"
 memory_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
 if [ "${cpu_count}" -lt 2 ] || [ "${memory_kb}" -lt 10000000 ]; then
@@ -57,7 +59,6 @@ systemctl enable --now docker
 docker compose version >/dev/null
 docker buildx version >/dev/null
 
-script_root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 if ! command -v oci >/dev/null 2>&1; then
   [ "${CLIXOR_SKIP_PACKAGES:-false}" != "true" ] || {
     echo "OCI CLI is missing; run ${script_root}/install-oci-cli.sh before deploying." >&2
@@ -153,6 +154,15 @@ install -d -m 0750 "${project_root}" "${project_root}/repo" \
 install -d -m 0700 -o 0 -g 0 "${project_root}/restore-drills"
 install -d -m 0755 -o 0 -g 0 "${backup_tool_root}" "${backup_config_root}"
 install -d -m 0700 -o 0 -g 0 "${secret_root}" "${pki_root}"
+# A fresh host has no selected release to preserve, so bootstrap may install the
+# authenticated connector directly. An existing host deliberately does not
+# mutate /usr/bin/cloudflared here: deploy.sh stages the exact package, captures
+# the prior executable under the shared lock, arms rollback, and only then
+# publishes it as part of a release transaction.
+if [ ! -e "${project_root}/releases/current" ] && \
+  [ ! -L "${project_root}/releases/current" ]; then
+  sh "${script_root}/install-cloudflared-package.sh" install
+fi
 secret_mode=/etc/clixor/secret-mode
 if [ ! -e "${secret_mode}" ] && [ ! -L "${secret_mode}" ]; then
   temporary_mode="/etc/clixor/.secret-mode.$$"
@@ -261,9 +271,18 @@ python3 "${script_root}/validate-origin-identity.py" \
   --shadow-status "$(passwd --status "${gateway_user}")"
 install -m 0644 -o 0 -g 0 "${script_root}/clixor-origin.conf" \
   /etc/tmpfiles.d/clixor-origin.conf
-install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-origin-gate.conf" \
-  /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/clixor-origin.conf
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-origin-gate.conf" \
+    /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
+else
+  [ -f /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf ] && \
+    [ ! -L /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf ] && \
+    [ "$(stat -c '%u:%g:%a' /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf)" = "0:0:644" ] || {
+    echo "Stable Cloudflare origin-gate tmpfiles policy is missing or unsafe; run explicit bootstrap." >&2
+    exit 1
+  }
+fi
 systemd-tmpfiles --create /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
   [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || {
@@ -498,9 +517,24 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
   # source/image/PKI mismatch.
   install -d -m 0700 -o 0 -g 0 "${project_root}/releases/pending"
   if [ -L "${project_root}/releases/current" ]; then
-    exec 8>"${project_root}/runtime/deploy.lock"
+    shared_deploy_lock="${project_root}/runtime/deploy.lock"
+    if [ -e "${shared_deploy_lock}" ] || [ -L "${shared_deploy_lock}" ]; then
+      [ -f "${shared_deploy_lock}" ] && [ ! -L "${shared_deploy_lock}" ] && \
+        [ "$(stat -c '%u:%g:%a' "${shared_deploy_lock}")" = "0:0:600" ] || {
+        echo "Shared deploy lock is unsafe." >&2
+        exit 1
+      }
+    else
+      install -m 0600 -o 0 -g 0 /dev/null "${shared_deploy_lock}"
+    fi
+    exec 8<>"${shared_deploy_lock}"
     flock -n 8 || {
       echo "A deployment is active; refusing the runtime-controller transition." >&2
+      exit 1
+    }
+    [ "$(readlink -- "${project_root}/releases/current")" = \
+      "${selected_boot_release}" ] || {
+      echo "Current release changed before the runtime-controller lock was acquired." >&2
       exit 1
     }
     controller_source_root="$(CDPATH= cd -- "${script_root}/../.." && pwd)"
@@ -557,6 +591,17 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
       trusted_git fetch --force --no-tags origin \
         "+${legacy_source_sha}:refs/clixor/legacy-baseline"
       trusted_git fsck --full --strict "${legacy_source_sha}" >/dev/null
+    fi
+    if [ -e "${selected_boot_release}/runtime-bundle/manifest.json" ] || \
+      [ -L "${selected_boot_release}/runtime-bundle/manifest.json" ]; then
+      # Releases finalized by the previous controller lack the Cloudflare
+      # promoter/unit/gate files. Attach one independently inventoried cohort
+      # before any stable host tool changes, so both exit rollback and the crash
+      # watchdog have exact release-local restore authority.
+      /usr/bin/python3 "${script_root}/runtime_bundle.py" \
+        install-promotion-extension \
+        --release "${selected_boot_release}" \
+        --source "${controller_source_root}"
     fi
     /usr/bin/python3 "${script_root}/runtime-reconciler.py" \
       establish-legacy-baseline \
@@ -643,15 +688,33 @@ install -m 0400 -o 99 -g 99 "${script_root}/haproxy.cfg" \
 install -m 0400 -o 986 -g 987 "${script_root}/api-gateway-nginx.conf" \
   "${runtime_root}/api-gateway/nginx.conf"
 install -d -m 0755 -o 0 -g 0 /usr/local/libexec/clixor
-install -m 0555 -o 0 -g 0 "${script_root}/cloudflare-promote.py" \
-  /usr/local/libexec/clixor/cloudflare-promote.py
-sha256sum /usr/local/libexec/clixor/cloudflare-promote.py > \
-  /usr/local/libexec/clixor/cloudflare-promote.py.sha256
-chown 0:0 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
-chmod 0444 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+if [ "${defer_host_tool_activation}" = "false" ]; then
+  install -m 0555 -o 0 -g 0 "${script_root}/cloudflare-promote.py" \
+    /usr/local/libexec/clixor/cloudflare-promote.py
+  sha256sum /usr/local/libexec/clixor/cloudflare-promote.py > \
+    /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+  chown 0:0 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+  chmod 0444 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+  install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-promote.service" \
+    /etc/systemd/system/clixor-cloudflare-promote.service
+else
+  for stable_promotion_file in \
+    /usr/local/libexec/clixor/cloudflare-promote.py \
+    /usr/local/libexec/clixor/cloudflare-promote.py.sha256 \
+    /etc/systemd/system/clixor-cloudflare-promote.service
+  do
+    [ -f "${stable_promotion_file}" ] && [ ! -L "${stable_promotion_file}" ] || {
+      echo "Stable Cloudflare promotion tooling is missing; run explicit bootstrap." >&2
+      exit 1
+    }
+  done
+  (cd / && sha256sum --check --strict \
+    /usr/local/libexec/clixor/cloudflare-promote.py.sha256 >/dev/null) || {
+    echo "Stable Cloudflare promotion controller checksum is invalid." >&2
+    exit 1
+  }
+fi
 /usr/bin/python3 /usr/local/libexec/clixor/cloudflare-promote.py initialize-gate
-install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-promote.service" \
-  /etc/systemd/system/clixor-cloudflare-promote.service
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
   "${runtime_root}/postgres-backup/backup.sh"
 if [ "${defer_host_tool_activation}" = "false" ]; then

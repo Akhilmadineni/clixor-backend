@@ -33,14 +33,23 @@ TEMP_ROOT = "/private/tmp" if Path("/private/tmp").is_dir() else None
 
 
 def _materialize_legacy_controller(target: Path) -> None:
-    """Use immutable Git objects, never today's mutable controller files."""
+    """Materialize the authenticated base plus promotion-tool extension cohort."""
     repository = SCRIPT_ROOT.parent.parent
     target.mkdir(parents=True, mode=0o700)
+    extension = {
+        "deploy/oci/cloudflare-promote.py",
+        "deploy/oci/clixor-cloudflare-promote.service",
+        "deploy/oci/clixor-cloudflare-origin-gate.conf",
+    }
     for relative in RECONCILER.LEGACY_CONTROLLER_FILES:
-        content = subprocess.check_output(
-            ["git", "show", f"{RECONCILER.LEGACY_CONTROLLER_REVISION}:{relative}"],
-            cwd=repository,
-        )
+        if relative in extension:
+            content = (repository / relative).read_bytes()
+        else:
+            content = subprocess.check_output(
+                ["git", "show", f"{RECONCILER.LEGACY_CONTROLLER_REVISION}:{relative}"],
+                cwd=repository,
+            )
+        assert hashlib.sha256(content).hexdigest() == RECONCILER.LEGACY_CONTROLLER_FILES[relative]
         path = target.parent.parent / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
@@ -255,6 +264,25 @@ class RuntimeFixture:
         return release
 
 
+def _remove_historical_promotion_cohort(release: Path) -> None:
+    bundle = release / runtime_bundle.BUNDLE_DIRECTORY
+    manifest_path = bundle / runtime_bundle.MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+    manifest["files"] = [
+        record
+        for record in manifest["files"]
+        if record["path"] not in runtime_bundle.PROMOTION_EXTENSION_REQUIRED
+    ]
+    for relative in runtime_bundle.PROMOTION_EXTENSION_REQUIRED:
+        (bundle / relative).unlink()
+    manifest_path.chmod(0o600)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+        encoding="ascii",
+    )
+    manifest_path.chmod(0o400)
+
+
 class RuntimeBundleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(
@@ -290,6 +318,65 @@ class RuntimeBundleTests(unittest.TestCase):
         release.mkdir(mode=0o700)
         with self.assertRaisesRegex(runtime_bundle.BundleError, "symbolic link"):
             runtime_bundle.stage_source(release, self.fixture.source, SOURCE_SHA)
+
+    def test_existing_release_gets_atomic_validated_promotion_extension(self) -> None:
+        release = self.fixture.finalized_release()
+        _remove_historical_promotion_cohort(release)
+        uid = self.fixture.root.stat().st_uid
+        gid = self.fixture.root.stat().st_gid
+        with self.assertRaisesRegex(runtime_bundle.BundleError, "unavailable"):
+            runtime_bundle.validate_runtime_bundle(
+                release, expected_uid=uid, expected_gid=gid
+            )
+
+        runtime_bundle.install_promotion_extension(release, self.fixture.source)
+        manifest = runtime_bundle.validate_runtime_bundle(
+            release, expected_uid=uid, expected_gid=gid
+        )
+        extension = release / runtime_bundle.PROMOTION_EXTENSION_DIRECTORY
+        self.assertEqual(manifest["source_sha"], SOURCE_SHA)
+        self.assertEqual(
+            runtime_bundle.promotion_host_tools_root(
+                release, expected_uid=uid, expected_gid=gid
+            ),
+            extension / "host-tools",
+        )
+        before = (extension / runtime_bundle.MANIFEST_NAME).read_bytes()
+        runtime_bundle.install_promotion_extension(release, self.fixture.source)
+        self.assertEqual(
+            (extension / runtime_bundle.MANIFEST_NAME).read_bytes(), before
+        )
+
+        promoter = extension / "host-tools/bin/cloudflare-promote.py"
+        promoter.chmod(0o600)
+        promoter.write_text("drift\n", encoding="ascii")
+        promoter.chmod(0o500)
+        with self.assertRaisesRegex(runtime_bundle.BundleError, "inventory changed"):
+            runtime_bundle.validate_runtime_bundle(
+                release, expected_uid=uid, expected_gid=gid
+            )
+
+    def test_partial_bundled_promotion_cohort_cannot_be_extended(self) -> None:
+        release = self.fixture.finalized_release()
+        bundle = release / runtime_bundle.BUNDLE_DIRECTORY
+        removed = "host-tools/bin/cloudflare-promote.py.sha256"
+        (bundle / removed).unlink()
+        manifest_path = bundle / runtime_bundle.MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text(encoding="ascii"))
+        manifest["files"] = [
+            record for record in manifest["files"] if record["path"] != removed
+        ]
+        manifest_path.chmod(0o600)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+            encoding="ascii",
+        )
+        manifest_path.chmod(0o400)
+        with self.assertRaisesRegex(runtime_bundle.BundleError, "partial"):
+            runtime_bundle.install_promotion_extension(release, self.fixture.source)
+        self.assertFalse(
+            (release / runtime_bundle.PROMOTION_EXTENSION_DIRECTORY).exists()
+        )
 
 
 class JournalRecoveryTests(unittest.TestCase):
@@ -526,6 +613,7 @@ class HostToolSelectionTests(unittest.TestCase):
             runner = FakeRunner()
             host_root = fixture.root / "installed-host-tools"
             systemd_root = fixture.root / "installed-systemd"
+            tmpfiles_root = fixture.root / "installed-tmpfiles"
             cloudflared_target = fixture.root / "installed-cloudflared"
             with mock.patch.object(
                 RECONCILER, "_atomic_install", side_effect=capture
@@ -533,6 +621,8 @@ class HostToolSelectionTests(unittest.TestCase):
                 RECONCILER, "HOST_TOOL_ROOT", host_root
             ), mock.patch.object(
                 RECONCILER, "SYSTEMD_ROOT", systemd_root
+            ), mock.patch.object(
+                RECONCILER, "TMPFILES_ROOT", tmpfiles_root
             ), mock.patch.object(
                 RECONCILER, "CLOUDFLARED_BINARY", cloudflared_target
             ):
@@ -549,7 +639,93 @@ class HostToolSelectionTests(unittest.TestCase):
                 installed,
             )
             self.assertIn(
+                (
+                    release / "runtime-bundle" / "host-tools" / "bin" / "cloudflare-promote.py",
+                    host_root / "cloudflare-promote.py",
+                    0, 0, 0o555,
+                ),
+                installed,
+            )
+            self.assertIn(
+                (
+                    release / "runtime-bundle" / "host-tools" / "systemd" / "clixor-cloudflare-promote.service",
+                    systemd_root / "clixor-cloudflare-promote.service",
+                    0, 0, 0o644,
+                ),
+                installed,
+            )
+            self.assertIn(
+                (
+                    release / "runtime-bundle" / "host-tools" / "tmpfiles" / "clixor-cloudflare-origin-gate.conf",
+                    tmpfiles_root / "clixor-cloudflare-origin-gate.conf",
+                    0, 0, 0o644,
+                ),
+                installed,
+            )
+            self.assertIn(
+                ("/usr/bin/systemd-tmpfiles", "--create",
+                 str(tmpfiles_root / "clixor-cloudflare-origin-gate.conf")),
+                runner.calls,
+            )
+            self.assertIn(
                 ("/usr/bin/systemctl", "daemon-reload"), runner.calls
+            )
+
+    def test_reconciler_restores_promotion_tools_from_existing_release_extension(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="clixor-host-extension-", dir=TEMP_ROOT
+        ) as temporary:
+            fixture = RuntimeFixture(Path(temporary))
+            release = fixture.finalized_release()
+            _remove_historical_promotion_cohort(release)
+            runtime_bundle.install_promotion_extension(release, fixture.source)
+            installed: list[tuple[Path, Path, int, int, int]] = []
+
+            def capture(source, target, uid, gid, mode):
+                installed.append((source, target, uid, gid, mode))
+
+            host_root = fixture.root / "installed-host-tools"
+            systemd_root = fixture.root / "installed-systemd"
+            tmpfiles_root = fixture.root / "installed-tmpfiles"
+            extension_tools = (
+                release
+                / runtime_bundle.PROMOTION_EXTENSION_DIRECTORY
+                / "host-tools"
+            )
+            with mock.patch.object(
+                RECONCILER, "_atomic_install", side_effect=capture
+            ), mock.patch.object(
+                RECONCILER, "HOST_TOOL_ROOT", host_root
+            ), mock.patch.object(
+                RECONCILER, "SYSTEMD_ROOT", systemd_root
+            ), mock.patch.object(
+                RECONCILER, "TMPFILES_ROOT", tmpfiles_root
+            ), mock.patch.object(
+                RECONCILER,
+                "CLOUDFLARED_BINARY",
+                fixture.root / "installed-cloudflared",
+            ):
+                RECONCILER._restore_host_tools(release, FakeRunner())
+            self.assertIn(
+                (
+                    extension_tools / "bin/cloudflare-promote.py",
+                    host_root / "cloudflare-promote.py",
+                    0,
+                    0,
+                    0o555,
+                ),
+                installed,
+            )
+            self.assertIn(
+                (
+                    extension_tools
+                    / "systemd/clixor-cloudflare-promote.service",
+                    systemd_root / "clixor-cloudflare-promote.service",
+                    0,
+                    0,
+                    0o644,
+                ),
+                installed,
             )
 
 
@@ -697,6 +873,16 @@ class LegacyBaselineTests(unittest.TestCase):
             self.assertEqual(os.readlink(current), str(legacy))
             manifest = RECONCILER._validate_bundle(legacy, fixture.root)
             self.assertEqual(manifest["source_sha"], source_sha)
+            for relative in (
+                "host-tools/bin/cloudflare-promote.py",
+                "host-tools/bin/cloudflare-promote.py.sha256",
+                "host-tools/systemd/clixor-cloudflare-promote.service",
+                "host-tools/tmpfiles/clixor-cloudflare-origin-gate.conf",
+            ):
+                self.assertTrue(
+                    (legacy / runtime_bundle.BUNDLE_DIRECTORY / relative).is_file(),
+                    relative,
+                )
             self.assertEqual(
                 (legacy / runtime_bundle.BUNDLE_DIRECTORY / "compose.yaml").read_bytes(),
                 approved_compose,
@@ -965,6 +1151,12 @@ class BootSelectionContractTests(unittest.TestCase):
         self.assertIn("publish-release", deploy)
         self.assertIn("quarantine-pending", deploy)
         self.assertIn("establish-legacy-baseline", bootstrap)
+        self.assertIn('exec 8<>"${shared_deploy_lock}"', bootstrap)
+        extension_install = bootstrap.index("install-promotion-extension")
+        stable_controller_install = bootstrap.index(
+            "/usr/local/libexec/clixor/runtime-reconciler.py", extension_install
+        )
+        self.assertLess(extension_install, stable_controller_install)
         controller_probe = deploy.index(
             "stable runtime controller is outdated; rerun the explicit bootstrap transition"
         )

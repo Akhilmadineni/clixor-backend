@@ -26,6 +26,8 @@ BUNDLE_SCHEMA = 2
 CONTROLLER_VERSION = 2
 BUNDLE_DIRECTORY = "runtime-bundle"
 MANIFEST_NAME = "manifest.json"
+PROMOTION_EXTENSION_DIRECTORY = "promotion-host-tools-v1"
+PROMOTION_EXTENSION_SCHEMA = 1
 RELEASE_RE = re.compile(r"^oci-[0-9a-f]{12}-[A-Za-z0-9._-]{1,160}$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -176,6 +178,8 @@ REQUIRED_HOST_TOOLS = frozenset(
         "host-tools/bin/backup-health.sh",
         "host-tools/bin/restore-drill.sh",
         "host-tools/bin/backup_manifest.py",
+        "host-tools/bin/cloudflare-promote.py",
+        "host-tools/bin/cloudflare-promote.py.sha256",
         "host-tools/bin/cloudflared",
         "host-tools/systemd/clixor-offsite-backup.service",
         "host-tools/systemd/clixor-offsite-backup.timer",
@@ -184,6 +188,8 @@ REQUIRED_HOST_TOOLS = frozenset(
         "host-tools/systemd/clixor-restore-drill.service",
         "host-tools/systemd/clixor-restore-drill.timer",
         "host-tools/systemd/cloudflared.service",
+        "host-tools/systemd/clixor-cloudflare-promote.service",
+        "host-tools/tmpfiles/clixor-cloudflare-origin-gate.conf",
     }
 )
 
@@ -192,6 +198,7 @@ HOST_TOOL_SOURCE_MODES = {
     "bin/backup-health.sh": True,
     "bin/restore-drill.sh": True,
     "bin/backup_manifest.py": True,
+    "bin/cloudflare-promote.py": True,
     "systemd/clixor-offsite-backup.service": False,
     "systemd/clixor-offsite-backup.timer": False,
     "systemd/clixor-backup-health.service": False,
@@ -199,7 +206,20 @@ HOST_TOOL_SOURCE_MODES = {
     "systemd/clixor-restore-drill.service": False,
     "systemd/clixor-restore-drill.timer": False,
     "systemd/cloudflared.service": False,
+    "systemd/clixor-cloudflare-promote.service": False,
+    "tmpfiles/clixor-cloudflare-origin-gate.conf": False,
 }
+PROMOTION_EXTENSION_SOURCE_MODES = {
+    "host-tools/bin/cloudflare-promote.py": True,
+    "host-tools/systemd/clixor-cloudflare-promote.service": False,
+    "host-tools/tmpfiles/clixor-cloudflare-origin-gate.conf": False,
+}
+PROMOTION_EXTENSION_REQUIRED = frozenset(
+    {
+        *PROMOTION_EXTENSION_SOURCE_MODES,
+        "host-tools/bin/cloudflare-promote.py.sha256",
+    }
+)
 
 
 class BundleError(RuntimeError):
@@ -429,6 +449,11 @@ def stage_host_tools(
             host_root / category / name,
             executable=executable,
         )
+    promoter = host_root / "bin" / "cloudflare-promote.py"
+    checksum = (_sha256_file(promoter)
+                + "  /usr/local/libexec/clixor/cloudflare-promote.py\n").encode("ascii")
+    _atomic_write(host_root / "bin" / "cloudflare-promote.py.sha256",
+                  checksum, 0o400)
     # cloudflared is package-managed host state, but it is part of the selected
     # ingress runtime just as much as its systemd unit. Snapshot the exact
     # executable so rollback/reboot does not silently select a later host
@@ -441,6 +466,155 @@ def stage_host_tools(
     _lock_tree_directories(host_root)
     _fsync_tree(host_root)
     _fsync(bundle)
+
+
+def _promotion_extension_inventory(
+    root: Path, *, expected_uid: int, expected_gid: int
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+        current = Path(directory)
+        metadata = current.lstat()
+        if (stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode)
+                or (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid)
+                or stat.S_IMODE(metadata.st_mode) != 0o700):
+            raise BundleError("promotion extension contains an unsafe directory")
+        for name in names:
+            if (current / name).is_symlink():
+                raise BundleError("promotion extension contains a symbolic link")
+        for name in files:
+            path = current / name
+            if path == root / MANIFEST_NAME:
+                continue
+            file_metadata = path.lstat()
+            if (not stat.S_ISREG(file_metadata.st_mode) or stat.S_ISLNK(file_metadata.st_mode)
+                    or (file_metadata.st_uid, file_metadata.st_gid)
+                    != (expected_uid, expected_gid)
+                    or file_metadata.st_size <= 0
+                    or file_metadata.st_size > MAX_FILE_BYTES):
+                raise BundleError("promotion extension contains an unsafe file")
+            records.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": _sha256_file(path),
+                    "size": file_metadata.st_size,
+                    "mode": stat.S_IMODE(file_metadata.st_mode),
+                }
+            )
+    records.sort(key=lambda record: str(record["path"]))
+    return records
+
+
+def validate_promotion_extension(
+    release: Path, source_sha: str, *, expected_uid: int = 0, expected_gid: int = 0
+) -> Path:
+    root = release / PROMOTION_EXTENSION_DIRECTORY
+    manifest_path = root / MANIFEST_NAME
+    manifest = _load_json(manifest_path)
+    manifest_metadata = manifest_path.lstat()
+    if ((manifest_metadata.st_uid, manifest_metadata.st_gid)
+            != (expected_uid, expected_gid)
+            or stat.S_IMODE(manifest_metadata.st_mode) != 0o400
+            or set(manifest) != {
+                "schema", "release", "source_sha", "controller_sha256", "files"
+            }
+            or manifest.get("schema") != PROMOTION_EXTENSION_SCHEMA
+            or manifest.get("release") != release.name
+            or manifest.get("source_sha") != source_sha):
+        raise BundleError("promotion extension manifest is invalid")
+    records = _promotion_extension_inventory(
+        root, expected_uid=expected_uid, expected_gid=expected_gid
+    )
+    if manifest.get("files") != records:
+        raise BundleError("promotion extension inventory changed")
+    paths = {str(record["path"]) for record in records}
+    if paths != PROMOTION_EXTENSION_REQUIRED:
+        raise BundleError("promotion extension inventory is incomplete")
+    expected_modes = {
+        "host-tools/bin/cloudflare-promote.py": 0o500,
+        "host-tools/bin/cloudflare-promote.py.sha256": 0o400,
+        "host-tools/systemd/clixor-cloudflare-promote.service": 0o400,
+        "host-tools/tmpfiles/clixor-cloudflare-origin-gate.conf": 0o400,
+    }
+    if any(record["mode"] != expected_modes[str(record["path"])] for record in records):
+        raise BundleError("promotion extension file mode is invalid")
+    checksum = (root / "host-tools/bin/cloudflare-promote.py.sha256").read_text(
+        encoding="ascii"
+    )
+    promoter_sha = _sha256_file(root / "host-tools/bin/cloudflare-promote.py")
+    if (manifest.get("controller_sha256") != promoter_sha
+            or checksum
+            != promoter_sha + "  /usr/local/libexec/clixor/cloudflare-promote.py\n"):
+        raise BundleError("promotion extension checksum is invalid")
+    return root / "host-tools"
+
+
+def install_promotion_extension(release: Path, source_root: Path) -> None:
+    """Atomically extend an already-committed pre-promotion runtime release."""
+    _validate_release_name(release)
+    bundle = release / BUNDLE_DIRECTORY
+    release_metadata = release.lstat()
+    expected_uid, expected_gid = release_metadata.st_uid, release_metadata.st_gid
+    destination = release / PROMOTION_EXTENSION_DIRECTORY
+    if destination.exists() or destination.is_symlink():
+        validate_runtime_bundle(
+            release, expected_uid=expected_uid, expected_gid=expected_gid
+        )
+        return
+    manifest = validate_runtime_bundle(
+        release,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        _allow_missing_promotion_extension=True,
+    )
+    source_sha = manifest["source_sha"]
+    assert isinstance(source_sha, str)
+    if (bundle / "host-tools/bin/cloudflare-promote.py").is_file():
+        return
+    temporary = Path(tempfile.mkdtemp(
+        prefix=f".{PROMOTION_EXTENSION_DIRECTORY}.", dir=release
+    ))
+    try:
+        for relative, executable in PROMOTION_EXTENSION_SOURCE_MODES.items():
+            _, category, name = relative.split("/", 2)
+            _copy_locked(source_root / "deploy" / "oci" / name,
+                         temporary / "host-tools" / category / name,
+                         executable=executable)
+        promoter = temporary / "host-tools/bin/cloudflare-promote.py"
+        checksum = (_sha256_file(promoter)
+                    + "  /usr/local/libexec/clixor/cloudflare-promote.py\n").encode("ascii")
+        _atomic_write(temporary / "host-tools/bin/cloudflare-promote.py.sha256",
+                      checksum, 0o400)
+        _lock_tree_directories(temporary)
+        records = _promotion_extension_inventory(
+            temporary,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        document = {
+            "schema": PROMOTION_EXTENSION_SCHEMA,
+            "release": release.name,
+            "source_sha": source_sha,
+            "controller_sha256": _sha256_file(promoter),
+            "files": records,
+        }
+        _atomic_write(
+            temporary / MANIFEST_NAME,
+            (
+                json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True)
+                + "\n"
+            ).encode("ascii"),
+            0o400,
+        )
+        _fsync_tree(temporary)
+        os.rename(temporary, destination)
+        _fsync(release)
+        validate_runtime_bundle(
+            release, expected_uid=expected_uid, expected_gid=expected_gid
+        )
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
 
 
 def _copy_runtime_artifacts(bundle: Path, runtime_root: Path, pki_root: Path) -> None:
@@ -578,7 +752,11 @@ def _require_bool(value: Any, description: str) -> bool:
 
 
 def validate_runtime_bundle(
-    release: Path, *, expected_uid: int = 0, expected_gid: int = 0
+    release: Path,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+    _allow_missing_promotion_extension: bool = False,
 ) -> Mapping[str, Any]:
     """Validate an immutable runtime bundle and return its strict manifest."""
 
@@ -728,8 +906,31 @@ def validate_runtime_bundle(
                 raise BundleError("runtime bundle file checksum changed")
     if actual_paths != set(expected_inventory):
         raise BundleError("runtime bundle is missing an inventoried file")
+    promotion_paths = actual_paths.intersection(PROMOTION_EXTENSION_REQUIRED)
+    extension = release / PROMOTION_EXTENSION_DIRECTORY
+    if promotion_paths == PROMOTION_EXTENSION_REQUIRED:
+        if extension.exists() or extension.is_symlink():
+            raise BundleError("runtime release has an unexpected promotion extension")
+    elif promotion_paths:
+        raise BundleError("runtime bundle has a partial promotion-controller cohort")
+    elif not _allow_missing_promotion_extension:
+        # Schema-2 releases committed by the previous stable controller predate
+        # these four files. An explicit, shared-lock bootstrap may attach one
+        # independently inventoried, release-bound extension so crash recovery
+        # can restore the exact pre-deploy controller. No ordinary deploy can
+        # create or change this extension.
+        validate_promotion_extension(
+            release,
+            source_sha,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+    elif extension.exists() or extension.is_symlink():
+        raise BundleError("runtime release has an unvalidated promotion extension")
     required_paths = {artifact.bundle_path for artifact in RUNTIME_ARTIFACTS}
-    required_paths.update(REQUIRED_HOST_TOOLS)
+    required_paths.update(REQUIRED_HOST_TOOLS - PROMOTION_EXTENSION_REQUIRED)
+    if promotion_paths == PROMOTION_EXTENSION_REQUIRED:
+        required_paths.update(PROMOTION_EXTENSION_REQUIRED)
     required_paths.update(
         {"source-sha", "compose.yaml", "source/go.mod", "source/deploy/oci/compose.yaml"}
     )
@@ -745,6 +946,27 @@ def validate_runtime_bundle(
     if compose.count('restart: "no"') < 11:
         raise BundleError("runtime Compose model does not disable every persistent restart")
     return manifest
+
+
+def promotion_host_tools_root(
+    release: Path, *, expected_uid: int = 0, expected_gid: int = 0
+) -> Path:
+    """Return the single validated promotion-tool cohort for ``release``."""
+
+    manifest = validate_runtime_bundle(
+        release, expected_uid=expected_uid, expected_gid=expected_gid
+    )
+    bundled = release / BUNDLE_DIRECTORY / "host-tools"
+    if (bundled / "bin" / "cloudflare-promote.py").is_file():
+        return bundled
+    source_sha = manifest["source_sha"]
+    assert isinstance(source_sha, str)
+    return validate_promotion_extension(
+        release,
+        source_sha,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
 
 
 def runtime_artifact_sources(
@@ -778,6 +1000,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     finalize.add_argument("--state-file", required=True, type=Path)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--release", required=True, type=Path)
+    extension = subparsers.add_parser("install-promotion-extension")
+    extension.add_argument("--release", required=True, type=Path)
+    extension.add_argument("--source", required=True, type=Path)
     options = parser.parse_args(arguments)
     try:
         if options.action == "stage-source":
@@ -801,6 +1026,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.image_id,
                 options.state_file,
             )
+        elif options.action == "install-promotion-extension":
+            install_promotion_extension(options.release, options.source)
         else:
             validate_runtime_bundle(options.release)
     except (BundleError, OSError) as error:

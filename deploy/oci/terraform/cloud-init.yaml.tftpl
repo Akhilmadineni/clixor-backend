@@ -32,6 +32,12 @@ write_files:
     content: |
       ${indent(6, chomp(mount_data_script))}
 
+  - path: /usr/local/sbin/clixor-install-cloudflared-package
+    owner: root:root
+    permissions: "0750"
+    content: |
+      ${indent(6, chomp(cloudflared_package_installer))}
+
   - path: /etc/default/clixor-data-volume
     owner: root:root
     permissions: "0644"
@@ -55,6 +61,7 @@ write_files:
       RequiresMountsFor=/srv/clixor
 
 runcmd:
+  - [sh, /usr/local/sbin/clixor-install-cloudflared-package, install]
   - [bash, -lc, "systemctl stop docker.service docker.socket || true"]
   - [bash, -lc, "systemctl daemon-reload"]
   - [bash, -lc, "systemctl enable clixor-data-volume.service docker.service"]

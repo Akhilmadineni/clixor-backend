@@ -61,6 +61,7 @@ resource "oci_core_instance" "clixor" {
       data_volume_size_gbs          = var.data_volume_size_gbs
       mount_data_script             = file("${path.module}/clixor-mount-data.sh")
       mount_data_unit               = file("${path.module}/clixor-data-volume.service")
+      cloudflared_package_installer = file("${path.module}/install-cloudflared-package.sh")
       bastion_private_endpoint_cidr = "${oci_bastion_bastion.clixor.private_endpoint_ip_address}/32"
     }))
   }
