@@ -975,14 +975,24 @@ class SmokeSuite:
         self.websocket = WebSocketClient(self.api_origin, member_session.access_token)
         ready = self.websocket.receive_json(15.0)
         ready_payload = ready.get("payload")
-        self.check(
+        ready_identity_valid = (
             ready.get("type") == "session.ready"
             and isinstance(ready_payload, dict)
             and ready_payload.get("user_id") == member.user_id
             and ready_payload.get("device_id") == member.device_id
-            and isinstance(ready_payload.get("heartbeat_seconds"), (int, float)),
-            "realtime session.ready identity was incorrect",
+            and isinstance(ready_payload.get("heartbeat_seconds"), (int, float))
         )
+        if not ready_identity_valid:
+            payload = ready_payload if isinstance(ready_payload, dict) else {}
+            raise SmokeFailure(
+                "realtime session.ready identity was incorrect "
+                f"(type_ok={ready.get('type') == 'session.ready'} "
+                f"payload_object={isinstance(ready_payload, dict)} "
+                f"user_ok={payload.get('user_id') == member.user_id} "
+                f"device_ok={payload.get('device_id') == member.device_id} "
+                f"heartbeat_numeric={isinstance(payload.get('heartbeat_seconds'), (int, float))})"
+            )
+        self.check(True, "realtime session.ready identity was incorrect")
 
         ciphertext = secrets.token_bytes(96)
         client_message_id = str(uuid.uuid4())

@@ -138,6 +138,14 @@ class ValidationTests(unittest.TestCase):
         source = inspect.getsource(smoke.SmokeSuite.account)
         self.assertIn('email=f"{self.prefix}-{role}@example.com".lower()', source)
 
+    def test_realtime_identity_diagnostic_does_not_expose_identifiers(self) -> None:
+        source = inspect.getsource(smoke.SmokeSuite.verify_group_realtime_and_media)
+        self.assertIn("type_ok=", source)
+        self.assertIn("user_ok=", source)
+        self.assertIn("device_ok=", source)
+        self.assertNotIn("member.user_id!r", source)
+        self.assertNotIn("member.device_id!r", source)
+
     def test_deploy_uses_the_exact_destructive_smoke_confirmation(self) -> None:
         deploy = (Path(__file__).resolve().with_name("deploy.sh")).read_text(
             encoding="utf-8"
