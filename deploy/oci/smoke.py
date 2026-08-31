@@ -1144,8 +1144,16 @@ class SmokeSuite:
         ):
             raise SmokeFailure("media slot returned invalid upload headers")
         normalized_headers = {key.lower(): value for key, value in upload_headers.items()}
+        expected_upload_headers = {
+            "content-type": "application/octet-stream",
+            "content-length": str(len(media_bytes)),
+            "opc-checksum-algorithm": "SHA256",
+            "opc-content-sha256": base64.b64encode(
+                hashlib.sha256(media_bytes).digest()
+            ).decode("ascii"),
+        }
         self.check(
-            normalized_headers == {"content-type": "application/octet-stream"},
+            normalized_headers == expected_upload_headers,
             "media slot returned unexpected upload headers",
         )
         upload_par(self.transport, upload_url, media_bytes, upload_headers)

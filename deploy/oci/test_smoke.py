@@ -167,6 +167,12 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertNotIn(".oci.customer-oci.com", deploy)
 
+    def test_media_smoke_binds_oci_checksum_upload_headers(self) -> None:
+        source = inspect.getsource(smoke.SmokeSuite.verify_group_realtime_and_media)
+        self.assertIn('"opc-checksum-algorithm": "SHA256"', source)
+        self.assertIn('"opc-content-sha256": base64.b64encode(', source)
+        self.assertIn('"content-length": str(len(media_bytes))', source)
+
     def test_https_origin_validation(self) -> None:
         self.assertEqual(
             smoke.validate_origin("https://API.Example.com/", "test"),
