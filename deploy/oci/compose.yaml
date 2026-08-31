@@ -280,6 +280,14 @@ services:
           # Never let Docker create an absent boot-time trust boundary as
           # root:root with daemon defaults.
           create_host_path: false
+      - type: bind
+        # Bind the always-present directory, never the optional public-open
+        # capability. Docker therefore cannot manufacture an absent marker.
+        source: /var/lib/clixor/origin-gate-public
+        target: /run/clixor-origin-gate
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health/live"]
       interval: 10s

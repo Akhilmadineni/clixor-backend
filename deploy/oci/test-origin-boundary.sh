@@ -6,6 +6,8 @@ chmod 0711 "${root}"
 cleanup() { kill "${server_pid:-0}" 2>/dev/null || true; rm -rf -- "${root}"; }
 trap cleanup EXIT HUP INT TERM
 install -d -m 0750 -o 986 -g 987 "${root}/origin"
+install -d -m 0755 -o 0 -g 0 "${root}/origin-gate-public"
+install -m 0400 -o 0 -g 0 /dev/null "${root}/origin-gate-public/public-open"
 
 # Faithful kernel boundary: the gateway owner creates a 0770 Unix socket; only
 # a process carrying connector GID 987 can connect. Other host/runner identities
@@ -48,6 +50,29 @@ fi
 setpriv --reuid=986 --regid=987 --clear-groups rm -f -- "${root}/origin/gateway.sock"
 [ ! -e "${root}/origin/gateway.sock" ]
 
+# The gateway and connector may stat the persistent capability through their
+# read-only bind mount, but neither numeric identity can create, remove, or
+# rename host gate artifacts. Missing public-open is therefore fail-closed.
+for identity in '986 987' '65530 987'; do
+  set -- ${identity}
+  setpriv --reuid="$1" --regid="$2" --clear-groups \
+    test -f "${root}/origin-gate-public/public-open"
+  if setpriv --reuid="$1" --regid="$2" --clear-groups \
+    touch "${root}/origin-gate-public/created" 2>/dev/null; then
+    echo "non-root identity created an origin gate artifact" >&2; exit 1
+  fi
+  if setpriv --reuid="$1" --regid="$2" --clear-groups \
+    rm -f "${root}/origin-gate-public/public-open" 2>/dev/null; then
+    echo "non-root identity removed the origin gate capability" >&2; exit 1
+  fi
+  if setpriv --reuid="$1" --regid="$2" --clear-groups \
+    mv "${root}/origin-gate-public/public-open" \
+       "${root}/origin-gate-public/replaced" 2>/dev/null; then
+    echo "non-root identity renamed the origin gate capability" >&2; exit 1
+  fi
+done
+[ "$(stat -c '%u:%g:%a:%s' "${root}/origin-gate-public/public-open")" = "0:0:400:0" ]
+
 # The bootstrap's collision guard is exact: any pre-existing numeric owner with
 # another name is a terminal condition, never silently adopted.
 python3 - "$(dirname "$0")/bootstrap.sh" <<'PY'
@@ -69,7 +94,7 @@ fi
 python3 - "$(dirname "$0")/api-gateway-nginx.conf" <<'PY'
 import pathlib, sys
 raw=pathlib.Path(sys.argv[1]).read_text()
-_, health=raw.split("  server {", 2)[1:]
+health=raw[raw.index("listen 8080;")-200:]
 assert "listen 8080;" in health
 assert 'proxy_set_header CF-Connecting-IP "";' in health
 assert "location / { return 404; }" in health

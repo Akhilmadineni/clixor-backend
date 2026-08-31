@@ -1268,7 +1268,7 @@ rollback() {
         if ! install -m 0400 -o 99 -g 99 \
           "${previous_runtime_root}/dependency-tls/haproxy.cfg" \
           "${project_root}/runtime/dependency-tls/haproxy.cfg" || \
-          ! install -m 0400 -o 101 -g 101 \
+          ! install -m 0400 -o 986 -g 987 \
           "${previous_runtime_root}/api-gateway/nginx.conf" \
           "${project_root}/runtime/api-gateway/nginx.conf" || \
           ! install -m 0500 -o 0 -g 0 \

@@ -261,7 +261,10 @@ python3 "${script_root}/validate-origin-identity.py" \
   --shadow-status "$(passwd --status "${gateway_user}")"
 install -m 0644 -o 0 -g 0 "${script_root}/clixor-origin.conf" \
   /etc/tmpfiles.d/clixor-origin.conf
+install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-origin-gate.conf" \
+  /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/clixor-origin.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/clixor-cloudflare-origin-gate.conf
 [ -d /run/clixor-origin ] && [ ! -L /run/clixor-origin ] && \
   [ "$(stat -c '%u:%g:%a' /run/clixor-origin)" = "986:987:750" ] || {
   echo "Connector origin tmpfs boundary is unsafe." >&2
@@ -646,6 +649,7 @@ sha256sum /usr/local/libexec/clixor/cloudflare-promote.py > \
   /usr/local/libexec/clixor/cloudflare-promote.py.sha256
 chown 0:0 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
 chmod 0444 /usr/local/libexec/clixor/cloudflare-promote.py.sha256
+/usr/bin/python3 /usr/local/libexec/clixor/cloudflare-promote.py initialize-gate
 install -m 0644 -o 0 -g 0 "${script_root}/clixor-cloudflare-promote.service" \
   /etc/systemd/system/clixor-cloudflare-promote.service
 install -m 0500 -o 0 -g 0 "${script_root}/backup.sh" \
