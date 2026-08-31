@@ -34,6 +34,7 @@ MAX_BODY_BYTES = 2 << 20
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CONFIRMATION = "DELETE-ALL-SMOKE-DATA"
 SAFE_ERROR_CODE = re.compile(r"^[a-z0-9_.-]{1,80}$")
+CANONICAL_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
 class SmokeFailure(RuntimeError):
@@ -57,11 +58,25 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 @dataclass(frozen=True)
 class HTTPResult:
     status: int
-    headers: Mapping[str, str]
+    headers: Mapping[str, str] | tuple[tuple[str, str], ...]
     body: bytes
 
+    def header_values(self, name: str) -> tuple[str, ...]:
+        target = name.lower()
+        fields: Iterable[tuple[str, str]]
+        if isinstance(self.headers, Mapping):
+            fields = self.headers.items()
+        else:
+            fields = self.headers
+        return tuple(
+            str(value)
+            for field_name, value in fields
+            if str(field_name).lower() == target
+        )
+
     def header(self, name: str) -> str:
-        return self.headers.get(name.lower(), "")
+        values = self.header_values(name)
+        return values[0] if len(values) == 1 else ""
 
 
 class HTTPTransport:
@@ -102,10 +117,11 @@ class HTTPTransport:
         try:
             payload = response.read(MAX_BODY_BYTES + 1)
             status = int(getattr(response, "status", getattr(response, "code", 0)))
-            response_headers = {
-                str(name).lower(): str(value)
-                for name, value in response.headers.items()
-            }
+            raw_items = getattr(response.headers, "raw_items", None)
+            header_items = raw_items() if callable(raw_items) else response.headers.items()
+            response_headers = tuple(
+                (str(name).lower(), str(value)) for name, value in header_items
+            )
         except OSError as error:
             raise SmokeFailure(
                 f"{label} response failed ({type(error).__name__})"
@@ -176,6 +192,57 @@ def json_object(result: HTTPResult, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SmokeFailure(f"{label} returned an unexpected JSON shape")
     return value
+
+
+def strict_json_object(result: HTTPResult, label: str) -> dict[str, Any]:
+    """Decode a JSON object while rejecting every duplicate member name."""
+
+    if "application/json" not in result.header("content-type").lower():
+        raise SmokeFailure(f"{label} did not return JSON")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, member in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON member")
+            value[key] = member
+        return value
+
+    try:
+        value = json.loads(result.body, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise SmokeFailure(f"{label} returned malformed JSON") from None
+    if not isinstance(value, dict):
+        raise SmokeFailure(f"{label} returned an unexpected JSON shape")
+    return value
+
+
+def validate_revision(value: object, label: str) -> str:
+    if not isinstance(value, str) or CANONICAL_REVISION.fullmatch(value) is None:
+        raise SmokeFailure(f"{label} must be a canonical 40-character revision")
+    return value
+
+
+def assert_readiness_identity(
+    result: HTTPResult, expected_revision: str
+) -> dict[str, Any]:
+    expected = validate_revision(expected_revision, "expected revision")
+    readiness = strict_json_object(result, "readiness")
+    if readiness.get("status") != "ready":
+        raise SmokeFailure("readiness did not report ready")
+    body_revision = validate_revision(readiness.get("revision"), "readiness revision")
+    if not hmac.compare_digest(body_revision, expected):
+        raise SmokeFailure("readiness body came from a different revision")
+
+    header_revisions = result.header_values("x-clixor-revision")
+    if len(header_revisions) != 1:
+        raise SmokeFailure("readiness did not return exactly one revision header")
+    header_revision = validate_revision(
+        header_revisions[0], "readiness revision header"
+    )
+    if not hmac.compare_digest(header_revision, expected):
+        raise SmokeFailure("readiness header came from a different revision")
+    return readiness
 
 
 def error_code(result: HTTPResult) -> str:
@@ -545,6 +612,7 @@ class SmokeSuite:
         api_origin: str,
         legal_origin: str,
         media_host: str,
+        expected_revision: str,
         *,
         cleanup_timeout: float = 45.0,
         verify_legal_documents: bool = True,
@@ -555,6 +623,9 @@ class SmokeSuite:
         self.api_origin = api_origin
         self.legal_origin = legal_origin
         self.media_host = media_host
+        self.expected_revision = validate_revision(
+            expected_revision, "expected revision"
+        )
         self.cleanup_timeout = cleanup_timeout
         self.verify_legal_documents = verify_legal_documents
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -664,10 +735,8 @@ class SmokeSuite:
         self.check(json_object(live, "liveness") == {"status": "ok"}, "liveness failed")
         ready = self.api.expect("GET", "/health/ready")
         assert_cloudflare(ready)
-        self.check(
-            json_object(ready, "readiness") == {"status": "ready"},
-            "readiness failed",
-        )
+        assert_readiness_identity(ready, self.expected_revision)
+        self.check(True, "readiness identity failed")
         for path in ("/", "/privacy", "/legal", "/terms"):
             redirect = self.transport.request(
                 "GET", self.api_origin + path, label=f"legal redirect {path}"
@@ -1174,6 +1243,7 @@ def run(
     api_origin: str,
     legal_origin: str,
     media_host: str,
+    expected_revision: str,
     *,
     cleanup_timeout: float = 45.0,
     verify_legal_documents: bool = True,
@@ -1182,6 +1252,7 @@ def run(
         api_origin,
         legal_origin,
         media_host,
+        expected_revision,
         cleanup_timeout=cleanup_timeout,
         verify_legal_documents=verify_legal_documents,
     )
@@ -1219,6 +1290,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--legal-base-url", required=True)
     parser.add_argument("--expected-media-host", required=True)
+    parser.add_argument("--expected-revision", required=True)
     parser.add_argument(
         "--confirm-disposable-writes",
         required=True,
@@ -1240,6 +1312,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.base_url = validate_origin(args.base_url, "base URL")
         args.legal_base_url = validate_origin(args.legal_base_url, "legal base URL")
         args.expected_media_host = validate_media_host(args.expected_media_host)
+        args.expected_revision = validate_revision(
+            args.expected_revision, "expected revision"
+        )
     except SmokeFailure as error:
         parser.error(str(error))
     if args.base_url == args.legal_base_url:
@@ -1256,6 +1331,7 @@ def main(argv: list[str] | None = None) -> int:
             args.base_url,
             args.legal_base_url,
             args.expected_media_host,
+            args.expected_revision,
             cleanup_timeout=args.cleanup_timeout,
             verify_legal_documents=not args.canary_api_only,
         )

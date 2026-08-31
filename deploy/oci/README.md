@@ -23,8 +23,9 @@ Actions always deploys `clixor-oci-canary.atlanteanz.com`; `deploy.sh` rejects a
 production stage. The gate runs readiness/association checks and the disposable
 `smoke.py` lifecycle: account creation/deletion, WebSocket upgrade and reconnect,
 E2EE message delivery, OCI PAR upload/download, authorization, and verified media
-cleanup. Root-owned `canary-public-smoke.txt` binds that evidence to the exact
-release SHA.
+cleanup. Its readiness gate requires the exact release SHA in both the JSON body
+and a single canonical response header. Root-owned `canary-public-smoke.txt`
+binds that evidence to the exact release SHA.
 
 This is a **one-way NAS-to-OCI ownership transfer**. The NAS database is retired
 and OCI is authoritative, so there is deliberately no route rollback that could
