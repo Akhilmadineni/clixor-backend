@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -405,6 +406,24 @@ func TestRefreshTokenRotation(t *testing.T) {
 		map[string]any{"refresh_token": user.tokens.RefreshToken}, http.StatusUnauthorized, nil)
 	user.client.do(t, http.MethodPost, "/v1/auth/refresh",
 		map[string]any{"refresh_token": refreshed.RefreshToken}, http.StatusUnauthorized, nil)
+}
+
+func TestAuthRateLimitsUseSeparateOperationNamespaces(t *testing.T) {
+	source, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, namespace := range []string{
+		`"auth-register"`, `"auth-login"`, `"auth-refresh"`,
+		`"auth-phone-start"`, `"auth-phone-verify"`, `"auth-apple"`,
+	} {
+		if !bytes.Contains(source, []byte(namespace)) {
+			t.Fatalf("missing separate auth rate-limit namespace %s", namespace)
+		}
+	}
+	if bytes.Contains(source, []byte(`router.Use(s.rateLimit("auth",`)) {
+		t.Fatal("shared auth rate-limit namespace can throttle unrelated operations")
+	}
 }
 
 func TestRegistrationAllocatesAccountBoundDeviceIdentity(t *testing.T) {

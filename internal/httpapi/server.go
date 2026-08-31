@@ -130,17 +130,25 @@ func (s *Server) Router() http.Handler {
 		router.With(s.rateLimit("account-deletion-execute", 10, time.Hour, true)).
 			Post("/account-deletions/{requestID}/execute", s.executeAccountDeletionIntent)
 		router.Route("/auth", func(router chi.Router) {
-			router.Use(s.rateLimit("auth", 20, 5*time.Minute, true))
-			router.Post("/register", s.register)
-			router.Post("/login", s.login)
+			// Keep costly unauthenticated operations independently bounded. A
+			// shared bucket lets unrelated sign-up or phone traffic prevent a
+			// legitimate device from refreshing an already-issued session.
+			router.With(s.rateLimit("auth-register", 10, 5*time.Minute, true)).
+				Post("/register", s.register)
+			router.With(s.rateLimit("auth-login", 20, 5*time.Minute, true)).
+				Post("/login", s.login)
 			router.With(s.rateLimit("password-reset-start", 5, time.Hour, true)).
 				Post("/password/reset/start", s.startPasswordReset)
 			router.With(s.rateLimit("password-reset-confirm", 15, 15*time.Minute, true)).
 				Post("/password/reset/confirm", s.confirmPasswordReset)
-			router.Post("/refresh", s.refresh)
-			router.Post("/phone/start", s.startPhoneVerification)
-			router.Post("/phone/verify", s.verifyPhone)
-			router.Post("/apple", s.verifyAppleIdentity)
+			router.With(s.rateLimit("auth-refresh", 60, 5*time.Minute, true)).
+				Post("/refresh", s.refresh)
+			router.With(s.rateLimit("auth-phone-start", 10, 5*time.Minute, true)).
+				Post("/phone/start", s.startPhoneVerification)
+			router.With(s.rateLimit("auth-phone-verify", 20, 5*time.Minute, true)).
+				Post("/phone/verify", s.verifyPhone)
+			router.With(s.rateLimit("auth-apple", 20, 5*time.Minute, true)).
+				Post("/apple", s.verifyAppleIdentity)
 		})
 
 		router.Group(func(router chi.Router) {
