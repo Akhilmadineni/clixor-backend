@@ -104,6 +104,6 @@ output "mail_smtp_endpoint" {
 }
 
 output "mail_smtp_user_id" {
-  description = "Dedicated IAM user OCID on which an operator manually issues the SMTP credential after apply."
-  value       = oci_identity_user.smtp_submitter.id
+  description = "Dedicated IAM user OCID when its identity is explicitly managed by this stack; null while the pre-existing production identity remains external to state."
+  value       = var.manage_smtp_submitter_identity ? oci_identity_user.smtp_submitter[0].id : null
 }

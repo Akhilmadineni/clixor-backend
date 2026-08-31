@@ -21,3 +21,7 @@ media_bucket_name   = "clixor-prod-media"
 # First apply must leave this false. Publish the output DKIM CNAME and SPF TXT
 # in Cloudflare, wait for OCI to report DKIM ACTIVE, then set true and re-apply.
 create_mail_approved_sender = false
+
+# The production SMTP IAM user already exists. Leave external to Terraform
+# until all three pre-existing IAM resources have been safely imported.
+manage_smtp_submitter_identity = false

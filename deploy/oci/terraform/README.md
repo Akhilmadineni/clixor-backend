@@ -86,18 +86,18 @@ change; do not bypass that guard during routine updates.
 
 ## Email Delivery: two-phase DNS activation
 
-Email Delivery is regional, so this stack provisions the sending domain and IAM
-principal in Phoenix. It cannot safely create the approved sender on the first
-apply: Oracle must observe the DKIM record in public DNS and report the DKIM as
-`ACTIVE` first. Keep `create_mail_approved_sender=false` for the first plan and
-apply.
+Email Delivery is regional, so this stack provisions the sending domain in
+Phoenix. The production SMTP IAM principal already exists outside Resource
+Manager state, so routine applies leave it untouched. It cannot safely create
+the approved sender on the first apply: Oracle must observe the DKIM record in
+public DNS and report the DKIM as `ACTIVE` first. Keep
+`create_mail_approved_sender=false` for the first plan and apply.
 
 After that apply, copy these non-sensitive Resource Manager outputs:
 
 - `mail_dkim_cname_name` and `mail_dkim_cname_value`;
 - `mail_spf_txt_name` and `mail_spf_txt_value`;
 - `mail_smtp_endpoint`; and
-- `mail_smtp_user_id`.
 
 In the Cloudflare DNS zone for `atlanteanz.com`:
 
@@ -138,14 +138,20 @@ state. Likewise, the DKIM resource deliberately omits `private_key`; OCI
 generates and retains the signing key while Terraform records only public DNS
 metadata.
 
-After DNS activation and approved-sender creation, locate the IAM user by the
-`mail_smtp_user_id` output and generate one SMTP credential interactively in the
-OCI Console. Copy the one-time username/password directly into the approved
+After DNS activation and approved-sender creation, locate the pre-existing IAM
+user `clixor-email-smtp` in the OCI Console and generate one SMTP credential
+interactively. Copy the one-time username/password directly into the approved
 secret-management path; never paste them into Terraform variables, outputs,
 Cloudflare, GitHub Actions, shell history, tickets, or this repository. Terraform
 does not create, read, rotate, or destroy that credential. Rotate it manually,
 with an overlap canary, and retain no more than the two OCI credentials allowed
 per user.
+
+Keep `manage_smtp_submitter_identity=false` unless the existing user, its SMTP
+capability, and its group membership have all been explicitly imported into
+Resource Manager state. Enabling it before that adoption would cause Terraform
+to try creating a duplicate IAM identity; it is not needed for normal stack
+updates.
 
 Configure the application for mandatory implicit TLS using the
 `mail_smtp_endpoint` output (port 465), `CLUSTER_SMTP_TRANSPORT=implicit_tls`,
