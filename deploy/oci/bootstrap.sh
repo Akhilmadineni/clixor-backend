@@ -666,6 +666,8 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
     /usr/local/libexec/clixor/runtime_bundle.py
   install -m 0500 -o 0 -g 0 "${script_root}/runtime-reconciler.py" \
     /usr/local/libexec/clixor/runtime-reconciler.py
+  install -m 0500 -o 0 -g 0 "${script_root}/manual-deploy.sh" \
+    /usr/local/libexec/clixor/manual-deploy
   for runtime_unit in \
     clixor-runtime-reconcile.service \
     clixor-runtime-watchdog.service \

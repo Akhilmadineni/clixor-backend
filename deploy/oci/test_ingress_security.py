@@ -1,10 +1,112 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 class IngressBoundaryTests(unittest.TestCase):
+    def test_installer_post_start_authority_boolean_is_not_inverted(self) -> None:
+        installer = (ROOT / "install-cloudflared-service.sh").read_text(
+            encoding="utf-8"
+        )
+        start = installer.index("connector_authority_is_current() {")
+        end = installer.index("\n}\n\nif ! systemctl", start) + len("\n}")
+        authority_function = installer[start:end]
+        fake_helper = """\
+import os
+import pathlib
+import sys
+
+action = sys.argv[1]
+with pathlib.Path(os.environ["CALL_LOG"]).open("a", encoding="ascii") as output:
+    output.write(action + "\\n")
+if action == "verify":
+    raise SystemExit(int(os.environ.get("LOCAL_STATUS", "0")))
+if action == "verify-remote":
+    raise SystemExit(int(os.environ.get("REMOTE_STATUS", "0")))
+raise SystemExit(97)
+"""
+        with tempfile.TemporaryDirectory(prefix="clixor-installer-authority-") as directory:
+            root = Path(directory)
+            release = root / "oci-aaaaaaaaaaaa-test"
+            bundle = release / "runtime-bundle"
+            bundle.mkdir(parents=True)
+            helper = root / "helper.py"
+            helper.write_text(fake_helper, encoding="ascii")
+            call_log = root / "calls"
+            shell = (
+                "set -eu\n"
+                + authority_function
+                + "\nconnector_controller=$1\ncurrent_release=$2\n"
+                + "connector_authority_is_current\n"
+            )
+
+            def run(remote_status: int) -> subprocess.CompletedProcess[bytes]:
+                call_log.unlink(missing_ok=True)
+                environment = {
+                    **os.environ,
+                    "CALL_LOG": str(call_log),
+                    "LOCAL_STATUS": "0",
+                    "REMOTE_STATUS": str(remote_status),
+                }
+                return subprocess.run(
+                    ["/bin/sh", "-c", shell, "authority-test", str(helper), str(release)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    check=False,
+                )
+
+            # A production release has no canary metadata and succeeds without
+            # invoking remote verification.
+            self.assertEqual(run(remote_status=9).returncode, 0)
+            self.assertEqual(call_log.read_text(encoding="ascii"), "verify\n")
+
+            metadata = bundle / "cloudflare-canary-connector.json"
+            metadata.write_text("{}\n", encoding="ascii")
+            self.assertEqual(run(remote_status=0).returncode, 0)
+            self.assertEqual(
+                call_log.read_text(encoding="ascii"), "verify\nverify-remote\n"
+            )
+            self.assertNotEqual(run(remote_status=1).returncode, 0)
+            self.assertEqual(
+                call_log.read_text(encoding="ascii"), "verify\nverify-remote\n"
+            )
+
+    def test_manual_deploy_examples_use_the_locked_archive_helper(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        helper = (ROOT / "manual-deploy.sh").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+        workflow = (ROOT.parent.parent / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('revision="$(git rev-parse HEAD)"', readme)
+        self.assertNotIn('deploy.sh "$PWD"', readme)
+        self.assertNotIn("sh deploy/oci/deploy.sh", readme)
+        self.assertGreaterEqual(
+            readme.count("/usr/local/libexec/clixor/manual-deploy"), 5
+        )
+        self.assertIn(
+            "trusted_remote=https://github.com/Akhilmadineni/clixor-backend.git",
+            helper,
+        )
+        self.assertIn("mirror_root=/srv/clixor/runtime/manual-source.git", helper)
+        self.assertIn("/usr/bin/git --git-dir=\"${mirror_root}\" archive", helper)
+        self.assertIn('-type d -exec /usr/bin/chmod 0500', helper)
+        self.assertIn("verify-approved-source", helper)
+        self.assertIn('CLIXOR_APPROVED_GIT_DIR="${mirror_root}"', helper)
+        self.assertIn('"${approved_source}/deploy/oci/deploy.sh"', helper)
+        self.assertIn('/usr/bin/env -i PATH="${PATH}"', helper)
+        self.assertIn(
+            'install -m 0500 -o 0 -g 0 "${script_root}/manual-deploy.sh"',
+            bootstrap,
+        )
+        self.assertIn("sh -n ../actions-deploy.sh ../manual-deploy.sh", workflow)
+
     def test_tcp_listener_cannot_proxy_forged_cloudflare_identity(self) -> None:
         nginx = (ROOT / "api-gateway-nginx.conf").read_text(encoding="utf-8")
         self.assertIn("listen unix:/run/clixor-origin/gateway.sock default_server;", nginx)
@@ -202,12 +304,16 @@ class IngressBoundaryTests(unittest.TestCase):
         # same start -> verify -> fail-closed contract.
         self.assertNotIn("try-restart cloudflared.service", bootstrap)
         install_start = installer.index("systemctl enable --now cloudflared.service")
-        install_remote = installer.index("verify-remote", install_start)
-        install_refusal = installer.index("rm -f -- /run/clixor/runtime-ready", install_remote)
+        install_authority = installer.index(
+            "! connector_authority_is_current", install_start
+        )
+        install_refusal = installer.index(
+            "rm -f -- /run/clixor/runtime-ready", install_authority
+        )
         install_stop = installer.index("systemctl stop cloudflared.service", install_refusal)
         install_disable = installer.index("systemctl disable cloudflared.service", install_stop)
-        self.assertLess(install_start, install_remote)
-        self.assertLess(install_remote, install_refusal)
+        self.assertLess(install_start, install_authority)
+        self.assertLess(install_authority, install_refusal)
         self.assertLess(install_refusal, install_stop)
         self.assertLess(install_stop, install_disable)
 

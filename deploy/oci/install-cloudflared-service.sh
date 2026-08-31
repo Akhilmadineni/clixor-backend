@@ -60,13 +60,23 @@ token_mode="$(stat -c '%a' "${token_file}")"
 
 install -m 0644 -o 0 -g 0 "${unit_source}" /etc/systemd/system/cloudflared.service
 systemctl daemon-reload
+
+connector_authority_is_current() {
+  /usr/bin/python3 "${connector_controller}" verify \
+    --release "${current_release}" >/dev/null || return 1
+  canary_metadata="${current_release}/runtime-bundle/cloudflare-canary-connector.json"
+  if [ -f "${canary_metadata}" ] && [ ! -L "${canary_metadata}" ]; then
+    /usr/bin/python3 "${connector_controller}" verify-remote \
+      --release "${current_release}" >/dev/null || return 1
+  elif [ -e "${canary_metadata}" ] || [ -L "${canary_metadata}" ]; then
+    return 1
+  fi
+  return 0
+}
+
 if ! systemctl enable --now cloudflared.service || \
   ! systemctl is-active --quiet cloudflared.service || \
-  ! /usr/bin/python3 "${connector_controller}" verify \
-    --release "${current_release}" >/dev/null || \
-  { [ ! -f "${current_release}/runtime-bundle/cloudflare-canary-connector.json" ] || \
-    /usr/bin/python3 "${connector_controller}" verify-remote \
-      --release "${current_release}" >/dev/null; }
+  ! connector_authority_is_current
 then
   # A started process is not a successful installation until its local
   # credential and, for a canary, complete effective remote configuration are

@@ -384,12 +384,13 @@ the cutover refuses to run from an uncommitted/fallback-only host. GitHub Action
 always forces the cutover flag off and therefore cannot perform it:
 
 ```sh
-revision="$(git rev-parse HEAD)"
+revision='<full-reviewed-40-hex-commit>'
 sudo env \
   CLIXOR_REQUIRE_PUBLIC_SMOKE=true \
   CLIXOR_REQUIRE_VAULT_HYDRATION=true \
   CLIXOR_INITIAL_VAULT_CUTOVER=true \
-  sh deploy/oci/deploy.sh "$PWD" "$revision" manual-vault-cutover-20260830T120000Z
+  /usr/local/libexec/clixor/manual-deploy \
+  "$revision" manual-vault-cutover-20260830T120000Z
 ```
 
 While rollback is armed, deploy authenticates only as the VM instance principal
@@ -544,11 +545,13 @@ recovery, and a separately implemented operator procedure.
 
 ## 4. Deploy an immutable source revision
 
-From the source checkout:
+Choose the exact reviewed Git commit and use the root-installed source
+preparation boundary:
 
 ```sh
-revision="$(git rev-parse HEAD)"
-sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-20260830T120000Z
+revision='<full-reviewed-40-hex-commit>'
+sudo /usr/local/libexec/clixor/manual-deploy \
+  "$revision" manual-20260830T120000Z
 ```
 
 Use a new non-secret run identifier for every attempt. Release directories are
@@ -757,17 +760,20 @@ sudo env CLIXOR_IMAGE_TAG="$(basename "$(readlink /srv/clixor/releases/current)"
 The exact SHA argument is the deployment boundary. Deploying `main` does not
 silently include features that exist only on another branch.
 
-Manual deployments have the same source boundary as Actions. `deploy.sh`
-refuses an ordinary checkout: the source must be an exact Git archive from a
-canonical root-owned bare object store, every extracted directory must be mode
-`0500`, every blob must be root-owned mode `0400` (or `0500` for a Git
-executable), and `CLIXOR_APPROVED_GIT_DIR` must select that object store. Build
-the source under `/srv/clixor/runtime` with trusted system `git archive` and
-`tar`, lock it with root-owned `find ... -exec chmod`, and then pass both the
-locked directory and the full commit SHA to `deploy.sh`. The runtime-bundle
-controller independently runs strict Git object verification and compares every
-pathname, executable bit, and blob object ID twice (preflight and snapshot).
-Never copy a working tree or merely supply the SHA as a label.
+Manual deployments have the same source boundary as Actions. Explicit
+bootstrap installs the only advertised manual entry point at root-owned mode
+`0500`: `/usr/local/libexec/clixor/manual-deploy`. Given a full commit SHA and a
+non-secret run ID, it fetches that exact object from the fixed public GitHub
+repository into `/srv/clixor/runtime/manual-source.git`, a root-owned mode-0700
+bare store. It verifies the object graph, creates a fresh `git archive` under
+`/srv/clixor/runtime`, locks every extracted directory to `0500` and every blob
+to `0400` (or `0500` for a Git executable), and uses the separately installed
+stable runtime-bundle controller to compare every pathname, executable bit, and
+Git blob ID before the archived `deploy.sh` can run. The deploy transaction
+repeats the same verification before snapshotting and receives the approved Git
+directory only from the helper. The temporary archive is removed on every exit.
+Never invoke `deploy.sh` from a checkout, use `$PWD` as deployment source, or
+merely supply a SHA as a label.
 
 All third-party GitHub Actions used by CI and deployment are pinned to immutable
 40-character commits. Container base images, CI service images, the isolated
@@ -948,7 +954,7 @@ the production origin capability is absent:
 
 ```sh
 test ! -e /run/clixor-origin-gate/public-open
-revision="$(git rev-parse HEAD)"
+revision='<full-reviewed-40-hex-commit>'
 sudo env \
   CLIXOR_ENABLE_CANARY_CONNECTOR=true \
   CLIXOR_CANARY_CLOUDFLARE_ACCOUNT_ID='<32-hex-account-id>' \
@@ -964,7 +970,8 @@ sudo env \
   CLIXOR_PUBLIC_ASSOCIATION_URL='https://clixor-oci-canary.atlanteanz.com/.well-known/apple-app-site-association' \
   CLIXOR_PUBLIC_SMOKE_BASE_URL='https://clixor-oci-canary.atlanteanz.com' \
   CLIXOR_PUBLIC_SMOKE_LEGAL_URL='https://clixor.atlanteanz.com' \
-  sh deploy/oci/deploy.sh "$PWD" "$revision" "manual-canary-$(date +%s)"
+  /usr/local/libexec/clixor/manual-deploy \
+  "$revision" "manual-canary-$(date +%s)"
 ```
 
 The release-local credential controller calls OCI CLI with
@@ -997,8 +1004,9 @@ generation. It enables the unit but restarts it only if the reviewed executable,
 unit, or token changed, using a bounded 90-second readiness gate:
 
 ```sh
-revision="$(git rev-parse HEAD)"
-sudo sh deploy/oci/deploy.sh "$PWD" "$revision" manual-cloudflare-cutover
+revision='<full-reviewed-40-hex-commit>'
+sudo /usr/local/libexec/clixor/manual-deploy \
+  "$revision" manual-cloudflare-cutover
 sudo systemctl status --no-pager cloudflared.service
 ```
 
