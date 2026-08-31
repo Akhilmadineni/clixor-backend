@@ -469,8 +469,9 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	now := time.Now().UTC()
 	deletedConversations := make(map[uuid.UUID]struct{})
 	sharedConversations := make(map[uuid.UUID]struct{})
-	var objectKeys []string
-	mediaDeleteNotBefore := now.Add(store.MediaDeleteGrace)
+	var immediateObjectKeys []string
+	var deferredObjectKeys []string
+	mediaDeleteNotBefore := time.Time{}
 	var updatedEntities []domain.Entity
 
 	for _, conversationID := range s.accountConversationScopeLocked(userID) {
@@ -604,9 +605,13 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		ownedPending := mediaObject.Scope == domain.MediaScopeConversation &&
 			mediaObject.OwnerID == userID && mediaObject.Status == "pending"
 		if conversationDeleted || ownedProfile || ownedPending {
-			objectKeys = append(objectKeys, mediaObject.ObjectKey)
-			if candidate := memoryMediaDeleteNotBefore(mediaObject.UploadValidUntil); candidate.After(mediaDeleteNotBefore) {
-				mediaDeleteNotBefore = candidate
+			if mediaObject.Status == "pending" {
+				deferredObjectKeys = append(deferredObjectKeys, mediaObject.ObjectKey)
+				if candidate := memoryMediaDeleteNotBefore(mediaObject.UploadValidUntil); candidate.After(mediaDeleteNotBefore) {
+					mediaDeleteNotBefore = candidate
+				}
+			} else {
+				immediateObjectKeys = append(immediateObjectKeys, mediaObject.ObjectKey)
 			}
 			delete(s.media, id)
 			delete(s.mediaUploadCapabilities, id)
@@ -748,9 +753,13 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		payload, _ := json.Marshal(entity)
 		s.appendOutbox("entity.updated", entity.ConversationID, payload)
 	}
-	if len(objectKeys) > 0 {
-		sort.Strings(objectKeys)
-		s.appendMediaDeletesAt(userID, objectKeys, mediaDeleteNotBefore)
+	if len(immediateObjectKeys) > 0 {
+		sort.Strings(immediateObjectKeys)
+		s.appendMediaDeletesAt(userID, immediateObjectKeys, now)
+	}
+	if len(deferredObjectKeys) > 0 {
+		sort.Strings(deferredObjectKeys)
+		s.appendMediaDeletesAt(userID, deferredObjectKeys, mediaDeleteNotBefore)
 	}
 	return nil
 }

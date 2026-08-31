@@ -179,6 +179,62 @@ func TestDeleteAccountErasesPrivateStateAndQueuesPersonalMediaDeletion(t *testin
 	}
 }
 
+func TestDeleteAccountQueuesReadyOrphanedMediaForImmediateDeletion(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	t.Cleanup(persistence.Close)
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "erase-ready@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: user.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := persistence.CreateMedia(
+		ctx, testConversationMedia(user.ID, conversation.ID, 3), store.DefaultMediaReservationLimits(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := persistence.ClaimMediaVerification(ctx, created.ID, user.ID, time.Minute)
+	if err != nil || claim.VerificationLeaseToken == nil {
+		t.Fatalf("claim ready media: media=%+v err=%v", claim, err)
+	}
+	readyKey := "published/" + created.ObjectKey
+	if _, err := persistence.MarkMediaReady(ctx, created.ID, user.ID, *claim.VerificationLeaseToken, readyKey); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	events, err := persistence.LockOutboxBatch(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Topic != "media.delete" {
+			continue
+		}
+		var payload store.MediaDeletePayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		for _, objectKey := range payload.ObjectKeys {
+			if objectKey == readyKey {
+				if payload.NotBefore == nil || payload.NotBefore.After(started.Add(2*time.Second)) {
+					t.Fatalf("ready erased media was delayed: %+v", payload)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("no immediate deletion queued for ready object %q: %+v", readyKey, events)
+}
+
 func TestDeleteAccountSanitizesLiveAndReplayableChoreCreatorPII(t *testing.T) {
 	ctx := context.Background()
 	persistence := New()

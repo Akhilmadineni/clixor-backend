@@ -150,24 +150,30 @@ func (s *Store) deleteAccountTx(
 
 	var deletedConversationIDs []uuid.UUID
 	var sharedConversationIDs []uuid.UUID
-	var objectKeys []string
-	deleteNotBefore := mediaDeleteNotBefore(time.Time{})
+	var immediateObjectKeys []string
+	var deferredObjectKeys []string
+	deleteNotBefore := time.Time{}
 	profileMediaRows, err := tx.Query(ctx, `
 		DELETE FROM profile_media_objects
-		WHERE owner_id=$1 RETURNING object_key,upload_valid_until`, userID)
+		WHERE owner_id=$1 RETURNING object_key,status,upload_valid_until`, userID)
 	if err != nil {
 		return err
 	}
 	for profileMediaRows.Next() {
 		var key string
+		var status string
 		var uploadValidUntil time.Time
-		if err := profileMediaRows.Scan(&key, &uploadValidUntil); err != nil {
+		if err := profileMediaRows.Scan(&key, &status, &uploadValidUntil); err != nil {
 			profileMediaRows.Close()
 			return err
 		}
-		objectKeys = append(objectKeys, key)
-		if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
-			deleteNotBefore = candidate
+		if status == "pending" {
+			deferredObjectKeys = append(deferredObjectKeys, key)
+			if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+				deleteNotBefore = candidate
+			}
+		} else {
+			immediateObjectKeys = append(immediateObjectKeys, key)
 		}
 	}
 	if err := profileMediaRows.Err(); err != nil {
@@ -193,7 +199,7 @@ func (s *Store) deleteAccountTx(
 			pendingMediaRows.Close()
 			return err
 		}
-		objectKeys = append(objectKeys, key)
+		deferredObjectKeys = append(deferredObjectKeys, key)
 		if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
 			deleteNotBefore = candidate
 		}
@@ -206,7 +212,7 @@ func (s *Store) deleteAccountTx(
 	for _, conversation := range conversations {
 		if !conversation.successorID.Valid {
 			mediaRows, err := tx.Query(ctx, `
-				SELECT object_key,upload_valid_until FROM media_objects
+				SELECT object_key,status,upload_valid_until FROM media_objects
 				WHERE conversation_id=$1 ORDER BY object_key`,
 				conversation.id)
 			if err != nil {
@@ -214,14 +220,19 @@ func (s *Store) deleteAccountTx(
 			}
 			for mediaRows.Next() {
 				var key string
+				var status string
 				var uploadValidUntil time.Time
-				if err := mediaRows.Scan(&key, &uploadValidUntil); err != nil {
+				if err := mediaRows.Scan(&key, &status, &uploadValidUntil); err != nil {
 					mediaRows.Close()
 					return err
 				}
-				objectKeys = append(objectKeys, key)
-				if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
-					deleteNotBefore = candidate
+				if status == "pending" {
+					deferredObjectKeys = append(deferredObjectKeys, key)
+					if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+						deleteNotBefore = candidate
+					}
+				} else {
+					immediateObjectKeys = append(immediateObjectKeys, key)
 				}
 			}
 			if err := mediaRows.Err(); err != nil {
@@ -478,11 +489,17 @@ func (s *Store) deleteAccountTx(
 			return err
 		}
 	}
-	if len(objectKeys) > 0 {
-		for start := 0; start < len(objectKeys); start += store.MediaDeleteBatchSize {
-			end := min(start+store.MediaDeleteBatchSize, len(objectKeys))
+	for _, deletion := range []struct {
+		objectKeys []string
+		notBefore  time.Time
+	}{
+		{objectKeys: immediateObjectKeys, notBefore: time.Now().UTC()},
+		{objectKeys: deferredObjectKeys, notBefore: deleteNotBefore},
+	} {
+		for start := 0; start < len(deletion.objectKeys); start += store.MediaDeleteBatchSize {
+			end := min(start+store.MediaDeleteBatchSize, len(deletion.objectKeys))
 			if err := enqueueMediaDeletesAt(
-				ctx, tx, userID, objectKeys[start:end], deleteNotBefore,
+				ctx, tx, userID, deletion.objectKeys[start:end], deletion.notBefore,
 			); err != nil {
 				return err
 			}
