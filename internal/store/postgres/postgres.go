@@ -301,6 +301,20 @@ func (s *Store) UpsertDevice(ctx context.Context, device domain.Device) (domain.
 	if device.CreatedAt.IsZero() {
 		device.CreatedAt = time.Now().UTC()
 	}
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		stored, err := s.upsertDeviceOnce(ctx, device)
+		if !isAccountDeletionRetryable(err) || attempt == maxAttempts-1 {
+			return stored, err
+		}
+		if err := ctx.Err(); err != nil {
+			return domain.Device{}, err
+		}
+	}
+	return domain.Device{}, nil
+}
+
+func (s *Store) upsertDeviceOnce(ctx context.Context, device domain.Device) (domain.Device, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return domain.Device{}, err
@@ -388,6 +402,24 @@ func (s *Store) ClearDevicePushToken(ctx context.Context, userID, deviceID uuid.
 }
 
 func (s *Store) PutOneTimePreKeys(ctx context.Context, deviceID uuid.UUID, keys []domain.OneTimePreKey) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var userID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT user_id FROM devices WHERE id=$1`, deviceID).Scan(&userID); err != nil {
+		return mapError(err)
+	}
+	if err := lockLiveUser(ctx, tx, userID); err != nil {
+		return err
+	}
+	var lockedDeviceID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM devices WHERE id=$1 AND user_id=$2 FOR UPDATE`, deviceID, userID,
+	).Scan(&lockedDeviceID); err != nil {
+		return mapError(err)
+	}
 	batch := &pgx.Batch{}
 	for _, key := range keys {
 		batch.Queue(`
@@ -395,14 +427,17 @@ func (s *Store) PutOneTimePreKeys(ctx context.Context, deviceID uuid.UUID, keys 
 			VALUES($1,$2,$3) ON CONFLICT(device_id,key_id) DO NOTHING`,
 			deviceID, key.KeyID, key.PublicKey)
 	}
-	results := s.pool.SendBatch(ctx, batch)
+	results := tx.SendBatch(ctx, batch)
 	defer results.Close()
 	for range keys {
 		if _, err := results.Exec(); err != nil {
 			return mapError(err)
 		}
 	}
-	return results.Close()
+	if err := results.Close(); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) ClaimPreKeys(ctx context.Context, targetUserID uuid.UUID) ([]domain.PreKeyBundle, error) {
@@ -411,6 +446,9 @@ func (s *Store) ClaimPreKeys(ctx context.Context, targetUserID uuid.UUID) ([]dom
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, targetUserID); err != nil {
+		return nil, err
+	}
 	rows, err := tx.Query(ctx, `
 		SELECT id,user_id,name,platform,push_token,identity_key,COALESCE(signed_prekey,'null'::jsonb),last_seen_at,created_at
 		FROM devices WHERE user_id=$1 AND identity_key<>'' ORDER BY created_at`, targetUserID)
@@ -495,6 +533,27 @@ func (s *Store) IssueSession(
 		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
 		return domain.User{}, domain.Device{}, domain.ErrInvalid
 	}
+	p.Device.PushToken = strings.ToLower(strings.TrimSpace(p.Device.PushToken))
+	if p.Device.CreatedAt.IsZero() {
+		p.Device.CreatedAt = time.Now().UTC()
+	}
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		user, device, err := s.issueSessionOnce(ctx, p)
+		if !isAccountDeletionRetryable(err) || attempt == maxAttempts-1 {
+			return user, device, err
+		}
+		if err := ctx.Err(); err != nil {
+			return domain.User{}, domain.Device{}, err
+		}
+	}
+	return domain.User{}, domain.Device{}, nil
+}
+
+func (s *Store) issueSessionOnce(
+	ctx context.Context,
+	p store.SessionIssueParams,
+) (domain.User, domain.Device, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return domain.User{}, domain.Device{}, err
@@ -516,10 +575,6 @@ func (s *Store) IssueSession(
 		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
 	}
 	device := p.Device
-	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
-	if device.CreatedAt.IsZero() {
-		device.CreatedAt = time.Now().UTC()
-	}
 	if device.PushToken != "" {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, device.PushToken); err != nil {
 			return domain.User{}, domain.Device{}, err
@@ -793,6 +848,9 @@ func (s *Store) UpdateConversation(ctx context.Context, conversationID, actorID 
 		return domain.Conversation{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.Conversation{}, err
+	}
 	var conversation domain.Conversation
 	var actorRole string
 	err = tx.QueryRow(ctx, `
@@ -839,6 +897,12 @@ func (s *Store) UpdateConversation(ctx context.Context, conversationID, actorID 
 	if err != nil {
 		return domain.Conversation{}, mapError(err)
 	}
+	payload, _ := json.Marshal(conversation)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload)
+		VALUES('conversation.updated',$1,$2)`, conversation.ID, payload); err != nil {
+		return domain.Conversation{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return domain.Conversation{}, err
 	}
@@ -851,6 +915,12 @@ func (s *Store) DeleteConversation(ctx context.Context, conversationID, actorID 
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return err
+	}
 	if err := lockMediaQuota(ctx, tx, "conversation", conversationID); err != nil {
 		return err
 	}
@@ -1109,7 +1179,7 @@ func (s *Store) AddConversationMember(ctx context.Context, conversationID, actor
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if err := lockLiveUser(ctx, tx, userID); err != nil {
+	if err := lockLiveUsers(ctx, tx, actorID, userID); err != nil {
 		return err
 	}
 	var kind, actorRole string
@@ -1194,6 +1264,12 @@ func (s *Store) CreateConversationInvites(ctx context.Context, conversationID, a
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return err
+	}
+	if err := lockConversation(ctx, tx, conversationID); err != nil {
+		return err
+	}
 	var allowed bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS(
@@ -1317,6 +1393,9 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUsers(ctx, tx, actorID, userID); err != nil {
+		return err
+	}
 	var kind, actorRole string
 	var metadata json.RawMessage
 	err = tx.QueryRow(ctx, `
@@ -1388,6 +1467,9 @@ func (s *Store) TransferConversationOwnership(ctx context.Context, conversationI
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUsers(ctx, tx, actorID, targetID); err != nil {
+		return err
+	}
 	var kind, actorRole string
 	err = tx.QueryRow(ctx, `
 		SELECT c.kind,m.role FROM conversations c
@@ -1410,14 +1492,32 @@ func (s *Store) TransferConversationOwnership(ctx context.Context, conversationI
 	} else if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE conversation_members
-		SET role=CASE WHEN user_id=$2 THEN 'admin' ELSE 'owner' END
-		WHERE conversation_id=$1 AND user_id IN ($2,$3)`,
-		conversationID, actorID, targetID); err != nil {
+	demoted, err := tx.Exec(ctx, `
+		UPDATE conversation_members SET role='admin'
+		WHERE conversation_id=$1 AND user_id=$2 AND role='owner'`,
+		conversationID, actorID)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE conversations SET updated_at=now() WHERE id=$1`, conversationID); err != nil {
+	if demoted.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	promoted, err := tx.Exec(ctx, `
+		UPDATE conversation_members SET role='owner'
+		WHERE conversation_id=$1 AND user_id=$2 AND role=$3`,
+		conversationID, targetID, targetRole)
+	if err != nil {
+		return err
+	}
+	if promoted.RowsAffected() != 1 {
+		return domain.ErrConflict
+	}
+	// created_by is the conversation authority pointer used by deletion. Keep it
+	// synchronized with the sole owner so an ownership transfer cannot leave a
+	// group with no principal authorized to delete it.
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations SET created_by=$2,updated_at=now() WHERE id=$1`,
+		conversationID, targetID); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -1429,6 +1529,12 @@ func (s *Store) CreateMessage(ctx context.Context, p store.CreateMessageParams) 
 		return domain.Message{}, nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, p.SenderID); err != nil {
+		return domain.Message{}, nil, err
+	}
+	if err := lockConversation(ctx, tx, p.ConversationID); err != nil {
+		return domain.Message{}, nil, err
+	}
 	if err := s.requireMember(ctx, tx, p.ConversationID, p.SenderID); err != nil {
 		return domain.Message{}, nil, err
 	}
@@ -1544,6 +1650,12 @@ func (s *Store) UpsertReceipt(ctx context.Context, receipt domain.Receipt) (doma
 		return domain.Receipt{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, receipt.UserID); err != nil {
+		return domain.Receipt{}, err
+	}
+	if err := lockConversation(ctx, tx, receipt.ConversationID); err != nil {
+		return domain.Receipt{}, err
+	}
 	if err := s.requireMember(ctx, tx, receipt.ConversationID, receipt.UserID); err != nil {
 		return domain.Receipt{}, err
 	}
@@ -1603,6 +1715,9 @@ func (s *Store) PutEntity(ctx context.Context, entity domain.Entity, expectedVer
 		return domain.Entity{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, entity.CreatedBy); err != nil {
+		return domain.Entity{}, err
+	}
 	var conversationMetadata json.RawMessage
 	if err := tx.QueryRow(ctx, `SELECT metadata FROM conversations WHERE id=$1 FOR SHARE`, entity.ConversationID).Scan(&conversationMetadata); err != nil {
 		return domain.Entity{}, mapError(err)
@@ -1696,6 +1811,12 @@ func (s *Store) DeleteEntity(ctx context.Context, conversationID, actorID uuid.U
 		return domain.Entity{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.Entity{}, err
+	}
+	if err := lockConversation(ctx, tx, conversationID); err != nil {
+		return domain.Entity{}, err
+	}
 	if err := s.requireMember(ctx, tx, conversationID, actorID); err != nil {
 		return domain.Entity{}, err
 	}
@@ -1748,6 +1869,9 @@ func (s *Store) RotateChore(ctx context.Context, p store.RotateChoreParams) (sto
 		return store.RotateChoreResult{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, p.ActorID); err != nil {
+		return store.RotateChoreResult{}, err
+	}
 	// The conversation row is the membership authority. Take its update lock
 	// before observing membership or a replay result so a concurrent removal
 	// has one unambiguous serialization point: a removal that owns the lock
@@ -1889,7 +2013,13 @@ func (s *Store) CreateMedia(ctx context.Context, media domain.MediaObject, limit
 	if err := lockMediaQuota(ctx, tx, "user", media.OwnerID); err != nil {
 		return domain.MediaObject{}, err
 	}
+	if err := lockLiveUser(ctx, tx, media.OwnerID); err != nil {
+		return domain.MediaObject{}, err
+	}
 	if err := lockMediaQuota(ctx, tx, "conversation", media.ConversationID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	if err := lockConversation(ctx, tx, media.ConversationID); err != nil {
 		return domain.MediaObject{}, err
 	}
 	if err := s.requireMember(ctx, tx, media.ConversationID, media.OwnerID); err != nil {
@@ -1990,51 +2120,129 @@ func (s *Store) PersistMediaUploadCapability(
 	if id == uuid.Nil || actorID == uuid.Nil || revocationToken == "" || len(revocationToken) > 1024 {
 		return domain.ErrInvalid
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE media_objects SET upload_capability_id=$3
-		WHERE id=$1 AND owner_id=$2 AND status='pending'
-		  AND (upload_capability_id IS NULL OR upload_capability_id=$3)`,
-		id, actorID, revocationToken)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		tag, err = s.pool.Exec(ctx, `
+	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return err
+	}
+	var tag pgconn.CommandTag
+	if conversationMedia {
+		tag, err = tx.Exec(ctx, `
+			UPDATE media_objects SET upload_capability_id=$3
+			WHERE id=$1 AND owner_id=$2 AND status='pending'
+			  AND (upload_capability_id IS NULL OR upload_capability_id=$3)`,
+			id, actorID, revocationToken)
+	} else {
+		tag, err = tx.Exec(ctx, `
 			UPDATE profile_media_objects SET upload_capability_id=$3
 			WHERE id=$1 AND owner_id=$2 AND status='pending'
 			  AND (upload_capability_id IS NULL OR upload_capability_id=$3)`,
 			id, actorID, revocationToken)
-		if err != nil {
-			return err
-		}
+	}
+	if err != nil {
+		return err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := s.mediaForOwner(ctx, id, actorID); err != nil {
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM media_objects WHERE id=$1 AND owner_id=$2
+				UNION ALL
+				SELECT 1 FROM profile_media_objects WHERE id=$1 AND owner_id=$2
+			)`, id, actorID).Scan(&exists); err != nil {
 			return err
+		}
+		if !exists {
+			return domain.ErrNotFound
 		}
 		return domain.ErrConflict
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) MediaUploadCapability(
 	ctx context.Context,
 	id, actorID uuid.UUID,
 ) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return "", err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return "", err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return "", err
+	}
 	var token string
-	err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(upload_capability_id,'') FROM media_objects
-		WHERE id=$1 AND owner_id=$2 AND status<>'deleted'
-		UNION ALL
-		SELECT COALESCE(upload_capability_id,'') FROM profile_media_objects
-		WHERE id=$1 AND owner_id=$2 AND status<>'deleted'
-		LIMIT 1`, id, actorID).Scan(&token)
-	return token, mapError(err)
+	if conversationMedia {
+		err = tx.QueryRow(ctx, `
+			SELECT COALESCE(upload_capability_id,'') FROM media_objects
+			WHERE id=$1 AND owner_id=$2 AND status<>'deleted'`, id, actorID).Scan(&token)
+	} else {
+		err = tx.QueryRow(ctx, `
+			SELECT COALESCE(upload_capability_id,'') FROM profile_media_objects
+			WHERE id=$1 AND owner_id=$2 AND status<>'deleted'`, id, actorID).Scan(&token)
+	}
+	if err != nil {
+		return "", mapError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func lockMediaQuota(ctx context.Context, tx pgx.Tx, scope string, id uuid.UUID) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "media:"+scope+":"+id.String())
 	return err
+}
+
+// lockConversationMediaMutation resolves a conversation-media child without
+// locking it, then takes every parent lock in the global order before the
+// caller touches that child row. The unlocked lookup is only a routing hint;
+// callers must still qualify the eventual child mutation by id and owner.
+func (s *Store) lockConversationMediaMutation(
+	ctx context.Context,
+	tx pgx.Tx,
+	id, actorID uuid.UUID,
+) (uuid.UUID, bool, error) {
+	var conversationID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT conversation_id FROM media_objects
+		WHERE id=$1 AND owner_id=$2 AND status<>'deleted'`, id, actorID,
+	).Scan(&conversationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if err := lockMediaQuota(ctx, tx, "conversation", conversationID); err != nil {
+		return uuid.Nil, false, err
+	}
+	if err := lockConversation(ctx, tx, conversationID); err != nil {
+		return uuid.Nil, false, err
+	}
+	if err := s.requireMember(ctx, tx, conversationID, actorID); err != nil {
+		return uuid.Nil, false, err
+	}
+	return conversationID, true, nil
 }
 
 func checkUserMediaQuota(
@@ -2147,31 +2355,51 @@ func (s *Store) ClaimMediaVerification(
 	if id == uuid.Nil || actorID == uuid.Nil || leaseDuration < time.Second || leaseDuration > 5*time.Minute {
 		return domain.MediaObject{}, domain.ErrInvalid
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
 	leaseToken := uuid.New()
 	leaseMilliseconds := leaseDuration.Milliseconds()
 	var media domain.MediaObject
-	err := s.pool.QueryRow(ctx, `
-		UPDATE media_objects
-		SET verification_lease_token=$3,
-			verification_locked_until=now()+($4 * interval '1 millisecond'),updated_at=now()
-		WHERE id=$1 AND owner_id=$2 AND status='pending' AND expires_at>now()
-		  AND (verification_locked_until IS NULL OR verification_locked_until<=now())
-		RETURNING id,owner_id,conversation_id,object_key,content_type,byte_size,
-			ciphertext_sha256,status,expires_at,upload_valid_until,
-			verification_lease_token,verification_locked_until,created_at,updated_at`,
-		id, actorID, leaseToken, leaseMilliseconds,
-	).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
-		&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
-		&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
-		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
-	if err == nil {
-		media.Scope = domain.MediaScopeConversation
-		return media, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.MediaObject{}, mapError(err)
-	}
-	err = s.pool.QueryRow(ctx, `
+	if conversationMedia {
+		err = tx.QueryRow(ctx, `
+			UPDATE media_objects
+			SET verification_lease_token=$3,
+				verification_locked_until=now()+($4 * interval '1 millisecond'),updated_at=now()
+			WHERE id=$1 AND owner_id=$2 AND status='pending' AND expires_at>now()
+			  AND (verification_locked_until IS NULL OR verification_locked_until<= now())
+			RETURNING id,owner_id,conversation_id,object_key,content_type,byte_size,
+				ciphertext_sha256,status,expires_at,upload_valid_until,
+				verification_lease_token,verification_locked_until,created_at,updated_at`,
+			id, actorID, leaseToken, leaseMilliseconds,
+		).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
+			&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
+			&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
+			&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+		if err == nil {
+			media.Scope = domain.MediaScopeConversation
+			if err := tx.Commit(ctx); err != nil {
+				return domain.MediaObject{}, err
+			}
+			return media, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.MediaObject{}, mapError(err)
+		}
+	} else {
+		err = tx.QueryRow(ctx, `
 		UPDATE profile_media_objects
 		SET verification_lease_token=$3,
 			verification_locked_until=now()+($4 * interval '1 millisecond'),updated_at=now()
@@ -2180,21 +2408,25 @@ func (s *Store) ClaimMediaVerification(
 		RETURNING id,owner_id,object_key,content_type,byte_size,ciphertext_sha256,
 			status,expires_at,upload_valid_until,verification_lease_token,
 			verification_locked_until,created_at,updated_at`,
-		id, actorID, leaseToken, leaseMilliseconds,
-	).Scan(&media.ID, &media.OwnerID, &media.ObjectKey, &media.ContentType,
-		&media.ByteSize, &media.CiphertextSHA256, &media.Status, &media.ExpiresAt,
-		&media.UploadValidUntil, &media.VerificationLeaseToken,
-		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
-	if err == nil {
-		media.Scope = domain.MediaScopeProfile
-		return media, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return domain.MediaObject{}, mapError(err)
+			id, actorID, leaseToken, leaseMilliseconds,
+		).Scan(&media.ID, &media.OwnerID, &media.ObjectKey, &media.ContentType,
+			&media.ByteSize, &media.CiphertextSHA256, &media.Status, &media.ExpiresAt,
+			&media.UploadValidUntil, &media.VerificationLeaseToken,
+			&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+		if err == nil {
+			media.Scope = domain.MediaScopeProfile
+			if err := tx.Commit(ctx); err != nil {
+				return domain.MediaObject{}, err
+			}
+			return media, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.MediaObject{}, mapError(err)
+		}
 	}
 	var status string
 	var expired bool
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT status,(expires_at IS NULL OR expires_at<=now()) FROM media_objects
 		WHERE id=$1 AND owner_id=$2
 		UNION ALL
@@ -2208,6 +2440,9 @@ func (s *Store) ClaimMediaVerification(
 		return domain.MediaObject{}, err
 	}
 	if status == "ready" {
+		if err := tx.Commit(ctx); err != nil {
+			return domain.MediaObject{}, err
+		}
 		return s.mediaForOwner(ctx, id, actorID)
 	}
 	if status == "pending" && expired {
@@ -2293,6 +2528,17 @@ func (s *Store) markConversationMediaReady(
 		return domain.MediaObject{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	if _, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID); err != nil {
+		return domain.MediaObject{}, err
+	} else if !conversationMedia {
+		return domain.MediaObject{}, domain.ErrNotFound
+	}
 	var media domain.MediaObject
 	err = tx.QueryRow(ctx, `
 		SELECT id,owner_id,conversation_id,object_key,content_type,byte_size,
@@ -2454,28 +2700,42 @@ func (s *Store) ReleaseMediaVerification(
 	if leaseToken == uuid.Nil {
 		return domain.ErrConflict
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE media_objects
-		SET verification_lease_token=NULL,verification_locked_until=NULL,updated_at=now()
-		WHERE id=$1 AND owner_id=$2 AND status='pending' AND verification_lease_token=$3`,
-		id, actorID, leaseToken)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		tag, err = s.pool.Exec(ctx, `
+	defer tx.Rollback(ctx)
+	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
+		return err
+	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return err
+	}
+	var tag pgconn.CommandTag
+	if conversationMedia {
+		tag, err = tx.Exec(ctx, `
+			UPDATE media_objects
+			SET verification_lease_token=NULL,verification_locked_until=NULL,updated_at=now()
+			WHERE id=$1 AND owner_id=$2 AND status='pending' AND verification_lease_token=$3`,
+			id, actorID, leaseToken)
+	} else {
+		tag, err = tx.Exec(ctx, `
 			UPDATE profile_media_objects
 			SET verification_lease_token=NULL,verification_locked_until=NULL,updated_at=now()
 			WHERE id=$1 AND owner_id=$2 AND status='pending' AND verification_lease_token=$3`,
 			id, actorID, leaseToken)
-		if err != nil {
-			return err
-		}
+	}
+	if err != nil {
+		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.ErrConflict
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (s *Store) RejectMediaVerification(
@@ -2497,8 +2757,16 @@ func (s *Store) DeleteMedia(ctx context.Context, id, actorID uuid.UUID) (domain.
 	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
 		return domain.MediaObject{}, err
 	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
 	var media domain.MediaObject
-	err = tx.QueryRow(ctx, `
+	if conversationMedia {
+		err = tx.QueryRow(ctx, `
 		WITH selected AS (
 			SELECT id,upload_valid_until FROM media_objects
 			WHERE id=$1 AND owner_id=$2 AND status<>'deleted' FOR UPDATE
@@ -2511,16 +2779,16 @@ func (s *Store) DeleteMedia(ctx context.Context, id, actorID uuid.UUID) (domain.
 			objects.content_type,objects.byte_size,objects.ciphertext_sha256,objects.status,
 			objects.expires_at,objects.upload_valid_until,objects.verification_lease_token,
 			objects.verification_locked_until,objects.created_at,objects.updated_at`, id, actorID,
-	).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
-		&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
-		&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
-		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+		).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
+			&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
+			&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
+			&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+	} else {
+		err = pgx.ErrNoRows
+	}
 	if err == nil {
 		media.Scope = domain.MediaScopeConversation
 	} else if errors.Is(err, pgx.ErrNoRows) {
-		if err := lockLiveUser(ctx, tx, actorID); err != nil {
-			return domain.MediaObject{}, err
-		}
 		err = tx.QueryRow(ctx, `
 			WITH selected AS (
 				SELECT id,upload_valid_until FROM profile_media_objects
@@ -2579,8 +2847,16 @@ func (s *Store) rejectPendingMedia(
 	if err := lockMediaQuota(ctx, tx, "user", actorID); err != nil {
 		return domain.MediaObject{}, err
 	}
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
+	_, conversationMedia, err := s.lockConversationMediaMutation(ctx, tx, id, actorID)
+	if err != nil {
+		return domain.MediaObject{}, err
+	}
 	var media domain.MediaObject
-	err = tx.QueryRow(ctx, `
+	if conversationMedia {
+		err = tx.QueryRow(ctx, `
 		WITH selected AS (
 			SELECT id,upload_valid_until FROM media_objects
 			WHERE id=$1 AND owner_id=$2 AND status='pending'
@@ -2596,10 +2872,13 @@ func (s *Store) rejectPendingMedia(
 			objects.content_type,objects.byte_size,objects.ciphertext_sha256,objects.status,
 			objects.expires_at,objects.upload_valid_until,objects.verification_lease_token,
 			objects.verification_locked_until,objects.created_at,objects.updated_at`, id, actorID, leaseToken,
-	).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
-		&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
-		&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
-		&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+		).Scan(&media.ID, &media.OwnerID, &media.ConversationID, &media.ObjectKey,
+			&media.ContentType, &media.ByteSize, &media.CiphertextSHA256, &media.Status,
+			&media.ExpiresAt, &media.UploadValidUntil, &media.VerificationLeaseToken,
+			&media.VerificationLockedUntil, &media.CreatedAt, &media.UpdatedAt)
+	} else {
+		err = pgx.ErrNoRows
+	}
 	if err == nil {
 		media.Scope = domain.MediaScopeConversation
 	} else if errors.Is(err, pgx.ErrNoRows) {
@@ -3301,16 +3580,42 @@ func (s *Store) requireMember(ctx context.Context, query memberQuerier, conversa
 	return nil
 }
 
-// lockLiveUser is the common user-row serialization point for state created in
-// additive extension tables. Account deletion takes its media advisory before
-// this row; writers that only need the user row never subsequently wait on that
-// advisory, so completed writes are cleaned and later writes fail without a
-// lock-order cycle.
+// Store mutation lock order is global and must not be inverted:
+//
+//	account-delivery barrier (when external delivery is involved)
+//	-> user media quota (when media totals/capabilities are involved)
+//	-> all live users, sorted by UUID
+//	-> conversation media quota (when media is involved)
+//	-> all conversations, sorted by UUID
+//	-> membership/invite/entity/media child rows.
+//
+// Account deletion follows the same prefix. In particular, never add a user
+// lock after a conversation or child-row lock: doing so creates a cycle with
+// erasure's user -> conversation -> child traversal.
 func lockLiveUser(ctx context.Context, tx pgx.Tx, userID uuid.UUID) error {
 	var lockedUserID uuid.UUID
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, userID,
 	).Scan(&lockedUserID)
+	return mapError(err)
+}
+
+func lockLiveUsers(ctx context.Context, tx pgx.Tx, userIDs ...uuid.UUID) error {
+	ordered := uniqueUUIDs(userIDs)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].String() < ordered[j].String() })
+	for _, userID := range ordered {
+		if err := lockLiveUser(ctx, tx, userID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func lockConversation(ctx context.Context, tx pgx.Tx, conversationID uuid.UUID) error {
+	var lockedID uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, conversationID,
+	).Scan(&lockedID)
 	return mapError(err)
 }
 

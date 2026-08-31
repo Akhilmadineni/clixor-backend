@@ -25,7 +25,7 @@ const MediaDeleteGrace = 3 * time.Minute
 // topics are never searched with raw identity substrings.
 func AccountSanitizableOutboxTopic(topic string) bool {
 	switch topic {
-	case "conversation.created", "entity.updated", "entity.deleted":
+	case "conversation.created", "conversation.updated", "entity.updated", "entity.deleted":
 		return true
 	default:
 		return false
@@ -63,7 +63,7 @@ func DecodeAccountOutboxPayload(
 	}
 	result := AccountOutboxPayload{ConversationID: aggregateID}
 	switch topic {
-	case "conversation.created":
+	case "conversation.created", "conversation.updated":
 		var conversation domain.Conversation
 		if decodeAccountOutboxStrict(raw, &conversation) != nil || conversation.ID != aggregateID ||
 			conversation.CreatedBy == uuid.Nil || strings.TrimSpace(conversation.Kind) == "" {

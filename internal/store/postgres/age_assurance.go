@@ -20,7 +20,15 @@ func (s *Store) AgeAssurance(ctx context.Context, userID uuid.UUID) (domain.AgeA
 }
 
 func (s *Store) UpsertAgeAssurance(ctx context.Context, assurance domain.AgeAssurance) (domain.AgeAssurance, error) {
-	err := s.pool.QueryRow(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return domain.AgeAssurance{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, assurance.UserID); err != nil {
+		return domain.AgeAssurance{}, err
+	}
+	err = tx.QueryRow(ctx, `
 		INSERT INTO age_assurances(
 			user_id,status,minimum_age,source,declaration,policy_version,checked_at,expires_at
 		) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
@@ -39,5 +47,11 @@ func (s *Store) UpsertAgeAssurance(ctx context.Context, assurance domain.AgeAssu
 		&assurance.UserID, &assurance.Status, &assurance.MinimumAge, &assurance.Source,
 		&assurance.Declaration, &assurance.PolicyVersion, &assurance.CheckedAt, &assurance.ExpiresAt,
 	)
-	return assurance, mapError(err)
+	if err != nil {
+		return domain.AgeAssurance{}, mapError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.AgeAssurance{}, err
+	}
+	return assurance, nil
 }

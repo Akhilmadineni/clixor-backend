@@ -178,6 +178,12 @@ func TestDecodeAccountOutboxPayloadValidatesOwnedSchemas(t *testing.T) {
 				ID: conversationID, Kind: "group", CreatedBy: actorID,
 			}),
 		},
+		{
+			topic: "conversation.updated",
+			raw: mustAccountJSON(t, domain.Conversation{
+				ID: conversationID, Kind: "group", CreatedBy: actorID,
+			}),
+		},
 	}
 	for _, test := range valid {
 		decoded, err := DecodeAccountOutboxPayload(test.topic, conversationID, test.raw)
@@ -194,6 +200,7 @@ func TestDecodeAccountOutboxPayloadValidatesOwnedSchemas(t *testing.T) {
 		{"conversation.member_added", json.RawMessage(`{"conversation_id":"` + conversationID.String() + `"}`)},
 		{"entity.updated", json.RawMessage(`{"email":"deleted@example.com"}`)},
 		{"conversation.created", json.RawMessage(`"deleted@example.com"`)},
+		{"conversation.updated", json.RawMessage(`"deleted@example.com"`)},
 		{"receipt.updated", json.RawMessage(`{"conversation_id":"` + conversationID.String() +
 			`","user_id":"` + userID.String() + `","delivered_seq":1,"read_seq":0,` +
 			`"updated_at":"0001-01-01T00:00:00Z","unknown":true}`)},

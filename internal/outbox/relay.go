@@ -869,14 +869,18 @@ func (r *Relay) translate(ctx context.Context, item domain.OutboxEvent) (domain.
 			Type: item.Topic, ConversationID: &entity.ConversationID, Seq: entity.Version,
 			Payload: item.Payload, OccurredAt: item.CreatedAt,
 		}
-	case "conversation.created":
+	case "conversation.created", "conversation.updated":
 		var conversation domain.Conversation
 		if err := json.Unmarshal(item.Payload, &conversation); err != nil {
 			r.logger.Error("outbox_payload_invalid", "error", err, "outbox_id", item.ID)
 			return domain.RealtimeEvent{}, nil, false
 		}
+		eventID := conversation.ID.String()
+		if item.Topic == "conversation.updated" {
+			eventID = fmt.Sprintf("conversation-updated:%s:%d", conversation.ID, conversation.UpdatedAt.UnixNano())
+		}
 		event = domain.RealtimeEvent{
-			ID: conversation.ID.String(), Type: item.Topic, ConversationID: &conversation.ID,
+			ID: eventID, Type: item.Topic, ConversationID: &conversation.ID,
 			Payload: item.Payload, OccurredAt: item.CreatedAt,
 		}
 	case "conversation.member_added":

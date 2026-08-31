@@ -285,6 +285,11 @@ type Store interface {
 	PrunePushDeliveries(context.Context, time.Time, time.Time, int) (int64, error)
 	PrunePublishedOutbox(context.Context, time.Time, int) (int64, error)
 	LockMailDeliveryBatch(context.Context, int) ([]domain.MailDelivery, error)
+	// WithMailDeliveryLease revalidates a claimed row under the account-erasure
+	// delivery barrier and keeps that barrier held for the external transport
+	// callback. Implementations must not expose a cached encrypted payload when
+	// the row was canceled or removed after the batch claim.
+	WithMailDeliveryLease(context.Context, uuid.UUID, uuid.UUID, func(context.Context, domain.MailDelivery) error) error
 	FinishMailDelivery(context.Context, uuid.UUID, uuid.UUID, string, time.Time, string) error
 	PruneMailDeliveries(context.Context, time.Time, time.Time, time.Time, int) (int64, error)
 }

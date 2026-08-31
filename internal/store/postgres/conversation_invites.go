@@ -232,6 +232,12 @@ func (s *Store) RevokeConversationInvite(ctx context.Context, conversationID, ac
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := lockLiveUser(ctx, tx, actorID); err != nil {
+		return err
+	}
+	if err := lockConversation(ctx, tx, conversationID); err != nil {
+		return err
+	}
 	var role string
 	err = tx.QueryRow(ctx, `
 		SELECT role FROM conversation_members

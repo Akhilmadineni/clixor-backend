@@ -51,7 +51,7 @@ func TestOutboxTopicDomainMigrationFailsClosedOnDrift(t *testing.T) {
 	}
 	sql := string(raw)
 	expected := []string{
-		"conversation.created", "conversation.member_added", "message.created",
+		"conversation.created", "conversation.updated", "conversation.member_added", "message.created",
 		"receipt.updated", "entity.updated", "entity.deleted", "media.delete",
 	}
 	preflight := strings.Index(sql, "IF EXISTS")
@@ -74,6 +74,41 @@ func TestOutboxTopicDomainMigrationFailsClosedOnDrift(t *testing.T) {
 				t.Fatalf("%s topic[%d]=%q, want %q", name, index, matches[index][1], topic)
 			}
 		}
+	}
+}
+
+func TestOutboxTopicDomainMigrationScrubsLegacyPushAndEnforcesOwnership(t *testing.T) {
+	raw, err := migrationFiles.ReadFile("migrations/000021_outbox_topic_domain.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := string(raw)
+	for _, required := range []string{
+		"SET LOCAL lock_timeout = '5s'",
+		"SET LOCAL statement_timeout = '30s'",
+		"UPDATE push_deliveries",
+		"title='Clixor'",
+		"body='You have new activity. Open the app to view it.'",
+		"kind='activity'",
+		"outbox_account_erasure_idx",
+		"conversation_member_tombstones_user_idx",
+		"SELECT count(*) FROM conversation_members owner",
+		") <> 1",
+		"owner.user_id=conversation.created_by",
+		"CREATE UNIQUE INDEX conversation_members_single_owner_idx",
+		"WHERE role='owner'",
+	} {
+		if !strings.Contains(sql, required) {
+			t.Fatalf("migration 21 is missing %q", required)
+		}
+	}
+	if scrub, seal := strings.Index(sql, "UPDATE push_deliveries"),
+		strings.Index(sql, "ADD CONSTRAINT outbox_events_topic_domain_check"); scrub < 0 || seal < 0 || scrub > seal {
+		t.Fatal("legacy push rows must be genericized before the outbox topic domain is sealed")
+	}
+	if ownerGate, ownerIndex := strings.Index(sql, "conversation must have exactly one owner"),
+		strings.Index(sql, "CREATE UNIQUE INDEX conversation_members_single_owner_idx"); ownerGate < 0 || ownerIndex < 0 || ownerGate > ownerIndex {
+		t.Fatal("migration must reject ownership drift before creating the unique owner index")
 	}
 }
 

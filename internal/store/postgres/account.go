@@ -21,6 +21,8 @@ type accountConversation struct {
 	metadata    json.RawMessage
 	role        string
 	successorID pgtype.UUID
+	ownerID     pgtype.UUID
+	active      bool
 }
 
 // DeleteAccount irreversibly removes every authentication and discovery
@@ -96,19 +98,34 @@ func (s *Store) deleteAccountTx(
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT c.id,c.created_by,c.metadata,m.role,successor.user_id
-		FROM conversation_members m
-		JOIN conversations c ON c.id=m.conversation_id
+		WITH account_conversations AS MATERIALIZED (
+			SELECT conversation_id FROM conversation_members WHERE user_id=$1
+			UNION
+			SELECT conversation_id FROM conversation_member_tombstones WHERE user_id=$1
+		)
+		SELECT c.id,c.created_by,c.metadata,COALESCE(m.role,''),successor.user_id,
+		       owner.user_id,(m.user_id IS NOT NULL)
+		FROM account_conversations account
+		JOIN conversations c ON c.id=account.conversation_id
+		LEFT JOIN conversation_members m
+		  ON m.conversation_id=c.id AND m.user_id=$1
 		LEFT JOIN LATERAL (
 			SELECT other.user_id
 			FROM conversation_members other
-			WHERE other.conversation_id=m.conversation_id AND other.user_id<>m.user_id
+			WHERE other.conversation_id=c.id AND other.user_id<>$1
 			ORDER BY other.joined_at,other.user_id
 			LIMIT 1
 		) successor ON true
-		WHERE m.user_id=$1
+		LEFT JOIN LATERAL (
+			SELECT current_owner.user_id
+			FROM conversation_members current_owner
+			WHERE current_owner.conversation_id=c.id
+			  AND current_owner.user_id<>$1 AND current_owner.role='owner'
+			ORDER BY current_owner.joined_at,current_owner.user_id
+			LIMIT 1
+		) owner ON true
 		ORDER BY c.id
-		FOR UPDATE OF c,m`, userID)
+		FOR UPDATE OF c`, userID)
 	if err != nil {
 		return err
 	}
@@ -117,7 +134,8 @@ func (s *Store) deleteAccountTx(
 		var conversation accountConversation
 		if err := rows.Scan(
 			&conversation.id, &conversation.createdBy, &conversation.metadata,
-			&conversation.role, &conversation.successorID,
+			&conversation.role, &conversation.successorID, &conversation.ownerID,
+			&conversation.active,
 		); err != nil {
 			rows.Close()
 			return err
@@ -157,6 +175,34 @@ func (s *Store) deleteAccountTx(
 		return err
 	}
 	profileMediaRows.Close()
+	// Ready conversation ciphertext is shared history and remains available to
+	// the other members. Pending uploads are private capabilities owned by the
+	// departing account, so revoke them and schedule their staging objects for
+	// deletion before the user tombstone is committed.
+	pendingMediaRows, err := tx.Query(ctx, `
+		DELETE FROM media_objects
+		WHERE owner_id=$1 AND status='pending'
+		RETURNING object_key,upload_valid_until`, userID)
+	if err != nil {
+		return err
+	}
+	for pendingMediaRows.Next() {
+		var key string
+		var uploadValidUntil time.Time
+		if err := pendingMediaRows.Scan(&key, &uploadValidUntil); err != nil {
+			pendingMediaRows.Close()
+			return err
+		}
+		objectKeys = append(objectKeys, key)
+		if candidate := mediaDeleteNotBefore(uploadValidUntil); candidate.After(deleteNotBefore) {
+			deleteNotBefore = candidate
+		}
+	}
+	if err := pendingMediaRows.Err(); err != nil {
+		pendingMediaRows.Close()
+		return err
+	}
+	pendingMediaRows.Close()
 	for _, conversation := range conversations {
 		if !conversation.successorID.Valid {
 			mediaRows, err := tx.Query(ctx, `
@@ -199,42 +245,52 @@ func (s *Store) deleteAccountTx(
 		createdBy := conversation.createdBy
 		if createdBy == userID {
 			createdBy = conversation.successorID.Bytes
+			if conversation.ownerID.Valid {
+				createdBy = conversation.ownerID.Bytes
+			}
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE conversations SET created_by=$2,metadata=$3,updated_at=now() WHERE id=$1`,
 			conversation.id, createdBy, metadata); err != nil {
 			return err
 		}
-		if conversation.role == "owner" {
+		promoteSuccessor := (conversation.active && conversation.role == "owner") ||
+			(!conversation.ownerID.Valid && conversation.createdBy == userID)
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM receipts WHERE conversation_id=$1 AND user_id=$2`,
+			conversation.id, userID); err != nil {
+			return err
+		}
+		if conversation.active {
+			tombstone := store.ConversationMemberTombstone{UserID: userID}
+			if err := tx.QueryRow(ctx, `
+				SELECT local_id FROM conversation_member_local_ids
+				WHERE conversation_id=$1 AND user_id=$2`, conversation.id, userID,
+			).Scan(&tombstone.LocalID); err != nil {
+				return mapError(err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
+				VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
+				conversation.id, userID, tombstone.LocalID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `
+				DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
+				conversation.id, userID); err != nil {
+				return err
+			}
+		}
+		// The unique owner index is immediate. Remove the departing owner before
+		// promoting the successor so the invariant is never violated by two
+		// simultaneously visible owner rows inside this transaction.
+		if promoteSuccessor {
 			if _, err := tx.Exec(ctx, `
 				UPDATE conversation_members SET role='owner'
 				WHERE conversation_id=$1 AND user_id=$2`,
 				conversation.id, conversation.successorID.Bytes); err != nil {
 				return err
 			}
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM receipts WHERE conversation_id=$1 AND user_id=$2`,
-			conversation.id, userID); err != nil {
-			return err
-		}
-		tombstone := store.ConversationMemberTombstone{UserID: userID}
-		if err := tx.QueryRow(ctx, `
-			SELECT local_id FROM conversation_member_local_ids
-			WHERE conversation_id=$1 AND user_id=$2`, conversation.id, userID,
-		).Scan(&tombstone.LocalID); err != nil {
-			return mapError(err)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id)
-			VALUES($1,$2,$3) ON CONFLICT(conversation_id,user_id) DO NOTHING`,
-			conversation.id, userID, tombstone.LocalID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `
-			DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
-			conversation.id, userID); err != nil {
-			return err
 		}
 		metadata, err = projectConversationMetadata(ctx, tx, conversation.id, metadata)
 		if err != nil {
@@ -452,7 +508,7 @@ func sanitizeAccountOutbox(
 		return nil
 	}
 	topics := []string{
-		"conversation.created", "conversation.member_added", "receipt.updated",
+		"conversation.created", "conversation.updated", "conversation.member_added", "receipt.updated",
 		"entity.updated", "entity.deleted",
 	}
 	rows, err := tx.Query(ctx, `

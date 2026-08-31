@@ -473,11 +473,13 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	mediaDeleteNotBefore := now.Add(store.MediaDeleteGrace)
 	var updatedEntities []domain.Entity
 
-	for conversationID, members := range s.members {
-		if _, present := members[userID]; !present {
+	for _, conversationID := range s.accountConversationScopeLocked(userID) {
+		members, exists := s.members[conversationID]
+		if !exists {
 			continue
 		}
-		if len(members) == 1 {
+		member, activeMember := members[userID]
+		if len(members) == 0 || (activeMember && len(members) == 1) {
 			deletedConversations[conversationID] = struct{}{}
 			delete(s.conversations, conversationID)
 			delete(s.members, conversationID)
@@ -492,7 +494,7 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		successor := oldestMember(members, userID)
 		conversation := s.conversations[conversationID]
 		if conversation.CreatedBy == userID {
-			conversation.CreatedBy = successor.UserID
+			conversation.CreatedBy = conversationAuthorityMember(members, userID).UserID
 		}
 		if metadata, changed, err := store.AnonymizeAccountJSON(conversation.Metadata, identity); err != nil {
 			return err
@@ -501,21 +503,25 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 		}
 		conversation.UpdatedAt = now
 		s.conversations[conversationID] = conversation
-		if members[userID].Role == "owner" {
+		if activeMember && member.Role == "owner" {
 			successor.Role = "owner"
 			members[successor.UserID] = successor
+			conversation.CreatedBy = successor.UserID
+			s.conversations[conversationID] = conversation
 		}
-		if s.memberTombstones[conversationID] == nil {
-			s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+		if activeMember {
+			if s.memberTombstones[conversationID] == nil {
+				s.memberTombstones[conversationID] = make(map[uuid.UUID]store.ConversationMemberTombstone)
+			}
+			localID := s.memberLocalIDs[conversationID][userID]
+			if localID == uuid.Nil {
+				localID = userID
+			}
+			s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
+				UserID: userID, LocalID: localID,
+			}
+			delete(members, userID)
 		}
-		localID := s.memberLocalIDs[conversationID][userID]
-		if localID == uuid.Nil {
-			localID = userID
-		}
-		s.memberTombstones[conversationID][userID] = store.ConversationMemberTombstone{
-			UserID: userID, LocalID: localID,
-		}
-		delete(members, userID)
 		s.projectConversationMembersLocked(conversationID)
 		delete(s.receipts, conversationID.String()+":"+userID.String())
 
@@ -594,7 +600,10 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 	}
 	for id, mediaObject := range s.media {
 		_, conversationDeleted := deletedConversations[mediaObject.ConversationID]
-		if conversationDeleted || (mediaObject.Scope == domain.MediaScopeProfile && mediaObject.OwnerID == userID) {
+		ownedProfile := mediaObject.Scope == domain.MediaScopeProfile && mediaObject.OwnerID == userID
+		ownedPending := mediaObject.Scope == domain.MediaScopeConversation &&
+			mediaObject.OwnerID == userID && mediaObject.Status == "pending"
+		if conversationDeleted || ownedProfile || ownedPending {
 			objectKeys = append(objectKeys, mediaObject.ObjectKey)
 			if candidate := memoryMediaDeleteNotBefore(mediaObject.UploadValidUntil); candidate.After(mediaDeleteNotBefore) {
 				mediaDeleteNotBefore = candidate
@@ -750,8 +759,10 @@ func (s *Store) validateAccountDeletionJSONLocked(
 	userID uuid.UUID,
 	identity store.AccountIdentity,
 ) error {
-	for conversationID, members := range s.members {
-		if _, present := members[userID]; !present || len(members) < 2 {
+	for _, conversationID := range s.accountConversationScopeLocked(userID) {
+		members := s.members[conversationID]
+		_, active := members[userID]
+		if len(members) == 0 || (active && len(members) < 2) {
 			continue
 		}
 		if _, _, err := store.AnonymizeAccountJSON(
@@ -776,6 +787,38 @@ func (s *Store) validateAccountDeletionJSONLocked(
 		}
 	}
 	return nil
+}
+
+func (s *Store) accountConversationScopeLocked(userID uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{})
+	for conversationID, members := range s.members {
+		if _, active := members[userID]; active {
+			seen[conversationID] = struct{}{}
+		}
+	}
+	for conversationID, tombstones := range s.memberTombstones {
+		if _, former := tombstones[userID]; former {
+			seen[conversationID] = struct{}{}
+		}
+	}
+	result := make([]uuid.UUID, 0, len(seen))
+	for conversationID := range seen {
+		result = append(result, conversationID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].String() < result[j].String() })
+	return result
+}
+
+func conversationAuthorityMember(
+	members map[uuid.UUID]domain.ConversationMember,
+	excluded uuid.UUID,
+) domain.ConversationMember {
+	for id, member := range members {
+		if id != excluded && member.Role == "owner" {
+			return member
+		}
+	}
+	return oldestMember(members, excluded)
 }
 
 func oldestMember(members map[uuid.UUID]domain.ConversationMember, excluded uuid.UUID) domain.ConversationMember {
@@ -885,6 +928,14 @@ func (s *Store) ClearDevicePushToken(_ context.Context, userID, deviceID uuid.UU
 func (s *Store) PutOneTimePreKeys(_ context.Context, deviceID uuid.UUID, keys []domain.OneTimePreKey) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	user, ok := s.users[device.UserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
 	existing := make(map[uint32]struct{}, len(s.preKeys[deviceID]))
 	for _, key := range s.preKeys[deviceID] {
 		existing[key.KeyID] = struct{}{}
@@ -903,6 +954,10 @@ func (s *Store) PutOneTimePreKeys(_ context.Context, deviceID uuid.UUID, keys []
 func (s *Store) ClaimPreKeys(_ context.Context, targetUserID uuid.UUID) ([]domain.PreKeyBundle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	user, ok := s.users[targetUserID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return nil, domain.ErrNotFound
+	}
 	var result []domain.PreKeyBundle
 	for _, device := range s.devices {
 		if device.UserID != targetUserID || device.IdentityKey == "" {
@@ -1185,6 +1240,8 @@ func (s *Store) UpdateConversation(_ context.Context, conversationID, actorID uu
 	}
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
+	payload, _ := json.Marshal(conversation)
+	s.appendOutbox("conversation.updated", conversationID, payload)
 	return conversation, nil
 }
 
@@ -1850,6 +1907,7 @@ func (s *Store) TransferConversationOwnership(_ context.Context, conversationID,
 	members[actorID] = actor
 	members[targetID] = target
 	conversation := s.conversations[conversationID]
+	conversation.CreatedBy = targetID
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
 	return nil
@@ -2200,6 +2258,9 @@ func (s *Store) PersistMediaUploadCapability(
 	if media.OwnerID != actorID {
 		return domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return err
+	}
 	if media.Status != "pending" {
 		return domain.ErrConflict
 	}
@@ -2223,7 +2284,23 @@ func (s *Store) MediaUploadCapability(
 	if media.OwnerID != actorID {
 		return "", domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return "", err
+	}
 	return s.mediaUploadCapabilities[id], nil
+}
+
+func (s *Store) authorizeMediaMutationLocked(media domain.MediaObject, actorID uuid.UUID) error {
+	user, ok := s.users[actorID]
+	if !ok || string(user.Profile) == `{"deleted":true}` {
+		return domain.ErrNotFound
+	}
+	if media.Scope == domain.MediaScopeConversation {
+		if _, member := s.members[media.ConversationID][actorID]; !member {
+			return domain.ErrForbidden
+		}
+	}
+	return nil
 }
 
 func (s *Store) createMediaLocked(media domain.MediaObject, limits store.MediaReservationLimits) (domain.MediaObject, error) {
@@ -2324,6 +2401,9 @@ func (s *Store) ClaimMediaVerification(
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
 	if media.Status == "ready" {
 		return media, nil
 	}
@@ -2363,6 +2443,9 @@ func (s *Store) MarkMediaReady(
 	}
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
+	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
 	}
 	if media.Status == "ready" {
 		return media, nil
@@ -2430,6 +2513,9 @@ func (s *Store) ReleaseMediaVerification(
 	if media.OwnerID != actorID {
 		return domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return err
+	}
 	if media.Status != "pending" || leaseToken == uuid.Nil ||
 		media.VerificationLeaseToken == nil || *media.VerificationLeaseToken != leaseToken {
 		return domain.ErrConflict
@@ -2465,6 +2551,9 @@ func (s *Store) rejectPendingMedia(
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
 	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
+	}
 	if media.Status != "pending" {
 		return domain.MediaObject{}, domain.ErrConflict
 	}
@@ -2495,6 +2584,9 @@ func (s *Store) DeleteMedia(_ context.Context, id, actorID uuid.UUID) (domain.Me
 	}
 	if media.OwnerID != actorID {
 		return domain.MediaObject{}, domain.ErrForbidden
+	}
+	if err := s.authorizeMediaMutationLocked(media, actorID); err != nil {
+		return domain.MediaObject{}, err
 	}
 	now := time.Now().UTC()
 	deleteNotBefore := memoryMediaDeleteNotBefore(media.UploadValidUntil)

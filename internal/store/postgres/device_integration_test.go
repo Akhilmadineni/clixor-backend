@@ -171,3 +171,61 @@ func TestPostgresPushTokenOwnershipIsTransactionalAndUnique(t *testing.T) {
 		t.Fatalf("failed transaction cleared previous token owner: %q", unchanged.PushToken)
 	}
 }
+
+func TestPostgresConcurrentPushTokenSwapsRetryDeadlocks(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	persistence, err := Open(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persistence.Close()
+	first, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "swap-first-" + uuid.NewString() + "@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "swap-second-" + uuid.NewString() + "@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDevice := domain.Device{ID: uuid.New(), UserID: first.ID, Name: "first", Platform: "ios", PushToken: "swap-token-a-" + uuid.NewString()}
+	secondDevice := domain.Device{ID: uuid.New(), UserID: second.ID, Name: "second", Platform: "ios", PushToken: "swap-token-b-" + uuid.NewString()}
+	if firstDevice, err = persistence.UpsertDevice(ctx, firstDevice); err != nil {
+		t.Fatal(err)
+	}
+	if secondDevice, err = persistence.UpsertDevice(ctx, secondDevice); err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 10; round++ {
+		firstWant, secondWant := secondDevice.PushToken, firstDevice.PushToken
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		go func() {
+			<-start
+			firstDevice.PushToken = firstWant
+			var writeErr error
+			firstDevice, writeErr = persistence.UpsertDevice(ctx, firstDevice)
+			results <- writeErr
+		}()
+		go func() {
+			<-start
+			secondDevice.PushToken = secondWant
+			var writeErr error
+			secondDevice, writeErr = persistence.UpsertDevice(ctx, secondDevice)
+			results <- writeErr
+		}()
+		close(start)
+		for range 2 {
+			if err := <-results; err != nil {
+				t.Fatalf("round %d token swap failed after retry: %v", round, err)
+			}
+		}
+		if firstDevice.PushToken != firstWant || secondDevice.PushToken != secondWant {
+			t.Fatalf("round %d swap mismatch: first=%q second=%q", round, firstDevice.PushToken, secondDevice.PushToken)
+		}
+	}
+}

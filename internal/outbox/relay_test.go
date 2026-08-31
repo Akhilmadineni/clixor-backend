@@ -251,6 +251,33 @@ func TestSubscriptionCreateSendsOneNotificationAndSuppressesInitialCharge(t *tes
 	}
 }
 
+func TestConversationUpdatedIsTranslatedDurablyWithoutPush(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Subscriptions"}`))
+	conversation := fixture.conversation
+	conversation.Title = "Updated title"
+	conversation.UpdatedAt = conversation.UpdatedAt.Add(time.Second)
+	raw, err := json.Marshal(conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := domain.OutboxEvent{
+		ID: 991, Topic: "conversation.updated", AggregateID: conversation.ID,
+		Payload: raw, CreatedAt: conversation.UpdatedAt,
+	}
+	event, recipients, ok := fixture.relay.translate(fixture.ctx, item)
+	if !ok {
+		t.Fatal("conversation.updated was treated as an unknown outbox topic")
+	}
+	if event.Type != item.Topic || event.ConversationID == nil ||
+		*event.ConversationID != conversation.ID || !bytes.Equal(event.Payload, raw) ||
+		len(recipients) == 0 {
+		t.Fatalf("unexpected translated update: event=%+v recipients=%v", event, recipients)
+	}
+	if _, notify, err := fixture.relay.notificationFor(fixture.ctx, item, recipients); err != nil || notify {
+		t.Fatalf("conversation update generated a push: notify=%t err=%v", notify, err)
+	}
+}
+
 func TestPersonalMediaDeletionRetriesUntilObjectStoreSucceeds(t *testing.T) {
 	ctx := context.Background()
 	persistence := memory.New()

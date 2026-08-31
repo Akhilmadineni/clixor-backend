@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -421,6 +422,105 @@ func TestDeleteAccountNeverMutatesSharedE2EECiphertextOrEnvelope(t *testing.T) {
 	}
 	if messages[0].Ciphertext != ciphertext || string(messages[0].Envelope) != string(envelope) {
 		t.Fatalf("E2EE message bytes changed: ciphertext=%q envelope=%s", messages[0].Ciphertext, messages[0].Envelope)
+	}
+}
+
+func TestDeleteAccountErasesFormerMemberHistoryWithoutChangingSharedCiphertext(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	deleted, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "former-delete@example.com", Phone: "+13125550888",
+		DisplayName: "Former Member", PasswordHash: "hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted, err = persistence.UpdateUserProfile(ctx, deleted.ID, json.RawMessage(
+		`{"username":"@former_member","display_name":"Former Member"}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := persistence.CreateUser(ctx, store.CreateUserParams{
+		Email: "former-owner@example.com", DisplayName: "Remaining Owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := json.RawMessage(`{"audit":{"backendUserId":"` + deleted.ID.String() +
+		`","displayName":"Former Member","email":"former-delete@example.com","username":"@former_member"}}`)
+	conversation, err := persistence.CreateConversation(ctx, store.CreateConversationParams{
+		Kind: "group", CreatedBy: remaining.ID, MemberIDs: []uuid.UUID{deleted.ID}, Metadata: metadata,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: deleted.ID, Name: "sender", Platform: "ios", IdentityKey: "identity",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entityID := uuid.New()
+	if _, err := persistence.PutEntity(ctx, domain.Entity{
+		ConversationID: conversation.ID, Kind: "note", ID: entityID, CreatedBy: deleted.ID,
+		Payload: json.RawMessage(`{"createdBy":"` + deleted.ID.String() +
+			`","creatorName":"Former Member","email":"former-delete@example.com","amount":19.25}`),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := "Rm9ybWVyIE1lbWJlciBlbmNyeXB0ZWQ="
+	envelope := json.RawMessage(`{"wrappedKey":"Former Member","opaque":"former-delete@example.com"}`)
+	message, _, err := persistence.CreateMessage(ctx, store.CreateMessageParams{
+		ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: conversation.ID,
+		SenderID: deleted.ID, SenderDeviceID: device.ID, ContentType: "ciphertext",
+		Ciphertext: ciphertext, Envelope: envelope,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistence.RemoveConversationMember(
+		ctx, conversation.ID, remaining.ID, deleted.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, active := persistence.members[conversation.ID][deleted.ID]; active {
+		t.Fatal("removed user remained an active member")
+	}
+	if _, former := persistence.memberTombstones[conversation.ID][deleted.ID]; !former {
+		t.Fatal("removed user did not retain a membership tombstone")
+	}
+	if err := persistence.DeleteAccount(ctx, deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := persistence.Conversation(ctx, conversation.ID, remaining.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entities, err := persistence.ListEntities(ctx, conversation.ID, remaining.ID, "note", time.Time{}, 10)
+	if err != nil || len(entities) != 1 || entities[0].ID != entityID {
+		t.Fatalf("former-member entity missing: entities=%+v err=%v", entities, err)
+	}
+	for label, raw := range map[string][]byte{"metadata": after.Metadata, "entity": entities[0].Payload} {
+		text := strings.ToLower(string(raw))
+		for _, forbidden := range []string{"former member", "former-delete@example.com", "@former_member"} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%s retained former-member identity %q: %s", label, forbidden, raw)
+			}
+		}
+		if !strings.Contains(text, deleted.ID.String()) {
+			t.Fatalf("%s removed the shared tombstone id: %s", label, raw)
+		}
+	}
+	messages, err := persistence.ListMessages(ctx, store.ListMessagesParams{
+		ConversationID: conversation.ID, UserID: remaining.ID, Limit: 10,
+	})
+	if err != nil || len(messages) != 1 || messages[0].ID != message.ID {
+		t.Fatalf("shared message missing: messages=%+v err=%v", messages, err)
+	}
+	if messages[0].Ciphertext != ciphertext || !bytes.Equal(messages[0].Envelope, envelope) {
+		t.Fatalf("former-member E2EE bytes changed: ciphertext=%q envelope=%s", messages[0].Ciphertext, messages[0].Envelope)
 	}
 }
 

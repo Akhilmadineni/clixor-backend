@@ -19,7 +19,9 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
+	"github.com/Akhilmadineni/clixor-backend/internal/outbox"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
+	"github.com/Akhilmadineni/clixor-backend/internal/push"
 	"github.com/Akhilmadineni/clixor-backend/internal/ratelimit"
 	"github.com/Akhilmadineni/clixor-backend/internal/store/memory"
 	"github.com/Akhilmadineni/clixor-backend/internal/verification"
@@ -308,8 +310,10 @@ func TestRealtimeMessageDelivery(t *testing.T) {
 		}, http.StatusCreated, nil)
 
 	var event domain.RealtimeEvent
-	if err := socket.ReadJSON(&event); err != nil {
-		t.Fatal(err)
+	for event.Type != "message.created" {
+		if err := socket.ReadJSON(&event); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if event.Type != "message.created" || event.Seq != 1 || event.ConversationID == nil ||
 		*event.ConversationID != conversation.ID {
@@ -814,6 +818,11 @@ func newTestHTTPServerWithVerifierAndMail(
 	})
 	tokens := auth.NewTokenManager("test", strings.Repeat("s", 48), 15*time.Minute, 30*24*time.Hour, persistence)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	relayContext, stopRelay := context.WithCancel(context.Background())
+	go outbox.New(
+		persistence, bus, push.Disabled{}, media.Unavailable{}, logger,
+	).Run(relayContext)
+	t.Cleanup(stopRelay)
 	server := httptest.NewServer(New(
 		persistence, tokens, bus, limiter, media.Unavailable{},
 		verifier, appleauth.Unavailable{}, presenceService, mailQueue,
