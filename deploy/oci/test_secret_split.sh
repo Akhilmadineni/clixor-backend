@@ -47,7 +47,7 @@ assert_keys() {
   expected=$2
   actual="$(awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/ { print $1 }' "${file}" | sort | tr '\n' ' ')"
   [ "${actual}" = "${expected}" ] || fail "$(basename -- "${file}") keys were ${actual}"
-  [ "$(stat -f '%Lp' "${file}" 2>/dev/null || stat -c '%a' "${file}")" = 600 ] || \
+  [ "$(stat -c '%a' "${file}" 2>/dev/null || stat -f '%Lp' "${file}")" = 600 ] || \
     fail "$(basename -- "${file}") mode is not 0600"
 }
 
