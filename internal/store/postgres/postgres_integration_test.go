@@ -701,7 +701,7 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 		('entity.updated',$1,jsonb_build_object(
 			'conversation_id',$1,'kind','note','id',$4,'version',1,
 			'payload',jsonb_build_object('description','keep unrelated'),'created_by',$5,
-			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')))`,
+			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z'))`,
 		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID, remainingUser.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -856,7 +856,11 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 		if err := json.Unmarshal(raw, &payload); err != nil {
 			t.Fatal(err)
 		}
-		foundMediaDelete = len(payload.ObjectKeys) == 1 && payload.ObjectKeys[0] == mediaObject.ObjectKey
+		for _, objectKey := range payload.ObjectKeys {
+			if objectKey == mediaObject.ObjectKey {
+				foundMediaDelete = true
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)

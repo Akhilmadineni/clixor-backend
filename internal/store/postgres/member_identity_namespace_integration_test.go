@@ -208,7 +208,7 @@ func TestPostgresMigrationRunnerRejectsRecordedLegacy16WithoutBridge(t *testing.
 		t.Fatal(err)
 	}
 	err = Migrate(ctx, isolated)
-	if err == nil || !strings.Contains(err.Error(), "migration 16 is recorded without") {
+	if err == nil || !strings.Contains(err.Error(), "migration 16 compatibility bridge is absent or incomplete") {
 		t.Fatalf("version-only legacy-16 ledger was not rejected: %v", err)
 	}
 	var advanced bool
@@ -571,14 +571,19 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 		if collision {
 			reserved = f.joining
 		}
-		if _, err := migration.Exec(ctx, `
-			INSERT INTO users(id) VALUES($1),($2),($3);
-			INSERT INTO conversations(id) VALUES($4);
-			INSERT INTO conversation_members VALUES($4,$1,'owner',now());
-			INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id) VALUES($4,$1,$5);
-			INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id) VALUES($4,$3,$6)`,
-			f.owner, f.joining, f.historical, f.conversation, reserved, f.historicalLocal); err != nil {
-			t.Fatal(err)
+		for _, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO users(id) VALUES($1),($2),($3)`, []any{f.owner, f.joining, f.historical}},
+			{`INSERT INTO conversations(id) VALUES($1)`, []any{f.conversation}},
+			{`INSERT INTO conversation_members VALUES($1,$2,'owner',now())`, []any{f.conversation, f.owner}},
+			{`INSERT INTO conversation_member_local_ids(conversation_id,user_id,local_id) VALUES($1,$2,$3)`, []any{f.conversation, f.owner, reserved}},
+			{`INSERT INTO conversation_member_tombstones(conversation_id,user_id,local_id) VALUES($1,$2,$3)`, []any{f.conversation, f.historical, f.historicalLocal}},
+		} {
+			if _, err := migration.Exec(ctx, statement.query, statement.args...); err != nil {
+				t.Fatal(err)
+			}
 		}
 		return f
 	}

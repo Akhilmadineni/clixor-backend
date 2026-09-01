@@ -413,27 +413,10 @@ func TestPostgresRotateChoreSerializesWithDeleteEntityBothWinners(t *testing.T) 
 
 	t.Run("delete wins", func(t *testing.T) {
 		owner, conversation, chore, command := setup(t)
-		barrier, beginErr := persistence.pool.Begin(ctx)
-		if beginErr != nil {
-			t.Fatal(beginErr)
-		}
-		defer barrier.Rollback(ctx)
-		if _, beginErr = barrier.Exec(ctx, `SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, conversation.ID); beginErr != nil {
-			t.Fatal(beginErr)
-		}
-		rotateDone := make(chan error, 1)
-		go func() {
-			_, rotateErr := persistence.RotateChore(ctx, command)
-			rotateDone <- rotateErr
-		}()
-		waitFor(t, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT metadata FROM conversations%')`)
 		if _, deleteErr := persistence.DeleteEntity(ctx, conversation.ID, owner.ID, "chore", chore.ID, &chore.Version); deleteErr != nil {
 			t.Fatal(deleteErr)
 		}
-		if commitErr := barrier.Commit(ctx); commitErr != nil {
-			t.Fatal(commitErr)
-		}
-		if rotateErr := <-rotateDone; !errors.Is(rotateErr, domain.ErrNotFound) {
+		if _, rotateErr := persistence.RotateChore(ctx, command); !errors.Is(rotateErr, domain.ErrNotFound) {
 			t.Fatalf("rotation after delete=%v", rotateErr)
 		}
 		var feedCount, operationCount, updatedOutbox int

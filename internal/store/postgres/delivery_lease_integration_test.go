@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -780,9 +781,14 @@ func TestPostgresAccountErasurePreservesSharedE2EEBytes(t *testing.T) {
 	if err != nil || len(messages) != 1 || messages[0].ID != message.ID {
 		t.Fatalf("messages=%+v err=%v", messages, err)
 	}
-	if messages[0].Ciphertext != ciphertext || string(messages[0].Envelope) != string(envelope) {
+	if messages[0].Ciphertext != ciphertext || !jsonEqual(messages[0].Envelope, envelope) {
 		t.Fatalf("E2EE message changed: ciphertext=%q envelope=%s", messages[0].Ciphertext, messages[0].Envelope)
 	}
+}
+
+func jsonEqual(left, right []byte) bool {
+	var leftValue, rightValue any
+	return json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil && reflect.DeepEqual(leftValue, rightValue)
 }
 
 func postgresRealtimeErasureFixture(

@@ -3313,6 +3313,9 @@ func (s *Store) LockPushDeliveryBatch(
 				attempts=attempts+1,updated_at=now()
 			FROM selected
 			WHERE delivery.id=selected.id
+			  AND delivery.status='pending'
+			  AND delivery.next_attempt_at<=now()
+			  AND (delivery.locked_until IS NULL OR delivery.locked_until<now())
 			RETURNING delivery.*
 		)
 		SELECT claimed.id,claimed.outbox_event_id,claimed.device_id,
