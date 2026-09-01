@@ -130,7 +130,7 @@ jobs:
       - name: Test least-privilege secret split and Compose exposure
         run: sh ../test_secret_split.sh
       - name: Test OCI Vault hydration and atomic rotation
-        run: python3 -m unittest -v ../test_vault_hydration.py
+        run: python3 ../test_vault_hydration.py -v
       - name: Validate scoped OCI Compose YAML
         run: |
           sudo install -d -m 0700 /srv/clixor/secrets
