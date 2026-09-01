@@ -116,6 +116,9 @@ func TestPostgresPushDeliveryClaimsAreConcurrentSafeAndLeaseFenced(t *testing.T)
 	var firstClaim domain.PushDelivery
 	count := 0
 	for delivery := range claimed {
+		if delivery.OutboxEventID != source.ID || delivery.DeviceID != recipientDevice.ID {
+			continue
+		}
 		firstClaim = delivery
 		count++
 	}

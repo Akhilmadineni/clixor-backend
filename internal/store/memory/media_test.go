@@ -587,7 +587,7 @@ func TestEveryMediaDeletionPathHonorsImmutableUploadValidity(t *testing.T) {
 		if err := persistence.DeleteAccount(ctx, user.ID); err != nil {
 			t.Fatal(err)
 		}
-		assertMediaDeleteScheduledImmediately(t, persistence, created.ObjectKey)
+		assertMediaDeleteDeadline(t, persistence, created.ObjectKey, created.UploadValidUntil)
 	})
 }
 
