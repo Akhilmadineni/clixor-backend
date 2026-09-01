@@ -663,9 +663,11 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 			}
 			writerResult <- writeErr
 		}()
+		var earlyWriterResult error
+		writerReturnedEarly := false
 		select {
-		case err := <-writerResult:
-			t.Fatalf("post-fence writer did not block: %v", err)
+		case earlyWriterResult = <-writerResult:
+			writerReturnedEarly = true
 		case <-time.After(150 * time.Millisecond):
 		}
 		if _, err := migrationTx.Exec(ctx, string(migrationSQL[at:])); err != nil {
@@ -673,6 +675,9 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 		}
 		if err := migrationTx.Commit(ctx); err != nil {
 			t.Fatal(err)
+		}
+		if writerReturnedEarly {
+			t.Fatalf("post-fence writer did not block: %v", earlyWriterResult)
 		}
 		var pgErr *pgconn.PgError
 		if err := <-writerResult; !errors.As(err, &pgErr) || pgErr.ConstraintName != "conversation_member_backend_local_disjoint" {

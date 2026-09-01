@@ -94,6 +94,13 @@ func TestPostgresPushDeliveryClaimsAreConcurrentSafeAndLeaseFenced(t *testing.T)
 	if err != nil || inserted != 0 {
 		t.Fatalf("idempotent enqueue inserted=%d err=%v", inserted, err)
 	}
+	// This integration database is shared by the package. Isolate this claim
+	// race from deliveries intentionally created by earlier test cases.
+	if _, err := persistence.pool.Exec(ctx, `
+		UPDATE push_deliveries SET status='delivered', delivered_at=now()
+		WHERE status='pending' AND outbox_event_id<>$1`, source.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	var workers sync.WaitGroup
 	workers.Add(2)

@@ -699,11 +699,11 @@ func TestPostgresDeleteAccountTransaction(t *testing.T) {
 		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES
 		('entity.updated',$1::uuid,jsonb_build_object(
 			'conversation_id',$1::uuid,'kind','expense','id',$2::uuid,'version',1,
-			'payload',jsonb_build_object('description',$3),'created_by',$5,
+			'payload',jsonb_build_object('description',$3::text),'created_by',$5::uuid,
 			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z')),
 		('entity.updated',$1::uuid,jsonb_build_object(
 			'conversation_id',$1::uuid,'kind','note','id',$4::uuid,'version',1,
-			'payload',jsonb_build_object('description','keep unrelated'),'created_by',$5,
+			'payload',jsonb_build_object('description','keep unrelated'),'created_by',$5::uuid,
 			'created_at','0001-01-01T00:00:00Z','updated_at','0001-01-01T00:00:00Z'))`,
 		shared.ID, expenseID, "Postgres Delete", unrelatedOutboxEntityID, remainingUser.ID); err != nil {
 		t.Fatal(err)
