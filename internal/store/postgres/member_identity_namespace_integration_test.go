@@ -653,13 +653,15 @@ func TestPostgresIdentityNamespaceActualMigrationIsDeadlockFreeAndAtomic(t *test
 				writerResult <- beginErr
 				return
 			}
-			defer tx.Rollback(ctx)
 			_, writeErr := tx.Exec(ctx, `SELECT id FROM users WHERE id=$1 FOR UPDATE`, f.joining)
 			if writeErr == nil {
 				_, writeErr = tx.Exec(ctx, `SELECT id FROM conversations WHERE id=$1 FOR UPDATE`, f.conversation)
 				if writeErr == nil {
 					_, writeErr = tx.Exec(ctx, `INSERT INTO conversation_members VALUES($1,$2,'member',now())`, f.conversation, f.joining)
 				}
+			}
+			if rollbackErr := tx.Rollback(ctx); writeErr == nil && rollbackErr != nil {
+				writeErr = rollbackErr
 			}
 			writerResult <- writeErr
 		}()
