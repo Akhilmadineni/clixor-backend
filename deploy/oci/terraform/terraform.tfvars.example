@@ -1,0 +1,27 @@
+# Resource Manager supplies tenancy_ocid, compartment_ocid, and region.
+# Never put passwords, API keys, tunnel tokens, APNs keys, or other secrets here.
+region                    = "us-phoenix-1"
+create_compartment        = true
+compartment_name          = "ClixorProd"
+availability_domain_index = 0
+ssh_public_key            = "ssh-ed25519 REPLACE_WITH_AN_EXISTING_PUBLIC_KEY"
+admin_cidr                = "203.0.113.10/32"
+
+instance_shape      = "VM.Standard.A1.Flex"
+instance_ocpus      = 2
+instance_memory_gbs = 12
+boot_volume_size_gbs = 50
+data_volume_size_gbs = 100
+
+vcn_cidr            = "10.42.0.0/16"
+private_subnet_cidr = "10.42.10.0/24"
+backup_bucket_name  = "clixor-prod-backups"
+media_bucket_name   = "clixor-prod-media"
+
+# First apply must leave this false. Publish the output DKIM CNAME and SPF TXT
+# in Cloudflare, wait for OCI to report DKIM ACTIVE, then set true and re-apply.
+create_mail_approved_sender = false
+
+# The production SMTP IAM user already exists. Leave external to Terraform
+# until all three pre-existing IAM resources have been safely imported.
+manage_smtp_submitter_identity = false

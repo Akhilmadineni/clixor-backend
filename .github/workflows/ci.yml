@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:17.5-alpine@sha256:6567bca8d7bc8c82c5922425a0baee57be8402df92bae5eacad5f01ae9544daa
         env:
           POSTGRES_DB: clustr_test
           POSTGRES_USER: clustr
@@ -31,7 +31,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:8-alpine
+        image: redis:8.0.3-alpine@sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c
         ports:
           - 6379:6379
         options: >-
@@ -42,16 +42,35 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://clustr:clustr-test-password@127.0.0.1:5432/clustr_test?sslmode=disable
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      TEST_NATS_URL: nats://127.0.0.1:4222
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26.6"
           cache: true
+      - name: Reject retired NAS automation
+        run: |
+          test ! -e .github/workflows/deploy-nas.yml
+          test ! -e .github/workflows/configure-legal-hostname.yml
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Start pinned JetStream test service
+        run: |
+          docker run --detach --rm --name clixor-ci-nats \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.11.6-alpine@sha256:7dec3f8f1ff181975dbdfc0d903d2a9724659648294dbc2ebb2fa3a294d573a6 \
+            --jetstream --store_dir=/data --http_port=8222
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8222/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs clixor-ci-nats
+          exit 1
       - name: Race-enabled tests
         run: go test -race -coverprofile=coverage.out ./...
       - name: Vulnerability scan
@@ -65,12 +84,81 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: false
           tags: clustr-api:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  oci-terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: deploy/oci/terraform
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The one-time 9e41/d2f5 bootstrap proof authenticates the historical
+          # application object itself; a synthetic or shallow-only tree is not authority.
+          fetch-depth: 0
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.5.7
+      - name: Install target nftables syntax checker
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nftables
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive
+      - name: Initialize the locked OCI provider
+        run: terraform init -backend=false -input=false
+      - name: Validate the OCI Resource Manager stack
+        run: terraform validate -no-color
+      - name: Check OCI deployment entrypoints
+        run: sh -n ../actions-deploy.sh ../manual-deploy.sh ../bootstrap.sh ../deploy.sh ../quiesce-cloudflared-rollback.sh ../split-runtime-secrets.sh ../prepare-runtime-secrets.sh ../quarantine-staging-secrets.sh ../test_secret_split.sh ../install-cloudflared-package.sh install-cloudflared-package.sh ../install-cloudflared-service.sh ../install-oci-cli.sh ../backup.sh ../offsite-backup.sh ../backup-health.sh ../restore-drill.sh ../test-backup.sh ../test-origin-boundary.sh ../test-origin-gate-nginx.sh ../test-cloudflare-promote-service.sh
+      - name: Compile OCI Python entrypoints
+        run: |
+          git -C ../../.. ls-files --error-unmatch deploy/oci/verify-canary-negative.py >/dev/null
+          python3 -m py_compile ../*.py
+      - name: Test least-privilege secret split and Compose exposure
+        run: sh ../test_secret_split.sh
+      - name: Test OCI Vault hydration and atomic rotation
+        run: python3 ../test_vault_hydration.py -v
+      - name: Validate scoped OCI Compose YAML
+        run: |
+          sudo install -d -m 0700 /srv/clixor/secrets
+          for name in api postgres redis nats grafana backup migrate; do
+            sudo install -m 0600 "../${name}.env.example" "/srv/clixor/secrets/${name}.env"
+          done
+          sudo install -d -m 0750 -o 0 -g 65532 /srv/clixor/secrets/apns
+          sudo install -m 0440 -o 0 -g 65534 /dev/null /srv/clixor/secrets/metrics.token
+          sudo install -d -m 0700 /run/clixor/secrets
+          sudo ln -s /srv/clixor/secrets /run/clixor/secrets/active
+          CLIXOR_IMAGE_TAG=ci docker compose --file ../compose.yaml config --quiet
+      - name: Test OCI backup health gate
+        run: sh ../test-backup.sh
+      - name: Test crash-consistent OCI runtime selection
+        run: python3 ../test_runtime_reconciler.py -v
+      - name: Reproduce the legacy proof from a shallow checkout
+        run: sh ../test_legacy_shallow_checkout.sh
+      - name: Test OCI deployment helpers offline
+        run: python3 -m unittest discover -v -s .. -p 'test_*.py'
+      - name: Test privileged connector-only origin boundary
+        run: sudo sh ../test-origin-boundary.sh
+      - name: Test the real Nginx production gate and independent canary
+        run: sudo sh ../test-origin-gate-nginx.sh
+      - name: Test systemd promotion state cold start
+        run: sudo sh ../test-cloudflare-promote-service.sh
+      - name: Check the data-volume mount helper
+        run: bash -n clixor-mount-data.sh
+      - name: Verify the break-glass upload bundle
+        run: |
+          ./package-stack.sh /tmp/clixor-oci-resource-manager.zip
+          unzip -t /tmp/clixor-oci-resource-manager.zip

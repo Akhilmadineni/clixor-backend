@@ -1,0 +1,48 @@
+[Unit]
+Description=Clixor isolated PostgreSQL restore drill
+Wants=network-online.target
+After=network-online.target docker.service clixor-offsite-backup.service clixor-runtime-reconcile.service
+ConditionPathExists=/run/clixor/runtime-ready
+ConditionPathExists=/etc/clixor/offsite-backup.env
+ConditionPathIsDirectory=/srv/clixor/backups/postgres
+ConditionPathIsDirectory=/srv/clixor/repo/internal/store/postgres/migrations
+ConditionPathIsReadWrite=/srv/clixor/restore-drills
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=OCI_CLI_AUTH=instance_principal
+Environment=HOME=/run/clixor-backup
+ExecStart=/usr/local/libexec/clixor/restore-drill.sh
+RuntimeDirectory=clixor-backup
+RuntimeDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=30m
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/srv/clixor/backups /srv/clixor/restore-drills /run/clixor-backup
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

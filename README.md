@@ -1,13 +1,14 @@
 # Clixor production backend
 
-Go backend for Clustr messaging and shared-group data. The production topology uses
-PostgreSQL, Redis, NATS, S3-compatible object storage, a Redis-backed OTP service
-with Telnyx SMS transport, and APNs.
+Go backend for Clustr messaging and shared-group data. The OCI production topology
+uses PostgreSQL, Redis, NATS, native private OCI Object Storage, a Redis-backed OTP
+service with Telnyx SMS transport, OCI Email Delivery, and APNs.
 
 This is the sole source repository for the backend. The
 `Uthejmopathi/Clustr` repository contains the Swift/iOS client; retained `clustr`
 runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
-the existing NAS deployment.
+the retired NAS deployment package. OCI is the active production target; see
+`deploy/oci/README.md`.
 
 ## Contributors
 
@@ -36,8 +37,9 @@ cp .env.docker.example .env
 docker compose up --build
 ```
 
-The API listens on `http://127.0.0.1:8080`; the MinIO administration console is at
-`http://127.0.0.1:9001`.
+The local-only Compose stack uses MinIO for development compatibility. The API
+listens on `http://127.0.0.1:8080`; its MinIO administration console is at
+`http://127.0.0.1:9001`. OCI production does not deploy MinIO or S3 credentials.
 
 ## Verify
 
@@ -53,7 +55,7 @@ and launch gates.
 Operational SLOs, deployment sequencing, backup/restore requirements, and incident
 steps are in `RUNBOOK.md`.
 
-Phone authentication keeps its challenge and fraud-control state on the NAS. See
+Phone authentication keeps its challenge and fraud-control state in Redis. See
 `PHONE_VERIFICATION_PLAN.md` for its security policy, Telnyx sender-registration
 prerequisites, secret contract, and rollout gates.
 

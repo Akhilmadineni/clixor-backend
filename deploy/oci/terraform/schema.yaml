@@ -1,0 +1,196 @@
+title: "Clixor production on OCI Always Free"
+description: "Private single-node ARM64 deployment foundation. Runtime secrets are deliberately excluded from Terraform state."
+schemaVersion: 1.1.0
+version: "1.0"
+locale: "en"
+
+variableGroups:
+  - title: "OCI placement"
+    variables:
+      - tenancy_ocid
+      - compartment_ocid
+      - region
+      - create_compartment
+      - compartment_name
+      - availability_domain_index
+  - title: "Administrative access"
+    variables:
+      - ssh_public_key
+      - admin_cidr
+  - title: "Always Free capacity"
+    variables:
+      - instance_shape
+      - instance_ocpus
+      - instance_memory_gbs
+      - boot_volume_size_gbs
+      - data_volume_size_gbs
+      - data_device
+  - title: "Network and Object Storage"
+    variables:
+      - vcn_cidr
+      - private_subnet_cidr
+      - media_bucket_name
+      - backup_bucket_name
+  - title: "Outbound email"
+    variables:
+      - create_mail_approved_sender
+      - manage_smtp_submitter_identity
+
+variables:
+  tenancy_ocid:
+    type: string
+    required: true
+    visible: false
+  compartment_ocid:
+    type: oci:identity:compartment:id
+    required: true
+    title: "Parent compartment"
+    description: "Choose the tenancy root to create the ClixorProd child compartment."
+  region:
+    type: oci:identity:region:name
+    required: true
+    title: "Home region"
+    default: "us-phoenix-1"
+  create_compartment:
+    type: boolean
+    required: true
+    title: "Create dedicated ClixorProd compartment"
+    default: true
+  compartment_name:
+    type: string
+    required: true
+    title: "Compartment name"
+    default: "ClixorProd"
+  availability_domain_index:
+    type: integer
+    required: true
+    title: "Availability-domain index"
+    description: "Start at 0. Change to 1 or 2 and re-plan only if A1 host capacity is unavailable."
+    default: 0
+    minimum: 0
+    maximum: 2
+  ssh_public_key:
+    type: string
+    required: true
+    title: "Existing SSH public key"
+    description: "Paste one OpenSSH public key. Never paste a private key."
+  admin_cidr:
+    type: string
+    required: true
+    title: "Administrator public IPv4 /32"
+    description: "Only this address may initiate OCI Bastion sessions."
+  instance_shape:
+    type: string
+    required: true
+    title: "Always Free shape"
+    default: "VM.Standard.A1.Flex"
+  instance_ocpus:
+    type: number
+    required: true
+    title: "OCPUs"
+    default: 2
+    minimum: 1
+    maximum: 2
+  instance_memory_gbs:
+    type: number
+    required: true
+    title: "Memory (GB)"
+    default: 12
+    minimum: 1
+    maximum: 12
+  boot_volume_size_gbs:
+    type: integer
+    required: true
+    title: "Boot volume (GB)"
+    default: 50
+    minimum: 50
+    maximum: 100
+  data_volume_size_gbs:
+    type: integer
+    required: true
+    title: "Data volume (GB)"
+    default: 100
+    minimum: 50
+    maximum: 150
+  data_device:
+    type: string
+    required: true
+    title: "OCI data device"
+    default: "/dev/oracleoci/oraclevdb"
+  vcn_cidr:
+    type: string
+    required: true
+    title: "VCN CIDR"
+    default: "10.42.0.0/16"
+  private_subnet_cidr:
+    type: string
+    required: true
+    title: "Private subnet CIDR"
+    default: "10.42.10.0/24"
+  backup_bucket_name:
+    type: string
+    required: true
+    title: "Private backup bucket"
+    default: "clixor-prod-backups"
+  media_bucket_name:
+    type: string
+    required: true
+    title: "Private media bucket"
+    description: "Primary application-media bucket. It must differ from the backup bucket."
+    default: "clixor-prod-media"
+  create_mail_approved_sender:
+    type: boolean
+    required: true
+    title: "Create approved mail sender"
+    description: "Leave disabled for the first apply. Enable only after publishing the output DKIM CNAME and SPF TXT records in Cloudflare and OCI reports DKIM ACTIVE."
+    default: false
+  manage_smtp_submitter_identity:
+    type: boolean
+    required: true
+    title: "Manage SMTP IAM identity"
+    description: "Leave disabled unless the existing SMTP user, capability, and membership have first been imported into Resource Manager state."
+    default: false
+
+outputs:
+  instance_private_ip:
+    type: copyableString
+    title: "Instance private IP"
+  bastion_id:
+    type: copyableString
+    title: "Bastion OCID"
+  backup_bucket_name:
+    type: copyableString
+    title: "Backup bucket"
+  media_bucket_name:
+    type: copyableString
+    title: "Media bucket"
+  object_storage_namespace:
+    type: copyableString
+    title: "Object Storage namespace"
+  object_storage_region:
+    type: copyableString
+    title: "Object Storage region"
+  object_storage_native_endpoint:
+    type: copyableString
+    title: "Native Object Storage endpoint"
+  vault_id:
+    type: copyableString
+    title: "Vault OCID"
+  mail_dkim_cname_name:
+    type: copyableString
+    title: "Mail DKIM CNAME name"
+  mail_dkim_cname_value:
+    type: copyableString
+    title: "Mail DKIM CNAME target"
+  mail_spf_txt_name:
+    type: copyableString
+    title: "Mail SPF TXT name"
+  mail_spf_txt_value:
+    type: copyableString
+    title: "Mail SPF TXT value"
+  mail_smtp_endpoint:
+    type: copyableString
+    title: "Mail SMTP implicit-TLS endpoint"
+  mail_smtp_user_id:
+    type: copyableString
+    title: "Managed SMTP IAM user OCID"

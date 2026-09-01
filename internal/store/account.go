@@ -1,14 +1,116 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/google/uuid"
 )
 
 const DeletedUserDisplayName = "Deleted user"
 const MediaDeleteBatchSize = 500
+const MediaDeleteGrace = 3 * time.Minute
+
+// AccountSanitizableOutboxTopic is the closed set of conversation-scoped
+// realtime schemas whose JSON shape is owned by this service and can therefore
+// be structurally anonymized during account erasure. Unknown/future transport
+// topics are never searched with raw identity substrings.
+func AccountSanitizableOutboxTopic(topic string) bool {
+	switch topic {
+	case "conversation.created", "conversation.updated", "entity.updated", "entity.deleted":
+		return true
+	default:
+		return false
+	}
+}
+
+// AccountErasureOutboxTopic is the closed set of server-readable realtime
+// schemas account deletion may inspect. E2EE message envelopes are deliberately
+// absent. Receipt and membership events are decoded and removed only when their
+// typed user_id is the deleted account; the remaining topics may be sanitized.
+func AccountErasureOutboxTopic(topic string) bool {
+	return AccountSanitizableOutboxTopic(topic) ||
+		topic == "receipt.updated" || topic == "conversation.member_added"
+}
+
+// AccountOutboxPayload contains only the typed routing/identity fields needed
+// by account erasure. DecodeAccountOutboxPayload rejects a known topic whose
+// body does not have the service-owned schema or whose conversation ID does not
+// match the immutable outbox aggregate.
+type AccountOutboxPayload struct {
+	ConversationID uuid.UUID
+	UserID         uuid.UUID
+	ActorID        uuid.UUID
+	EntityKind     string
+	EntityID       uuid.UUID
+}
+
+func DecodeAccountOutboxPayload(
+	topic string,
+	aggregateID uuid.UUID,
+	raw json.RawMessage,
+) (AccountOutboxPayload, error) {
+	if aggregateID == uuid.Nil || !json.Valid(raw) {
+		return AccountOutboxPayload{}, domain.ErrInvalid
+	}
+	result := AccountOutboxPayload{ConversationID: aggregateID}
+	switch topic {
+	case "conversation.created", "conversation.updated":
+		var conversation domain.Conversation
+		if decodeAccountOutboxStrict(raw, &conversation) != nil || conversation.ID != aggregateID ||
+			conversation.CreatedBy == uuid.Nil || strings.TrimSpace(conversation.Kind) == "" {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+	case "entity.updated", "entity.deleted":
+		var entity domain.Entity
+		if decodeAccountOutboxStrict(raw, &entity) != nil || entity.ConversationID != aggregateID ||
+			entity.ID == uuid.Nil || entity.CreatedBy == uuid.Nil || entity.Version < 1 ||
+			strings.TrimSpace(entity.Kind) == "" || !json.Valid(entity.Payload) {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.EntityKind = entity.Kind
+		result.EntityID = entity.ID
+	case "receipt.updated":
+		var receipt domain.Receipt
+		if decodeAccountOutboxStrict(raw, &receipt) != nil || receipt.ConversationID != aggregateID ||
+			receipt.UserID == uuid.Nil || receipt.DeliveredSeq < 0 || receipt.ReadSeq < 0 {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.UserID = receipt.UserID
+	case "conversation.member_added":
+		var added domain.ConversationMemberAdded
+		if decodeAccountOutboxStrict(raw, &added) != nil || added.ConversationID != aggregateID ||
+			added.ActorID == uuid.Nil || added.UserID == uuid.Nil {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.UserID = added.UserID
+		result.ActorID = added.ActorID
+	default:
+		return AccountOutboxPayload{}, domain.ErrInvalid
+	}
+	return result, nil
+}
+
+func decodeAccountOutboxStrict(raw json.RawMessage, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return domain.ErrInvalid
+	}
+	return nil
+}
 
 // AccountIdentity contains the identifiers which must no longer be exposed after
 // an account is deleted. UserID remains as an opaque tombstone identifier so
@@ -22,13 +124,35 @@ type AccountIdentity struct {
 }
 
 type MediaDeletePayload struct {
-	ObjectKeys []string `json:"object_keys"`
+	ObjectKeys []string   `json:"object_keys"`
+	NotBefore  *time.Time `json:"not_before,omitempty"`
+}
+
+func NewMediaDeletePayload(objectKeys []string, queuedAt time.Time) MediaDeletePayload {
+	return NewMediaDeletePayloadAt(objectKeys, queuedAt.UTC().Add(MediaDeleteGrace))
+}
+
+func NewMediaDeletePayloadAt(objectKeys []string, notBefore time.Time) MediaDeletePayload {
+	notBefore = notBefore.UTC()
+	return MediaDeletePayload{ObjectKeys: objectKeys, NotBefore: &notBefore}
 }
 
 // AnonymizeAccountJSON removes identity fields from JSON owned by the deleted
 // account. Stable user/member IDs are deliberately retained because expense and
 // settlement payloads use them to preserve shared financial history.
 func AnonymizeAccountJSON(raw json.RawMessage, identity AccountIdentity) (json.RawMessage, bool, error) {
+	return anonymizeAccountJSON(raw, identity, false)
+}
+
+// AnonymizeAccountJSONWithAuthority uses the same structural sanitizer after
+// the caller has independently proven that the root aggregate/entity belongs
+// to or references the account. Authority only enables explicit identity-name
+// fields at that root; it never turns arbitrary descendant strings into PII.
+func AnonymizeAccountJSONWithAuthority(raw json.RawMessage, identity AccountIdentity) (json.RawMessage, bool, error) {
+	return anonymizeAccountJSON(raw, identity, true)
+}
+
+func anonymizeAccountJSON(raw json.RawMessage, identity AccountIdentity, authorized bool) (json.RawMessage, bool, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return raw, false, nil
 	}
@@ -36,7 +160,18 @@ func AnonymizeAccountJSON(raw json.RawMessage, identity AccountIdentity) (json.R
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, false, err
 	}
-	changed := anonymizeJSONValue(value, identity)
+	// Strong identifiers in a scalar are still PII. Display names remain
+	// excluded here because a scalar such as "A" has no identity schema and may
+	// be ordinary application data.
+	if text, scalar := value.(string); scalar {
+		redacted, changed := redactAccountIdentityText(text, identity, false)
+		if !changed {
+			return raw, false, nil
+		}
+		encoded, err := json.Marshal(redacted)
+		return encoded, true, err
+	}
+	changed := anonymizeJSONValue(value, identity, authorized)
 	if !changed {
 		return raw, false, nil
 	}
@@ -44,28 +179,81 @@ func AnonymizeAccountJSON(raw json.RawMessage, identity AccountIdentity) (json.R
 	return encoded, true, err
 }
 
-func anonymizeJSONValue(value any, identity AccountIdentity) bool {
+// AccountJSONReferencesIdentity reports whether JSON has non-ambiguous
+// authority tying it to the account: the stable user UUID, or an email, phone,
+// or username. Display names are intentionally excluded because short/common
+// names cannot identify an account safely.
+func AccountJSONReferencesIdentity(raw json.RawMessage, identity AccountIdentity) (bool, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, err
+	}
+	return jsonValueReferencesIdentity(value, identity), nil
+}
+
+func jsonValueReferencesIdentity(value any, identity AccountIdentity) bool {
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if jsonValueReferencesIdentity(item, identity) {
+				return true
+			}
+		}
+	case map[string]any:
+		if objectBelongsToAccount(typed, identity.UserID) || objectContainsIdentity(typed, identity) {
+			return true
+		}
+		for _, item := range typed {
+			if jsonValueReferencesIdentity(item, identity) {
+				return true
+			}
+		}
+	case string:
+		if identity.UserID != uuid.Nil && containsBoundedIdentity(typed, identity.UserID.String()) {
+			return true
+		}
+		for _, identifier := range []string{identity.Email, identity.Phone, identity.Username} {
+			if containsBoundedIdentity(typed, identifier) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func anonymizeJSONValue(value any, identity AccountIdentity, authorized bool) bool {
 	switch typed := value.(type) {
 	case []any:
 		changed := false
-		for _, item := range typed {
-			changed = anonymizeJSONValue(item, identity) || changed
+		for index, item := range typed {
+			if text, ok := item.(string); ok {
+				if redacted, textChanged := redactAccountIdentityText(text, identity, false); textChanged {
+					typed[index] = redacted
+					changed = true
+				}
+				continue
+			}
+			changed = anonymizeJSONValue(item, identity, false) || changed
 		}
 		return changed
 	case map[string]any:
 		changed := false
 		owned := objectBelongsToAccount(typed, identity.UserID) || objectContainsIdentity(typed, identity)
 		for key, item := range typed {
-			changed = anonymizeJSONValue(item, identity) || changed
 			normalized := normalizeJSONKey(key)
+			childAuthorized := (owned || authorized) && isIdentityContainerJSONKey(normalized)
+			changed = anonymizeJSONValue(item, identity, childAuthorized) || changed
 			text, isText := item.(string)
 			if owned && isPersonalJSONKey(normalized) {
 				delete(typed, key)
 				changed = true
 				continue
 			}
-			if owned && isText && isNameJSONKey(normalized) &&
-				identity.DisplayName != "" && text == identity.DisplayName {
+			if (owned || authorized) && isText && isAccountIdentityNameKey(normalized, owned) &&
+				identity.DisplayName != "" && strings.EqualFold(strings.TrimSpace(text), strings.TrimSpace(identity.DisplayName)) {
 				typed[key] = DeletedUserDisplayName
 				changed = true
 				continue
@@ -73,22 +261,46 @@ func anonymizeJSONValue(value any, identity AccountIdentity) bool {
 			if isText && isIdentifierJSONKey(normalized) && matchesIdentity(text, identity) {
 				delete(typed, key)
 				changed = true
+				continue
 			}
-		}
-		if owned {
-			for key, item := range typed {
-				if text, ok := item.(string); ok && isNameJSONKey(normalizeJSONKey(key)) &&
-					text != DeletedUserDisplayName {
-					typed[key] = DeletedUserDisplayName
+			if isText {
+				redacted, strongChanged := redactAccountIdentityText(text, identity, false)
+				if (owned || authorized) && isIdentityProseJSONKey(normalized) {
+					var nameChanged bool
+					redacted, nameChanged = redactAccountIdentityText(redacted, identity, true)
+					strongChanged = strongChanged || nameChanged
+				}
+				if strongChanged {
+					typed[key] = redacted
 					changed = true
 				}
 			}
+		}
+		if owned {
 			if deleted, ok := typed["isDeleted"].(bool); !ok || !deleted {
 				typed["isDeleted"] = true
 				changed = true
 			}
 		}
 		return changed
+	default:
+		return false
+	}
+}
+
+func isIdentityContainerJSONKey(key string) bool {
+	switch key {
+	case "payload", "metadata", "result", "choreresult", "feedresult":
+		return true
+	default:
+		return false
+	}
+}
+
+func isIdentityProseJSONKey(key string) bool {
+	switch key {
+	case "description":
+		return true
 	default:
 		return false
 	}
@@ -108,7 +320,7 @@ func objectBelongsToAccount(object map[string]any, userID uuid.UUID) bool {
 	wanted := userID.String()
 	for key, item := range object {
 		switch normalizeJSONKey(key) {
-		case "backenduserid", "userid", "useruuid", "owneruserid", "createdbyuserid":
+		case "backenduserid", "userid", "useruuid", "owneruserid", "createdbyuserid", "createdby", "creatorid", "actorid":
 			if text, ok := item.(string); ok && strings.EqualFold(text, wanted) {
 				return true
 			}
@@ -133,11 +345,105 @@ func normalizeJSONKey(key string) string {
 
 func isNameJSONKey(key string) bool {
 	switch key {
-	case "name", "displayname", "membername", "payername", "creatorname", "creatordisplayname":
+	case "name", "displayname",
+		"membername", "memberdisplayname",
+		"payername", "payerdisplayname",
+		"creatorname", "creatordisplayname",
+		"createdbyname", "createdbydisplayname",
+		"actorname", "actordisplayname",
+		"ownername", "ownerdisplayname":
 		return true
 	default:
 		return false
 	}
+}
+
+func isAccountIdentityNameKey(key string, owned bool) bool {
+	if key == "name" {
+		return owned
+	}
+	return isNameJSONKey(key)
+}
+
+// redactAccountIdentityText removes bounded occurrences from human-readable
+// fields (for example feed descriptions and chore titles). Identifiers embedded
+// in prose are PII just as much as dedicated email/phone/name fields. A display
+// name is included only after surrounding structure has proven account
+// ownership; otherwise common names would corrupt unrelated data.
+func redactAccountIdentityText(value string, identity AccountIdentity, includeDisplayName bool) (string, bool) {
+	needles := []string{identity.Email, identity.Phone, identity.Username}
+	if includeDisplayName {
+		needles = append(needles, identity.DisplayName)
+	}
+	sort.SliceStable(needles, func(i, j int) bool { return len(needles[i]) > len(needles[j]) })
+	changed := false
+	for _, needle := range needles {
+		needle = strings.TrimSpace(needle)
+		if needle == "" || strings.EqualFold(needle, DeletedUserDisplayName) {
+			continue
+		}
+		pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(needle))
+		if err != nil {
+			continue
+		}
+		matches := pattern.FindAllStringIndex(value, -1)
+		if len(matches) == 0 {
+			continue
+		}
+		var redacted strings.Builder
+		redacted.Grow(len(value))
+		cursor := 0
+		needleChanged := false
+		for _, match := range matches {
+			if !identityTextBoundaryBefore(value, match[0]) ||
+				!identityTextBoundaryAfter(value, match[1]) {
+				continue
+			}
+			redacted.WriteString(value[cursor:match[0]])
+			redacted.WriteString(DeletedUserDisplayName)
+			cursor = match[1]
+			needleChanged = true
+		}
+		if needleChanged {
+			redacted.WriteString(value[cursor:])
+			value = redacted.String()
+			changed = true
+		}
+	}
+	return value, changed
+}
+
+func containsBoundedIdentity(value, identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return false
+	}
+	pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(identity))
+	if err != nil {
+		return false
+	}
+	for _, match := range pattern.FindAllStringIndex(value, -1) {
+		if identityTextBoundaryBefore(value, match[0]) && identityTextBoundaryAfter(value, match[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func identityTextBoundaryBefore(value string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(value[:index])
+	return r != '_' && !unicode.IsLetter(r) && !unicode.IsNumber(r)
+}
+
+func identityTextBoundaryAfter(value string, index int) bool {
+	if index == len(value) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(value[index:])
+	return r != '_' && !unicode.IsLetter(r) && !unicode.IsNumber(r)
 }
 
 func isIdentifierJSONKey(key string) bool {

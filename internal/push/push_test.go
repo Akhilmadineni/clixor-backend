@@ -72,6 +72,42 @@ func TestEnvironmentFallbackOnlyInvalidatesAfterBothEndpointsRejectToken(t *test
 	}
 }
 
+func TestDeliveryErrorsUseBoundedRetryAndMetricClasses(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		err        error
+		retryable  bool
+		errorClass string
+	}{
+		{"rate limit", &DeliveryError{StatusCode: 429, Reason: "TooManyRequests"}, true, "throttled"},
+		{"provider outage", &DeliveryError{StatusCode: 503, Reason: "Shutdown"}, true, "provider_5xx"},
+		{"bad topic", &DeliveryError{StatusCode: 403, Reason: "InvalidProviderToken"}, false, "provider_4xx"},
+		{"unregistered", &DeliveryError{StatusCode: 410, Reason: "Unregistered"}, false, "invalid_token"},
+		{"network", errors.New("connection reset"), true, "network"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsRetryable(test.err); got != test.retryable {
+				t.Fatalf("IsRetryable = %t, want %t", got, test.retryable)
+			}
+			if got := ErrorClass(test.err); got != test.errorClass {
+				t.Fatalf("ErrorClass = %q, want %q", got, test.errorClass)
+			}
+		})
+	}
+}
+
+func TestIsDisabledRecognizesAbsentProviders(t *testing.T) {
+	if !IsDisabled(nil) || !IsDisabled(Disabled{}) {
+		t.Fatal("absent push providers were not recognized")
+	}
+	if !IsDisabled(&EnvironmentFallback{Primary: Disabled{}, Fallback: Disabled{}}) {
+		t.Fatal("fully disabled fallback was not recognized")
+	}
+	if IsDisabled(&EnvironmentFallback{Primary: &fakeService{}, Fallback: Disabled{}}) {
+		t.Fatal("configured primary provider was treated as disabled")
+	}
+}
+
 type fakeService struct {
 	calls int
 	err   error

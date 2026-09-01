@@ -9,7 +9,45 @@ into independent services when traffic requires it.
 
 The API is stateless. Durable state lives in PostgreSQL, transient rate-limit and
 presence state lives in Redis, realtime fan-out uses NATS, and encrypted media
-lives in private S3-compatible object storage.
+lives in private OCI Object Storage. The media interface also retains a hardened
+S3-compatible implementation for portable deployments.
+
+Media upload slots return provider-neutral `PUT` instructions. OCI uses an
+object-specific pre-authenticated request plus `Content-Type`, exact
+`Content-Length`, `opc-checksum-algorithm: SHA256`, and the base64
+`opc-content-sha256` declaration. S3 signs the same type and length plus
+`X-Amz-Checksum-Sha256` into its SigV4 URL.
+PostgreSQL serializes per-user and per-conversation reservations with transaction
+advisory locks, so concurrent requests through separate API replicas cannot race
+past pending or total stored count/byte quotas. Total storage includes pending
+reservations and ready objects across profile and conversation scopes; deleted
+rows stop consuming quota. Conversation upload reservations also have a dedicated
+60-per-user/hour rate limit and retain the production-05b 1 GiB per-object ceiling.
+OCI completion checks length, content type, and the Object Storage-computed SHA-256
+with a `HEAD` request, so a 1 GiB object is never streamed through an API replica.
+A missing checksum header is a definitive mismatch, not permission to publish an
+unverified object. The API persists the write PAR identifier before returning its
+URL, revokes that exact capability at completion, and conditionally renames the
+staging object to a deterministic `published/` key using the verified source ETag
+and destination `If-None-Match: *`. An already-authorized PUT can therefore only
+recreate the unserved staging key; it cannot overwrite a ready object. Publication,
+capability-state clearing, and durable staging cleanup are committed in one
+PostgreSQL transaction. S3 completion independently streams the ciphertext through
+SHA-256 and retains its existing key before marking it ready. Expired, rejected, deleted, and
+conversation-owned objects are removed through durable `media.delete`
+outbox events; database cascades never run before their object keys are captured.
+Destructive database paths enqueue both staging and published forms so deletion
+remains complete across a rename/database-commit or rolling-replica race.
+Deletion jobs wait three minutes after the upload capability expires so an upload accepted just
+before URL expiry cannot normally commit after an already-successful delete.
+Definitive missing-object or declaration mismatches reject the reservation and
+queue deletion; a provider timeout, network error, or storage 5xx leaves it pending
+and returns 503 so completion can be retried before expiry.
+
+Object Storage lifecycle rules should still abort incomplete multipart uploads
+and expire noncurrent versions. Completion has a two-minute application deadline;
+the API write timeout is 135 seconds, leaving an outer-layer margin while
+realtime/WebSocket requests remain exempt from the application request deadline.
 
 Phone verification is a Clustr-owned service: cryptographically random OTPs are
 HMACed with an independent secret and stored only in Redis with short TTLs. Atomic
@@ -27,11 +65,32 @@ Redis keys, durable storage, metrics, and logs.
 - A transactional outbox prevents committed messages from being lost between
   PostgreSQL and the event/push pipeline.
 - WebSocket events are at-least-once; clients deduplicate by event/message ID.
+- Eligible APNs deliveries are materialized idempotently per outbox event and
+  device before realtime publication. APNs failures therefore retry from a
+  separate durable queue without republishing the realtime event. Exponential
+  backoff is bounded; exhausted and permanent failures enter a retained dead
+  letter state, while invalid/unregistered tokens are removed transactionally.
+- A nonempty APNs token has exactly one device owner. Registration transfers
+  token ownership atomically across accounts, and delivery resolves the current
+  token from that authenticated device instead of persisting a stale token copy.
+- Published outbox rows are transport replay state, not an unbounded audit log.
+  Hourly bounded retention removes terminal per-device rows first, then removes
+  source rows older than the longest push retention window only when no delivery
+  still references them. Partial indexes and `SKIP LOCKED` keep concurrent
+  retention scans bounded across API replicas.
 - The API and database are designed to treat message bodies and media as opaque
   ciphertext and never require server-side decryption.
 - The current Swift transition codec base64-encodes JSON message data and uploads
   raw media bytes. Until audited client cryptography replaces that codec, the
   deployed system does receive plaintext-equivalent content and is not E2EE.
+- The compatibility API accepts that codec only with the exact one-field
+  `{protocol: clustr-transition-v1}` envelope. It does not apply the E2EE device
+  identity or recipient checks because production 05b never published those
+  keys. `clustr_messaging_transition_messages_total` measures remaining use; do
+  not remove the compatibility path until upgraded-client adoption is verified.
+- APNs acceptance and final user presentation are not exactly-once guarantees.
+  A worker crash after APNs accepts a request but before PostgreSQL records the
+  acknowledgement can resend the same collapse/notification ID.
 
 ## End-to-end encryption boundary
 

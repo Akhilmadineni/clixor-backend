@@ -16,6 +16,18 @@ type CreateUserParams struct {
 	PasswordHash string
 }
 
+// SessionIssueParams binds device registration and refresh-session creation to
+// one live-account serialization point. Password login additionally supplies
+// the exact hash that was verified outside the store; a reset that changes the
+// hash before this transaction acquires the user lock makes issuance fail.
+type SessionIssueParams struct {
+	UserID                   uuid.UUID
+	ExpectedPasswordHash     string
+	RequirePasswordHashMatch bool
+	Device                   domain.Device
+	Session                  domain.Session
+}
+
 type CreateConversationParams struct {
 	ID           uuid.UUID
 	Kind         string
@@ -44,6 +56,139 @@ type CreateMessageParams struct {
 	ReplyToID       *uuid.UUID
 }
 
+const MaxMessagePageSize = 500
+
+// MaxRetentionPruneBatchSize caps each retention transaction. Multiple relay
+// replicas may prune concurrently, so the stores must also lock candidate rows
+// with SKIP LOCKED rather than relying on this process-level bound alone.
+const MaxRetentionPruneBatchSize = 1000
+
+type ListMessagesParams struct {
+	ConversationID uuid.UUID
+	UserID         uuid.UUID
+	BeforeSeq      *int64
+	AfterSeq       *int64
+	Limit          int
+}
+
+func (p ListMessagesParams) Validate() error {
+	if p.ConversationID == uuid.Nil || p.UserID == uuid.Nil || p.Limit < 1 ||
+		p.Limit > MaxMessagePageSize || (p.BeforeSeq != nil && p.AfterSeq != nil) ||
+		(p.BeforeSeq != nil && *p.BeforeSeq < 1) || (p.AfterSeq != nil && *p.AfterSeq < 0) {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
+type CreateConversationInviteParams struct {
+	ID             uuid.UUID
+	ConversationID uuid.UUID
+	ActorID        uuid.UUID
+	TokenHash      []byte
+	ExpiresAt      time.Time
+	MaxUses        int
+}
+
+// MediaReservationLimits are enforced atomically by the persistence layer.
+// User totals include profile and conversation media. Stored totals include
+// pending reservations as well as ready objects, so completing uploads cannot
+// bypass storage limits and different API replicas cannot race around them.
+type MediaReservationLimits struct {
+	PendingTTL                  time.Duration
+	MaxPendingCountPerUser      int
+	MaxPendingBytesPerUser      int64
+	MaxPendingCountConversation int
+	MaxPendingBytesConversation int64
+	MaxStoredCountPerUser       int
+	MaxStoredBytesPerUser       int64
+	MaxStoredCountConversation  int
+	MaxStoredBytesConversation  int64
+}
+
+func DefaultMediaReservationLimits() MediaReservationLimits {
+	return MediaReservationLimits{
+		PendingTTL:                  5 * time.Minute,
+		MaxPendingCountPerUser:      8,
+		MaxPendingBytesPerUser:      2 << 30,
+		MaxPendingCountConversation: 32,
+		MaxPendingBytesConversation: 8 << 30,
+		MaxStoredCountPerUser:       2_000,
+		MaxStoredBytesPerUser:       2 << 30,
+		MaxStoredCountConversation:  10_000,
+		MaxStoredBytesConversation:  10 << 30,
+	}
+}
+
+func (l MediaReservationLimits) Validate() error {
+	if l.PendingTTL < time.Minute || l.PendingTTL > 15*time.Minute ||
+		l.MaxPendingCountPerUser < 1 || l.MaxPendingBytesPerUser < 1 ||
+		l.MaxPendingCountConversation < 1 || l.MaxPendingBytesConversation < 1 ||
+		l.MaxStoredCountPerUser < l.MaxPendingCountPerUser ||
+		l.MaxStoredBytesPerUser < l.MaxPendingBytesPerUser ||
+		l.MaxStoredCountConversation < l.MaxPendingCountConversation ||
+		l.MaxStoredBytesConversation < l.MaxPendingBytesConversation {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
+// MailDeliveryBuilder is invoked inside the password-reset transaction after
+// the live recipient address has been locked. Implementations must be local,
+// deterministic except for cryptographic nonce generation, and must never
+// perform network I/O.
+type MailDeliveryBuilder func(string) (domain.MailDelivery, error)
+
+// PasswordResetCompletion returns the authoritative account identity from the
+// same transaction that changed the password and revoked its sessions. The
+// caller can therefore fence local realtime sockets without a second lookup
+// that could fail after the password mutation has committed.
+type PasswordResetCompletion struct {
+	UserID uuid.UUID
+	Email  string
+}
+
+type PasswordResetFence func(uuid.UUID) error
+type AccountDeletionFence func(uuid.UUID) error
+
+// RotateChoreParams is a single, replayable business command. RequestHash is
+// the SHA-256 digest of the canonical command body and binds an operation ID to
+// exactly one actor and mutation for its entire retention window.
+type RotateChoreParams struct {
+	OperationID, ConversationID, ChoreID, ActorID uuid.UUID
+	ExpectedChoreVersion                          int64
+	ChorePayload, FeedPayload                     json.RawMessage
+	RequestHash                                   []byte
+}
+
+type RotateChoreResult struct {
+	OperationID uuid.UUID     `json:"operation_id"`
+	Chore       domain.Entity `json:"chore"`
+	FeedItem    domain.Entity `json:"feed_item"`
+}
+
+func (p RotateChoreParams) Validate() error {
+	if p.OperationID == uuid.Nil || p.ConversationID == uuid.Nil || p.ChoreID == uuid.Nil ||
+		p.ActorID == uuid.Nil || p.ExpectedChoreVersion < 1 || len(p.RequestHash) != 32 {
+		return domain.ErrInvalid
+	}
+	var chore struct {
+		ID      uuid.UUID `json:"id"`
+		GroupID uuid.UUID `json:"groupId"`
+	}
+	var feed struct {
+		ID        uuid.UUID  `json:"id"`
+		GroupID   uuid.UUID  `json:"groupId"`
+		RelatedID *uuid.UUID `json:"relatedId"`
+		Type      string     `json:"type"`
+	}
+	if json.Unmarshal(p.ChorePayload, &chore) != nil || json.Unmarshal(p.FeedPayload, &feed) != nil ||
+		chore.ID != p.ChoreID || chore.GroupID != p.ConversationID || feed.ID != p.OperationID ||
+		feed.GroupID != p.ConversationID || feed.RelatedID == nil || *feed.RelatedID != p.ChoreID || feed.Type != "note" {
+		return domain.ErrInvalid
+	}
+	return nil
+}
+
 type Store interface {
 	Close()
 	Ping(context.Context) error
@@ -62,6 +207,14 @@ type Store interface {
 	AgeAssurance(context.Context, uuid.UUID) (domain.AgeAssurance, error)
 	UpsertAgeAssurance(context.Context, domain.AgeAssurance) (domain.AgeAssurance, error)
 	DeleteAccount(context.Context, uuid.UUID) error
+	PutAccountDeletionIntent(context.Context, domain.AccountDeletionIntent) error
+	ExecuteAccountDeletionIntent(context.Context, uuid.UUID, []byte, AccountDeletionFence) error
+	CreatePasswordResetChallenge(context.Context, domain.PasswordResetChallenge) error
+	CreatePasswordResetChallengeWithMail(context.Context, domain.PasswordResetChallenge, MailDeliveryBuilder) error
+	CancelPasswordResetChallenge(context.Context, uuid.UUID) error
+	ConsumePasswordResetChallenge(context.Context, uuid.UUID, []byte, string, int) (string, error)
+	ConsumePasswordResetChallengeWithMail(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder) (PasswordResetCompletion, error)
+	ConsumePasswordResetChallengeWithMailAndFence(context.Context, uuid.UUID, []byte, string, int, MailDeliveryBuilder, PasswordResetFence) (PasswordResetCompletion, error)
 
 	UpsertDevice(context.Context, domain.Device) (domain.Device, error)
 	Device(context.Context, uuid.UUID, uuid.UUID) (domain.Device, error)
@@ -71,6 +224,7 @@ type Store interface {
 	ClaimPreKeys(context.Context, uuid.UUID) ([]domain.PreKeyBundle, error)
 
 	CreateSession(context.Context, domain.Session) error
+	IssueSession(context.Context, SessionIssueParams) (domain.User, domain.Device, error)
 	RotateSession(context.Context, uuid.UUID, []byte, []byte, time.Time) (domain.Session, error)
 	RevokeSession(context.Context, uuid.UUID, uuid.UUID) error
 	SessionActive(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)
@@ -88,20 +242,54 @@ type Store interface {
 	TransferConversationOwnership(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 	CreateConversationInvites(context.Context, uuid.UUID, uuid.UUID, []string) error
 	ClaimConversationInvites(context.Context, uuid.UUID, string) ([]uuid.UUID, error)
+	CreateConversationInvite(context.Context, CreateConversationInviteParams) (domain.ConversationInvite, error)
+	ConversationInvitePreview(context.Context, []byte, uuid.UUID) (domain.ConversationInvitePreview, error)
+	AcceptConversationInvite(context.Context, []byte, uuid.UUID) (domain.ConversationInviteAcceptance, error)
+	RevokeConversationInvite(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
 
 	CreateMessage(context.Context, CreateMessageParams) (domain.Message, []uuid.UUID, error)
-	ListMessages(context.Context, uuid.UUID, uuid.UUID, int64, int) ([]domain.Message, error)
+	ListMessages(context.Context, ListMessagesParams) ([]domain.Message, error)
 	UpsertReceipt(context.Context, domain.Receipt) (domain.Receipt, error)
 	ListReceipts(context.Context, uuid.UUID, uuid.UUID) ([]domain.Receipt, error)
 
 	PutEntity(context.Context, domain.Entity, *int64) (domain.Entity, error)
 	ListEntities(context.Context, uuid.UUID, uuid.UUID, string, time.Time, int) ([]domain.Entity, error)
 	DeleteEntity(context.Context, uuid.UUID, uuid.UUID, string, uuid.UUID, *int64) (domain.Entity, error)
+	RotateChore(context.Context, RotateChoreParams) (RotateChoreResult, error)
+	PruneChoreRotationOperations(context.Context, time.Time, int) (int, error)
 
-	CreateMedia(context.Context, domain.MediaObject) (domain.MediaObject, error)
+	CreateMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
+	CreateProfileMedia(context.Context, domain.MediaObject, MediaReservationLimits) (domain.MediaObject, error)
+	PersistMediaUploadCapability(context.Context, uuid.UUID, uuid.UUID, string) error
+	MediaUploadCapability(context.Context, uuid.UUID, uuid.UUID) (string, error)
 	Media(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
-	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	ClaimMediaVerification(context.Context, uuid.UUID, uuid.UUID, time.Duration) (domain.MediaObject, error)
+	MarkMediaReady(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string) (domain.MediaObject, error)
+	ReleaseMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
+	RejectMediaVerification(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	RejectPendingMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	DeleteMedia(context.Context, uuid.UUID, uuid.UUID) (domain.MediaObject, error)
+	ExpirePendingMedia(context.Context, time.Time, int) (int, error)
 
 	LockOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	LockRealtimeOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	LockMediaDeleteOutboxBatch(context.Context, int) ([]domain.OutboxEvent, error)
+	DeliverRealtimeOutbox(context.Context, int64, int, func(context.Context, domain.OutboxEvent) error) error
+	ReleaseOutboxEvent(context.Context, int64, time.Time) error
 	MarkOutboxPublished(context.Context, []int64) error
+	EnqueuePushDeliveries(context.Context, domain.PushDelivery, []uuid.UUID) (int, error)
+	LockPushDeliveryBatch(context.Context, int) ([]domain.PushDelivery, error)
+	WithPushDeliveryLease(context.Context, int64, uuid.UUID, func(context.Context, domain.PushDelivery) error) error
+	FinishPushDelivery(context.Context, int64, uuid.UUID, string, time.Time, string) error
+	InvalidatePushDelivery(context.Context, int64, uuid.UUID, uuid.UUID, uuid.UUID, string) error
+	PrunePushDeliveries(context.Context, time.Time, time.Time, int) (int64, error)
+	PrunePublishedOutbox(context.Context, time.Time, int) (int64, error)
+	LockMailDeliveryBatch(context.Context, int) ([]domain.MailDelivery, error)
+	// WithMailDeliveryLease revalidates a claimed row under the account-erasure
+	// delivery barrier and keeps that barrier held for the external transport
+	// callback. Implementations must not expose a cached encrypted payload when
+	// the row was canceled or removed after the batch claim.
+	WithMailDeliveryLease(context.Context, uuid.UUID, uuid.UUID, func(context.Context, domain.MailDelivery) error) error
+	FinishMailDelivery(context.Context, uuid.UUID, uuid.UUID, string, time.Time, string) error
+	PruneMailDeliveries(context.Context, time.Time, time.Time, time.Time, int) (int64, error)
 }

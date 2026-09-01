@@ -1,15 +1,19 @@
 package httpapi
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/observability"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -117,12 +121,6 @@ func (s *Server) updateConversation(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	payload, _ := json.Marshal(conversation)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: uuid.NewString(), Type: "conversation.updated", ConversationID: &conversationID,
-		Payload: payload, OccurredAt: time.Now().UTC(),
-	})
 	writeJSON(w, http.StatusOK, conversation)
 }
 
@@ -156,7 +154,22 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
-	var users []domain.User
+	users := make([]domain.PublicUser, 0)
+	seen := make(map[uuid.UUID]int)
+	appendUser := func(user domain.User, includePhone bool) {
+		public := store.PublicUserFromUser(user, includePhone)
+		if index, duplicate := seen[user.ID]; duplicate {
+			// If one request matched both a submitted phone and a username,
+			// preserve the exact-phone correlation without exposing any other
+			// account identifier.
+			if includePhone {
+				users[index].MatchedPhone = public.MatchedPhone
+			}
+			return
+		}
+		seen[user.ID] = len(users)
+		users = append(users, public)
+	}
 	if len(request.Phones) > 0 {
 		phones, ok := normalizePhones(request.Phones)
 		if !ok || len(phones) > 1024 {
@@ -168,7 +181,9 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 			writeDomainError(w, err)
 			return
 		}
-		users = append(users, phoneUsers...)
+		for _, user := range phoneUsers {
+			appendUser(user, true)
+		}
 	}
 	if len(request.Usernames) > 0 {
 		if len(request.Usernames) > 1024 {
@@ -180,9 +195,11 @@ func (s *Server) lookupUsers(w http.ResponseWriter, r *http.Request) {
 			writeDomainError(w, err)
 			return
 		}
-		users = append(users, usernameUsers...)
+		for _, user := range usernameUsers {
+			appendUser(user, false)
+		}
 	}
-	writeJSON(w, http.StatusOK, domain.Page[domain.User]{Items: users})
+	writeJSON(w, http.StatusOK, domain.Page[domain.PublicUser]{Items: users})
 }
 
 func (s *Server) searchUsers(w http.ResponseWriter, r *http.Request) {
@@ -202,7 +219,11 @@ func (s *Server) searchUsers(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, domain.Page[domain.User]{Items: users})
+	public := make([]domain.PublicUser, 0, len(users))
+	for _, user := range users {
+		public = append(public, store.PublicUserFromUser(user, false))
+	}
+	writeJSON(w, http.StatusOK, domain.Page[domain.PublicUser]{Items: public})
 }
 
 func (s *Server) getConversation(w http.ResponseWriter, r *http.Request) {
@@ -289,8 +310,20 @@ func (s *Server) removeMember(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
+	s.removeConversationMember(w, r, conversationID, id.UserID, userID)
+}
+
+func (s *Server) removeSelfMember(w http.ResponseWriter, r *http.Request) {
+	id, conversationID, ok := requestConversation(w, r)
+	if !ok {
+		return
+	}
+	s.removeConversationMember(w, r, conversationID, id.UserID, id.UserID)
+}
+
+func (s *Server) removeConversationMember(w http.ResponseWriter, r *http.Request, conversationID, actorID, userID uuid.UUID) {
 	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	if err := s.store.RemoveConversationMember(r.Context(), conversationID, id.UserID, userID); err != nil {
+	if err := s.store.RemoveConversationMember(r.Context(), conversationID, actorID, userID); err != nil {
 		writeDomainError(w, err)
 		return
 	}
@@ -352,11 +385,12 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 	if request.ID == uuid.Nil {
 		request.ID = uuid.New()
 	}
-	envelope, validEnvelope := parseE2EEEnvelope(request.Envelope)
+	envelope, validE2EEEnvelope := parseE2EEEnvelope(request.Envelope)
+	production05bTransition := validProduction05bTransitionEnvelope(request.Envelope)
 	if len(request.ClientMessageID) < 8 || len(request.ClientMessageID) > 128 ||
 		len(request.Ciphertext) == 0 || len(request.Ciphertext) > 2<<20 ||
 		len(request.Envelope) == 0 || len(request.Envelope) > 1<<20 ||
-		!allowedContentType(request.ContentType) || !validEnvelope {
+		!allowedContentType(request.ContentType) || (!validE2EEEnvelope && !production05bTransition) {
 		writeDomainError(w, domain.ErrInvalid)
 		return
 	}
@@ -364,26 +398,28 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_ciphertext", "Ciphertext must be base64 encoded.")
 		return
 	}
-	device, err := s.store.Device(r.Context(), id.UserID, id.DeviceID)
-	if err != nil {
-		writeDomainError(w, err)
-		return
+	if validE2EEEnvelope {
+		device, err := s.store.Device(r.Context(), id.UserID, id.DeviceID)
+		if err != nil {
+			writeDomainError(w, err)
+			return
+		}
+		registeredIdentity, registered := decodeEncodedBytes(device.IdentityKey, 32)
+		senderIdentity, validSender := decodeEncodedBytes(envelope.SenderIdentityKey, 32)
+		if !registered {
+			writeError(w, http.StatusConflict, "e2ee_device_not_ready", "Publish this device's encryption identity before sending messages.")
+			return
+		}
+		if !validSender || subtle.ConstantTimeCompare(registeredIdentity, senderIdentity) != 1 {
+			writeError(w, http.StatusUnprocessableEntity, "e2ee_identity_mismatch", "The message identity does not match the authenticated device.")
+			return
+		}
+		if !envelope.hasRecipient(id.DeviceID) {
+			writeError(w, http.StatusUnprocessableEntity, "e2ee_sender_not_recipient", "The sending device must be able to decrypt its sent message.")
+			return
+		}
 	}
-	registeredIdentity, registered := decodeEncodedBytes(device.IdentityKey, 32)
-	senderIdentity, validSender := decodeEncodedBytes(envelope.SenderIdentityKey, 32)
-	if !registered {
-		writeError(w, http.StatusConflict, "e2ee_device_not_ready", "Publish this device's encryption identity before sending messages.")
-		return
-	}
-	if !validSender || subtle.ConstantTimeCompare(registeredIdentity, senderIdentity) != 1 {
-		writeError(w, http.StatusUnprocessableEntity, "e2ee_identity_mismatch", "The message identity does not match the authenticated device.")
-		return
-	}
-	if !envelope.hasRecipient(id.DeviceID) {
-		writeError(w, http.StatusUnprocessableEntity, "e2ee_sender_not_recipient", "The sending device must be able to decrypt its sent message.")
-		return
-	}
-	message, recipients, err := s.store.CreateMessage(r.Context(), store.CreateMessageParams{
+	message, _, err := s.store.CreateMessage(r.Context(), store.CreateMessageParams{
 		ID: request.ID, ClientMessageID: request.ClientMessageID, ConversationID: conversationID,
 		SenderID: id.UserID, SenderDeviceID: id.DeviceID, ContentType: request.ContentType,
 		Ciphertext: request.Ciphertext, Envelope: request.Envelope, ReplyToID: request.ReplyToID,
@@ -392,11 +428,9 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	eventPayload, _ := json.Marshal(message)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: message.ID.String(), Type: "message.created", ConversationID: &conversationID,
-		Seq: message.Seq, Payload: eventPayload, OccurredAt: time.Now().UTC(),
-	})
+	if production05bTransition {
+		observability.LegacyTransitionMessages.Inc()
+	}
 	writeJSON(w, http.StatusCreated, message)
 }
 
@@ -434,6 +468,33 @@ func parseE2EEEnvelope(value json.RawMessage) (e2eeMessageEnvelope, bool) {
 	return envelope, true
 }
 
+// validProduction05bTransitionEnvelope is the narrow compatibility contract for
+// the installed production-05b app. Its ciphertext is base64-encoded JSON and is
+// therefore plaintext-equivalent at the server; it is not E2EE. Only the exact
+// one-field legacy envelope is accepted so malformed or extended lookalikes
+// cannot bypass the full clixor-e2ee-v1 identity and recipient checks.
+func validProduction05bTransitionEnvelope(value json.RawMessage) bool {
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') || !decoder.More() {
+		return false
+	}
+	key, err := decoder.Token()
+	if err != nil || key != "protocol" {
+		return false
+	}
+	var protocol string
+	if decoder.Decode(&protocol) != nil || protocol != "clustr-transition-v1" || decoder.More() {
+		return false
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return false
+	}
+	var trailing any
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
+}
+
 func (e e2eeMessageEnvelope) hasRecipient(deviceID uuid.UUID) bool {
 	for _, recipient := range e.Recipients {
 		if recipient.DeviceID == deviceID {
@@ -461,18 +522,63 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after_seq"), 10, 64)
-	limit := parseLimit(r.URL.Query().Get("limit"), 100, 500)
-	items, err := s.store.ListMessages(r.Context(), conversationID, id.UserID, after, limit)
+	params, err := messagePageParams(r, conversationID, id.UserID)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	items, err := s.store.ListMessages(r.Context(), params)
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
 	next := ""
-	if len(items) == limit {
-		next = strconv.FormatInt(items[len(items)-1].Seq, 10)
+	if len(items) == params.Limit {
+		if params.AfterSeq != nil {
+			next = strconv.FormatInt(items[len(items)-1].Seq, 10)
+		} else {
+			next = strconv.FormatInt(items[0].Seq, 10)
+		}
 	}
 	writeJSON(w, http.StatusOK, domain.Page[domain.Message]{Items: items, NextCursor: next})
+}
+
+func messagePageParams(
+	r *http.Request,
+	conversationID uuid.UUID,
+	userID uuid.UUID,
+) (store.ListMessagesParams, error) {
+	params := store.ListMessagesParams{
+		ConversationID: conversationID,
+		UserID:         userID,
+		Limit:          100,
+	}
+	query := r.URL.Query()
+	if rawLimit := query.Get("limit"); rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit < 1 || limit > store.MaxMessagePageSize {
+			return store.ListMessagesParams{}, domain.ErrInvalid
+		}
+		params.Limit = limit
+	}
+	if rawBefore := query.Get("before_seq"); rawBefore != "" {
+		before, err := strconv.ParseInt(rawBefore, 10, 64)
+		if err != nil {
+			return store.ListMessagesParams{}, domain.ErrInvalid
+		}
+		params.BeforeSeq = &before
+	}
+	if rawAfter := query.Get("after_seq"); rawAfter != "" {
+		after, err := strconv.ParseInt(rawAfter, 10, 64)
+		if err != nil {
+			return store.ListMessagesParams{}, domain.ErrInvalid
+		}
+		params.AfterSeq = &after
+	}
+	if err := params.Validate(); err != nil {
+		return store.ListMessagesParams{}, err
+	}
+	return params, nil
 }
 
 func (s *Server) putReceipt(w http.ResponseWriter, r *http.Request) {
@@ -508,12 +614,6 @@ func (s *Server) putReceipt(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	recipients, _ := s.store.ConversationMemberIDs(r.Context(), conversationID)
-	payload, _ := json.Marshal(receipt)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID: uuid.NewString(), Type: "receipt.updated", ConversationID: &conversationID,
-		Seq: max(request.DeliveredSeq, request.ReadSeq), Payload: payload, OccurredAt: time.Now().UTC(),
-	})
 	writeJSON(w, http.StatusOK, receipt)
 }
 

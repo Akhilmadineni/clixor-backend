@@ -1,0 +1,77 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+  - docker-buildx
+  - docker-compose-v2
+  - gnupg
+  - jq
+  - python3
+  - ufw
+  - unzip
+  - xfsprogs
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-clixor-hardening.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      X11Forwarding no
+      AllowUsers ubuntu
+
+  - path: /usr/local/sbin/clixor-mount-data
+    owner: root:root
+    permissions: "0750"
+    content: |
+      ${indent(6, chomp(mount_data_script))}
+
+  - path: /usr/local/sbin/clixor-install-cloudflared-package
+    owner: root:root
+    permissions: "0750"
+    content: |
+      ${indent(6, chomp(cloudflared_package_installer))}
+
+  - path: /etc/default/clixor-data-volume
+    owner: root:root
+    permissions: "0644"
+    content: |
+      CLIXOR_DATA_DEVICE=${data_device}
+      CLIXOR_DATA_VOLUME_SIZE_GBS=${data_volume_size_gbs}
+
+  - path: /etc/systemd/system/clixor-data-volume.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ${indent(6, chomp(mount_data_unit))}
+
+  - path: /etc/systemd/system/docker.service.d/10-clixor-data.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Requires=clixor-data-volume.service
+      After=clixor-data-volume.service
+      RequiresMountsFor=/srv/clixor
+
+runcmd:
+  - [sh, /usr/local/sbin/clixor-install-cloudflared-package, install]
+  - [bash, -lc, "systemctl stop docker.service docker.socket || true"]
+  - [bash, -lc, "systemctl daemon-reload"]
+  - [bash, -lc, "systemctl enable clixor-data-volume.service docker.service"]
+  - [bash, -lc, "ufw default deny incoming"]
+  - [bash, -lc, "ufw default allow outgoing"]
+  - [bash, -lc, "ufw allow from ${bastion_private_endpoint_cidr} to any port 22 proto tcp"]
+  - [bash, -lc, "ufw --force enable"]
+  - [bash, -lc, "systemctl restart ssh"]
+  - [bash, -lc, "systemctl start clixor-data-volume.service"]
+  - [bash, -lc, "systemctl start docker.service"]
+  - [bash, -lc, "usermod -aG docker ubuntu"]
+
+final_message: "Clixor OCI host bootstrap finished. Runtime secrets and application deployment are intentionally separate."

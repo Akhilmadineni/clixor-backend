@@ -1,0 +1,9 @@
+# Reviewed ingress shape for the remotely managed token tunnel. Apply these
+# rules in the Cloudflare control plane; do not install this file or create a
+# persistent tunnel credential on the host.
+ingress:
+  # Canary is the only route installed before public smoke evidence exists.
+  # Production ownership is transferred atomically after the reviewed gate.
+  - hostname: clixor-oci-canary.atlanteanz.com
+    service: unix:/run/clixor-origin/gateway.sock
+  - service: http_status:404

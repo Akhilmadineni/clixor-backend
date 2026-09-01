@@ -9,12 +9,14 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
+	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/observability"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
@@ -28,27 +30,77 @@ import (
 )
 
 type Server struct {
-	store             store.Store
-	tokens            *auth.TokenManager
-	bus               events.Bus
-	limiter           ratelimit.Limiter
-	media             media.Service
-	verifier          verification.Service
-	apple             appleauth.Verifier
-	presence          presence.Service
-	logger            *slog.Logger
-	dummyHash         string
-	metricsToken      string
-	trustedProxyCIDRs []netip.Prefix
+	store                  store.Store
+	tokens                 *auth.TokenManager
+	bus                    events.Bus
+	limiter                ratelimit.Limiter
+	media                  media.Service
+	mailQueue              clustrmail.QueueSealer
+	verifier               verification.Service
+	apple                  appleauth.Verifier
+	presence               presence.Service
+	logger                 *slog.Logger
+	dummyHash              string
+	metricsToken           string
+	trustedProxyCIDRs      []netip.Prefix
+	passwordReset          PasswordResetPolicy
+	mediaPolicy            MediaPolicy
+	mediaVerifySlots       chan struct{}
+	sessionRevocations     *sessionRevocationCache
+	sessionRevocationsOnce sync.Once
+	realtimeSessionRecheck time.Duration
 }
 
-func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
+// buildRevision is replaced with the exact reviewed Git object ID in release
+// images. Development binaries retain the explicit non-production sentinel.
+var buildRevision = "development"
+
+type PasswordResetPolicy struct {
+	Enabled     bool
+	HMACSecret  string
+	CodeLength  int
+	TTL         time.Duration
+	MaxAttempts int
+}
+
+type MediaPolicy struct {
+	ConversationMaxBytes    int64
+	ProfileMaxBytes         int64
+	CompletionTimeout       time.Duration
+	VerificationConcurrency int
+	ReservationLimits       store.MediaReservationLimits
+}
+
+func DefaultMediaPolicy() MediaPolicy {
+	return MediaPolicy{
+		ConversationMaxBytes:    1 << 30,
+		ProfileMaxBytes:         20 << 20,
+		CompletionTimeout:       2 * time.Minute,
+		VerificationConcurrency: 4,
+		ReservationLimits:       store.DefaultMediaReservationLimits(),
+	}
+}
+
+func New(store store.Store, tokens *auth.TokenManager, bus events.Bus, limiter ratelimit.Limiter, mediaService media.Service, verifier verification.Service, apple appleauth.Verifier, presenceService presence.Service, mailQueue clustrmail.QueueSealer, passwordReset PasswordResetPolicy, mediaPolicy MediaPolicy, trustedProxyCIDRs []netip.Prefix, metricsToken string, logger *slog.Logger) *Server {
 	dummyHash, _ := auth.HashPassword("not-a-real-password-123")
+	if mediaPolicy.ConversationMaxBytes == 0 {
+		mediaPolicy = DefaultMediaPolicy()
+	} else if mediaPolicy.CompletionTimeout == 0 {
+		mediaPolicy.CompletionTimeout = DefaultMediaPolicy().CompletionTimeout
+	}
+	if mediaPolicy.VerificationConcurrency < 1 {
+		mediaPolicy.VerificationConcurrency = DefaultMediaPolicy().VerificationConcurrency
+	}
 	return &Server{
-		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService,
+		store: store, tokens: tokens, bus: bus, limiter: limiter, media: mediaService, mailQueue: mailQueue,
 		verifier: verifier, apple: apple, presence: presenceService, metricsToken: metricsToken,
 		trustedProxyCIDRs: append([]netip.Prefix(nil), trustedProxyCIDRs...),
-		logger:            logger, dummyHash: dummyHash,
+		logger:            logger, dummyHash: dummyHash, passwordReset: passwordReset, mediaPolicy: mediaPolicy,
+		mediaVerifySlots: make(chan struct{}, mediaPolicy.VerificationConcurrency),
+		sessionRevocations: newSessionRevocationCache(
+			sessionRevocationCacheCapacity, sessionRevocationCacheRetention, time.Now,
+		),
+		realtimeSessionRecheck: realtimeDurableSessionRecheckInterval,
 	}
 }
 
@@ -57,7 +109,7 @@ func (s *Server) Router() http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(s.requestIDHeader)
 	router.Use(middleware.Recoverer)
-	router.Use(middleware.Timeout(30 * time.Second))
+	router.Use(requestTimeoutByRoute(30*time.Second, s.mediaPolicy.CompletionTimeout))
 	router.Use(s.securityHeaders)
 	router.Use(s.requestLogger)
 	router.Use(s.rateLimit("api", 600, time.Minute, false))
@@ -68,18 +120,35 @@ func (s *Server) Router() http.Handler {
 	router.Get("/privacy", s.legal)
 	router.Get("/legal", s.legal)
 	router.Get("/terms", s.legal)
+	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
+	router.Get("/apple-app-site-association", s.appleAppSiteAssociation)
+	router.Get("/join", s.joinLanding)
 	router.Handle("/metrics", s.protectMetrics(promhttp.Handler()))
 
 	router.Route("/v1", func(router chi.Router) {
 		router.Post("/webhooks/telnyx/messaging", s.telnyxMessagingWebhook)
+		router.With(s.rateLimit("account-deletion-execute", 10, time.Hour, true)).
+			Post("/account-deletions/{requestID}/execute", s.executeAccountDeletionIntent)
 		router.Route("/auth", func(router chi.Router) {
-			router.Use(s.rateLimit("auth", 20, 5*time.Minute, true))
-			router.Post("/register", s.register)
-			router.Post("/login", s.login)
-			router.Post("/refresh", s.refresh)
-			router.Post("/phone/start", s.startPhoneVerification)
-			router.Post("/phone/verify", s.verifyPhone)
-			router.Post("/apple", s.verifyAppleIdentity)
+			// Keep costly unauthenticated operations independently bounded. A
+			// shared bucket lets unrelated sign-up or phone traffic prevent a
+			// legitimate device from refreshing an already-issued session.
+			router.With(s.rateLimit("auth-register", 10, 5*time.Minute, true)).
+				Post("/register", s.register)
+			router.With(s.rateLimit("auth-login", 20, 5*time.Minute, true)).
+				Post("/login", s.login)
+			router.With(s.rateLimit("password-reset-start", 5, time.Hour, true)).
+				Post("/password/reset/start", s.startPasswordReset)
+			router.With(s.rateLimit("password-reset-confirm", 15, 15*time.Minute, true)).
+				Post("/password/reset/confirm", s.confirmPasswordReset)
+			router.With(s.rateLimit("auth-refresh", 60, 5*time.Minute, true)).
+				Post("/refresh", s.refresh)
+			router.With(s.rateLimit("auth-phone-start", 10, 5*time.Minute, true)).
+				Post("/phone/start", s.startPhoneVerification)
+			router.With(s.rateLimit("auth-phone-verify", 20, 5*time.Minute, true)).
+				Post("/phone/verify", s.verifyPhone)
+			router.With(s.rateLimit("auth-apple", 20, 5*time.Minute, true)).
+				Post("/apple", s.verifyAppleIdentity)
 		})
 
 		router.Group(func(router chi.Router) {
@@ -88,12 +157,16 @@ func (s *Server) Router() http.Handler {
 			router.Post("/auth/logout", s.logout)
 			router.Get("/me", s.me)
 			router.Delete("/me", s.deleteAccount)
+			router.With(s.rateLimitIdentity("account-deletion-intent", 10, 24*time.Hour)).
+				Put("/me/deletion-intents/{requestID}", s.putAccountDeletionIntent)
 			router.With(s.rateLimitIdentity("age-assurance-read", 240, 24*time.Hour)).
 				Get("/me/age-assurance", s.getAgeAssurance)
 			router.With(s.rateLimitIdentity("age-assurance-write", 10, 24*time.Hour)).
 				Put("/me/age-assurance", s.putAgeAssurance)
 
 			router.Patch("/me", s.updateProfile)
+			router.With(s.rateLimitIdentity("profile-avatar", 20, time.Hour)).
+				Post("/me/avatar", s.createProfileMediaUpload)
 			router.Post("/me/phone/start", s.startPhoneLink)
 			router.Post("/me/phone/verify", s.verifyPhoneLink)
 			router.Post("/users/lookup", s.lookupUsers)
@@ -114,24 +187,71 @@ func (s *Server) Router() http.Handler {
 					router.Delete("/", s.deleteConversation)
 					router.Get("/members", s.listMembers)
 					router.Post("/members", s.addMember)
+					router.Delete("/members/me", s.removeSelfMember)
 					router.Delete("/members/{userID}", s.removeMember)
 					router.Put("/owner", s.transferOwner)
+					router.With(s.rateLimitIdentity("conversation-invite-write", 120, time.Hour)).
+						Post("/invites", s.createConversationInvite)
+					router.With(s.rateLimitIdentity("conversation-invite-write", 120, time.Hour)).
+						Delete("/invites/{inviteID}", s.revokeConversationInvite)
 					router.Get("/messages", s.listMessages)
 					router.Post("/messages", s.createMessage)
 					router.Get("/receipts", s.listReceipts)
 					router.Put("/receipt", s.putReceipt)
-					router.Post("/media", s.createMediaUpload)
+					router.With(s.rateLimitUser("conversation-media-upload", 60, time.Hour)).
+						Post("/media", s.createMediaUpload)
 					router.Get("/entities/{kind}", s.listEntities)
 					router.Put("/entities/{kind}/{entityID}", s.putEntity)
 					router.Delete("/entities/{kind}/{entityID}", s.deleteEntity)
+					router.Post("/chores/{choreID}/rotate", s.rotateChore)
 				})
 			})
-			router.Post("/media/{mediaID}/complete", s.completeMediaUpload)
+			router.With(s.rateLimitIdentity("conversation-invite-preview", 120, time.Minute)).
+				Post("/invites/preview", s.getConversationInvite)
+			router.With(s.rateLimitIdentity("conversation-invite-accept", 30, time.Minute)).
+				Post("/invites/accept", s.acceptConversationInvite)
+			router.With(s.rateLimitUser("media-complete", 120, time.Hour)).
+				Post("/media/{mediaID}/complete", s.completeMediaUpload)
 			router.Get("/media/{mediaID}/download", s.mediaDownload)
+			router.Delete("/media/{mediaID}", s.deleteMedia)
 			router.Get("/realtime", s.realtime)
 		})
 	})
 	return router
+}
+func requestTimeoutByRoute(
+	defaultTimeout time.Duration,
+	mediaCompletionTimeout time.Duration,
+) func(http.Handler) http.Handler {
+	withDefaultTimeout := middleware.Timeout(defaultTimeout)
+	withMediaCompletionTimeout := middleware.Timeout(mediaCompletionTimeout)
+	return func(next http.Handler) http.Handler {
+		defaultTimed := withDefaultTimeout(next)
+		mediaCompletionTimed := withMediaCompletionTimeout(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v1/realtime" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if isMediaCompletionRequest(r) {
+				mediaCompletionTimed.ServeHTTP(w, r)
+				return
+			}
+			defaultTimed.ServeHTTP(w, r)
+		})
+	}
+}
+
+func isMediaCompletionRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "media" || parts[3] != "complete" {
+		return false
+	}
+	_, err := uuid.Parse(parts[2])
+	return err == nil
 }
 
 func (s *Server) requestIDHeader(next http.Handler) http.Handler {
@@ -180,6 +300,35 @@ func (s *Server) rateLimitIdentity(namespace string, limit int, window time.Dura
 			if !allowed {
 				observability.RateLimited.WithLabelValues(namespace).Inc()
 				w.Header().Set("Retry-After", "60")
+				writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests.")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// rateLimitUser is deliberately independent of device/session identity. It is
+// used for storage-cost controls that must not be multiplied by registering
+// additional devices on the same account.
+func (s *Server) rateLimitUser(namespace string, limit int, window time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, ok := identityFrom(r.Context())
+			if !ok {
+				writeDomainError(w, domain.ErrUnauthenticated)
+				return
+			}
+			key := namespace + ":" + id.UserID.String()
+			allowed, err := s.limiter.Allow(r.Context(), key, limit, window)
+			if err != nil {
+				s.logger.Error("rate_limiter_unavailable", "error", err, "namespace", namespace)
+				writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
+				return
+			}
+			if !allowed {
+				observability.RateLimited.WithLabelValues(namespace).Inc()
+				w.Header().Set("Retry-After", strconv.FormatInt(max(1, int64(window/time.Second)), 10))
 				writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests.")
 				return
 			}
@@ -302,7 +451,11 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	w.Header().Set("X-Clixor-Revision", buildRevision)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":   "ready",
+		"revision": buildRevision,
+	})
 }
 
 func rawJSON(value any) json.RawMessage {

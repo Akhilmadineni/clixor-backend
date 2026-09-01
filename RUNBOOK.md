@@ -8,19 +8,23 @@ example hostnames, image names, secret stores, and paging destinations before us
 - API availability: 99.95% per calendar month, excluding planned maintenance.
 - Authenticated message acknowledgement: p95 under 250 ms and p99 under 750 ms.
 - Durable message-to-realtime outbox lag: p99 under 2 seconds.
-- Recovery point objective: 5 minutes for PostgreSQL and encrypted media metadata.
-- Recovery time objective: 60 minutes for a regional restore.
+- PostgreSQL backup freshness objective: no more than 8 hours between the live
+  database and the latest verified same-region offsite dump.
+- Basic same-region dump-restore objective: 4 hours. Cross-region recovery and
+  point-in-time recovery are not implemented and have no production SLO yet.
 
 Page when the five-minute error ratio exceeds 2%, readiness fails on more than one
 replica, p99 message acknowledgement exceeds 2 seconds, outbox lag exceeds 10
-seconds, or PostgreSQL replication/backup freshness exceeds the RPO. Alert without
-paging on sustained rate limiting, push failures, prekey depletion, or a single
-replica restart loop.
+seconds, or PostgreSQL backup freshness exceeds 8 hours. Alert without
+paging on sustained rate limiting, a rise in
+`clustr_push_delivery_failures_total`, any sustained dead-letter growth, prekey
+depletion, or a single replica restart loop.
 
 ## Deployment
 
 1. Build and scan one immutable image digest. Never deploy a mutable tag.
-2. Snapshot PostgreSQL and confirm the latest continuous-archive restore point.
+2. Validate and checksum a pre-change PostgreSQL custom dump. After migration,
+   require a fresh offsite dump and isolated restore drill before promotion.
 3. Run `/clustr-migrate` as the one-shot migration job and require success.
 4. Roll out one canary API replica. Verify readiness, auth, message replay,
    WebSocket delivery, outbox lag, and media upload/download.
@@ -32,25 +36,150 @@ Application rollback uses the previous immutable image. Schema changes are
 forward-compatible and forward-only; a destructive schema rollback requires a
 tested database restore and an incident declaration.
 
+Migration 9 adds the durable APNs delivery queue without constraining the existing
+`devices.push_token` column. This is deliberate: production-05b replicas can keep
+serving device updates throughout the rolling deployment. The new store serializes
+token transfers with an advisory lock. Deduplication and a database uniqueness
+constraint requires its own later migration after all 05b replicas are drained;
+do not rewrite already-applied migration 9. Migration 12 is mail-only and creates
+the encrypted durable delivery queue after media-owned migrations 10 and 11.
+
+Migration 10 adds bounded media reservations, stored-media quota indexes, pending
+expiry, verification leases, and delayed object-deletion scheduling. Migration 11
+adds the published-outbox retention index. Migration 12 adds the encrypted durable
+mail-delivery queue. Migration 13 enforces unique ownership of APNs device tokens.
+Migration 14 persists upload-capability identity and makes legacy account deletion
+cover both OCI staging and immutable published keys. Apply every available
+migration in numeric order before rolling out this binary. Never publish a
+different migration body under an already-applied version.
+The migration's ready-row constraint prevents a production-05b replica from
+publishing a capability-bearing upload without revocation. Drain old replicas
+before promotion so newly created and legacy in-flight OCI uploads complete on
+the immutable-publication code path; old rows with no capability remain readable.
+
+Migration 19 retains atomic chore-rotation replay results for at least 90 days.
+Each durable API replica runs one bounded cleanup batch immediately at boot and
+then every `CLUSTER_CHORE_ROTATION_CLEANUP_INTERVAL` (one hour by default). Each
+transaction deletes at most `CLUSTER_CHORE_ROTATION_CLEANUP_BATCH_SIZE` expired
+rows (500 by default), orders oldest first, uses `SKIP LOCKED`, and has a local
+five-second statement timeout. Failures retain the rows and retry on the next
+tick. Monitor `clustr_chores_rotation_cleanup_deleted_rows_total`,
+`clustr_chores_rotation_cleanup_failed_runs_total`, and
+`clustr_chores_rotation_cleanup_duration_seconds`; alert if failed runs persist
+or no rows are deleted while expired-row counts rise. The deleted-row counter
+counts rows and the failed-run counter counts attempts, so neither should be
+used as the denominator of a mixed-unit success ratio. For an incident run,
+restart one healthy API replica rather than issuing an unbounded manual DELETE;
+confirm batch progress with `SELECT count(*) FROM
+chore_rotation_operations WHERE expires_at<=now()`.
+
+`clustr_messaging_transition_messages_total` counts accepted messages from the
+installed production-05b codec. Those payloads are base64-encoded JSON,
+plaintext-equivalent at the server, and not E2EE. Track the counter by release;
+remove the strict one-field compatibility envelope only after upgraded-client
+adoption is verified and a coordinated minimum-version policy is active.
+
+Outbound reset email fails closed while `CLUSTER_MAIL_PROVIDER=disabled`.
+The OCI deployment supports authenticated implicit TLS on port 465 and mandatory
+STARTTLS on port 587; TLS 1.2+, CA/hostname validation, and post-TLS AUTH are
+required in both modes. It never sends credentials or reset codes to a plaintext
+relay. Enable SMTP only after the approved sender, SPF, DKIM, DMARC, provider
+suppression handling, and real-mailbox delivery canaries pass. A successful SMTP
+handshake alone does not prove Internet delivery.
+SMTP is intentionally not a core `/health/ready` dependency: an email outage must
+not eject both API replicas from service. The challenge and AES-256-GCM queue row
+are inserted in one transaction; remote delivery happens only in a leased worker.
+Monitor `clustr_mail_deliveries_total` and
+`clustr_mail_delivery_failures_total` separately. Expired, consumed, superseded,
+or permanently dead-lettered reset-code mail is canceled/suppressed, and reset
+codes, recipients, subjects, and bodies never exist as plaintext database fields.
+
+SMTP, reset, queue, JWT, OTP/Telnyx, APNs, and media provider values belong only
+in `/srv/clixor/secrets/api.env`. Data services, backup, Grafana, and the migration
+job each use separate allowlisted files. `runtime.env` is a non-consumed upgrade
+checkpoint; any scoped assignment found there is a deployment stop condition.
+
+Queue-key rotation is drain-only because this release intentionally has one key.
+With the old key/provider active, drain until
+`SELECT count(*) FROM mail_deliveries WHERE status='pending'` returns zero. Then
+disable mail, restart both APIs to freeze enqueue, and verify zero again. If rows
+appeared, restore the old configuration and drain. Only with the queue frozen and
+empty may you retain the old key in break-glass storage, install the new padded-
+base64 32-byte key, re-enable mail, restart, and complete a real-mailbox canary.
+
+## APNs delivery operations
+
+- `clustr_push_deliveries_total{result="retry_scheduled"}` records durable
+  retries; `result="dead_letter"` records jobs that exhausted the configured
+  budget or received a permanent APNs rejection.
+- `clustr_push_delivery_failures_total{class=...}` uses bounded, token-free
+  classes. No device token or provider response body is logged or used as a
+  metric label.
+- Delivered/invalid/canceled rows are retained for 24 hours by default;
+  dead-letter rows are retained for 30 days. Each hourly transaction deletes at
+  most 1,000 terminal rows and only after the source realtime outbox event is
+  acknowledged; an extended NATS outage therefore cannot erase APNs idempotency
+  state and resend old pushes.
+- After terminal push rows are pruned, published source outbox rows become
+  eligible only when they are older than the longer configured push-retention
+  window (30 days by default) and have no remaining `push_deliveries` references.
+  The source prune is also capped at 1,000 rows per transaction and uses
+  `SKIP LOCKED`, so replicas can make progress without a large blocking delete.
+- `clustr_push_deliveries_total{result="pruned"}` and
+  `clustr_outbox_events_total{result="pruned"}` count deleted retention rows.
+  The corresponding `result="prune_failed"` series count failed hourly attempts;
+  alert on sustained failures or unexpected absence of pruning while table sizes
+  grow.
+- Realtime outbox publication and APNs delivery run in separate loops. Each API
+  replica claims at most the configured worker concurrency (16 by default) and
+  sends that cohort in parallel, keeping the two-minute database lease ahead of
+  the APNs client's bounded request timeout.
+- Inspect a suspected backlog with a read-only count grouped by `status` and
+  `last_error_class` in `push_deliveries`. Never export notification bodies or
+  join device tokens into incident tickets.
+- Before replaying dead letters, repair and canary the underlying APNs key,
+  topic, payload, or network fault. Replay only the affected bounded cohort by
+  changing it back to `pending`, clearing its lease/dead-letter timestamp, and
+  setting `next_attempt_at=now()` in an audited transaction. Leave `attempts`
+  intact unless incident command explicitly approves a fresh retry budget.
+- An `invalid_token` outcome atomically clears only the exact token rejected by
+  APNs. A token rotated while a delivery was in flight remains registered.
+
 ## Backups and restore
 
-- PostgreSQL: encrypted daily base backup plus continuous WAL archiving to a
-  separate account/region. Retain 35 days and test point-in-time recovery monthly.
-- S3 media: encryption at rest, versioning, lifecycle policy, and cross-region
-  replication. Treat payloads as plaintext-sensitive until audited client-side
-  encryption is deployed; storage credentials and metadata are always sensitive.
+- PostgreSQL: custom-format dumps every six hours, seven-day local retention,
+  and immutable uploads to the same-region versioned OCI backup bucket. Current
+  objects expire after 14 days and previous versions after 21 days. This is not
+  continuous WAL archiving, point-in-time recovery, or cross-region disaster
+  recovery.
+- OCI Object Storage media: same-region encryption at rest and a lifecycle rule
+  that aborts incomplete multipart uploads. The media bucket is not versioned or
+  cross-region replicated. Treat payloads as plaintext-sensitive until audited
+  client-side encryption is deployed; PARs and metadata are always sensitive.
+- Alert on `clustr_media_pending_cleanup_total{result="failed"}` and sustained
+  media quota/rate-limit rejections. Confirm OCI lifecycle rules abort incomplete
+  multipart uploads, stored-object limits match the product plan, the configured
+  conversation ceiling remains 1 GiB while production-05b is supported, and a
+  missing `opc-content-sha256` can never transition an object to ready.
+- Alert on completion failures during PAR revocation or conditional rename. A
+  ready OCI row must reference `published/`; investigate pending rows with a
+  persisted capability older than their expiry and verify staging cleanup outbox
+  work is draining before retrying promotion.
 - Redis presence/rate limits and NATS realtime fan-out are rebuildable. PostgreSQL
   messages plus the transactional outbox are the recovery source of truth.
 - Export backup success and restore-point age as monitored metrics.
 
-A restore drill is successful only after membership counts, per-conversation
-message sequences, receipt watermarks, entity versions, media metadata, and a
-sample of stored-payload hashes match the source environment.
+The automated release gate is a basic integrity drill: it validates the dump
+checksum, restores into an isolated PostgreSQL 17 container, requires the exact
+migration set, reads core tables, and runs `pg_amcheck`. A full disaster-recovery
+exercise additionally compares membership counts, per-conversation sequences,
+receipt watermarks, entity versions, media metadata, and sampled payload hashes
+against a captured source manifest; that broader exercise remains a launch gate.
 
 ## Secret and key rotation
 
-- Store PostgreSQL, Redis, NATS, S3, Telnyx, OTP HMAC, APNs, JWT, and metrics credentials in
-  a managed secret store; never commit or place them in ConfigMaps.
+- Store PostgreSQL, Redis, NATS, OCI mail/Telnyx, OTP HMAC, APNs, JWT, and metrics
+  credentials in a managed secret store; never commit or place them in ConfigMaps.
 - Rotate infrastructure credentials at least every 90 days and immediately after
   suspected exposure.
 - JWT signing-key rotation needs an overlapping key ring before public launch; the
@@ -73,7 +202,8 @@ sample of stored-payload hashes match the source environment.
 
 ## Required launch exercises
 
-- PostgreSQL primary loss and point-in-time restore.
+- PostgreSQL primary loss and verified same-region dump restore; separately design
+  and test point-in-time and cross-region recovery before assigning those SLOs.
 - Redis loss during login and normal authenticated traffic.
 - NATS outage/reconnect with outbox replay and duplicate-event client handling.
 - APNs outage and invalid-device-token handling.
@@ -81,5 +211,9 @@ sample of stored-payload hashes match the source environment.
   destination spray, and daily SMS cost-cap handling.
 - Reconnect storm, hot 1024-member group, media quota, and one-time-prekey
   depletion load tests.
+- Concurrent pending-media quota races across both API replicas, expired upload
+  cleanup, invalid checksum/content-type rejection, and conversation deletion
+  while OCI Object Storage is unavailable (the outbox must retry without losing
+  object keys).
 - External penetration test, abuse review, privacy review, and client cryptography
   audit.

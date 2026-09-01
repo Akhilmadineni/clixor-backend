@@ -45,7 +45,6 @@ func (s *Server) putEntity(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
-	s.publishEntityEvent(r, "entity.updated", entity)
 	writeJSON(w, http.StatusOK, entity)
 }
 
@@ -88,28 +87,14 @@ func (s *Server) deleteEntity(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	entity, err := s.store.DeleteEntity(
+	_, err = s.store.DeleteEntity(
 		r.Context(), conversationID, id.UserID, kind, entityID, &expectedVersion,
 	)
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	s.publishEntityEvent(r, "entity.deleted", entity)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) publishEntityEvent(r *http.Request, eventType string, entity domain.Entity) {
-	recipients, err := s.store.ConversationMemberIDs(r.Context(), entity.ConversationID)
-	if err != nil {
-		return
-	}
-	payload, _ := json.Marshal(entity)
-	_ = s.bus.Publish(r.Context(), recipients, domain.RealtimeEvent{
-		ID:   eventType + ":" + entity.ID.String() + ":" + strconv.FormatInt(entity.Version, 10),
-		Type: eventType, ConversationID: &entity.ConversationID, Seq: entity.Version,
-		Payload: payload, OccurredAt: time.Now().UTC(),
-	})
 }
 
 func validEntityKind(kind string) bool {

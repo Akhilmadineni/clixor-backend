@@ -1,0 +1,17 @@
+[Unit]
+Description=Recover an interrupted Clixor deployment from releases/current
+Requires=docker.service clixor-runtime-secrets.service
+After=docker.service clixor-runtime-secrets.service clixor-runtime-reconcile.service
+RequiresMountsFor=/srv/clixor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/clixor/runtime-reconciler.py watchdog
+UMask=0077
+LimitCORE=0
+TimeoutStartSec=15m
+
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/srv/clixor /run/clixor /etc/systemd/system /etc/tmpfiles.d /usr/local/libexec/clixor /usr/bin

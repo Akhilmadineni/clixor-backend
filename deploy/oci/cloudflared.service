@@ -1,0 +1,51 @@
+[Unit]
+Description=Clixor Cloudflare Tunnel connector
+Documentation=https://developers.cloudflare.com/tunnel/
+After=network-online.target docker.service clixor-runtime-reconcile.service
+Wants=network-online.target
+Requires=docker.service
+ConditionPathExists=/run/clixor/runtime-ready
+
+[Service]
+Type=notify
+DynamicUser=yes
+SupplementaryGroups=clixor-origin
+LoadCredential=cloudflare-token:/run/clixor/cloudflare-connector/current/token
+# Reassert the tmpfs boundary after every boot. The `+` prefix applies only to
+# this mkdir/metadata operation; the connector itself remains DynamicUser.
+ExecStartPre=+/usr/bin/install -d -m 0750 -o 986 -g 987 /run/clixor-origin
+# `auto` prefers QUIC and falls back to HTTP/2 when UDP is unavailable.
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --protocol auto --metrics 127.0.0.1:20241 run --token-file %d/cloudflare-token
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=90s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+LimitCORE=0
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+TasksMax=512
+LimitNOFILE=70000
+
+[Install]
+WantedBy=multi-user.target

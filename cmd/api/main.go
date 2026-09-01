@@ -13,9 +13,11 @@ import (
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
+	"github.com/Akhilmadineni/clixor-backend/internal/chores"
 	"github.com/Akhilmadineni/clixor-backend/internal/config"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	"github.com/Akhilmadineni/clixor-backend/internal/httpapi"
+	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
 	"github.com/Akhilmadineni/clixor-backend/internal/media"
 	"github.com/Akhilmadineni/clixor-backend/internal/outbox"
 	"github.com/Akhilmadineni/clixor-backend/internal/presence"
@@ -29,6 +31,16 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if configPath := os.Getenv("CLUSTER_CONFIG_FILE"); configPath != "" {
+		if configPath != "/run/secrets/api.env" {
+			logger.Error("invalid configuration", "error", "unsupported runtime configuration path")
+			os.Exit(1)
+		}
+		if err := config.LoadAPIEnvironmentFile(configPath); err != nil {
+			logger.Error("invalid configuration", "error", err)
+			os.Exit(1)
+		}
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
@@ -45,6 +57,31 @@ func main() {
 	var verifier verification.Service
 	var pushService push.Service
 	var presenceService presence.Service
+	var mailSender clustrmail.Service = clustrmail.Unavailable{}
+	var mailQueue clustrmail.QueueSealer = clustrmail.UnavailableQueue()
+	var mailCipher *clustrmail.QueueCipher
+	if cfg.Mail.Provider == "smtp" {
+		mailCipher, err = clustrmail.NewQueueCipher(cfg.Mail.QueueEncryptionKey)
+		if err != nil {
+			logger.Error("configure encrypted mail queue", "error_class", "invalid_key")
+			os.Exit(1)
+		}
+		smtpService, err := clustrmail.NewAuthenticatedSMTP(clustrmail.SMTPConfig{
+			Address: cfg.Mail.SMTPAddress, From: cfg.Mail.From,
+			Username: cfg.Mail.SMTPUsername, Password: cfg.Mail.SMTPPassword,
+			ServerName: cfg.Mail.SMTPServerName, CAFile: cfg.Mail.SMTPCAFile,
+			Transport: cfg.Mail.SMTPTransport,
+		})
+		if err != nil {
+			logger.Error("configure authenticated SMTP submission", "error", err)
+			os.Exit(1)
+		}
+		mailSender = smtpService
+		mailQueue = mailCipher
+		logger.Info("password reset email provider enabled", "provider", "smtp")
+	} else {
+		logger.Warn("password reset email is disabled until authenticated SMTP is configured")
+	}
 	durableStore := false
 	switch cfg.Store {
 	case "memory":
@@ -57,7 +94,13 @@ func main() {
 		presenceService = presence.NewMemory()
 		logger.Warn("using non-durable memory dependencies; suitable only for tests and local smoke runs")
 	case "postgres":
-		pgStore, err := postgres.Open(ctx, cfg.DatabaseURL, cfg.AutoMigrate)
+		pgStore, err := postgres.OpenWithPool(
+			ctx,
+			cfg.DatabaseURL,
+			cfg.AutoMigrate,
+			cfg.DatabaseMaxConns,
+			cfg.DatabaseMinConns,
+		)
 		if err != nil {
 			logger.Error("open persistence", "error", err)
 			os.Exit(1)
@@ -88,10 +131,22 @@ func main() {
 			os.Exit(1)
 		}
 		presenceService = redisPresence
-		s3Media, err := media.NewS3(
-			ctx, cfg.S3.Endpoint, cfg.S3.PublicEndpoint, cfg.S3.AccessKey, cfg.S3.SecretKey,
-			cfg.S3.Bucket, cfg.S3.UseTLS, cfg.TLSCAFile,
-		)
+		var durableMedia media.Service
+		switch cfg.MediaProvider {
+		case "s3":
+			durableMedia, err = media.NewS3WithRegion(
+				ctx, cfg.S3.Endpoint, cfg.S3.PublicEndpoint, cfg.S3.Region,
+				cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Bucket, cfg.S3.UseTLS, cfg.TLSCAFile,
+			)
+		case "oci":
+			durableMedia, err = media.NewOCIObjectStorage(
+				ctx,
+				cfg.OCIObjectStorage.Region,
+				cfg.OCIObjectStorage.Namespace,
+				cfg.OCIObjectStorage.Bucket,
+				logger,
+			)
+		}
 		if err != nil {
 			limiter.Close()
 			presenceService.Close()
@@ -100,7 +155,7 @@ func main() {
 			logger.Error("open media store", "error", err)
 			os.Exit(1)
 		}
-		mediaService = s3Media
+		mediaService = durableMedia
 		if cfg.Verification.Provider == "telnyx" {
 			telnyxSender, err := verification.NewTelnyxSMS(
 				cfg.Verification.TelnyxAPIKey,
@@ -215,17 +270,67 @@ func main() {
 	}
 	api := httpapi.New(
 		persistence, tokenManager, bus, limiter, mediaService, verifier, appleVerifier,
-		presenceService, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
+		presenceService, mailQueue, httpapi.PasswordResetPolicy{
+			Enabled: cfg.Mail.Provider == "smtp", HMACSecret: cfg.Mail.PasswordResetSecret,
+			CodeLength: cfg.Mail.PasswordResetLength, TTL: cfg.Mail.PasswordResetTTL,
+			MaxAttempts: cfg.Mail.PasswordResetMaxAttempts,
+		}, httpapi.MediaPolicy{
+			ConversationMaxBytes:    cfg.Media.ConversationMaxBytes,
+			ProfileMaxBytes:         cfg.Media.ProfileMaxBytes,
+			CompletionTimeout:       cfg.Media.CompletionTimeout,
+			VerificationConcurrency: cfg.Media.VerificationConcurrency,
+			ReservationLimits: store.MediaReservationLimits{
+				PendingTTL:                  cfg.Media.PendingTTL,
+				MaxPendingCountPerUser:      cfg.Media.PendingUserMaxCount,
+				MaxPendingBytesPerUser:      cfg.Media.PendingUserMaxBytes,
+				MaxPendingCountConversation: cfg.Media.PendingConversationMaxCount,
+				MaxPendingBytesConversation: cfg.Media.PendingConversationMaxBytes,
+				MaxStoredCountPerUser:       cfg.Media.StoredUserMaxCount,
+				MaxStoredBytesPerUser:       cfg.Media.StoredUserMaxBytes,
+				MaxStoredCountConversation:  cfg.Media.StoredConversationMaxCount,
+				MaxStoredBytesConversation:  cfg.Media.StoredConversationMaxBytes,
+			},
+		}, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
 	if durableStore {
-		go outbox.New(persistence, bus, pushService, mediaService, logger).Run(ctx)
+		go outbox.NewWithPushRetryPolicy(
+			persistence, bus, pushService, mediaService, logger,
+			outbox.PushRetryPolicy{
+				BatchSize:           cfg.PushDelivery.BatchSize,
+				WorkerConcurrency:   cfg.PushDelivery.WorkerConcurrency,
+				MaxAttempts:         cfg.PushDelivery.MaxAttempts,
+				BaseDelay:           cfg.PushDelivery.BaseDelay,
+				MaxDelay:            cfg.PushDelivery.MaxDelay,
+				DeliveredRetention:  cfg.PushDelivery.DeliveredRetention,
+				DeadLetterRetention: cfg.PushDelivery.DeadLetterRetention,
+			},
+		).Run(ctx)
+		go media.RunPendingCleanup(
+			ctx, persistence, cfg.Media.CleanupInterval, cfg.Media.CleanupBatchSize, logger,
+		)
+		go chores.RunRotationCleanup(
+			ctx, persistence, cfg.ChoreRotation.CleanupInterval, cfg.ChoreRotation.CleanupBatchSize, logger,
+		)
+	}
+	if mailCipher != nil {
+		go clustrmail.NewWorker(
+			persistence, mailSender, mailCipher, logger,
+			clustrmail.DeliveryPolicy{
+				BatchSize:         cfg.Mail.QueueBatchSize,
+				WorkerConcurrency: cfg.Mail.QueueWorkerConcurrency,
+				MaxAttempts:       cfg.Mail.QueueMaxAttempts,
+				BaseDelay:         cfg.Mail.QueueBaseDelay, MaxDelay: cfg.Mail.QueueMaxDelay,
+				DeliveredRetention:  cfg.Mail.QueueDeliveredRetention,
+				DeadLetterRetention: cfg.Mail.QueueDeadLetterRetention,
+			},
+		).Run(ctx)
 	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           api.Router(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       35 * time.Second,
-		WriteTimeout:      35 * time.Second,
+		WriteTimeout:      cfg.HTTPWriteTimeout,
 		IdleTimeout:       75 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

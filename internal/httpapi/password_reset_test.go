@@ -1,0 +1,483 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
+	"github.com/Akhilmadineni/clixor-backend/internal/auth"
+	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/events"
+	"github.com/Akhilmadineni/clixor-backend/internal/media"
+	"github.com/Akhilmadineni/clixor-backend/internal/presence"
+	"github.com/Akhilmadineni/clixor-backend/internal/ratelimit"
+	"github.com/Akhilmadineni/clixor-backend/internal/store"
+	"github.com/Akhilmadineni/clixor-backend/internal/store/memory"
+	"github.com/Akhilmadineni/clixor-backend/internal/verification"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+)
+
+type resetMailRecorder struct {
+	mu          sync.Mutex
+	resetTo     string
+	resetCode   string
+	changedTo   string
+	resetCount  int
+	changeCount int
+	resetErr    error
+	resetCodes  []string
+	sealDelay   time.Duration
+}
+
+func (r *resetMailRecorder) SealPasswordReset(
+	challengeID uuid.UUID,
+	to, code string,
+	_ time.Duration,
+) (domain.MailDelivery, error) {
+	r.mu.Lock()
+	delay := r.sealDelay
+	r.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resetTo = to
+	r.resetCode = code
+	r.resetCount++
+	r.resetCodes = append(r.resetCodes, code)
+	if r.resetErr != nil {
+		return domain.MailDelivery{}, r.resetErr
+	}
+	now := time.Now().UTC()
+	return domain.MailDelivery{
+		ID: uuid.New(), ChallengeID: challengeID,
+		Purpose:    domain.MailDeliveryPasswordReset,
+		Ciphertext: make([]byte, 29), Status: domain.MailDeliveryPending,
+		NextAttemptAt: now, CreatedAt: now,
+	}, nil
+}
+
+func (r *resetMailRecorder) SealPasswordChanged(
+	challengeID uuid.UUID,
+	to string,
+) (domain.MailDelivery, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.changedTo = to
+	r.changeCount++
+	now := time.Now().UTC()
+	return domain.MailDelivery{
+		ID: uuid.New(), ChallengeID: challengeID,
+		Purpose:    domain.MailDeliveryPasswordChanged,
+		Ciphertext: make([]byte, 29), Status: domain.MailDeliveryPending,
+		NextAttemptAt: now, CreatedAt: now,
+	}, nil
+}
+
+func TestPasswordResetRequiresEmailedCodeAndRevokesSessions(t *testing.T) {
+	server, recorder := newPasswordResetHTTPServer(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	var registered authResponse
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "reset@example.com", "password": "original-password-123",
+		"display_name": "Reset User", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, &registered)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime"
+	socket, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
+		"Authorization": []string{"Bearer " + registered.Tokens.AccessToken},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socket.Close()
+	_ = socket.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var hello domain.RealtimeEvent
+	if err := socket.ReadJSON(&hello); err != nil || hello.Type != "session.ready" {
+		t.Fatalf("missing reset-test realtime hello: event=%+v err=%v", hello, err)
+	}
+
+	var started passwordResetStartResponse
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "reset@example.com",
+	}, http.StatusAccepted, &started)
+	if started.ChallengeID == "" || started.ExpiresIn != 600 {
+		t.Fatalf("unexpected reset response: %+v", started)
+	}
+	recorder.mu.Lock()
+	code := recorder.resetCode
+	if recorder.resetTo != "reset@example.com" || recorder.resetCount != 1 || len(code) != 8 {
+		t.Fatalf("unexpected queued reset mail: %+v", recorder)
+	}
+	recorder.mu.Unlock()
+	wrongCode := "00000000"
+	if code == wrongCode {
+		wrongCode = "99999999"
+	}
+
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/confirm", map[string]any{
+		"challenge_id": started.ChallengeID, "code": wrongCode,
+		"new_password": "replacement-password-456",
+	}, http.StatusBadRequest, nil)
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/confirm", map[string]any{
+		"challenge_id": started.ChallengeID, "code": code,
+		"new_password": "replacement-password-456",
+	}, http.StatusNoContent, nil)
+	var postResetEvent domain.RealtimeEvent
+	if err := socket.ReadJSON(&postResetEvent); err == nil {
+		t.Fatalf("password-reset revoked socket received an event: %+v", postResetEvent)
+	}
+
+	client.token = registered.Tokens.AccessToken
+	client.do(t, http.MethodGet, "/v1/me", nil, http.StatusUnauthorized, nil)
+	client.token = ""
+	client.do(t, http.MethodPost, "/v1/auth/login", map[string]any{
+		"email": "reset@example.com", "password": "original-password-123",
+		"device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusUnauthorized, nil)
+	client.do(t, http.MethodPost, "/v1/auth/login", map[string]any{
+		"email": "reset@example.com", "password": "replacement-password-456",
+		"device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusOK, nil)
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/confirm", map[string]any{
+		"challenge_id": started.ChallengeID, "code": code,
+		"new_password": "another-password-789",
+	}, http.StatusBadRequest, nil)
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.changedTo != "reset@example.com" || recorder.changeCount != 1 {
+		t.Fatalf("password change confirmation was not queued: %+v", recorder)
+	}
+}
+
+func TestPasswordResetStartDoesNotEnumerateAccounts(t *testing.T) {
+	server, recorder, persistence := newPasswordResetHTTPServerWithStore(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	var response passwordResetStartResponse
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "missing@example.com",
+	}, http.StatusAccepted, &response)
+	if response.ChallengeID == "" || !strings.Contains(response.Message, "If this email") {
+		t.Fatalf("unexpected generic response: %+v", response)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.resetCount != 1 {
+		t.Fatal("unknown account did not perform the same discarded local seal")
+	}
+	queued, err := persistence.LockMailDeliveryBatch(context.Background(), 10)
+	if err != nil || len(queued) != 0 {
+		t.Fatalf("unknown account persisted outbound mail: %+v err=%v", queued, err)
+	}
+}
+
+func TestPasswordResetStartKnownAndUnknownLatencyStayOnSameBoundedPath(t *testing.T) {
+	server, recorder := newPasswordResetHTTPServer(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "timing@example.com", "password": "original-password-123",
+		"display_name": "Timing", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+	recorder.mu.Lock()
+	recorder.sealDelay = 100 * time.Millisecond
+	recorder.mu.Unlock()
+
+	measure := func(email string) time.Duration {
+		started := time.Now()
+		client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+			"email": email,
+		}, http.StatusAccepted, nil)
+		return time.Since(started)
+	}
+	known := measure("timing@example.com")
+	unknown := measure("missing-timing@example.com")
+	difference := known - unknown
+	if difference < 0 {
+		difference = -difference
+	}
+	if known < 450*time.Millisecond || unknown < 450*time.Millisecond || difference > 200*time.Millisecond {
+		t.Fatalf("reset timing known=%s unknown=%s difference=%s", known, unknown, difference)
+	}
+}
+
+type aliasedPasswordResetStore struct {
+	store.Store
+	user domain.User
+}
+
+func (s aliasedPasswordResetStore) UserByEmail(context.Context, string) (domain.User, error) {
+	return s.user, nil
+}
+
+func TestPasswordResetSealsLockedAccountEmailNotLookupInput(t *testing.T) {
+	persistence := memory.New()
+	t.Cleanup(persistence.Close)
+	user, err := persistence.CreateUser(context.Background(), store.CreateUserParams{
+		Email: "canonical@example.com", PasswordHash: "existing-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, recorder := newPasswordResetHTTPServerForStore(t, aliasedPasswordResetStore{
+		Store: persistence, user: user,
+	})
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "prelookup-alias@example.com",
+	}, http.StatusAccepted, nil)
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.resetTo != user.Email {
+		t.Fatalf("queued recipient=%q want locked account email %q", recorder.resetTo, user.Email)
+	}
+}
+
+func TestConcurrentPasswordResetStartsReturnGenericResponsesAndOneUsableChallenge(t *testing.T) {
+	server, recorder, persistence := newPasswordResetHTTPServerWithStore(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "reset-concurrent@example.com", "password": "original-password-123",
+		"display_name": "Concurrent Reset", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+
+	type startResult struct {
+		status   int
+		response passwordResetStartResponse
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan startResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			request, err := http.NewRequestWithContext(
+				context.Background(), http.MethodPost,
+				server.URL+"/v1/auth/password/reset/start",
+				strings.NewReader(`{"email":"reset-concurrent@example.com"}`),
+			)
+			if err != nil {
+				results <- startResult{err: err}
+				return
+			}
+			request.Header.Set("Content-Type", "application/json")
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				results <- startResult{err: err}
+				return
+			}
+			defer response.Body.Close()
+			var decoded passwordResetStartResponse
+			err = json.NewDecoder(response.Body).Decode(&decoded)
+			results <- startResult{status: response.StatusCode, response: decoded, err: err}
+		}()
+	}
+	close(start)
+	responses := make([]passwordResetStartResponse, 0, 2)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.status != http.StatusAccepted || result.response.ChallengeID == "" ||
+			!strings.Contains(result.response.Message, "If this email") {
+			t.Fatalf("concurrent reset returned a non-generic response: %+v", result)
+		}
+		responses = append(responses, result.response)
+	}
+	recorder.mu.Lock()
+	codes := append([]string(nil), recorder.resetCodes...)
+	recorder.mu.Unlock()
+	if len(codes) != 2 {
+		t.Fatalf("concurrent reset mail count=%d, want 2", len(codes))
+	}
+
+	succeeded := 0
+	for _, response := range responses {
+		challengeID, err := uuid.Parse(response.ChallengeID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, code := range codes {
+			_, err := persistence.ConsumePasswordResetChallenge(
+				context.Background(), challengeID,
+				passwordResetCodeHash(strings.Repeat("r", 48), challengeID, code),
+				"replacement-hash", 5,
+			)
+			switch {
+			case err == nil:
+				succeeded++
+			case errors.Is(err, domain.ErrUnauthenticated):
+			default:
+				t.Fatalf("consume concurrent challenge returned %v", err)
+			}
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("usable concurrent reset challenges=%d, want exactly 1", succeeded)
+	}
+}
+
+type resetCreateNotFoundStore struct {
+	store.Store
+}
+
+func (resetCreateNotFoundStore) CreatePasswordResetChallenge(
+	context.Context,
+	domain.PasswordResetChallenge,
+) error {
+	return domain.ErrNotFound
+}
+
+func (resetCreateNotFoundStore) CreatePasswordResetChallengeWithMail(
+	context.Context,
+	domain.PasswordResetChallenge,
+	store.MailDeliveryBuilder,
+) error {
+	return domain.ErrNotFound
+}
+
+func TestPasswordResetDeleteRaceKeepsGenericStartResponse(t *testing.T) {
+	persistence := memory.New()
+	t.Cleanup(persistence.Close)
+	server, recorder := newPasswordResetHTTPServerForStore(
+		t, resetCreateNotFoundStore{Store: persistence},
+	)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "reset-delete-race@example.com", "password": "original-password-123",
+		"display_name": "Delete Race", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+	var response passwordResetStartResponse
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "reset-delete-race@example.com",
+	}, http.StatusAccepted, &response)
+	if response.ChallengeID == "" || !strings.Contains(response.Message, "If this email") {
+		t.Fatalf("delete race did not preserve the generic response: %+v", response)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.resetCount != 0 {
+		t.Fatal("delete-race reset queued mail without a persisted challenge")
+	}
+}
+
+func TestPasswordResetMailFailureCancelsChallenge(t *testing.T) {
+	server, recorder := newPasswordResetHTTPServer(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "mail-failure@example.com", "password": "original-password-123",
+		"display_name": "Mail Failure", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+
+	recorder.mu.Lock()
+	recorder.resetErr = errors.New("mail queue unavailable")
+	recorder.mu.Unlock()
+	var started passwordResetStartResponse
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "mail-failure@example.com",
+	}, http.StatusAccepted, &started)
+	recorder.mu.Lock()
+	code := recorder.resetCode
+	recorder.mu.Unlock()
+	if code == "" {
+		t.Fatal("mail failure test did not attempt to enqueue a reset code")
+	}
+
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/confirm", map[string]any{
+		"challenge_id": started.ChallengeID, "code": code,
+		"new_password": "replacement-password-456",
+	}, http.StatusBadRequest, nil)
+}
+
+func TestPasswordResetRateLimitDoesNotReplaceUsableChallenge(t *testing.T) {
+	server, recorder := newPasswordResetHTTPServer(t)
+	client := testClient{baseURL: server.URL, client: http.DefaultClient}
+	client.do(t, http.MethodPost, "/v1/auth/register", map[string]any{
+		"email": "reset-limit@example.com", "password": "original-password-123",
+		"display_name": "Reset Limit", "device_name": "Test iPhone", "platform": "ios",
+	}, http.StatusCreated, nil)
+
+	var latest passwordResetStartResponse
+	for range 3 {
+		client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+			"email": "reset-limit@example.com",
+		}, http.StatusAccepted, &latest)
+	}
+	recorder.mu.Lock()
+	latestCode := recorder.resetCode
+	resetCount := recorder.resetCount
+	recorder.mu.Unlock()
+	if latest.ChallengeID == "" || latestCode == "" || resetCount != 3 {
+		t.Fatalf("latest reset was not queued: response=%+v mail_count=%d", latest, resetCount)
+	}
+
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/start", map[string]any{
+		"email": "reset-limit@example.com",
+	}, http.StatusTooManyRequests, nil)
+	recorder.mu.Lock()
+	if recorder.resetCount != resetCount {
+		t.Fatalf("rate-limited reset unexpectedly queued mail: count=%d", recorder.resetCount)
+	}
+	recorder.mu.Unlock()
+
+	client.do(t, http.MethodPost, "/v1/auth/password/reset/confirm", map[string]any{
+		"challenge_id": latest.ChallengeID, "code": latestCode,
+		"new_password": "replacement-password-456",
+	}, http.StatusNoContent, nil)
+}
+
+func newPasswordResetHTTPServer(t *testing.T) (*httptest.Server, *resetMailRecorder) {
+	t.Helper()
+	server, recorder, _ := newPasswordResetHTTPServerWithStore(t)
+	return server, recorder
+}
+
+func newPasswordResetHTTPServerWithStore(
+	t *testing.T,
+) (*httptest.Server, *resetMailRecorder, *memory.Store) {
+	t.Helper()
+	persistence := memory.New()
+	t.Cleanup(persistence.Close)
+	server, recorder := newPasswordResetHTTPServerForStore(t, persistence)
+	return server, recorder, persistence
+}
+
+func newPasswordResetHTTPServerForStore(
+	t *testing.T,
+	persistence store.Store,
+) (*httptest.Server, *resetMailRecorder) {
+	t.Helper()
+	bus := events.NewMemoryBus()
+	limiter := ratelimit.NewMemory()
+	presenceService := presence.NewMemory()
+	recorder := &resetMailRecorder{}
+	t.Cleanup(func() {
+		presenceService.Close()
+		limiter.Close()
+		bus.Close()
+	})
+	tokens := auth.NewTokenManager(
+		"test", strings.Repeat("s", 48), 15*time.Minute, 30*24*time.Hour, persistence,
+	)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := httptest.NewServer(New(
+		persistence, tokens, bus, limiter, media.Unavailable{}, verification.Unavailable{},
+		appleauth.Unavailable{}, presenceService, recorder, PasswordResetPolicy{
+			Enabled: true, HMACSecret: strings.Repeat("r", 48), CodeLength: 8,
+			TTL: 10 * time.Minute, MaxAttempts: 5,
+		}, MediaPolicy{}, nil, "", logger,
+	).Router())
+	t.Cleanup(server.Close)
+	return server, recorder
+}

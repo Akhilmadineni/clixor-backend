@@ -1,0 +1,223 @@
+package memory
+
+import (
+	"context"
+	"crypto/subtle"
+	"time"
+
+	"github.com/Akhilmadineni/clixor-backend/internal/domain"
+	"github.com/Akhilmadineni/clixor-backend/internal/store"
+	"github.com/google/uuid"
+)
+
+func (s *Store) CreatePasswordResetChallenge(_ context.Context, challenge domain.PasswordResetChallenge) error {
+	return s.createPasswordResetChallenge(challenge, nil)
+}
+
+func (s *Store) CreatePasswordResetChallengeWithMail(
+	_ context.Context,
+	challenge domain.PasswordResetChallenge,
+	buildMail store.MailDeliveryBuilder,
+) error {
+	if buildMail == nil {
+		return domain.ErrInvalid
+	}
+	return s.createPasswordResetChallenge(challenge, buildMail)
+}
+
+func (s *Store) createPasswordResetChallenge(
+	challenge domain.PasswordResetChallenge,
+	buildMail store.MailDeliveryBuilder,
+) error {
+	// Replacing a challenge cancels its pending mail. Serialize that cancellation
+	// with an active external mail callback before taking the data lock.
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.users[challenge.UserID]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	var delivery *domain.MailDelivery
+	if buildMail != nil {
+		built, err := buildMail(user.Email)
+		if err != nil {
+			return err
+		}
+		if !validMailDelivery(built, domain.MailDeliveryPasswordReset, challenge.ID) {
+			return domain.ErrInvalid
+		}
+		delivery = &built
+	}
+	now := time.Now().UTC()
+	for id, existing := range s.passwordResets {
+		if existing.UserID == challenge.UserID && existing.ConsumedAt == nil {
+			existing.ConsumedAt = &now
+			s.passwordResets[id] = existing
+			for deliveryID, queued := range s.mailDeliveries {
+				if queued.ChallengeID == id && queued.Status == domain.MailDeliveryPending {
+					queued.Status = domain.MailDeliveryCanceled
+					queued.LeaseToken = uuid.Nil
+					queued.LockedUntil = time.Time{}
+					queued.CanceledAt = &now
+					queued.LastErrorClass = "superseded"
+					s.mailDeliveries[deliveryID] = queued
+				}
+			}
+		}
+	}
+	s.passwordResets[challenge.ID] = challenge
+	if delivery != nil {
+		copyDelivery := *delivery
+		copyDelivery.Ciphertext = append([]byte(nil), delivery.Ciphertext...)
+		s.mailDeliveries[delivery.ID] = copyDelivery
+	}
+	return nil
+}
+
+func (s *Store) CancelPasswordResetChallenge(_ context.Context, id uuid.UUID) error {
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.passwordResets, id)
+	for deliveryID, delivery := range s.mailDeliveries {
+		if delivery.ChallengeID == id {
+			delete(s.mailDeliveries, deliveryID)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ConsumePasswordResetChallenge(
+	_ context.Context,
+	id uuid.UUID,
+	codeHash []byte,
+	newPasswordHash string,
+	maxAttempts int,
+) (string, error) {
+	completion, err := s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, nil, nil)
+	return completion.Email, err
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMail(
+	_ context.Context,
+	id uuid.UUID,
+	codeHash []byte,
+	newPasswordHash string,
+	maxAttempts int,
+	buildMail store.MailDeliveryBuilder,
+) (store.PasswordResetCompletion, error) {
+	if buildMail == nil {
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail, nil)
+}
+
+func (s *Store) ConsumePasswordResetChallengeWithMailAndFence(
+	_ context.Context, id uuid.UUID, codeHash []byte, newPasswordHash string,
+	maxAttempts int, buildMail store.MailDeliveryBuilder, fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
+	if buildMail == nil || fence == nil {
+		return store.PasswordResetCompletion{}, domain.ErrInvalid
+	}
+	return s.consumePasswordResetChallenge(id, codeHash, newPasswordHash, maxAttempts, buildMail, fence)
+}
+
+func (s *Store) consumePasswordResetChallenge(
+	id uuid.UUID,
+	codeHash []byte,
+	newPasswordHash string,
+	maxAttempts int,
+	buildMail store.MailDeliveryBuilder,
+	fence store.PasswordResetFence,
+) (store.PasswordResetCompletion, error) {
+	// Mail delivery holds the shared side through provider acceptance. Take the
+	// exclusive side before canceling the one-time reset-code delivery, then the
+	// device barrier before clearing APNs tokens. This matches callback ordering.
+	s.deliveryBarrier.Lock()
+	defer s.deliveryBarrier.Unlock()
+	s.deviceDeliveryBarrier.Lock()
+	defer s.deviceDeliveryBarrier.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, ok := s.passwordResets[id]
+	now := time.Now().UTC()
+	if !ok || challenge.ConsumedAt != nil || !challenge.ExpiresAt.After(now) ||
+		challenge.Attempts >= maxAttempts {
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
+	}
+	if len(challenge.CodeHash) != len(codeHash) ||
+		subtle.ConstantTimeCompare(challenge.CodeHash, codeHash) != 1 {
+		challenge.Attempts++
+		s.passwordResets[id] = challenge
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
+	}
+	user, ok := s.users[challenge.UserID]
+	if !ok || user.PasswordHash == "" {
+		return store.PasswordResetCompletion{}, domain.ErrUnauthenticated
+	}
+	var delivery *domain.MailDelivery
+	if buildMail != nil {
+		built, err := buildMail(user.Email)
+		if err != nil {
+			return store.PasswordResetCompletion{}, err
+		}
+		if !validMailDelivery(built, domain.MailDeliveryPasswordChanged, id) {
+			return store.PasswordResetCompletion{}, domain.ErrInvalid
+		}
+		delivery = &built
+	}
+	if fence != nil {
+		if err := fence(user.ID); err != nil {
+			return store.PasswordResetCompletion{}, err
+		}
+	}
+	for deliveryID, queued := range s.mailDeliveries {
+		if queued.ChallengeID == id && queued.Purpose == domain.MailDeliveryPasswordReset &&
+			queued.Status == domain.MailDeliveryPending {
+			queued.Status = domain.MailDeliveryCanceled
+			queued.LeaseToken = uuid.Nil
+			queued.LockedUntil = time.Time{}
+			queued.CanceledAt = &now
+			queued.LastErrorClass = "challenge_consumed"
+			s.mailDeliveries[deliveryID] = queued
+		}
+	}
+	user.PasswordHash = newPasswordHash
+	user.UpdatedAt = now
+	s.users[user.ID] = user
+	for sessionID, session := range s.sessions {
+		if session.UserID == user.ID && session.RevokedAt == nil {
+			session.RevokedAt = &now
+			s.sessions[sessionID] = session
+		}
+	}
+	for deviceID, device := range s.devices {
+		if device.UserID == user.ID {
+			device.PushToken = ""
+			s.devices[deviceID] = device
+		}
+	}
+	for challengeID, existing := range s.passwordResets {
+		if existing.UserID == user.ID && existing.ConsumedAt == nil {
+			existing.ConsumedAt = &now
+			s.passwordResets[challengeID] = existing
+		}
+	}
+	if delivery != nil {
+		copyDelivery := *delivery
+		copyDelivery.Ciphertext = append([]byte(nil), delivery.Ciphertext...)
+		s.mailDeliveries[delivery.ID] = copyDelivery
+	}
+	return store.PasswordResetCompletion{UserID: user.ID, Email: user.Email}, nil
+}
+
+func validMailDelivery(delivery domain.MailDelivery, purpose string, challengeID uuid.UUID) bool {
+	return delivery.ID != uuid.Nil && delivery.ChallengeID == challengeID &&
+		delivery.Purpose == purpose && len(delivery.Ciphertext) >= 29
+}

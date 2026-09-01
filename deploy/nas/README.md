@@ -1,7 +1,12 @@
 # Clustr NAS deployment
 
-This is the production API deployment contract for the NAS. It intentionally does
-not contain credentials and will not start with placeholder values.
+> **Retired production target:** OCI is the active deployment target. The NAS
+> package remains only as recovery reference. Its GitHub Actions deployment and
+> Cloudflare-hostname mutation workflows have been removed; do not register or
+> enable a NAS runner for this repository.
+
+This historical deployment contract intentionally does not contain credentials
+and will not start with placeholder values.
 
 ## NAS layout
 
@@ -83,28 +88,16 @@ sudo env CLUSTER_IMAGE_TAG="${release_tag}" docker compose \
 curl --fail http://127.0.0.1:18180/health/ready
 ```
 
-## Automatic deployment
+## Deployment status
 
-`.github/workflows/deploy-nas.yml` runs only after `CI` succeeds
-for `main`. It targets a repository-scoped
-NAS runner labelled `self-hosted`, `nas`, and `clixor`. GitHub supplies only a
-short-lived checkout token; all application credentials remain in
-`/volume1/docker/clustr/secrets` and are never copied into Actions secrets.
+Automatic NAS deployment is retired. Main-branch CI has no self-hosted NAS job,
+and the former workflow that changed the NAS Cloudflare Tunnel hostname is also
+removed. If the old host recovers, keep `github-runner-clixor.service` stopped and
+remove its GitHub runner registration so it cannot receive future repository jobs.
 
-The host script builds immutable revision-labelled API and bootstrap images before
-rollout, serializes deployments with GitHub concurrency and a NAS file lock,
-refreshes root-owned runtime files in a capability-limited local container, and
-captures a mode-0600 PostgreSQL custom-format snapshot before migration. Local
-readiness gates success; a failed rollout restores the previous API image and
-Compose model. Database migrations are intentionally forward-only and must remain
-compatible with the previous API release; restoring a database dump is a separate,
-operator-approved disaster-recovery action, never an automatic rollback.
-
-The final workflow step verifies the public Cloudflare route independently. The
-repository-scoped runner is installed as `atlanteans-nas-clixor` in
-`/volume1/docker/github-runner-clixor` and runs under the enabled
-`github-runner-clixor.service` systemd unit. Keep it registered only to this
-repository and do not reuse the TradingBot or VerifyCore runner credentials.
+The commands above are break-glass reference only. Any deliberate rollback to
+this topology requires a separate migration and DNS cutover plan; never operate it
+against the OCI production database or tunnel hostnames at the same time.
 
 For Portainer, create a stack named `clustr` from `compose.yaml`, define
 `CLUSTER_IMAGE_TAG` as the already-built release tag, and keep the external network

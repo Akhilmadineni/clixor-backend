@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Clixor offsite PostgreSQL backup every six hours
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+AccuracySec=1min
+Unit=clixor-offsite-backup.service
+
+[Install]
+WantedBy=timers.target

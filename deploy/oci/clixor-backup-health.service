@@ -1,0 +1,34 @@
+[Unit]
+Description=Check Clixor local, offsite, and restore-drill backup freshness
+After=clixor-offsite-backup.service clixor-runtime-reconcile.service
+ConditionPathExists=/run/clixor/runtime-ready
+ConditionPathExists=/etc/clixor/offsite-backup.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/clixor/offsite-backup.env
+ExecStart=/usr/local/libexec/clixor/backup-health.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=

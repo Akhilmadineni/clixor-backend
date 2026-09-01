@@ -13,18 +13,30 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := config.Load()
+	if configPath := os.Getenv("CLUSTER_CONFIG_FILE"); configPath != "" {
+		if configPath != "/run/secrets/migrate.env" {
+			logger.Error("invalid_configuration", "error", "unsupported runtime configuration path")
+			os.Exit(1)
+		}
+		if err := config.LoadMigrationEnvironmentFile(configPath); err != nil {
+			logger.Error("invalid_configuration", "error", err)
+			os.Exit(1)
+		}
+	}
+	cfg, err := config.LoadMigration()
 	if err != nil {
 		logger.Error("invalid_configuration", "error", err)
 		os.Exit(1)
 	}
-	if cfg.Store != "postgres" {
-		logger.Error("migration_requires_postgres")
-		os.Exit(1)
-	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	persistence, err := postgres.Open(ctx, cfg.DatabaseURL, true)
+	persistence, err := postgres.OpenWithPool(
+		ctx,
+		cfg.DatabaseURL,
+		true,
+		cfg.DatabaseMaxConns,
+		cfg.DatabaseMinConns,
+	)
 	if err != nil {
 		logger.Error("migration_failed", "error", err)
 		os.Exit(1)

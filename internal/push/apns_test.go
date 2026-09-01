@@ -9,18 +9,32 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestAPNSRetriesProviderFailureAndSetsRequiredHeaders(t *testing.T) {
 	var calls atomic.Int32
+	testStarted := time.Now().UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		call := calls.Add(1)
 		if request.Header.Get("apns-topic") != "com.example.Clixor" ||
 			request.Header.Get("apns-push-type") != "alert" ||
 			request.Header.Get("apns-collapse-id") != "c5657319-cb6c-4f95-ab8d-10d6d365450b" {
 			t.Errorf("unexpected APNs headers: %#v", request.Header)
+		}
+		expiresAtUnix, parseErr := strconv.ParseInt(request.Header.Get("apns-expiration"), 10, 64)
+		if parseErr != nil {
+			t.Errorf("invalid apns-expiration: %q", request.Header.Get("apns-expiration"))
+		} else {
+			expiresAt := time.Unix(expiresAtUnix, 0).UTC()
+			minimum := testStarted.Add(notificationRetention - time.Minute)
+			maximum := time.Now().UTC().Add(notificationRetention + time.Minute)
+			if expiresAt.Before(minimum) || expiresAt.After(maximum) {
+				t.Errorf("apns-expiration = %s, expected a bounded 24-hour retention window", expiresAt)
+			}
 		}
 		body, _ := io.ReadAll(request.Body)
 		var payload map[string]any
