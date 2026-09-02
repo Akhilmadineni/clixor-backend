@@ -969,7 +969,8 @@ func (s *Store) ClaimPreKeys(_ context.Context, targetUserID uuid.UUID) ([]domai
 	}
 	var result []domain.PreKeyBundle
 	for _, device := range s.devices {
-		if device.UserID != targetUserID || device.IdentityKey == "" {
+		if device.UserID != targetUserID || device.IdentityKey == "" ||
+			len(device.SignedPreKey) == 0 || string(device.SignedPreKey) == "null" {
 			continue
 		}
 		bundle := domain.PreKeyBundle{

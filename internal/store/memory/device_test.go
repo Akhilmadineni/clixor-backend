@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -10,6 +11,37 @@ import (
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
 )
+
+func TestPreKeyClaimSkipsIncompleteDeviceIdentity(t *testing.T) {
+	ctx := context.Background()
+	persistence := New()
+	user, err := persistence.CreateUser(ctx, store.CreateUserParams{Email: "incomplete-key@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: uuid.New(), UserID: user.ID, Name: "Incomplete", Platform: "ios",
+		IdentityKey: "identity-without-a-signed-prekey",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	completeID := uuid.New()
+	if _, err := persistence.UpsertDevice(ctx, domain.Device{
+		ID: completeID, UserID: user.ID, Name: "Complete", Platform: "ios",
+		IdentityKey:  "complete-identity",
+		SignedPreKey: json.RawMessage(`{"key_id":1,"public_key":"public","signature":"signature"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	bundles, err := persistence.ClaimPreKeys(ctx, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bundles) != 1 || bundles[0].DeviceID != completeID {
+		t.Fatalf("claim returned incomplete devices: %+v", bundles)
+	}
+}
 
 func TestPushTokenOwnershipMovesAtomicallyAcrossAccounts(t *testing.T) {
 	ctx := context.Background()

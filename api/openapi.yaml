@@ -328,8 +328,11 @@ paths:
                 name: {type: string}
                 platform: {type: string}
                 push_token: {type: string}
-                identity_key: {type: string, description: Base64 public identity key}
-                signed_prekey: {$ref: "#/components/schemas/SignedPreKey"}
+                identity_key: {type: string, description: Base64 public identity key; must be supplied together with signed_prekey}
+                signed_prekey:
+                  allOf:
+                    - {$ref: "#/components/schemas/SignedPreKey"}
+                  description: Must be supplied together with identity_key; omitting both preserves existing encryption material.
       responses:
         "200":
           description: Device registered

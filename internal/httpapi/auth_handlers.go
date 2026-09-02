@@ -351,8 +351,11 @@ func (s *Server) upsertDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.PushToken = strings.ToLower(strings.TrimSpace(request.PushToken))
+	hasIdentityKey := request.IdentityKey != ""
+	hasSignedPreKey := len(request.SignedPreKey) > 0
 	if strings.TrimSpace(request.Name) == "" || request.Platform != "ios" ||
 		len(request.Name) > 100 || !validPushToken(request.PushToken) ||
+		hasIdentityKey != hasSignedPreKey ||
 		(request.IdentityKey != "" && !validEncodedKey(request.IdentityKey)) ||
 		(len(request.SignedPreKey) > 0 && !validSignedPreKey(request.SignedPreKey)) {
 		writeDomainError(w, domain.ErrInvalid)

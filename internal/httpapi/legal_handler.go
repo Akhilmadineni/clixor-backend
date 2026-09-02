@@ -10,6 +10,10 @@ var legalDocument []byte
 
 func (s *Server) legal(w http.ResponseWriter, r *http.Request) {
 	if r.Host == "clustr-api.atlanteanz.com" {
+		// This permanent redirect is a public, non-user-specific document route.
+		// Give it the same explicit cache contract as the destination so the edge
+		// does not re-resolve an immutable hostname migration on every request.
+		w.Header().Set("Cache-Control", "public, max-age=300")
 		http.Redirect(w, r, "https://clixor.atlanteanz.com"+r.URL.RequestURI(), http.StatusPermanentRedirect)
 		return
 	}
