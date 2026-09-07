@@ -128,10 +128,6 @@ type MediaDeletePayload struct {
 	NotBefore  *time.Time `json:"not_before,omitempty"`
 }
 
-func NewMediaDeletePayload(objectKeys []string, queuedAt time.Time) MediaDeletePayload {
-	return NewMediaDeletePayloadAt(objectKeys, queuedAt.UTC().Add(MediaDeleteGrace))
-}
-
 func NewMediaDeletePayloadAt(objectKeys []string, notBefore time.Time) MediaDeletePayload {
 	notBefore = notBefore.UTC()
 	return MediaDeletePayload{ObjectKeys: objectKeys, NotBefore: &notBefore}

@@ -153,34 +153,3 @@ func validAgeDeclaration(value string) bool {
 		return false
 	}
 }
-
-func (s *Server) requireAdultAgeAssurance(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id, ok := identityFrom(r.Context())
-		if !ok {
-			writeDomainError(w, domain.ErrUnauthenticated)
-			return
-		}
-		assurance, err := s.store.AgeAssurance(r.Context(), id.UserID)
-		if errors.Is(err, domain.ErrNotFound) || (err == nil && !currentAdultAssurance(assurance, time.Now().UTC())) {
-			if err == nil && assurance.Status == "underage" && assurance.PolicyVersion == adultAgePolicyVersion {
-				writeError(w, http.StatusForbidden, "adults_only", "Clixor is available only to people age 18 or older.")
-				return
-			}
-			writeError(w, http.StatusForbidden, "age_assurance_required", "Confirm that you are age 18 or older to continue.")
-			return
-		}
-		if err != nil {
-			s.logger.Error("age_assurance_check_failed", "error", err, "user_id", id.UserID)
-			writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "Please try again shortly.")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func currentAdultAssurance(assurance domain.AgeAssurance, now time.Time) bool {
-	return assurance.Status == "adult" && assurance.MinimumAge == minimumAccountAge &&
-		assurance.PolicyVersion == adultAgePolicyVersion && assurance.ExpiresAt != nil &&
-		assurance.ExpiresAt.After(now)
-}

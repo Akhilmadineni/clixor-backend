@@ -45,24 +45,6 @@ func NewTokenManager(issuer, secret string, accessTTL, refreshTTL time.Duration,
 	}
 }
 
-func (m *TokenManager) Issue(ctx context.Context, userID, deviceID uuid.UUID) (TokenPair, error) {
-	sessionID := uuid.New()
-	refreshSecret, err := randomToken(48)
-	if err != nil {
-		return TokenPair{}, err
-	}
-	now := m.now()
-	session := domain.Session{
-		ID: sessionID, UserID: userID, DeviceID: deviceID,
-		RefreshTokenHash: refreshHash(refreshSecret), CreatedAt: now,
-		ExpiresAt: now.Add(m.refreshTTL),
-	}
-	if err := m.store.CreateSession(ctx, session); err != nil {
-		return TokenPair{}, err
-	}
-	return m.pair(userID, deviceID, sessionID, refreshSecret, now)
-}
-
 // IssueWithDevice persists the authenticated device and its first refresh
 // session atomically under the store's live-user lock. expectedPasswordHash is
 // non-nil only for password login and closes the verify/reset stale-hash race.

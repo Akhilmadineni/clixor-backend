@@ -3625,20 +3625,6 @@ func lockConversation(ctx context.Context, tx pgx.Tx, conversationID uuid.UUID) 
 	return mapError(err)
 }
 
-func (s *Store) requireAdmin(ctx context.Context, conversationID, userID uuid.UUID) error {
-	var role string
-	err := s.pool.QueryRow(ctx, `
-		SELECT role FROM conversation_members WHERE conversation_id=$1 AND user_id=$2`,
-		conversationID, userID).Scan(&role)
-	if err != nil {
-		return mapError(err)
-	}
-	if role != "owner" && role != "admin" {
-		return domain.ErrForbidden
-	}
-	return nil
-}
-
 func conversationMemberIDs(ctx context.Context, query interface {
 	Query(context.Context, string, ...any) (pgx.Rows, error)
 }, conversationID uuid.UUID) ([]uuid.UUID, error) {

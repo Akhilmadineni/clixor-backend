@@ -1,6 +1,6 @@
 GO ?= go
 
-.PHONY: run test test-race test-integration fmt vet tidy migrate-up migrate-down
+.PHONY: run test test-race test-integration fmt vet deadcode tidy migrate-up migrate-down
 
 run:
 	CLUSTER_STORE=memory $(GO) run ./cmd/api
@@ -20,6 +20,13 @@ fmt:
 
 vet:
 	$(GO) vet ./...
+
+# Include test roots: development adapters and test fixtures are intentional.
+# deadcode reports findings on stdout but does not fail solely for findings.
+deadcode:
+	@findings="$$( $(GO) run golang.org/x/tools/cmd/deadcode@v0.44.0 -test ./... )" || exit $$?; \
+	if test -n "$$findings"; then printf '%s\n' "$$findings"; exit 1; fi
+	$(GO) run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=U1000 ./...
 
 tidy:
 	$(GO) mod tidy

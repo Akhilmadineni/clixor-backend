@@ -56,15 +56,15 @@ Active deployment target: OCI Phoenix (`deploy/oci`); NAS automation is retired.
 - This repository owns all backend application code, database migrations,
   OpenAPI definitions, backend tests, production Compose/Kubernetes manifests,
   OCI deployment automation, operational runbooks, and backend CI/CD. The
-  checked-in `deploy/nas` package is retired historical material and is not an
-  active deployment target.
+  retired `deploy/nas` package was removed in the September 2026 cleanup. Its
+  recovery reference remains in Git at `ffb38fc8165521f0b8ef147eac7db5e96b3f47c1`.
 - The combined `Uthejmopathi/Clustr` repository owns the Swift/iOS client only.
   Its historical backend directory and backend-specific GitHub Actions were
   removed from `main` in commit `610ff55` after this repository's reconciled
   production rollout succeeded.
 - Existing `CLUSTER_*` configuration keys, `clustr-*` runtime names, database
   names, and public hostnames are compatibility identifiers, not an indication
-  that their source belongs in the iOS repository. References to NAS paths in
-  the retired deployment package are historical and must not be used for OCI.
+  that their source belongs in the iOS repository. Historical NAS deployment
+  instructions must not be used for OCI.
 
 No live credential is stored in this repository.

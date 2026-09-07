@@ -2,13 +2,20 @@
 
 Go backend for Clustr messaging and shared-group data. The OCI production topology
 uses PostgreSQL, Redis, NATS, native private OCI Object Storage, a Redis-backed OTP
-service with Telnyx SMS transport, OCI Email Delivery, and APNs.
+service with Telnyx SMS transport, authenticated SMTP email delivery, and APNs
+support. Provider code being present does not mean its production credentials or
+end-to-end delivery have been enabled or verified.
 
 This is the sole source repository for the backend. The
 `Uthejmopathi/Clustr` repository contains the Swift/iOS client; retained `clustr`
 runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
 the retired NAS deployment package. OCI is the active production target; see
 `deploy/oci/README.md`.
+
+The next-environment proposal, migration gates, cost approval, and rollback plan
+are in [PRODUCTION_MIGRATION_PLAN.md](PRODUCTION_MIGRATION_PLAN.md). It is a plan,
+not a claim that multi-host HA is deployed. Cleanup scope and retained
+compatibility code are recorded in [DEAD_CODE_AUDIT.md](DEAD_CODE_AUDIT.md).
 
 ## Contributors
 
@@ -46,6 +53,7 @@ listens on `http://127.0.0.1:8080`; its MinIO administration console is at
 ```bash
 make test-race
 make vet
+make deadcode
 ```
 
 The API exposes `/health/live`, `/health/ready`, and `/metrics`. See
@@ -61,5 +69,5 @@ prerequisites, secret contract, and rollout gates.
 
 Production API processes require `CLUSTER_AUTO_MIGRATE=false`. Run the immutable
 release image's `/clustr-migrate` command as a one-shot deployment job before
-rolling out `/clustr-api`; the Kubernetes examples keep these lifecycle steps
-separate.
+rolling out `/clustr-api`. `deploy/k8s` is a reference scaffold, not a supported
+production deployment; see its [limitations](deploy/k8s/README.md).

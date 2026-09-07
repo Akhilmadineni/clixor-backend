@@ -53,10 +53,13 @@ jobs:
         run: |
           test ! -e .github/workflows/deploy-nas.yml
           test ! -e .github/workflows/configure-legal-hostname.yml
+          test ! -d deploy/nas
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
+      - name: Check unreachable Go code
+        run: make deadcode
       - name: Start pinned JetStream test service
         run: |
           docker run --detach --rm --name clixor-ci-nats \

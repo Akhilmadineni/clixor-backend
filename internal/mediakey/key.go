@@ -46,10 +46,6 @@ func DeletionKeys(objectKey string) ([]string, error) {
 	return []string{objectKey, published}, nil
 }
 
-func IsPublished(objectKey string) bool {
-	return strings.HasPrefix(objectKey, PublishedPrefix)
-}
-
 func Validate(objectKey string) error {
 	if objectKey == "" || len(objectKey) > maxObjectKeyBytes ||
 		!utf8.ValidString(objectKey) || strings.HasPrefix(objectKey, "/") || strings.TrimSpace(objectKey) != objectKey {
