@@ -26,7 +26,7 @@ vet:
 deadcode:
 	@findings="$$( $(GO) run golang.org/x/tools/cmd/deadcode@v0.44.0 -test ./... )" || exit $$?; \
 	if test -n "$$findings"; then printf '%s\n' "$$findings"; exit 1; fi
-	$(GO) run honnef.co/go/tools/cmd/staticcheck@v0.7.0 -checks=U1000 ./...
+	$(GO) run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=U1000 ./...
 
 tidy:
 	$(GO) mod tidy
