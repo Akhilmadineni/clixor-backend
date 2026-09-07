@@ -13,6 +13,10 @@ if git -C "${checkout}" cat-file -e d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c^{co
   exit 1
 fi
 git -C "${checkout}" fetch --quiet --unshallow origin
+# The pinned object is on a historical remote branch, not necessarily an
+# ancestor of main or the detached PR merge. Unshallowing alone cannot retain it.
+git -C "${checkout}" fetch --quiet origin \
+  d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c:refs/clixor-tests/legacy
 test "$(git -C "${checkout}" rev-parse d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c^{commit})" = \
   d2f5a69c9f14d504ad64176dcc62c5ffa7bb032c
 CLIXOR_TEST_REPOSITORY="${checkout}" \

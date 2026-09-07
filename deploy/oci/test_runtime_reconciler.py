@@ -887,6 +887,15 @@ class LegacyBaselineTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        # CI checks out a detached PR merge. The pinned legacy object can be
+        # reachable only through refs/remotes, which clone --bare does not copy.
+        # Transfer that exact, already-validated object rather than relying on
+        # branch names or synthesizing a replacement history.
+        subprocess.run(
+            ["/usr/bin/git", f"--git-dir={bare}", "fetch", "--quiet",
+             str(repository), f"{source_sha}:refs/clixor-tests/legacy"],
+            check=True,
+        )
         subprocess.run(
             ["/usr/bin/git", f"--git-dir={bare}", "cat-file", "-e", f"{source_sha}^{{commit}}"],
             check=True,

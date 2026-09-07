@@ -85,6 +85,9 @@ func TestLegacyLegalHostnameRedirectsToClixor(t *testing.T) {
 	if location := response.Header.Get("Location"); location != "https://clixor.atlanteanz.com/privacy?source=legacy" {
 		t.Fatalf("location = %q", location)
 	}
+	if cache := response.Header.Get("Cache-Control"); cache != "public, max-age=300" {
+		t.Fatalf("cache control = %q", cache)
+	}
 }
 
 type failingOptionalMailQueue struct{}
@@ -804,6 +807,25 @@ func TestMultiDevicePreKeyClaimAndDeviceIsolation(t *testing.T) {
 			t.Fatalf("one-time prekey for device %s was reused", bundle.DeviceID)
 		}
 	}
+}
+
+func TestDeviceEncryptionIdentityMustBePublishedAtomically(t *testing.T) {
+	t.Parallel()
+	server := newTestHTTPServer(t)
+	user := registerTestUser(t, server.URL, "atomic-device-identity@example.com")
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x21}, 32))
+	signature := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 64))
+	path := "/v1/devices/" + user.device.ID.String()
+
+	user.client.do(t, http.MethodPut, path, map[string]any{
+		"name": "iPhone", "platform": "ios", "identity_key": key,
+	}, http.StatusUnprocessableEntity, nil)
+	user.client.do(t, http.MethodPut, path, map[string]any{
+		"name": "iPhone", "platform": "ios",
+		"signed_prekey": map[string]any{
+			"key_id": 2, "public_key": key, "signature": signature,
+		},
+	}, http.StatusUnprocessableEntity, nil)
 }
 
 type registeredUser struct {

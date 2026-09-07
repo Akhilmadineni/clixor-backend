@@ -451,7 +451,10 @@ func (s *Store) ClaimPreKeys(ctx context.Context, targetUserID uuid.UUID) ([]dom
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT id,user_id,name,platform,push_token,identity_key,COALESCE(signed_prekey,'null'::jsonb),last_seen_at,created_at
-		FROM devices WHERE user_id=$1 AND identity_key<>'' ORDER BY created_at`, targetUserID)
+		FROM devices
+		WHERE user_id=$1 AND identity_key<>''
+			AND signed_prekey IS NOT NULL AND signed_prekey<>'null'::jsonb
+		ORDER BY created_at`, targetUserID)
 	if err != nil {
 		return nil, err
 	}
