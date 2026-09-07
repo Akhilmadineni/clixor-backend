@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
@@ -60,6 +61,45 @@ func TestValidateEntityParticipantsRequiresCurrentActiveRoster(t *testing.T) {
 		if err := ValidateEntityParticipants("expense", malformed, metadata, members); !errors.Is(err, domain.ErrInvalid) {
 			t.Fatalf("malformed participant shape accepted: %s: %v", malformed, err)
 		}
+	}
+}
+
+func TestValidateEntityParticipantsSwiftCustomAmounts(t *testing.T) {
+	active := uuid.MustParse("12345678-1234-4234-9234-123456789abc")
+	local, other, removed := uuid.New(), uuid.New(), uuid.New()
+	members := []domain.ConversationMember{{UserID: active}, {UserID: other}}
+	metadata := json.RawMessage(`{"members":[{"id":"` + local.String() + `","backendUserId":"` + active.String() + `"}]}`)
+	for name, test := range map[string]struct {
+		value string
+		valid bool
+	}{
+		"swift UUID dictionary":        {`["` + strings.ToUpper(active.String()) + `",30,"` + other.String() + `",18]`, true},
+		"legacy local UUID":            {`["` + local.String() + `",0]`, true},
+		"object remains supported":     {`{"` + active.String() + `":30}`, true},
+		"removed member":               {`["` + removed.String() + `",1]`, false},
+		"odd entries":                  {`["` + active.String() + `",1,"` + other.String() + `"]`, false},
+		"duplicate canonical identity": {`["` + active.String() + `",1,"` + strings.ToUpper(active.String()) + `",2]`, false},
+		"duplicate object identity":    {`{"` + active.String() + `":1,"` + strings.ToUpper(active.String()) + `":2}`, false},
+		"negative amount":              {`["` + active.String() + `",-1]`, false},
+		"string amount":                {`["` + active.String() + `","1"]`, false},
+		"null amount":                  {`["` + active.String() + `",null]`, false},
+		"object amount":                {`["` + active.String() + `",{}]`, false},
+		"non-string key":               {`[1,1]`, false},
+		"invalid UUID":                 {`["not-a-uuid",1]`, false},
+		"empty array":                  {`[]`, false},
+		"empty object":                 {`{}`, false},
+		"null":                         {`null`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload := json.RawMessage(`{"custom_amounts":` + test.value + `}`)
+			err := ValidateEntityParticipants("expense", payload, metadata, members)
+			if test.valid && err != nil {
+				t.Fatalf("valid Swift split rejected: %v", err)
+			}
+			if !test.valid && !errors.Is(err, domain.ErrInvalid) {
+				t.Fatalf("invalid split accepted: %v", err)
+			}
+		})
 	}
 }
 

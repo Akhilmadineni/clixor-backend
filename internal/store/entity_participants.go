@@ -106,18 +106,48 @@ func participantIDsForField(field string, raw json.RawMessage) ([]uuid.UUID, err
 		return nil, domain.ErrInvalid
 	}
 	if field == "customamounts" {
-		amounts, ok := value.(map[string]any)
-		if !ok || len(amounts) == 0 {
-			return nil, domain.ErrInvalid
-		}
-		result := make([]uuid.UUID, 0, len(amounts))
-		for key, amount := range amounts {
+		var result []uuid.UUID
+		seen := make(map[uuid.UUID]struct{})
+		appendAmount := func(key string, amount any) error {
 			id, err := strictParticipantUUID(key)
 			number, numeric := amount.(float64)
 			if err != nil || !numeric || number < 0 {
+				return domain.ErrInvalid
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return domain.ErrInvalid
+			}
+			seen[id] = struct{}{}
+			result = append(result, id)
+			return nil
+		}
+		switch amounts := value.(type) {
+		case map[string]any:
+			for key, amount := range amounts {
+				if err := appendAmount(key, amount); err != nil {
+					return nil, err
+				}
+			}
+		case []any:
+			// Swift Codable emits [UUID: Double] as alternating key/value
+			// entries. Preserve that established wire format and stored data.
+			if len(amounts)%2 != 0 {
 				return nil, domain.ErrInvalid
 			}
-			result = append(result, id)
+			for i := 0; i < len(amounts); i += 2 {
+				key, ok := amounts[i].(string)
+				if !ok {
+					return nil, domain.ErrInvalid
+				}
+				if err := appendAmount(key, amounts[i+1]); err != nil {
+					return nil, err
+				}
+			}
+		default:
+			return nil, domain.ErrInvalid
+		}
+		if len(result) == 0 {
+			return nil, domain.ErrInvalid
 		}
 		return result, nil
 	}
