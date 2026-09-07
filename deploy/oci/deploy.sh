@@ -37,6 +37,7 @@ public_smoke_legal_url=${CLIXOR_PUBLIC_SMOKE_LEGAL_URL:-https://clixor.atlantean
 vault_hydration_mode=${CLIXOR_REQUIRE_VAULT_HYDRATION:-false}
 initial_vault_cutover=${CLIXOR_INITIAL_VAULT_CUTOVER:-false}
 canary_connector_enabled=${CLIXOR_ENABLE_CANARY_CONNECTOR:-false}
+live_connector_enabled=false
 canary_cloudflare_account_id=${CLIXOR_CANARY_CLOUDFLARE_ACCOUNT_ID:-}
 canary_cloudflare_tunnel_id=${CLIXOR_CANARY_CLOUDFLARE_TUNNEL_ID:-}
 canary_cloudflare_secret_ocid=${CLIXOR_CANARY_CLOUDFLARE_SECRET_OCID:-}
@@ -754,7 +755,7 @@ activate_cloudflared() {
   /usr/bin/python3 \
     "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify \
     --release "${release_dir}"
-  if [ "${canary_connector_enabled}" = "true" ]; then
+  if [ "${canary_connector_enabled}" = "true" ] || [ "${live_connector_enabled}" = "true" ]; then
     /usr/bin/python3 \
       "${host_tool_stage}/bin/cloudflare-canary-credential.py" verify-remote \
       --release "${release_dir}"
@@ -1344,6 +1345,22 @@ case "${topology_ownership_state}" in
   uninitialized|pre-cutover-old|oci-live) ;;
   *) fail "Cloudflare topology ownership state is unknown" ;;
 esac
+if [ -e /var/lib/clixor/live-connector-adoption.json ] || \
+   [ -L /var/lib/clixor/live-connector-adoption.json ]; then
+  [ "${canary_connector_enabled}" = "false" ] && \
+    [ "${vault_hydration_mode}" = "false" ] && \
+    [ "${initial_vault_cutover}" = "false" ] || \
+    fail "adopted pilot ingress cannot implicitly switch connector or secret modes"
+  [ "${public_smoke_mode}" = "true" ] || \
+    fail "adopted live ingress requires the full public smoke gate"
+  /usr/bin/python3 "${source_root}/deploy/oci/cloudflare-canary-credential.py" \
+    verify-live-authority || fail "existing live connector adoption is invalid"
+  live_connector_enabled=true
+  topology_ownership_state=oci-live
+elif [ -e /var/lib/clixor/origin-gate-public/public-open ] && \
+     [ "${topology_ownership_state}" != "oci-live" ]; then
+  fail "live production gate has no verified ownership; run explicit live adoption"
+fi
 if [ "${canary_connector_enabled}" = "true" ]; then
   case "${topology_ownership_state}" in
     uninitialized|pre-cutover-old) ;;
@@ -1366,6 +1383,10 @@ if docker inspect clixor-oci-postgres >/dev/null 2>&1; then
 fi
 preflight_disk_capacity
 read_effective_secret_mode
+if [ "${live_connector_enabled}" = "true" ]; then
+  [ "${effective_secret_mode}" = "staging" ] || \
+    fail "adopted pilot connector requires the unchanged staging cohort"
+fi
 if [ "${effective_secret_mode}" = "vault" ]; then
   [ "${selected_mode_file}" != "${fallback_secret_mode_file}" ] || \
     fail "legacy unpinned Vault mode requires an explicit staging-to-Vault cutover"
@@ -1477,6 +1498,10 @@ if [ "${canary_connector_enabled}" = "true" ]; then
     --secret-ocid "${canary_cloudflare_secret_ocid}" \
     --secret-version "${canary_cloudflare_secret_version}" \
     --remote-config-version "${canary_cloudflare_config_version}"
+fi
+if [ "${live_connector_enabled}" = "true" ]; then
+  /usr/bin/python3 "${source_root}/deploy/oci/cloudflare-canary-credential.py" \
+    stage-live-metadata --release "${release_dir}"
 fi
 stage_release_boot_tooling
 sh "${source_root}/deploy/oci/install-cloudflared-package.sh" \
@@ -2355,6 +2380,7 @@ if grep -qx 'CLUSTER_ENV=production' "${api_env}"; then
   candidate_cloudflared=true
 fi
 [ "${canary_connector_enabled}" = "false" ] || candidate_cloudflared=true
+[ "${live_connector_enabled}" = "false" ] || candidate_cloudflared=true
 runtime_state_input="${release_dir}/runtime-state.partial"
 {
   printf 'cloudflared_enabled=%s\n' "${candidate_cloudflared}"
@@ -2394,6 +2420,11 @@ else
 fi
 if [ "${public_smoke_required}" = "true" ]; then
   verify_public_ingress "${source_sha}"
+  if [ "${live_connector_enabled}" = "true" ]; then
+    verify_production_candidate "${source_sha}"
+    /usr/bin/python3 "${source_root}/deploy/oci/cloudflare-canary-credential.py" \
+      verify-live-authority || fail "live connector authority drifted during deployment"
+  fi
   if [ "${ingress_stage}" = "canary" ]; then
     case "${topology_ownership_state}" in
       uninitialized|pre-cutover-old)
