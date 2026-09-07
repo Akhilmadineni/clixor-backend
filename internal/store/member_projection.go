@@ -349,42 +349,6 @@ type ConversationMemberTombstone struct {
 	LocalID uuid.UUID
 }
 
-// NewConversationMemberTombstone preserves a valid, unambiguous legacy local
-// UUID for an authoritative member. Malformed or duplicate identities fall
-// back to the backend user UUID and can never smuggle raw metadata into history.
-func NewConversationMemberTombstone(metadata json.RawMessage, userID uuid.UUID) ConversationMemberTombstone {
-	result := ConversationMemberTombstone{UserID: userID, LocalID: userID}
-	var root map[string]json.RawMessage
-	if json.Unmarshal(metadata, &root) != nil {
-		return result
-	}
-	var members []json.RawMessage
-	if json.Unmarshal(root["members"], &members) != nil {
-		return result
-	}
-	matched := false
-	for _, raw := range members {
-		var object map[string]json.RawMessage
-		if json.Unmarshal(raw, &object) != nil {
-			continue
-		}
-		backendID, present, valid := memberBackendUserID(object)
-		if !present || !valid || backendID != userID {
-			continue
-		}
-		if matched {
-			return ConversationMemberTombstone{UserID: userID, LocalID: userID}
-		}
-		matched = true
-		if local, present, valid := uniqueStringField(object, "id"); present && valid {
-			if parsed, err := uuid.Parse(local); err == nil && parsed != uuid.Nil {
-				result.LocalID = parsed
-			}
-		}
-	}
-	return result
-}
-
 type publicProfile struct {
 	DisplayName     string `json:"display_name"`
 	AvatarColor     string `json:"avatar_color"`
@@ -443,21 +407,6 @@ func memberBackendUserID(object map[string]json.RawMessage) (uuid.UUID, bool, bo
 		result = id
 	}
 	return result, found, found
-}
-
-func memberIsDeletedTombstone(object map[string]json.RawMessage) bool {
-	found := false
-	deleted := false
-	for key, raw := range object {
-		if normalizeJSONKey(key) != "isdeleted" {
-			continue
-		}
-		if found || json.Unmarshal(raw, &deleted) != nil {
-			return false
-		}
-		found = true
-	}
-	return found && deleted
 }
 
 func marshalProjectedMember(member domain.ConversationMember, localID uuid.UUID) json.RawMessage {
