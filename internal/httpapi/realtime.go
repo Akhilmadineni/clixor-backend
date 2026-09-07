@@ -188,7 +188,29 @@ func (s *Server) realtime(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			_ = connection.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			wrote, err := guard.WhileActive(func() error { return connection.WriteJSON(event) })
+			// Acquire the durable delivery barrier before the session guard, matching
+			// account deletion's lock order. Never wait for PostgreSQL while holding
+			// the guard that deletion must fence.
+			wrote := true // A filtered event is not a revoked socket.
+			writeEvent := func() error {
+				var writeErr error
+				wrote, writeErr = guard.WhileActive(func() error { return connection.WriteJSON(event) })
+				return writeErr
+			}
+			var err error
+			if event.Type == "message.created" || event.Type == "typing.changed" {
+				actor := communicationActor(event)
+				if actor == uuid.Nil {
+					continue
+				}
+				repo, repoErr := s.complianceRepository()
+				if repoErr != nil {
+					return
+				}
+				_, err = repo.DeliverIfAllowed(r.Context(), id.UserID, actor, writeEvent)
+			} else {
+				err = writeEvent()
+			}
 			if err != nil || !wrote {
 				return
 			}

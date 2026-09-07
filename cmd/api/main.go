@@ -292,6 +292,10 @@ func main() {
 			},
 		}, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
+	if err := api.ConfigureLegalRelease(os.Getenv("CLUSTER_LEGAL_RELEASE_FILE")); err != nil {
+		logger.Error("configure legal release", "error", err)
+		os.Exit(1)
+	}
 	if durableStore {
 		go outbox.NewWithPushRetryPolicy(
 			persistence, bus, pushService, mediaService, logger,
