@@ -66,7 +66,8 @@ def public_proof(revision):
     result = {}
     for host in (live.CANARY, *live.PRODUCTION_HOSTS):
         request = urllib.request.Request('https://' + host + '/health/ready',
-                                        headers={'Cache-Control': 'no-cache'})
+                                        headers={'Cache-Control': 'no-cache',
+                                                 'User-Agent': 'clixor-oci-adoption/1'})
         with opener.open(request, timeout=15) as response:
             body = response.read(65537)
             if response.status != 200 or len(body) > 65536:
