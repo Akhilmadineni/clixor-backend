@@ -26,5 +26,9 @@ func (s *Server) legal(w http.ResponseWriter, r *http.Request) {
 			"img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
 	)
 	w.WriteHeader(http.StatusOK)
+	if s.legalRelease.Enabled {
+		_, _ = w.Write([]byte(s.legalRelease.Document))
+		return
+	}
 	_, _ = w.Write(legalDocument)
 }

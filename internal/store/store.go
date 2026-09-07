@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/google/uuid"
 )
 
 type CreateUserParams struct {
-	Email        string
-	Phone        string
-	DisplayName  string
-	PasswordHash string
+	LegalAcceptance *compliance.Acceptance
+	Email           string
+	Phone           string
+	DisplayName     string
+	PasswordHash    string
 }
 
 // SessionIssueParams binds device registration and refresh-session creation to
@@ -190,6 +192,7 @@ func (p RotateChoreParams) Validate() error {
 }
 
 type Store interface {
+	Compliance() compliance.Repository
 	Close()
 	Ping(context.Context) error
 

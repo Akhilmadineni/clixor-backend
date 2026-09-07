@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/Akhilmadineni/clixor-backend/internal/verification"
@@ -17,11 +18,12 @@ import (
 var e164Pattern = regexp.MustCompile(`^\+[1-9][0-9]{7,14}$`)
 
 type phoneAuthRequest struct {
-	Phone      string    `json:"phone"`
-	Code       string    `json:"code,omitempty"`
-	DeviceID   uuid.UUID `json:"device_id,omitempty"`
-	DeviceName string    `json:"device_name,omitempty"`
-	Platform   string    `json:"platform,omitempty"`
+	Legal      *compliance.Declaration `json:"legal,omitempty"`
+	Phone      string                  `json:"phone"`
+	Code       string                  `json:"code,omitempty"`
+	DeviceID   uuid.UUID               `json:"device_id,omitempty"`
+	DeviceName string                  `json:"device_name,omitempty"`
+	Platform   string                  `json:"platform,omitempty"`
 }
 
 func (s *Server) startPhoneVerification(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +80,11 @@ func (s *Server) verifyPhone(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := s.store.UserByPhone(r.Context(), request.Phone)
 	if errors.Is(err, domain.ErrNotFound) {
-		user, err = s.store.CreateUser(r.Context(), store.CreateUserParams{Phone: request.Phone})
+		acceptance, ok := s.registrationAcceptance(w, request.Legal)
+		if !ok {
+			return
+		}
+		user, err = s.store.CreateUser(r.Context(), store.CreateUserParams{Phone: request.Phone, LegalAcceptance: acceptance})
 		if errors.Is(err, domain.ErrConflict) {
 			user, err = s.store.UserByPhone(r.Context(), request.Phone)
 		}

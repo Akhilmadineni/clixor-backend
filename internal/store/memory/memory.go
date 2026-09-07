@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/mediakey"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
@@ -19,7 +20,8 @@ import (
 )
 
 type Store struct {
-	mu sync.RWMutex
+	compliance *compliance.Memory
+	mu         sync.RWMutex
 	// deliveryBarrier serializes account erasure with the small interval in
 	// which a claimed realtime/APNs row is revalidated and handed to an
 	// external transport.  It is deliberately separate from mu: delivery
@@ -68,6 +70,7 @@ type Store struct {
 
 func New() *Store {
 	return &Store{
+		compliance:                compliance.NewMemory(),
 		users:                     make(map[uuid.UUID]domain.User),
 		emailToUser:               make(map[string]uuid.UUID),
 		phoneToUser:               make(map[string]uuid.UUID),
@@ -113,7 +116,7 @@ type memoryChoreRotation struct {
 func (*Store) Close()                     {}
 func (*Store) Ping(context.Context) error { return nil }
 
-func (s *Store) CreateUser(_ context.Context, p store.CreateUserParams) (domain.User, error) {
+func (s *Store) CreateUser(ctx context.Context, p store.CreateUserParams) (domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	email := strings.ToLower(strings.TrimSpace(p.Email))
@@ -131,6 +134,17 @@ func (s *Store) CreateUser(_ context.Context, p store.CreateUserParams) (domain.
 	user := domain.User{
 		ID: uuid.New(), Email: email, Phone: p.Phone, DisplayName: p.DisplayName,
 		PasswordHash: p.PasswordHash, CreatedAt: now, UpdatedAt: now,
+	}
+	if p.LegalAcceptance != nil {
+		a := *p.LegalAcceptance
+		a.UserID = user.ID
+		a.AcceptedAt = now
+		if !a.Agreed {
+			return domain.User{}, domain.ErrInvalid
+		}
+		if _, err := s.compliance.Accept(ctx, a); err != nil {
+			return domain.User{}, err
+		}
 	}
 	s.users[user.ID] = user
 	if email != "" {
@@ -1967,7 +1981,13 @@ func (s *Store) ListMessages(_ context.Context, p store.ListMessagesParams) ([]d
 	if _, ok := s.members[p.ConversationID][p.UserID]; !ok {
 		return nil, domain.ErrForbidden
 	}
-	messages := s.messages[p.ConversationID]
+	messages := make([]domain.Message, 0, len(s.messages[p.ConversationID]))
+	for _, message := range s.messages[p.ConversationID] {
+		blocked, _ := s.compliance.Blocked(context.Background(), p.UserID, message.SenderID)
+		if !blocked {
+			messages = append(messages, message)
+		}
+	}
 	result := make([]domain.Message, 0, min(p.Limit, len(messages)))
 	if p.AfterSeq != nil {
 		for _, message := range messages {
@@ -3009,6 +3029,27 @@ func (s *Store) WithPushDeliveryLease(
 		}
 		s.mu.Unlock()
 	}()
+	if leased.Kind == "message" {
+		s.mu.RLock()
+		var sender uuid.UUID
+		for _, m := range s.messages[leased.ConversationID] {
+			if m.ID == leased.EntityID {
+				sender = m.SenderID
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if sender != uuid.Nil {
+			allowed, err := s.compliance.DeliverIfAllowed(ctx, leased.UserID, sender, func() error { return deliver(ctx, leased) })
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return domain.ErrNotFound
+			}
+			return nil
+		}
+	}
 	return deliver(ctx, leased)
 }
 

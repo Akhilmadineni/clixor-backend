@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/google/uuid"
@@ -13,12 +14,13 @@ import (
 
 func (s *Server) verifyAppleIdentity(w http.ResponseWriter, r *http.Request) {
 	var request struct {
-		IdentityToken string    `json:"identity_token"`
-		RawNonce      string    `json:"raw_nonce"`
-		DisplayName   string    `json:"display_name,omitempty"`
-		DeviceID      uuid.UUID `json:"device_id,omitempty"`
-		DeviceName    string    `json:"device_name,omitempty"`
-		Platform      string    `json:"platform,omitempty"`
+		Legal         *compliance.Declaration `json:"legal,omitempty"`
+		IdentityToken string                  `json:"identity_token"`
+		RawNonce      string                  `json:"raw_nonce"`
+		DisplayName   string                  `json:"display_name,omitempty"`
+		DeviceID      uuid.UUID               `json:"device_id,omitempty"`
+		DeviceName    string                  `json:"device_name,omitempty"`
+		Platform      string                  `json:"platform,omitempty"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -43,8 +45,13 @@ func (s *Server) verifyAppleIdentity(w http.ResponseWriter, r *http.Request) {
 		user, err = s.store.UserByEmail(r.Context(), identity.Email)
 	}
 	if errors.Is(err, domain.ErrNotFound) {
+		acceptance, ok := s.registrationAcceptance(w, request.Legal)
+		if !ok {
+			return
+		}
 		user, err = s.store.CreateUser(r.Context(), store.CreateUserParams{
-			Email: identity.Email, DisplayName: strings.TrimSpace(request.DisplayName),
+			LegalAcceptance: acceptance,
+			Email:           identity.Email, DisplayName: strings.TrimSpace(request.DisplayName),
 		})
 		if errors.Is(err, domain.ErrConflict) && identity.Email != "" {
 			user, err = s.store.UserByEmail(r.Context(), identity.Email)
