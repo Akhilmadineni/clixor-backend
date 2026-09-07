@@ -682,6 +682,8 @@ if [ "${defer_host_tool_activation}" = "false" ]; then
         /usr/local/libexec/clixor/prepare-runtime-secrets-launcher.py
     fi
   fi
+  install -m 0500 -o 0 -g 0 "${script_root}/live_connector.py" \
+    /usr/local/libexec/clixor/live_connector.py
   install -m 0500 -o 0 -g 0 "${script_root}/runtime_bundle.py" \
     /usr/local/libexec/clixor/runtime_bundle.py
   install -m 0500 -o 0 -g 0 "${script_root}/runtime-reconciler.py" \

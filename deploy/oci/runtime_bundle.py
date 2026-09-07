@@ -17,14 +17,18 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+sys.dont_write_bytecode = True  # Root must not mutate a commit-authenticated archive.
+import live_connector
+
 
 BUNDLE_SCHEMA = 2
-CONTROLLER_VERSION = 2
+CONTROLLER_VERSION = 3
 BUNDLE_DIRECTORY = "runtime-bundle"
 MANIFEST_NAME = "manifest.json"
 PROMOTION_EXTENSION_DIRECTORY = "promotion-host-tools-v1"
@@ -683,6 +687,9 @@ def stage_host_tools(
             host_root / "bin" / "cloudflare-canary-credential.py",
             executable=True,
         )
+        live_helper = source_root / "deploy/oci/live_connector.py"
+        if live_helper.is_file() and not live_helper.is_symlink():
+            _copy_locked(live_helper, host_root / "bin/live_connector.py", executable=True)
     promoter = host_root / "bin" / "cloudflare-promote.py"
     checksum = (_sha256_file(promoter)
                 + "  /usr/local/libexec/clixor/cloudflare-promote.py\n").encode("ascii")
@@ -993,7 +1000,7 @@ def _validate_canary_connector_metadata(path: Path) -> Mapping[str, Any]:
         "schema", "mode", "account_id", "tunnel_id", "secret", "remote_config"
     }:
         raise BundleError("canary connector metadata fields are invalid")
-    if document.get("schema") != 1 or document.get("mode") != "canary":
+    if document.get("schema") != 1 or document.get("mode") not in ("canary", "adopted-live"):
         raise BundleError("canary connector metadata schema is invalid")
     account_id = document.get("account_id")
     tunnel_id = document.get("tunnel_id")
@@ -1022,6 +1029,8 @@ def _validate_canary_connector_metadata(path: Path) -> Mapping[str, Any]:
         {"hostname": CANARY_HOSTNAME, "service": CANARY_ORIGIN},
         {"service": "http_status:404"},
     ]
+    if document["mode"] == "adopted-live":
+        expected_ingress = live_connector.ingress()
     if (not isinstance(remote, dict)
             or set(remote) != {"version", "ingress"}
             or isinstance(remote.get("version"), bool)
@@ -1192,7 +1201,15 @@ def validate_runtime_bundle(
         metadata_record = expected_inventory[CANARY_CONNECTOR_METADATA]
         if metadata_record[2] != 0o400:
             raise BundleError("canary connector metadata mode is unsafe")
-        _validate_canary_connector_metadata(bundle / CANARY_CONNECTOR_METADATA)
+        connector_metadata = _validate_canary_connector_metadata(bundle / CANARY_CONNECTOR_METADATA)
+        if connector_metadata["mode"] == "adopted-live":
+            if "host-tools/bin/live_connector.py" not in actual_paths:
+                raise BundleError("live connector authority module is missing")
+            try:
+                if live_connector.authority(expected_uid)['metadata'] != connector_metadata:
+                    raise ValueError('live metadata mismatch')
+            except (ValueError, OSError) as error:
+                raise BundleError("live connector authority does not match") from error
         if CANARY_CONNECTOR_HELPER not in actual_paths:
             raise BundleError("canary connector credential controller is missing")
         if cloudflared != {"enabled": True, "active": True}:
@@ -1236,6 +1253,10 @@ def validate_runtime_bundle(
             raise BundleError("runtime Compose model permits independent restart")
     if compose.count('restart: "no"') < 11:
         raise BundleError("runtime Compose model does not disable every persistent restart")
+    try:
+        live_connector.extension(release, expected_uid)
+    except (ValueError, OSError) as error:
+        raise BundleError("live connector extension is invalid") from error
     return manifest
 
 

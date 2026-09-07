@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import subprocess
 import tempfile
 import time
@@ -28,6 +29,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+sys.dont_write_bytecode = True
+import live_connector
 
 
 SCHEMA = 1
@@ -134,6 +138,7 @@ def _metadata_document(
     secret_ocid: str,
     secret_version: int,
     remote_config_version: int,
+    mode: str = "canary",
 ) -> dict[str, Any]:
     try:
         normalized_tunnel = str(uuid.UUID(tunnel_id))
@@ -149,15 +154,17 @@ def _metadata_document(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise CredentialError(f"{label} must be a positive integer")
+    if mode not in ("canary", "adopted-live"):
+        raise CredentialError("unsupported connector mode")
     return {
         "schema": SCHEMA,
-        "mode": "canary",
+        "mode": mode,
         "account_id": account_id,
         "tunnel_id": normalized_tunnel,
         "secret": {"ocid": secret_ocid, "version": secret_version},
         "remote_config": {
             "version": remote_config_version,
-            "ingress": [
+            "ingress": live_connector.ingress() if mode == "adopted-live" else [
                 {"hostname": CANARY_HOSTNAME, "service": CANARY_ORIGIN},
                 {"service": "http_status:404"},
             ],
@@ -170,7 +177,7 @@ def validate_metadata(document: Mapping[str, Any]) -> Mapping[str, Any]:
         "schema", "mode", "account_id", "tunnel_id", "secret", "remote_config"
     }:
         raise CredentialError("canary connector metadata fields are invalid")
-    if document.get("schema") != SCHEMA or document.get("mode") != "canary":
+    if document.get("schema") != SCHEMA or document.get("mode") not in ("canary", "adopted-live"):
         raise CredentialError("canary connector metadata schema is invalid")
     secret = document.get("secret")
     remote = document.get("remote_config")
@@ -184,6 +191,7 @@ def validate_metadata(document: Mapping[str, Any]) -> Mapping[str, Any]:
         str(secret.get("ocid", "")),
         secret.get("version"),  # type: ignore[arg-type]
         remote.get("version"),  # type: ignore[arg-type]
+        str(document["mode"]),
     )
     if document != expected:
         raise CredentialError("canary connector metadata is not canonical")
@@ -191,6 +199,9 @@ def validate_metadata(document: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def load_metadata(release: Path) -> Mapping[str, Any] | None:
+    adopted = live_connector.metadata_for_baseline(release)
+    if adopted is not None:
+        return validate_metadata(adopted)
     path = release / "runtime-bundle" / METADATA_NAME
     if not path.exists() and not path.is_symlink():
         return None
@@ -591,7 +602,9 @@ def prepare(
     if metadata is not None:
         if mode != "staging" or not active:
             raise CredentialError("canary metadata is valid only for an active staging connector")
-        if PRODUCTION_GATE.exists() or PRODUCTION_GATE.is_symlink():
+        if metadata["mode"] == "adopted-live":
+            live_connector.require_live(metadata)
+        elif PRODUCTION_GATE.exists() or PRODUCTION_GATE.is_symlink():
             raise CredentialError("production origin gate must remain closed during canary")
         _validate_canary_origin_boundary(release)
         secret = metadata["secret"]
@@ -657,7 +670,9 @@ def verify(
         mode=0o600, owner=runtime_owner,
     )
     if metadata is not None:
-        if PRODUCTION_GATE.exists() or PRODUCTION_GATE.is_symlink():
+        if metadata["mode"] == "adopted-live":
+            live_connector.require_live(metadata)
+        elif PRODUCTION_GATE.exists() or PRODUCTION_GATE.is_symlink():
             raise CredentialError("production origin gate must remain closed during canary")
         _validate_canary_origin_boundary(release)
         validate_tunnel_token(token, str(metadata["account_id"]), str(metadata["tunnel_id"]))
@@ -702,23 +717,16 @@ def _verify_remote_config_once(
     if set(config) != {"ingress", "warp-routing", "originRequest"}:
         raise CredentialError("cloudflared remote configuration fields are invalid")
     ingress = config.get("ingress")
-    if not isinstance(ingress, list) or len(ingress) != 2:
+    if not isinstance(ingress, list) or len(ingress) != len(remote["ingress"]):
         raise CredentialError("cloudflared remote ingress is not canary-only")
     expected_ingress = [
         {
-            "hostname": CANARY_HOSTNAME,
+            "hostname": rule.get("hostname", ""),
             "path": None,
-            "service": CANARY_ORIGIN,
+            "service": rule["service"],
             "Handlers": None,
             "originRequest": DEFAULT_ORIGIN_REQUEST,
-        },
-        {
-            "hostname": "",
-            "path": None,
-            "service": "http_status:404",
-            "Handlers": None,
-            "originRequest": DEFAULT_ORIGIN_REQUEST,
-        },
+        } for rule in remote["ingress"]
     ]
     if ingress != expected_ingress:
         raise CredentialError(
@@ -765,6 +773,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
     stage.add_argument("--secret-ocid", required=True)
     stage.add_argument("--secret-version", required=True, type=int)
     stage.add_argument("--remote-config-version", required=True, type=int)
+    live = subparsers.add_parser("stage-live-metadata")
+    live.add_argument("--release", required=True, type=Path)
+    subparsers.add_parser("verify-live-authority")
     for action in ("prepare", "verify", "verify-remote"):
         command = subparsers.add_parser(action)
         command.add_argument("--release", required=True, type=Path)
@@ -784,6 +795,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     options.secret_version, options.remote_config_version,
                 ),
             )
+        elif options.action == "stage-live-metadata":
+            metadata = validate_metadata(live_connector.authority()['metadata'])
+            live_connector.require_live(metadata)
+            stage_metadata(options.release, metadata)
+        elif options.action == "verify-live-authority":
+            metadata = validate_metadata(live_connector.authority()['metadata'])
+            live_connector.require_live(metadata)
+            verify_remote_config(metadata, attempts=1)
         elif options.action == "prepare":
             if os.geteuid() != 0 and options.runtime_root == DEFAULT_RUNTIME_ROOT:
                 raise CredentialError("connector credential preparation must run as root")
@@ -806,7 +825,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if os.geteuid() != 0 and options.runtime_root == DEFAULT_RUNTIME_ROOT:
                 raise CredentialError("connector credential cleanup must run as root")
             _clean(options.runtime_root)
-    except (CredentialError, OSError) as error:
+    except (CredentialError, OSError, ValueError) as error:
         print(f"Clixor connector credential refused: {error}", file=os.sys.stderr)
         return 1
     return 0

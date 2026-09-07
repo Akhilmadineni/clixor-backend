@@ -2098,6 +2098,13 @@ def _boot_bundle_validate(release: Path, runner: CommandRunner) -> None:
 
 
 def _connector_credential_controller(release: Path) -> Path | None:
+    import live_connector
+    try:
+        extension = live_connector.extension(release)
+    except (ValueError, OSError) as error:
+        raise ReconcileError("live connector extension is invalid") from error
+    if extension is not None:
+        return extension / "cloudflare-canary-credential.py"
     bundle = release / runtime_bundle.BUNDLE_DIRECTORY
     helper = bundle / "host-tools" / "bin" / "cloudflare-canary-credential.py"
     if helper.is_file() and not helper.is_symlink():

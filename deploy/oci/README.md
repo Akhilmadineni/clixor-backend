@@ -194,6 +194,52 @@ rollback, and let the common-lock watchdog restore the exact
 
 ## Security and availability boundaries
 
+### Repairing an already-live staging pilot
+
+Do not rerun NAS promotion for a pilot whose production routes already reach
+OCI. Do not force `CLUSTER_ENV=production` merely to keep its connector running:
+that mode requires the separately approved complete Vault/provider cohort.
+
+The explicit operator tool `adopt-live-connector.py` adopts only a running,
+already-open pilot. It verifies the locked Git source, current release and both
+replica image IDs, exact default-expanded live tunnel configuration, the running
+connector's exact existing Vault token version (without logging it), and HTTPS
+readiness on all three fixed hostnames. It never changes DNS, Cloudflare rules,
+services, database data, app credentials, or the origin capability. This is an
+operator attestation of already-reviewed live routing, not a replacement for the
+Cloudflare ownership-transfer protocol or proof of remote DNS record ownership.
+
+Run from an exact reviewed root-owned Git archive verified by the installed
+source verifier, with the watchdog already paused and no deployment/promotion
+transaction in progress. First omit `--apply` for read-only checks:
+
+```sh
+sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  python3 /ROOT_OWNED_APPROVED_SOURCE/deploy/oci/adopt-live-connector.py \
+  --source /ROOT_OWNED_APPROVED_SOURCE --source-sha FULL_REVIEWED_SHA \
+  --git-dir /srv/clixor/runtime/manual-source.git \
+  --baseline /srv/clixor/releases/EXACT_CURRENT_RELEASE --config-version 2
+```
+
+Repeat the same command with `--apply` only after reviewing that output. The
+operator tool keeps the original runtime bundle untouched, attaches an atomic,
+checksummed `live-connector-extension-v1` bound to the original manifest and
+controller SHA, and installs backward-compatible stable controller version3.
+The adoption evidence and exact non-secret connector selection are root-owned
+under `/var/lib/clixor`. The old application revision remains unchanged. Rerun
+the exact command after interruption; mismatched existing authority is refused,
+never overwritten. Do not restart the watchdog until validation and the ordinary
+deployment below succeed. Incomplete setup is not a committed deployment.
+
+Then use the normal `manual-deploy` entrypoint with public smoke required,
+canary connector flag **false**, Vault hydration **false**, and the existing
+canary hostname as the disposable smoke base. Both production hostnames must
+serve the new exact revision before commit. The persistent adoption record
+automatically retains the live connector without enabling deferred providers.
+Later Vault/provider migration is a separate reviewed transition; this pilot
+authority deliberately rejects implicit mode changes. Keep its evidence as long
+as any retained release needs it for reboot/rollback.
+
 - On the bundled private-subnet foundation, allow SSH only from the OCI Bastion
   private endpoint. Do not open 80, 443, 8080, 3000, 5432, 6379, or 4222 in
   the VCN security list, network security group, or Ubuntu firewall.
