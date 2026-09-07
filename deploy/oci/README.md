@@ -231,6 +231,21 @@ the exact command after interruption; mismatched existing authority is refused,
 never overwritten. Do not restart the watchdog until validation and the ordinary
 deployment below succeed. Incomplete setup is not a committed deployment.
 
+For an existing adoption whose stable controller needs repair, add
+`--repair-controller` to the read-only check and subsequent `--apply` command.
+This re-proves the original evidence and retains the authority and extension
+byte-for-byte; only the source-authenticated stable controller cohort is updated.
+The stable `live-connector-credential.py` handles the immutable adopted baseline,
+while ordinary releases retain their own bundled controller. Rollback resolves
+the helper through `runtime-reconciler.py connector-helper --release ...`, which
+validates the release and extension before returning an executable. Never select
+the baseline's old canary-only helper by constructing its pathname directly.
+The existing public-open capability accepts canonical root-only0400 and legacy
+root-only0600; tmpfiles normalization to0400 must not invalidate live authority.
+After a failed deployment, verify the recovered baseline locally and publicly,
+then archive its transaction as recovered (quarantining, not deleting, the
+failed candidate) before running this repair. Do not erase an active journal.
+
 Then use the normal `manual-deploy` entrypoint with public smoke required,
 canary connector flag **false**, Vault hydration **false**, and the existing
 canary hostname as the disposable smoke base. Both production hostnames must

@@ -30,7 +30,7 @@ from typing import Any, Mapping, Sequence
 import runtime_bundle
 
 
-CONTROLLER_VERSION = 2
+CONTROLLER_VERSION = 3
 JOURNAL_SCHEMA = 2
 PROJECT_ROOT = Path("/srv/clixor")
 HOST_TOOL_ROOT = Path("/usr/local/libexec/clixor")
@@ -2104,7 +2104,15 @@ def _connector_credential_controller(release: Path) -> Path | None:
     except (ValueError, OSError) as error:
         raise ReconcileError("live connector extension is invalid") from error
     if extension is not None:
-        return extension / "cloudflare-canary-credential.py"
+        # Immutable extension proves baseline/authority ownership. Execute the
+        # source-authenticated stable compatibility controller so historical
+        # extension bugs do not return during rollback or boot reconciliation.
+        helper = HOST_TOOL_ROOT / "live-connector-credential.py"
+        try:
+            live_connector.read(helper, mode=0o500)
+        except (ValueError, OSError) as error:
+            raise ReconcileError("stable live connector controller is unsafe or missing") from error
+        return helper
     bundle = release / runtime_bundle.BUNDLE_DIRECTORY
     helper = bundle / "host-tools" / "bin" / "cloudflare-canary-credential.py"
     if helper.is_file() and not helper.is_symlink():
@@ -3117,6 +3125,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     archive.add_argument("--outcome", required=True)
     validate = subparsers.add_parser("validate-release")
     validate.add_argument("--release", required=True, type=Path)
+    connector_helper = subparsers.add_parser("connector-helper")
+    connector_helper.add_argument("--release", required=True, type=Path)
     staging_snapshot = subparsers.add_parser("snapshot-staging-secrets")
     staging_snapshot.add_argument("--release", required=True, type=Path)
     commit_dump = subparsers.add_parser("commit-pre-migration-boundary")
@@ -3149,11 +3159,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             update_journal_phase(project_root, options.phase)
         elif options.action == "journal-archive":
             archive_journal(project_root, options.outcome)
-        elif options.action == "validate-release":
+        elif options.action in ("validate-release", "connector-helper"):
             runtime_bundle.validate_runtime_bundle(
                 options.release, expected_uid=expected_uid, expected_gid=expected_gid
             )
             _boot_bundle_validate(options.release, CommandRunner())
+            if options.action == "connector-helper":
+                helper = _connector_credential_controller(options.release)
+                if helper is not None:
+                    print(helper)
         elif options.action == "snapshot-staging-secrets":
             snapshot_staging_secret_manifest(options.release, project_root)
         elif options.action == "commit-pre-migration-boundary":
