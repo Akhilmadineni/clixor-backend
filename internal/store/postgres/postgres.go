@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/mediakey"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
@@ -32,7 +33,7 @@ type Store struct {
 // conversation, outbox, or push row. This fixed ordering prevents a callback
 // that uses another pooled Store method from forming a row-lock cycle with an
 // erasure transaction.
-const accountDeliveryBarrierKey int64 = 0x436c69786f724552
+const accountDeliveryBarrierKey int64 = compliance.AccountDeliveryBarrierKey
 
 func lockAccountDeliveryBarrierShared(ctx context.Context, tx pgx.Tx) error {
 	_, err := tx.Exec(ctx,
@@ -98,19 +99,43 @@ func (s *Store) Close()                         { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *Store) CreateUser(ctx context.Context, p store.CreateUserParams) (domain.User, error) {
+	var tx pgx.Tx
+	var query interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	} = s.pool
+	if p.LegalAcceptance != nil {
+		var err error
+		tx, err = s.pool.Begin(ctx)
+		if err != nil {
+			return domain.User{}, err
+		}
+		defer tx.Rollback(ctx)
+		query = tx
+	}
 	now := time.Now().UTC()
 	user := domain.User{
 		ID: uuid.New(), Email: nullableString(strings.ToLower(strings.TrimSpace(p.Email))),
 		Phone: nullableString(p.Phone), DisplayName: p.DisplayName, PasswordHash: p.PasswordHash,
 		Profile: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now,
 	}
-	err := s.pool.QueryRow(ctx, `
+	err := query.QueryRow(ctx, `
 		INSERT INTO users (id,email,phone,display_name,password_hash,created_at,updated_at)
 		VALUES ($1,NULLIF($2,''),NULLIF($3,''),$4,$5,$6,$6)
 		RETURNING id,COALESCE(email,''),COALESCE(phone,''),display_name,avatar_url,profile,password_hash,created_at,updated_at`,
 		user.ID, user.Email, user.Phone, user.DisplayName, user.PasswordHash, now,
 	).Scan(&user.ID, &user.Email, &user.Phone, &user.DisplayName, &user.AvatarURL, &user.Profile,
 		&user.PasswordHash, &user.CreatedAt, &user.UpdatedAt)
+	if err == nil && tx != nil {
+		a := p.LegalAcceptance
+		if !a.Agreed {
+			return domain.User{}, domain.ErrInvalid
+		}
+		_, err = tx.Exec(ctx, `INSERT INTO legal_acceptances(user_id,version,document_sha256,age_group,guardian_permission)
+			VALUES($1,$2,$3,$4,$5)`, user.ID, a.Version, a.DocumentSHA256, a.AgeGroup, a.GuardianPermission)
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+	}
 	return user, mapError(err)
 }
 
@@ -1609,8 +1634,9 @@ func (s *Store) ListMessages(ctx context.Context, p store.ListMessagesParams) ([
 		rows, err = s.pool.Query(ctx, `
 			SELECT id,client_message_id,conversation_id,sender_id,sender_device_id,seq,content_type,
 			       ciphertext,COALESCE(envelope,'null'::jsonb),reply_to_id,created_at,server_received_at
-			FROM messages WHERE conversation_id=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`,
-			p.ConversationID, *p.AfterSeq, p.Limit)
+			FROM messages m WHERE conversation_id=$1 AND seq>$2 AND NOT EXISTS
+			(SELECT 1 FROM user_blocks b WHERE (b.blocker_id=$4 AND b.blocked_id=m.sender_id) OR (b.blocked_id=$4 AND b.blocker_id=m.sender_id))
+			ORDER BY seq ASC LIMIT $3`, p.ConversationID, *p.AfterSeq, p.Limit, p.UserID)
 	case p.BeforeSeq != nil:
 		rows, err = s.pool.Query(ctx, `
 			SELECT id,client_message_id,conversation_id,sender_id,sender_device_id,seq,content_type,
@@ -1619,8 +1645,10 @@ func (s *Store) ListMessages(ctx context.Context, p store.ListMessagesParams) ([
 				SELECT id,client_message_id,conversation_id,sender_id,sender_device_id,seq,content_type,
 				       ciphertext,COALESCE(envelope,'null'::jsonb) AS envelope,reply_to_id,
 				       created_at,server_received_at
-				FROM messages WHERE conversation_id=$1 AND seq<$2 ORDER BY seq DESC LIMIT $3
-			) AS message_page ORDER BY seq ASC`, p.ConversationID, *p.BeforeSeq, p.Limit)
+				FROM messages m WHERE conversation_id=$1 AND seq<$2 AND NOT EXISTS
+				(SELECT 1 FROM user_blocks b WHERE (b.blocker_id=$4 AND b.blocked_id=m.sender_id) OR (b.blocked_id=$4 AND b.blocker_id=m.sender_id))
+				ORDER BY seq DESC LIMIT $3
+			) AS message_page ORDER BY seq ASC`, p.ConversationID, *p.BeforeSeq, p.Limit, p.UserID)
 	default:
 		rows, err = s.pool.Query(ctx, `
 			SELECT id,client_message_id,conversation_id,sender_id,sender_device_id,seq,content_type,
@@ -1629,8 +1657,10 @@ func (s *Store) ListMessages(ctx context.Context, p store.ListMessagesParams) ([
 				SELECT id,client_message_id,conversation_id,sender_id,sender_device_id,seq,content_type,
 				       ciphertext,COALESCE(envelope,'null'::jsonb) AS envelope,reply_to_id,
 				       created_at,server_received_at
-				FROM messages WHERE conversation_id=$1 ORDER BY seq DESC LIMIT $2
-			) AS message_page ORDER BY seq ASC`, p.ConversationID, p.Limit)
+				FROM messages m WHERE conversation_id=$1 AND NOT EXISTS
+				(SELECT 1 FROM user_blocks b WHERE (b.blocker_id=$3 AND b.blocked_id=m.sender_id) OR (b.blocked_id=$3 AND b.blocker_id=m.sender_id))
+				ORDER BY seq DESC LIMIT $2
+			) AS message_page ORDER BY seq ASC`, p.ConversationID, p.Limit, p.UserID)
 	}
 	if err != nil {
 		return nil, err
@@ -3397,6 +3427,17 @@ func (s *Store) WithPushDeliveryLease(
 	}
 	if err != nil {
 		return err
+	}
+	if delivery.Kind == "message" {
+		var blocked bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM messages m JOIN user_blocks b ON
+			(b.blocker_id=$1 AND b.blocked_id=m.sender_id) OR (b.blocked_id=$1 AND b.blocker_id=m.sender_id)
+			WHERE m.conversation_id=$2 AND m.id=$3)`, delivery.UserID, delivery.ConversationID, delivery.EntityID).Scan(&blocked); err != nil {
+			return err
+		}
+		if blocked {
+			return domain.ErrNotFound
+		}
 	}
 	if err := deliver(ctx, delivery); err != nil {
 		return err

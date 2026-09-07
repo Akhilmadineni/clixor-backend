@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/store"
 	"github.com/go-chi/chi/v5"
@@ -16,12 +17,13 @@ import (
 )
 
 type credentialsRequest struct {
-	Email       string    `json:"email"`
-	Password    string    `json:"password"`
-	DisplayName string    `json:"display_name,omitempty"`
-	DeviceID    uuid.UUID `json:"device_id,omitempty"`
-	DeviceName  string    `json:"device_name"`
-	Platform    string    `json:"platform"`
+	Legal       *compliance.Declaration `json:"legal,omitempty"`
+	Email       string                  `json:"email"`
+	Password    string                  `json:"password"`
+	DisplayName string                  `json:"display_name,omitempty"`
+	DeviceID    uuid.UUID               `json:"device_id,omitempty"`
+	DeviceName  string                  `json:"device_name"`
+	Platform    string                  `json:"platform"`
 }
 
 type authResponse struct {
@@ -33,6 +35,10 @@ type authResponse struct {
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var request credentialsRequest
 	if !decodeJSON(w, r, &request) {
+		return
+	}
+	acceptance, ok := s.registrationAcceptance(w, request.Legal)
+	if !ok {
 		return
 	}
 	request.Email = strings.ToLower(strings.TrimSpace(request.Email))
@@ -47,7 +53,8 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := s.store.CreateUser(r.Context(), store.CreateUserParams{
-		Email: request.Email, DisplayName: strings.TrimSpace(request.DisplayName), PasswordHash: hash,
+		LegalAcceptance: acceptance,
+		Email:           request.Email, DisplayName: strings.TrimSpace(request.DisplayName), PasswordHash: hash,
 	})
 	if err != nil {
 		writeDomainError(w, err)

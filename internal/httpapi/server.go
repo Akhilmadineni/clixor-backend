@@ -14,6 +14,7 @@ import (
 
 	"github.com/Akhilmadineni/clixor-backend/internal/appleauth"
 	"github.com/Akhilmadineni/clixor-backend/internal/auth"
+	"github.com/Akhilmadineni/clixor-backend/internal/compliance"
 	"github.com/Akhilmadineni/clixor-backend/internal/domain"
 	"github.com/Akhilmadineni/clixor-backend/internal/events"
 	clustrmail "github.com/Akhilmadineni/clixor-backend/internal/mail"
@@ -30,6 +31,7 @@ import (
 )
 
 type Server struct {
+	legalRelease           compliance.Release
 	store                  store.Store
 	tokens                 *auth.TokenManager
 	bus                    events.Bus
@@ -120,12 +122,17 @@ func (s *Server) Router() http.Handler {
 	router.Get("/privacy", s.legal)
 	router.Get("/legal", s.legal)
 	router.Get("/terms", s.legal)
+	router.Get("/support", s.supportPage)
+	router.Get("/support.js", s.supportScript)
 	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
 	router.Get("/apple-app-site-association", s.appleAppSiteAssociation)
 	router.Get("/join", s.joinLanding)
 	router.Handle("/metrics", s.protectMetrics(promhttp.Handler()))
 
 	router.Route("/v1", func(router chi.Router) {
+		router.Get("/legal/policy", s.getLegalPolicy)
+		router.With(s.rateLimit("support-submit", 10, time.Hour, true)).Put("/support/cases/{caseID}", s.submitSupportCase)
+		router.With(s.rateLimit("support-status", 60, time.Hour, true)).Get("/support/cases/{caseID}", s.supportCaseStatus)
 		router.Post("/webhooks/telnyx/messaging", s.telnyxMessagingWebhook)
 		router.With(s.rateLimit("account-deletion-execute", 10, time.Hour, true)).
 			Post("/account-deletions/{requestID}/execute", s.executeAccountDeletionIntent)
@@ -156,6 +163,11 @@ func (s *Server) Router() http.Handler {
 			router.Use(s.rateLimitIdentity("user", 1200, time.Minute))
 			router.Post("/auth/logout", s.logout)
 			router.Get("/me", s.me)
+			router.Get("/me/blocks", s.listBlocks)
+			router.With(s.rateLimitIdentity("user-block", 60, time.Hour)).Put("/me/blocks/{userID}", s.setBlock)
+			router.With(s.rateLimitIdentity("user-block", 60, time.Hour)).Delete("/me/blocks/{userID}", s.setBlock)
+			router.Get("/me/legal-acceptance", s.getLegalAcceptance)
+			router.With(s.rateLimitIdentity("legal-acceptance", 20, time.Hour)).Put("/me/legal-acceptance", s.acceptLegalPolicy)
 			router.Delete("/me", s.deleteAccount)
 			router.With(s.rateLimitIdentity("account-deletion-intent", 10, 24*time.Hour)).
 				Put("/me/deletion-intents/{requestID}", s.putAccountDeletionIntent)

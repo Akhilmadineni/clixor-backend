@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer"><title>Clixor — Privacy and Safety Requests</title>
+<style>
+body{font:17px/1.6 system-ui,sans-serif;max-width:46rem;margin:auto;padding:1.5rem;color:#211a32;background:#faf8ff}h1,h2{line-height:1.2}label{display:block;margin:1rem 0 .3rem}input,select,textarea,button{font:inherit;box-sizing:border-box;max-width:100%}input:not([type=checkbox]),textarea,select{width:100%;padding:.6rem;border:1px solid #786b89;border-radius:.4rem}button{padding:.7rem 1rem;margin-top:1rem;background:#6038af;color:white;border:0;border-radius:.5rem}button:disabled{opacity:.5}a{color:#6038af}fieldset{border:1px solid #c1b7d4;border-radius:.6rem;margin-top:1rem}#result{white-space:pre-wrap;overflow-wrap:anywhere}.warning{border-left:4px solid #6038af;padding:.7rem;background:#eee7fa}:focus-visible{outline:3px solid #0758a8;outline-offset:3px}
+</style><script src="/support.js" defer></script></head>
+<body><h1>Privacy and safety requests</h1>
+<p><a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p>
+{{if .IntakeEnabled}}
+<p>No account is required. For immediate physical danger in the United States, call 911. This is not an emergency service.</p>
+<p class="warning">Do not upload or forward suspected child sexual abuse material. Supply identifying information instead. Do not send passwords or authentication codes.</p>
+<p>For help or if this form is unavailable, contact <a href="mailto:{{.ContactEmail}}">{{.ContactEmail}}</a>. Submission is not automatic proof of identity or authority and does not itself trigger deletion or disclosure.</p>
+<details><summary>Nonconsensual intimate imagery removal requests</summary><p>The depicted person or an authorized representative may request removal of real or digitally fabricated intimate imagery shared without consent. Include your signature, sufficient information to locate the depiction, a good-faith statement with relevant context, and a contact method. You do not need an account, a police report, copyright ownership, or to find duplicates yourself. For valid requests within the TAKE IT DOWN Act, covered platforms must remove the content and make reasonable efforts to remove known identical copies within 48 hours of receipt.</p></details>
+<details><summary>Copyright and counter-notices</summary><p>For a copyright complaint, include your signature, the copyrighted work, the material's location, contact details, a good-faith statement that the use is unauthorized, and a statement of accuracy and authority under penalty of perjury. A counter-notice requires additional statutory statements, jurisdiction/service consent, and can disclose your identifying information to the complainant. Contact us for the designated-agent process; this general intake does not establish a registered DMCA agent or replace that process.</p></details>
+<form id="report"><fieldset><legend>Your request</legend>
+<label for="category">Request type</label><select id="category" required>
+<option value="safety">Safety or harassment</option><option value="intimate_imagery">Nonconsensual intimate imagery removal</option>
+<option value="privacy_access">Privacy: access/export</option><option value="privacy_correction">Privacy: correction</option><option value="privacy_deletion">Privacy: deletion</option><option value="privacy_appeal">Privacy: appeal</option><option value="copyright">Copyright complaint</option><option value="copyright_counter_notice">Copyright counter-notice</option></select>
+<label for="contact">How can we contact you? (email, phone, or mailing address)</label><input id="contact" required minlength="3" maxlength="320" autocomplete="off">
+<label for="reference">Content location, message/group identifier, or prior case ID</label><textarea id="reference" maxlength="2000" rows="2"></textarea>
+<label for="details">What happened / what are you requesting?</label><textarea id="details" required minlength="10" maxlength="8000" rows="6"></textarea>
+<label for="signature">Electronic signature (typed name; required for intimate imagery)</label><input id="signature" maxlength="200" autocomplete="off">
+<label><input id="goodFaith" type="checkbox"> For intimate imagery: I have a good-faith belief the depiction was published without the depicted person's consent. I included relevant context above.</label>
+<label><input id="authorized" type="checkbox"> For intimate imagery: I am the depicted person or authorized to act for that person.</label>
+<button id="submit" type="submit">Submit request</button></fieldset></form>
+<noscript><p>This form needs JavaScript. Contact the email above if you cannot use it.</p></noscript>
+<p id="result" role="status" aria-live="polite"></p>
+<section id="receipt" hidden><h2>Save your private receipt</h2><p>Keep this receipt somewhere private. The secret lets its holder read case status. It is not put in a URL or stored in your browser. Save it before closing this page.</p><textarea id="receiptText" rows="5" readonly aria-label="Private receipt"></textarea></section>
+<h2>Check a request</h2><form id="lookup"><label for="caseID">Case ID</label><input id="caseID" required autocomplete="off"><label for="caseSecret">Receipt secret</label><input id="caseSecret" type="password" required autocomplete="off"><button type="submit">Check status</button></form><p id="status" role="status" aria-live="polite"></p>
+{{else}}<p>Online reporting is not enabled yet. No report has been submitted. For an immediate physical emergency in the United States, call 911.</p>{{end}}
+</body></html>

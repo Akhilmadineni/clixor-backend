@@ -71,6 +71,9 @@ func (s *Server) createConversation(w http.ResponseWriter, r *http.Request) {
 		if memberID == id.UserID {
 			continue
 		}
+		if !s.communicationAllowed(w, r, id.UserID, memberID) {
+			return
+		}
 		if _, err := s.store.UserByID(r.Context(), memberID); err != nil {
 			writeDomainError(w, err)
 			return
@@ -289,6 +292,9 @@ func (s *Server) addMember(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.store.UserByID(r.Context(), request.UserID); err != nil {
 		writeDomainError(w, err)
+		return
+	}
+	if !s.communicationAllowed(w, r, id.UserID, request.UserID) {
 		return
 	}
 	if err := s.store.AddConversationMember(r.Context(), conversationID, id.UserID, request.UserID, request.Role); err != nil {
