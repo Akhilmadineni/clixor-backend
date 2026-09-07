@@ -11,6 +11,7 @@ from unittest import mock
 
 import live_connector as live
 from test_cloudflare_canary_credential import CREDENTIAL, ACCOUNT, TUNNEL, SECRET_OCID, FakeResponse
+from test_runtime_reconciler import RECONCILER
 
 SPEC = importlib.util.spec_from_file_location('adopt_live', Path(__file__).parent / 'adopt-live-connector.py')
 ADOPT = importlib.util.module_from_spec(SPEC)
@@ -74,6 +75,57 @@ class LiveConnectorTests(unittest.TestCase):
             changed[path] = value
             with self.assertRaises(ValueError):
                 live.require_live(changed, self.uid)
+
+    def test_tmpfiles_gate_mode_and_legacy_mode_are_accepted(self):
+        for mode in (0o400, 0o600):
+            self.gate.chmod(mode)
+            self.assertEqual(live.require_live(self.meta, self.uid), self.auth)
+
+    def test_gate_rejects_other_modes_and_nonempty_content(self):
+        for mode in (0o000, 0o440, 0o640, 0o644, 0o666, 0o700):
+            self.gate.chmod(mode)
+            with self.assertRaises((ValueError, OSError)):
+                live.require_live(self.meta, self.uid)
+        self.write(self.gate, b'not-a-capability', 0o400)
+        with self.assertRaises(ValueError):
+            live.require_live(self.meta, self.uid)
+
+    def test_baseline_rollback_uses_stable_compatibility_controller(self):
+        helper = RECONCILER.HOST_TOOL_ROOT / 'live-connector-credential.py'
+        with mock.patch.object(live, 'extension', return_value=self.release / live.EXTENSION), \
+             mock.patch.object(live, 'read', return_value=b'reviewed') as read:
+            runner = mock.Mock()
+            RECONCILER._prepare_connector_credential(self.release, self.root, runner)
+            read.assert_called_once_with(helper, mode=0o500)
+            runner.run.assert_called_once_with([
+                '/usr/bin/python3', str(helper), 'prepare', '--release', str(self.release),
+                '--project-root', str(self.root)])
+
+    def test_rollback_never_falls_back_when_extension_or_controller_is_unsafe(self):
+        for method in ('extension', 'read'):
+            with mock.patch.object(live, 'extension', return_value=self.release / live.EXTENSION), \
+                 mock.patch.object(live, method, side_effect=ValueError('tampered')):
+                with self.assertRaises(RECONCILER.ReconcileError):
+                    RECONCILER._connector_credential_controller(self.release)
+
+    def test_deploy_rollback_uses_validating_resolver(self):
+        script = (Path(__file__).parent / 'deploy.sh').read_text()
+        rollback = script.split('restore_previous_connector_credential() {', 1)[1].split('\nrestore_cloudflared()', 1)[0]
+        self.assertIn('connector-helper --release "${previous_release}"', rollback)
+        self.assertNotIn('${previous_release}/runtime-bundle/host-tools/bin/', rollback)
+
+    def test_controller_repair_preserves_authority_and_rejects_drift(self):
+        with mock.patch.object(live, 'authority', return_value=self.auth), \
+             mock.patch.object(live, 'extension', return_value=self.release / live.EXTENSION):
+            newer = dict(self.auth, controller_sha='d' * 40)
+            self.assertEqual(ADOPT.preserved_repair_authority(newer, self.release), self.auth)
+            for key in ('baseline', 'baseline_manifest_sha256', 'metadata', 'evidence_sha256'):
+                with self.assertRaises(RuntimeError):
+                    ADOPT.preserved_repair_authority(dict(newer, **{key: 'changed'}), self.release)
+        with mock.patch.object(live, 'authority', return_value=self.auth), \
+             mock.patch.object(live, 'extension', return_value=None):
+            with self.assertRaises(RuntimeError):
+                ADOPT.preserved_repair_authority(self.auth, self.release)
 
     def test_live_metadata_is_narrow_not_arbitrary_ingress(self):
         CREDENTIAL.validate_metadata(self.meta)

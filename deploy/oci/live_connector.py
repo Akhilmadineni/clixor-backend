@@ -49,7 +49,8 @@ def read(path: Path, mode=0o400, uid=0):
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
-                or stat.S_IMODE(info.st_mode) != mode or info.st_size > 1048576):
+                or stat.S_IMODE(info.st_mode) not in (mode if isinstance(mode, tuple) else (mode,))
+                or info.st_size > 1048576):
             raise ValueError('unsafe live authority file')
         with os.fdopen(fd, 'rb', closefd=False) as stream:
             return stream.read(1048577)
@@ -91,12 +92,18 @@ def authority(uid=0):
     return result
 
 
+def require_open_gate(uid=0):
+    # tmpfiles canonicalizes this existing capability to 0400. Accept the
+    # historical root-only 0600 marker during adoption, never broader modes.
+    if read(GATE, mode=(0o400, 0o600), uid=uid) != b'':
+        raise ValueError('live origin capability must be empty')
+
+
 def require_live(metadata, uid=0):
     selected = authority(uid)
     if metadata != selected['metadata']:
         raise ValueError('connector differs from adopted live authority')
-    if read(GATE, mode=0o600, uid=uid) != b'':
-        raise ValueError('live origin capability must be empty')
+    require_open_gate(uid)
     return selected
 
 

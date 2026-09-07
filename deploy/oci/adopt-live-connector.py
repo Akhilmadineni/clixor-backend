@@ -79,7 +79,15 @@ def public_proof(revision):
     return result
 
 
-def adopt(source, source_sha, git_dir, baseline, config_version, apply):
+def preserved_repair_authority(record, baseline):
+    existing = live.authority()
+    expected = dict(record, controller_sha=existing['controller_sha'])
+    if existing != expected or live.extension(baseline) is None:
+        raise RuntimeError('controller repair differs from original adoption')
+    return existing
+
+
+def adopt(source, source_sha, git_dir, baseline, config_version, apply, repair_controller=False):
     if os.geteuid() != 0:
         raise RuntimeError('adoption must run as root')
     runtime_bundle.validate_approved_source(source, source_sha, git_dir)
@@ -95,10 +103,10 @@ def adopt(source, source_sha, git_dir, baseline, config_version, apply):
         raise RuntimeError('deployment lock is unsafe')
     with lock_path.open('r+') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return adopt_locked(source, source_sha, baseline, config_version, apply)
+        return adopt_locked(source, source_sha, baseline, config_version, apply, repair_controller)
 
 
-def adopt_locked(source, source_sha, baseline, config_version, apply):
+def adopt_locked(source, source_sha, baseline, config_version, apply, repair_controller=False):
     for path in (Path('/var/lib/clixor/cloudflare-promotion.json'),
                  ROOT / 'runtime/deploy-transaction.json',
                  Path('/var/lib/clixor/cloudflare-topology-authority.json')):
@@ -119,8 +127,7 @@ def adopt_locked(source, source_sha, baseline, config_version, apply):
         raise RuntimeError('adoption is restricted to an existing staging pilot')
     if manifest['state']['cloudflared'] != {'enabled': True, 'active': True}:
         raise RuntimeError('baseline does not own an enabled connector')
-    if live.read(live.GATE, mode=0o600) != b'':
-        raise RuntimeError('production gate must already be open')
+    live.require_open_gate()
     revision = manifest['source_sha']
     for replica in ('clixor-oci-api-a', 'clixor-oci-api-b'):
         image = run('/usr/bin/docker', 'inspect', replica, '--format', '{{.Image}}').strip().decode()
@@ -147,6 +154,12 @@ def adopt_locked(source, source_sha, baseline, config_version, apply):
               'controller_sha': source_sha, 'metadata': metadata,
               'evidence_sha256': live.digest(live.canonical(evidence))}
     raw = live.canonical(record)
+    if repair_controller:
+        # Repair stable executable code only, not authority or the immutable
+        # extension. Re-prove every adoption invariant and require the exact
+        # original record apart from its intentionally historical source SHA.
+        record = preserved_repair_authority(record, baseline)
+        raw = live.canonical(record)
     if live.AUTHORITY.exists() or live.AUTHORITY.is_symlink():
         if live.read(live.AUTHORITY) != raw:
             raise RuntimeError('existing adoption differs; refusing to overwrite authority')
@@ -158,7 +171,7 @@ def adopt_locked(source, source_sha, baseline, config_version, apply):
         'files': {name: live.digest((source / 'deploy/oci' / name).read_bytes()) for name in helper_names}}
     if extension.exists() or extension.is_symlink():
         live.extension(baseline)
-        if live.document(extension / 'manifest.json') != extension_record:
+        if not repair_controller and live.document(extension / 'manifest.json') != extension_record:
             raise RuntimeError('existing baseline extension differs')
     # Repeat route/version proof immediately before any authority publication.
     credential.verify_remote_config(metadata, attempts=1)
@@ -172,8 +185,12 @@ def adopt_locked(source, source_sha, baseline, config_version, apply):
     atomic(audit, live.canonical(evidence), 0o400)
     # These stable files are backward compatible before extension publication.
     # Install the shared module first; do not restart any service here.
-    for name in ('live_connector.py', 'runtime_bundle.py', 'runtime-reconciler.py'):
+    for name in ('live_connector.py', 'runtime_bundle.py'):
         atomic(STABLE / name, (source / 'deploy/oci' / name).read_bytes(), 0o500)
+    atomic(STABLE / 'live-connector-credential.py',
+           (source / 'deploy/oci/cloudflare-canary-credential.py').read_bytes(), 0o500)
+    atomic(STABLE / 'runtime-reconciler.py',
+           (source / 'deploy/oci/runtime-reconciler.py').read_bytes(), 0o500)
     for name in ('clixor-runtime-reconcile.service', 'clixor-runtime-watchdog.service'):
         atomic(Path('/etc/systemd/system') / name, (source / 'deploy/oci' / name).read_bytes(), 0o644)
     run('/usr/bin/systemctl', 'daemon-reload')
@@ -210,9 +227,12 @@ def main():
     parser.add_argument('--baseline', required=True, type=Path)
     parser.add_argument('--config-version', required=True, type=int)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--repair-controller', action='store_true',
+                        help='repair stable code while preserving an existing adoption authority and extension')
     args = parser.parse_args()
     try:
-        adopt(args.source, args.source_sha, args.git_dir, args.baseline, args.config_version, args.apply)
+        adopt(args.source, args.source_sha, args.git_dir, args.baseline, args.config_version,
+              args.apply, args.repair_controller)
     except Exception as error:
         print('Live adoption refused: ' + str(error), file=sys.stderr)
         return 1

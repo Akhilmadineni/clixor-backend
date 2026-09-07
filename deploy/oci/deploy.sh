@@ -800,7 +800,8 @@ restore_previous_connector_credential() {
     return 1
   case "${previous_release:-}" in
     "${release_root}"/oci-*)
-      previous_connector_helper="${previous_release}/runtime-bundle/host-tools/bin/cloudflare-canary-credential.py"
+      previous_connector_helper="$(/usr/bin/python3 "${stable_runtime_controller}" \
+        connector-helper --release "${previous_release}")" || return 1
       ;;
   esac
   if [ -n "${previous_connector_helper}" ] && \
@@ -1313,6 +1314,9 @@ done
 /usr/bin/python3 "${stable_runtime_controller}" --help 2>/dev/null | \
   grep -q 'snapshot-staging-secrets' || \
   fail "stable runtime controller lacks staging integrity support; rerun the explicit bootstrap transition"
+/usr/bin/python3 "${stable_runtime_controller}" --help 2>/dev/null | \
+  grep -q 'connector-helper' || \
+  fail "stable runtime controller lacks safe connector rollback; run the explicit controller repair"
 
 mkdir -p "${project_root}/runtime"
 if [ -e "${lock_file}" ] || [ -L "${lock_file}" ]; then
