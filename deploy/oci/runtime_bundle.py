@@ -17,11 +17,13 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+sys.dont_write_bytecode = True  # Root must not mutate a commit-authenticated archive.
 import live_connector
 
 

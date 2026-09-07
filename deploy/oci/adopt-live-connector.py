@@ -21,6 +21,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 import live_connector as live
 import runtime_bundle
 

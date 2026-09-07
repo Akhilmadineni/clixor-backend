@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import subprocess
 import tempfile
 import time
@@ -29,6 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+sys.dont_write_bytecode = True
 import live_connector
 
 
