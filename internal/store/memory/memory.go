@@ -723,12 +723,14 @@ func (s *Store) deleteAccountLocked(userID uuid.UUID) error {
 				removedOutboxIDs[event.ID] = struct{}{}
 				continue
 			}
-			if (event.Topic == "receipt.updated" || event.Topic == "conversation.member_added") &&
+			if (event.Topic == "receipt.updated" || event.Topic == "conversation.member_added" ||
+				event.Topic == "conversation.member_removed") &&
 				(typed.UserID == userID || typed.ActorID == userID) {
 				removedOutboxIDs[event.ID] = struct{}{}
 				continue
 			}
-			if event.Topic == "receipt.updated" || event.Topic == "conversation.member_added" {
+			if event.Topic == "receipt.updated" || event.Topic == "conversation.member_added" ||
+				event.Topic == "conversation.member_removed" {
 				filtered = append(filtered, event)
 				continue
 			}
@@ -1905,6 +1907,10 @@ func (s *Store) RemoveConversationMember(_ context.Context, conversationID, acto
 	conversation.UpdatedAt = time.Now().UTC()
 	s.conversations[conversationID] = conversation
 	s.projectConversationMembersLocked(conversationID)
+	payload, _ := json.Marshal(domain.ConversationMemberRemoved{
+		ConversationID: conversationID, ActorID: actorID, UserID: userID,
+	})
+	s.appendOutbox("conversation.member_removed", conversationID, payload)
 	return nil
 }
 

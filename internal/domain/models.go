@@ -159,6 +159,12 @@ type ConversationMemberAdded struct {
 	UserID         uuid.UUID `json:"user_id"`
 }
 
+type ConversationMemberRemoved struct {
+	ConversationID uuid.UUID `json:"conversation_id"`
+	ActorID        uuid.UUID `json:"actor_id"`
+	UserID         uuid.UUID `json:"user_id"`
+}
+
 // ConversationInvite contains only persisted invite metadata. The raw invite
 // token is deliberately absent: it is returned once by the create endpoint and
 // only its SHA-256 digest crosses the store boundary.

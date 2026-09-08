@@ -533,6 +533,15 @@ paths:
                 role: {type: string, enum: [member, admin]}
       responses:
         "204": {description: Member added or role updated}
+  /conversations/{conversation_id}/members/me:
+    delete:
+      operationId: leaveConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "204": {description: Caller left the conversation}
+        "403": {description: Owner cannot leave while other members remain}
+        "404": {description: Conversation not found or caller is not a member}
   /conversations/{conversation_id}/members/{user_id}:
     delete:
       operationId: removeConversationMember
