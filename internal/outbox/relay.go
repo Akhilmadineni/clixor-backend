@@ -343,7 +343,7 @@ func (r *Relay) enqueuePush(ctx context.Context, item domain.OutboxEvent, recipi
 		kind = genericPushKind
 	}
 	inserted, err := r.store.EnqueuePushDeliveries(ctx, domain.PushDelivery{
-		OutboxEventID: item.ID,
+		OutboxEventID:  item.ID,
 		Title:          title,
 		Body:           body,
 		Kind:           kind,
@@ -740,7 +740,7 @@ func (r *Relay) notificationFor(
 		return activityNotification{
 			actorID: added.ActorID, conversationID: conversation.ID,
 			entityID: conversation.ID, kind: "membership", title: groupName,
-			body: clip(displayName(r, ctx, added.ActorID)+" added you to "+groupName, 180),
+			body:           clip(displayName(r, ctx, added.ActorID)+" added you to "+groupName, 180),
 			onlyRecipients: []uuid.UUID{added.UserID},
 		}, true, nil
 
