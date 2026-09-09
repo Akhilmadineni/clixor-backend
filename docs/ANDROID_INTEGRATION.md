@@ -134,6 +134,9 @@ containers cannot read it. The current OCI deployment does not have this new
 credential mount. Merely setting an arbitrary host path in `api.env` will not
 make it available inside the API containers. No secret pipeline or production
 provider was silently enabled in this code change.
+The current OCI Vault/staging env parser intentionally rejects all four Android
+activation keys above. Add their validation/allowlisting and exact-template
+contract as part of that reviewed cohort change; do not bypass the parser.
 
 Create an Android notification channel and request runtime notification
 permission where required. Register token refresh through `onNewToken`, and
