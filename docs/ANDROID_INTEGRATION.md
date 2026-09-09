@@ -163,7 +163,8 @@ device using `adb shell pm verify-app-links --re-verify <package>` and
 
 Before enabling Android clients in production:
 
-- Apply migration 23 through the normal backup/migration/restore-gated rollout.
+- Apply migration 24 through the normal backup/migration/restore-gated rollout
+  (migration 23 adds the reviewed membership-removal outbox topic).
   It changes token uniqueness from token-only to `(platform, push_token)` and
   leaves existing APNs values untouched. Keep Android enrollment off until every
   replica runs compatible code. Do not run older token-normalizing writers

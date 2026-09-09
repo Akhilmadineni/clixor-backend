@@ -1,12 +1,14 @@
 # Android backend checkpoint — 2026-09-08
 
 - Branch: feature/akhil/android-backend-support, based on main 3261688.
-- Implementation is local, uncommitted and unpushed. No deployment this turn.
+- Original Android implementation committed as fea9c1e on September 9. Being
+  integrated with `feature/apns-activity-coverage` at the user's request; see
+  `docs/NOTIFICATION_ACTIVITY_INTEGRATION.md`. No deployment this turn.
 - User approved FCM for push only. Accounts/data remain OCI; no Android package
   name or signing fingerprint exists yet. App Links default to `[]`; FCM off.
 - Implemented Android authentication/device validation, immutable device
   platform, opaque case-sensitive tokens, provider-scoped token uniqueness via
-  migration 23, platform-aware durable queue claims and delivery, FCM HTTP v1
+  migration 24 (renumbered during APNs integration), platform-aware durable queue claims and delivery, FCM HTTP v1
   OAuth2 provider with bounded retries/errors, and configurable assetlinks route.
 - Existing iOS default platform/APNs behavior retained. No production mutation,
   DNS change, provider account creation, secret provisioning or deployment.

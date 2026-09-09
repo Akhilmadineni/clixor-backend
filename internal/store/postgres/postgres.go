@@ -1483,6 +1483,14 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 		conversationID, metadata); err != nil {
 		return err
 	}
+	payload, _ := json.Marshal(domain.ConversationMemberRemoved{
+		ConversationID: conversationID, ActorID: actorID, UserID: userID,
+	})
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('conversation.member_removed',$1,$2)`,
+		conversationID, payload); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 

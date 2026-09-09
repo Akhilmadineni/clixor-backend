@@ -58,6 +58,9 @@ func TestPostgresMigration21ScrubsLegacyPushAndSealsInvariants(t *testing.T) {
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `
 		ALTER TABLE outbox_events DROP CONSTRAINT IF EXISTS outbox_events_topic_domain_check;
+		-- Reconstruct the historical pre-23 topic set only inside this rolled-back
+		-- transaction. Do not weaken migration 21's unknown-topic rejection.
+		DELETE FROM outbox_events WHERE topic='conversation.member_removed';
 		DROP INDEX IF EXISTS outbox_account_erasure_idx;
 		DROP INDEX IF EXISTS conversation_member_tombstones_user_idx;
 		DROP INDEX IF EXISTS conversation_members_single_owner_idx;`); err != nil {

@@ -87,7 +87,8 @@ func TestMessagePushFansOutToEveryRecipientDeviceAndExcludesActor(t *testing.T) 
 		if call.title != genericPushTitle || call.body != genericPushBody {
 			t.Fatalf("unexpected copy: title=%q body=%q", call.title, call.body)
 		}
-		if len(call.data) != 1 || call.data["type"] != genericPushKind {
+		if call.data["type"] != "message" || call.data["groupId"] != fixture.conversation.ID.String() ||
+			call.data["entityId"] != message.ID.String() || call.data["accountId"] != fixture.recipient.ID.String() {
 			t.Fatalf("unexpected client data: %#v", call.data)
 		}
 	}
@@ -157,8 +158,8 @@ func TestReassignedPushTokenNeverReceivesPreviousAccountMetadata(t *testing.T) {
 		t.Fatalf("claim delivery: items=%d error=%v", len(claimed), err)
 	}
 	if claimed[0].Title != genericPushTitle || claimed[0].Body != genericPushBody ||
-		claimed[0].Kind != genericPushKind {
-		t.Fatalf("durable push retained account metadata: %+v", claimed[0])
+		claimed[0].Kind != "message" {
+		t.Fatalf("durable push leaked personal copy or dropped route kind: %+v", claimed[0])
 	}
 
 	// Simulate account switching after the worker copied the token but before
@@ -236,6 +237,16 @@ func TestExpenseAndTaskPushesOnlyFireOnCreate(t *testing.T) {
 		t.Fatalf("unexpected task notification: %#v", notification)
 	}
 
+	settlement := domain.Entity{
+		ConversationID: fixture.conversation.ID, Kind: "settlement", ID: uuid.New(),
+		Version: 1, CreatedBy: fixture.actor.ID,
+		Payload: json.RawMessage(`{"amount":40}`),
+	}
+	notification = notificationForEntity(t, fixture, settlement, recipients)
+	if notification.kind != "settlement" || notification.body != "Akhil recorded a settlement ($40.00)" {
+		t.Fatalf("unexpected settlement notification: %#v", notification)
+	}
+
 	expense.Version = 2
 	raw, _ := json.Marshal(expense)
 	if _, ok, err := fixture.relay.notificationFor(fixture.ctx, domain.OutboxEvent{
@@ -308,6 +319,142 @@ func TestConversationUpdatedIsTranslatedDurablyWithoutPush(t *testing.T) {
 	}
 	if _, notify, err := fixture.relay.notificationFor(fixture.ctx, item, recipients); err != nil || notify {
 		t.Fatalf("conversation update generated a push: notify=%t err=%v", notify, err)
+	}
+}
+
+func TestRegularGroupMemberAddedNotifiesAddedUserOnly(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	added := createUser(t, fixture.store, "added@example.com", "Drew")
+	if err := fixture.store.AddConversationMember(
+		fixture.ctx, fixture.conversation.ID, fixture.actor.ID, added.ID, "member",
+	); err != nil {
+		t.Fatal(err)
+	}
+	createDevice(t, fixture.store, added.ID, "added-token")
+	recipients, err := fixture.store.ConversationMemberIDs(fixture.ctx, fixture.conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(domain.ConversationMemberAdded{
+		ConversationID: fixture.conversation.ID, ActorID: fixture.actor.ID, UserID: added.ID,
+	})
+	notification, ok, err := fixture.relay.notificationFor(fixture.ctx, domain.OutboxEvent{
+		Topic: "conversation.member_added", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients)
+	if err != nil || !ok {
+		t.Fatalf("member added should notify: ok=%t err=%v", ok, err)
+	}
+	if notification.kind != "membership" ||
+		notification.body != "Akhil added you to Group 1" ||
+		len(notification.onlyRecipients) != 1 || notification.onlyRecipients[0] != added.ID {
+		t.Fatalf("unexpected membership notification: %#v", notification)
+	}
+	if err := fixture.relay.enqueuePush(fixture.ctx, domain.OutboxEvent{
+		ID: 401, Topic: "conversation.member_added", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients); err != nil {
+		t.Fatal(err)
+	}
+	fixture.relay.flushPush(fixture.ctx)
+	if len(fixture.push.calls) != 1 {
+		t.Fatalf("push calls = %d, want 1", len(fixture.push.calls))
+	}
+	if fixture.push.calls[0].data["type"] != "membership" ||
+		fixture.push.calls[0].data["groupId"] != fixture.conversation.ID.String() {
+		t.Fatalf("unexpected client data: %#v", fixture.push.calls[0].data)
+	}
+}
+
+func TestGroupCreationAndSettlementDeliveryUsePrivateCopyAndAccountBoundRoutes(t *testing.T) {
+	for _, kind := range []string{"membership", "settlement"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+			raw, _ := json.Marshal(f.conversation)
+			item := domain.OutboxEvent{ID: 601, Topic: "conversation.created", AggregateID: f.conversation.ID, Payload: raw}
+			if kind == "settlement" {
+				raw, _ = json.Marshal(domain.Entity{ID: uuid.New(), ConversationID: f.conversation.ID, CreatedBy: f.actor.ID, Kind: kind, Version: 1, Payload: json.RawMessage(`{"amount":123.45,"description":"private"}`)})
+				item.Topic, item.Payload = "entity.updated", raw
+			}
+			recipients, err := f.store.ConversationMemberIDs(f.ctx, f.conversation.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.relay.enqueuePush(f.ctx, item, recipients); err != nil {
+				t.Fatal(err)
+			}
+			f.relay.flushPush(f.ctx)
+			if len(f.push.calls) != len(f.recipientDevices) {
+				t.Fatal("wrong recipients")
+			}
+			for _, call := range f.push.calls {
+				if call.title != genericPushTitle || call.body != genericPushBody || call.data["type"] != kind || call.data["accountId"] != f.recipient.ID.String() || len(call.data) != 4 {
+					t.Fatalf("unsafe or unroutable payload: %+v", call)
+				}
+			}
+		})
+	}
+}
+
+func TestRepeatedMembershipEventsKeepDistinctRealtimeAndPushIDs(t *testing.T) {
+	f := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	raw, _ := json.Marshal(domain.ConversationMemberAdded{ConversationID: f.conversation.ID, ActorID: f.actor.ID, UserID: f.recipient.ID})
+	var previous string
+	var pushID string
+	for _, id := range []int64{701, 702} {
+		item := domain.OutboxEvent{ID: id, Topic: "conversation.member_added", AggregateID: f.conversation.ID, Payload: raw}
+		event, recipients, ok := f.relay.translate(f.ctx, item)
+		if !ok || event.ID == previous {
+			t.Fatal("rejoin realtime event would be deduplicated")
+		}
+		previous = event.ID
+		if err := f.relay.enqueuePush(f.ctx, item, recipients); err != nil {
+			t.Fatal(err)
+		}
+		f.relay.flushPush(f.ctx)
+		last := f.push.calls[len(f.push.calls)-1].notificationID
+		if _, err := uuid.Parse(last); err != nil || last == pushID {
+			t.Fatal("rejoin push would be collapsed or invalid")
+		}
+		pushID = last
+	}
+}
+
+func TestMemberRemovedNotifiesRemainingMembers(t *testing.T) {
+	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	if err := fixture.store.RemoveConversationMember(
+		fixture.ctx, fixture.conversation.ID, fixture.recipient.ID, fixture.recipient.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	recipients, err := fixture.store.ConversationMemberIDs(fixture.ctx, fixture.conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(domain.ConversationMemberRemoved{
+		ConversationID: fixture.conversation.ID,
+		ActorID:        fixture.recipient.ID, UserID: fixture.recipient.ID,
+	})
+	notification, ok, err := fixture.relay.notificationFor(fixture.ctx, domain.OutboxEvent{
+		Topic: "conversation.member_removed", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients)
+	if err != nil || !ok {
+		t.Fatalf("member removed should notify: ok=%t err=%v", ok, err)
+	}
+	if notification.kind != "member_left" || notification.body != "Bailey left Group 1" {
+		t.Fatalf("unexpected leave notification: %#v", notification)
+	}
+	if err := fixture.relay.enqueuePush(fixture.ctx, domain.OutboxEvent{
+		ID: 402, Topic: "conversation.member_removed", AggregateID: fixture.conversation.ID, Payload: raw,
+	}, recipients); err != nil {
+		t.Fatal(err)
+	}
+	fixture.relay.flushPush(fixture.ctx)
+	if len(fixture.push.calls) == 0 {
+		t.Fatal("remaining members were not notified")
+	}
+	for _, call := range fixture.push.calls {
+		if call.data["type"] != "member_left" {
+			t.Fatalf("unexpected client data: %#v", call.data)
+		}
 	}
 }
 
