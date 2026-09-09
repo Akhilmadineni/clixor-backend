@@ -41,11 +41,30 @@ OCI_NON_VAULT_RUNTIME_KEYS = frozenset(
         # Compose supplies the immutable gateway /32 outside api.env so a Vault
         # editor cannot widen the trusted-proxy boundary.
         "CLUSTER_TRUSTED_PROXY_CIDRS",
+        # Android provider/link activation is deliberately unavailable in the
+        # current OCI secret cohort. No package/signing identity or FCM secret
+        # has been provisioned, and there is no approved API-only FCM mount.
+        # Keep these rejected (also in staging) until that cohort is reviewed.
+        "CLUSTER_ANDROID_PACKAGE_NAME",
+        "CLUSTER_ANDROID_SIGNING_SHA256",
+        "CLUSTER_FCM_PROJECT_ID",
+        "CLUSTER_FCM_CREDENTIALS_FILE",
     }
 )
 
 
 class VaultHydrationTest(unittest.TestCase):
+    def test_unprovisioned_android_activation_is_rejected_by_oci_env_parser(self) -> None:
+        for key in (
+            "CLUSTER_ANDROID_PACKAGE_NAME", "CLUSTER_ANDROID_SIGNING_SHA256",
+            "CLUSTER_FCM_PROJECT_ID", "CLUSTER_FCM_CREDENTIALS_FILE",
+        ):
+            with self.subTest(key=key), self.assertRaises(HYDRATOR.HydrationError):
+                HYDRATOR._parse_env(
+                    (key + "=not-provisioned\n").encode(), "api_env",
+                    HYDRATOR.API_ALLOWED_KEYS, frozenset(),
+                )
+
     def test_api_template_is_the_exact_vault_runtime_contract(self) -> None:
         template = (SCRIPT_ROOT / "api.env.example").read_bytes()
         assignments = []

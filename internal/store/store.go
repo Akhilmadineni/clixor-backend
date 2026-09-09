@@ -281,7 +281,7 @@ type Store interface {
 	ReleaseOutboxEvent(context.Context, int64, time.Time) error
 	MarkOutboxPublished(context.Context, []int64) error
 	EnqueuePushDeliveries(context.Context, domain.PushDelivery, []uuid.UUID) (int, error)
-	LockPushDeliveryBatch(context.Context, int) ([]domain.PushDelivery, error)
+	LockPushDeliveryBatch(context.Context, int, ...string) ([]domain.PushDelivery, error)
 	WithPushDeliveryLease(context.Context, int64, uuid.UUID, func(context.Context, domain.PushDelivery) error) error
 	FinishPushDelivery(context.Context, int64, uuid.UUID, string, time.Time, string) error
 	InvalidatePushDelivery(context.Context, int64, uuid.UUID, uuid.UUID, uuid.UUID, string) error

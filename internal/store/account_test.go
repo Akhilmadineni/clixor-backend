@@ -166,6 +166,13 @@ func TestDecodeAccountOutboxPayloadValidatesOwnedSchemas(t *testing.T) {
 			user: userID, actor: actorID,
 		},
 		{
+			topic: "conversation.member_removed",
+			raw: mustAccountJSON(t, domain.ConversationMemberRemoved{
+				ConversationID: conversationID, ActorID: actorID, UserID: userID,
+			}),
+			user: userID, actor: actorID,
+		},
+		{
 			topic: "entity.updated",
 			raw: mustAccountJSON(t, domain.Entity{
 				ConversationID: conversationID, Kind: "note", ID: uuid.New(), Version: 1,
@@ -198,6 +205,7 @@ func TestDecodeAccountOutboxPayloadValidatesOwnedSchemas(t *testing.T) {
 	}{
 		{"receipt.updated", json.RawMessage(`{"user_id":"` + userID.String() + `"}`)},
 		{"conversation.member_added", json.RawMessage(`{"conversation_id":"` + conversationID.String() + `"}`)},
+		{"conversation.member_removed", json.RawMessage(`{"conversation_id":"` + conversationID.String() + `"}`)},
 		{"entity.updated", json.RawMessage(`{"email":"deleted@example.com"}`)},
 		{"conversation.created", json.RawMessage(`"deleted@example.com"`)},
 		{"conversation.updated", json.RawMessage(`"deleted@example.com"`)},

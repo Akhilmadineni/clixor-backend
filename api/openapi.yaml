@@ -4,10 +4,23 @@ info:
   version: 0.1.0
   description: Production messaging and shared-group API. The current production-05b transition message format is plaintext-equivalent at the server and is not E2EE; clixor-e2ee-v1 is the encrypted successor.
 servers:
-  - url: https://api.clustr.example/v1
+  - url: https://clustr-api.atlanteanz.com/v1
 security:
   - bearerAuth: []
 paths:
+  /.well-known/assetlinks.json:
+    servers:
+      - url: https://clixor.atlanteanz.com
+    get:
+      security: []
+      operationId: androidAppLinks
+      description: Android Digital Asset Links. Returns an empty array until the real Android package and release-signing fingerprints are configured. No redirect or authentication is required.
+      responses:
+        "200":
+          description: Association statements, or an empty array when unconfigured
+          content:
+            application/json:
+              schema: {type: array, items: {type: object}}
   /auth/register:
     post:
       security: []
@@ -139,7 +152,7 @@ paths:
                 code: {type: string}
                 device_id: {type: string, format: uuid}
                 device_name: {type: string}
-                platform: {type: string, enum: [ios, android, web]}
+                platform: {type: string, enum: [ios, android]}
       responses:
         "200":
           description: Authenticated
@@ -326,8 +339,8 @@ paths:
               required: [name, platform]
               properties:
                 name: {type: string}
-                platform: {type: string}
-                push_token: {type: string}
+                platform: {type: string, enum: [ios, android], description: Immutable for an existing device identity}
+                push_token: {type: string, maxLength: 2048, description: "Android: opaque case-sensitive FCM token (printable ASCII, no whitespace). iOS: APNs hexadecimal token (up to 512 characters). Omission preserves an existing token; logout clears it."}
                 identity_key: {type: string, description: Base64 public identity key; must be supplied together with signed_prekey}
                 signed_prekey:
                   allOf:
@@ -533,6 +546,15 @@ paths:
                 role: {type: string, enum: [member, admin]}
       responses:
         "204": {description: Member added or role updated}
+  /conversations/{conversation_id}/members/me:
+    delete:
+      operationId: leaveConversation
+      parameters:
+        - {$ref: "#/components/parameters/ConversationID"}
+      responses:
+        "204": {description: Caller left the conversation}
+        "403": {description: Owner cannot leave while other members remain}
+        "404": {description: Conversation not found or caller is not a member}
   /conversations/{conversation_id}/members/{user_id}:
     delete:
       operationId: removeConversationMember
@@ -924,7 +946,7 @@ components:
         display_name: {type: string, maxLength: 100}
         device_id: {type: string, format: uuid}
         device_name: {type: string}
-        platform: {type: string}
+        platform: {type: string, enum: [ios, android], default: ios}
     TokenPair:
       type: object
       required: [access_token, refresh_token, token_type, expires_at]
@@ -1039,7 +1061,7 @@ components:
         id: {type: string, format: uuid}
         user_id: {type: string, format: uuid}
         name: {type: string}
-        platform: {type: string}
+        platform: {type: string, enum: [ios, android]}
         identity_key: {type: string}
         signed_prekey: {$ref: "#/components/schemas/SignedPreKey"}
     SignedPreKey:

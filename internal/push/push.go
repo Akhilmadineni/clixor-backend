@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 type Service interface {
@@ -32,6 +33,8 @@ func IsDisabled(service Service) bool {
 		return true
 	case *EnvironmentFallback:
 		return IsDisabled(candidate.Primary) && IsDisabled(candidate.Fallback)
+	case *Platforms:
+		return IsDisabled(candidate.IOS) && IsDisabled(candidate.Android)
 	default:
 		return false
 	}
@@ -76,6 +79,10 @@ func (e *DeliveryError) Error() string {
 }
 
 func IsInvalidToken(err error) bool {
+	var fcm *FCMError
+	if errors.As(err, &fcm) {
+		return fcm.StatusCode == 404 && fcm.Code == "UNREGISTERED"
+	}
 	var delivery *DeliveryError
 	if !errors.As(err, &delivery) {
 		return false
@@ -98,6 +105,10 @@ func IsRetryable(err error) bool {
 	if err == nil || IsInvalidToken(err) {
 		return false
 	}
+	var fcm *FCMError
+	if errors.As(err, &fcm) {
+		return fcm.StatusCode == 429 || fcm.StatusCode >= 500
+	}
 	var delivery *DeliveryError
 	if errors.As(err, &delivery) {
 		return delivery.StatusCode == 429 || delivery.StatusCode >= 500
@@ -114,6 +125,16 @@ func ErrorClass(err error) string {
 	}
 	if IsInvalidToken(err) {
 		return "invalid_token"
+	}
+	var fcm *FCMError
+	if errors.As(err, &fcm) {
+		if fcm.StatusCode == 429 {
+			return "throttled"
+		}
+		if fcm.StatusCode >= 500 {
+			return "provider_5xx"
+		}
+		return "provider_4xx"
 	}
 	var delivery *DeliveryError
 	if errors.As(err, &delivery) {
@@ -134,6 +155,14 @@ func ErrorClass(err error) string {
 		return "context"
 	}
 	return "network"
+}
+
+func MinimumRetryDelay(err error) time.Duration {
+	var fcm *FCMError
+	if errors.As(err, &fcm) {
+		return fcm.RetryAfter
+	}
+	return 0
 }
 
 // EnvironmentFallback supports both production and sandbox device tokens

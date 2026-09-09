@@ -357,11 +357,11 @@ func (s *Server) upsertDevice(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	request.PushToken = strings.ToLower(strings.TrimSpace(request.PushToken))
+	request.PushToken = domain.NormalizePushToken(request.Platform, request.PushToken)
 	hasIdentityKey := request.IdentityKey != ""
 	hasSignedPreKey := len(request.SignedPreKey) > 0
-	if strings.TrimSpace(request.Name) == "" || request.Platform != "ios" ||
-		len(request.Name) > 100 || !validPushToken(request.PushToken) ||
+	if strings.TrimSpace(request.Name) == "" || !domain.MobilePlatform(request.Platform) ||
+		len(request.Name) > 100 || !validPlatformPushToken(request.Platform, request.PushToken) ||
 		hasIdentityKey != hasSignedPreKey ||
 		(request.IdentityKey != "" && !validEncodedKey(request.IdentityKey)) ||
 		(len(request.SignedPreKey) > 0 && !validSignedPreKey(request.SignedPreKey)) {
@@ -391,15 +391,36 @@ func validPushToken(token string) bool {
 	return err == nil
 }
 
+func validPlatformPushToken(platform, token string) bool {
+	if platform == "ios" {
+		return validPushToken(token)
+	}
+	if platform != "android" {
+		return false
+	}
+	if len(token) > 2048 {
+		return false
+	}
+	for _, ch := range token {
+		if ch < 33 || ch > 126 {
+			return false
+		}
+	}
+	return true
+}
+
 func newAuthDevice(userID, deviceID uuid.UUID, name, platform string) domain.Device {
 	if deviceID == uuid.Nil {
 		deviceID = uuid.New()
 	}
-	if name == "" {
-		name = "iPhone"
-	}
 	if platform == "" {
 		platform = "ios"
+	}
+	if name == "" {
+		name = "iPhone"
+		if platform == "android" {
+			name = "Android"
+		}
 	}
 	return domain.Device{
 		ID: deviceID, UserID: userID, Name: name, Platform: platform,
@@ -413,5 +434,5 @@ func validEmail(value string) bool {
 }
 
 func validDeviceInfo(name, platform string) bool {
-	return len(name) <= 100 && (platform == "" || platform == "ios")
+	return len(name) <= 100 && (platform == "" || domain.MobilePlatform(platform))
 }

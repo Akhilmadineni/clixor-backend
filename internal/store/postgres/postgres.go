@@ -319,7 +319,7 @@ func (s *Store) UpdateUserPhone(ctx context.Context, id uuid.UUID, phone string)
 }
 
 func (s *Store) UpsertDevice(ctx context.Context, device domain.Device) (domain.Device, error) {
-	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
+	device.PushToken = domain.NormalizePushToken(device.Platform, device.PushToken)
 	if device.ID == uuid.Nil {
 		device.ID = uuid.New()
 	}
@@ -357,7 +357,7 @@ func (s *Store) upsertDeviceOnce(ctx context.Context, device domain.Device) (dom
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE devices SET push_token=''
-			WHERE push_token=$1 AND id<>$2`, device.PushToken, device.ID); err != nil {
+			WHERE push_token=$1 AND id<>$2 AND platform=$3`, device.PushToken, device.ID, device.Platform); err != nil {
 			return domain.Device{}, err
 		}
 	}
@@ -369,7 +369,7 @@ func (s *Store) upsertDeviceOnce(ctx context.Context, device domain.Device) (dom
 			push_token=CASE WHEN EXCLUDED.push_token='' THEN devices.push_token ELSE EXCLUDED.push_token END,
 			identity_key=CASE WHEN EXCLUDED.identity_key='' THEN devices.identity_key ELSE EXCLUDED.identity_key END,
 			signed_prekey=COALESCE(EXCLUDED.signed_prekey,devices.signed_prekey),last_seen_at=now()
-		WHERE devices.user_id=EXCLUDED.user_id
+		WHERE devices.user_id=EXCLUDED.user_id AND devices.platform=EXCLUDED.platform
 		RETURNING id,user_id,name,platform,push_token,identity_key,COALESCE(signed_prekey,'null'::jsonb),last_seen_at,created_at`,
 		device.ID, device.UserID, device.Name, device.Platform, device.PushToken,
 		device.IdentityKey, nullableJSON(device.SignedPreKey), device.CreatedAt,
@@ -561,7 +561,7 @@ func (s *Store) IssueSession(
 		p.Session.DeviceID != p.Device.ID || len(p.Session.RefreshTokenHash) == 0 {
 		return domain.User{}, domain.Device{}, domain.ErrInvalid
 	}
-	p.Device.PushToken = strings.ToLower(strings.TrimSpace(p.Device.PushToken))
+	p.Device.PushToken = domain.NormalizePushToken(p.Device.Platform, p.Device.PushToken)
 	if p.Device.CreatedAt.IsZero() {
 		p.Device.CreatedAt = time.Now().UTC()
 	}
@@ -607,8 +607,8 @@ func (s *Store) issueSessionOnce(
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, device.PushToken); err != nil {
 			return domain.User{}, domain.Device{}, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE devices SET push_token='' WHERE push_token=$1 AND id<>$2`,
-			device.PushToken, device.ID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE devices SET push_token='' WHERE push_token=$1 AND id<>$2 AND platform=$3`,
+			device.PushToken, device.ID, device.Platform); err != nil {
 			return domain.User{}, domain.Device{}, err
 		}
 	}
@@ -620,7 +620,7 @@ func (s *Store) issueSessionOnce(
 			push_token=CASE WHEN EXCLUDED.push_token='' THEN devices.push_token ELSE EXCLUDED.push_token END,
 			identity_key=CASE WHEN EXCLUDED.identity_key='' THEN devices.identity_key ELSE EXCLUDED.identity_key END,
 			signed_prekey=COALESCE(EXCLUDED.signed_prekey,devices.signed_prekey),last_seen_at=now()
-		WHERE devices.user_id=EXCLUDED.user_id
+		WHERE devices.user_id=EXCLUDED.user_id AND devices.platform=EXCLUDED.platform
 		RETURNING id,user_id,name,platform,push_token,identity_key,COALESCE(signed_prekey,'null'::jsonb),last_seen_at,created_at`,
 		device.ID, device.UserID, device.Name, device.Platform, device.PushToken,
 		device.IdentityKey, nullableJSON(device.SignedPreKey), device.CreatedAt,
@@ -1481,6 +1481,14 @@ func (s *Store) RemoveConversationMember(ctx context.Context, conversationID, ac
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversations SET metadata=$2,updated_at=now() WHERE id=$1`,
 		conversationID, metadata); err != nil {
+		return err
+	}
+	payload, _ := json.Marshal(domain.ConversationMemberRemoved{
+		ConversationID: conversationID, ActorID: actorID, UserID: userID,
+	})
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events(topic,aggregate_id,payload) VALUES('conversation.member_removed',$1,$2)`,
+		conversationID, payload); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -3308,7 +3316,7 @@ func (s *Store) EnqueuePushDeliveries(
 		SELECT $1,device.id,$2,$3,$4,$5,$6,$7
 		FROM devices AS device
 		WHERE device.user_id=ANY($8)
-		  AND device.platform='ios'
+		  AND device.platform IN ('ios','android')
 		  AND device.push_token<>''
 		ON CONFLICT(outbox_event_id,device_id) DO NOTHING`,
 		delivery.OutboxEventID, delivery.Title, delivery.Body, delivery.Kind,
@@ -3325,9 +3333,13 @@ func (s *Store) EnqueuePushDeliveries(
 func (s *Store) LockPushDeliveryBatch(
 	ctx context.Context,
 	limit int,
+	platforms ...string,
 ) ([]domain.PushDelivery, error) {
 	if limit < 1 {
 		return nil, domain.ErrInvalid
+	}
+	if len(platforms) == 0 {
+		platforms = nil
 	}
 	leaseToken := uuid.New()
 	rows, err := s.pool.Query(ctx, `
@@ -3337,6 +3349,8 @@ func (s *Store) LockPushDeliveryBatch(
 			WHERE status='pending'
 			  AND next_attempt_at<=now()
 			  AND (locked_until IS NULL OR locked_until<now())
+			  AND ($3::text[] IS NULL OR EXISTS (SELECT 1 FROM devices d
+			       WHERE d.id=push_deliveries.device_id AND d.platform=ANY($3)))
 			ORDER BY next_attempt_at,id
 			FOR UPDATE SKIP LOCKED
 			LIMIT $1
@@ -3352,7 +3366,7 @@ func (s *Store) LockPushDeliveryBatch(
 			RETURNING delivery.*
 		)
 		SELECT claimed.id,claimed.outbox_event_id,claimed.device_id,
-			device.user_id,COALESCE(device.push_token,''),
+			device.user_id,COALESCE(device.push_token,''),device.platform,
 			claimed.title,claimed.body,claimed.kind,claimed.conversation_id,
 			claimed.entity_id,claimed.notification_id,claimed.status,
 			claimed.attempts,claimed.next_attempt_at,claimed.lease_token,
@@ -3360,7 +3374,7 @@ func (s *Store) LockPushDeliveryBatch(
 			claimed.dead_lettered_at,claimed.last_error_class
 		FROM claimed
 		JOIN devices AS device ON device.id=claimed.device_id
-		ORDER BY claimed.next_attempt_at,claimed.id`, limit, leaseToken)
+		ORDER BY claimed.next_attempt_at,claimed.id`, limit, leaseToken, platforms)
 	if err != nil {
 		return nil, err
 	}
@@ -3370,7 +3384,7 @@ func (s *Store) LockPushDeliveryBatch(
 		var delivery domain.PushDelivery
 		if err := rows.Scan(
 			&delivery.ID, &delivery.OutboxEventID, &delivery.DeviceID,
-			&delivery.UserID, &delivery.PushToken, &delivery.Title, &delivery.Body,
+			&delivery.UserID, &delivery.PushToken, &delivery.Platform, &delivery.Title, &delivery.Body,
 			&delivery.Kind, &delivery.ConversationID, &delivery.EntityID,
 			&delivery.NotificationID, &delivery.Status, &delivery.Attempts,
 			&delivery.NextAttemptAt, &delivery.LeaseToken, &delivery.LockedUntil,
@@ -3404,7 +3418,7 @@ func (s *Store) WithPushDeliveryLease(
 	var delivery domain.PushDelivery
 	err = tx.QueryRow(ctx, `
 		SELECT delivery.id,delivery.outbox_event_id,delivery.device_id,
-		       device.user_id,COALESCE(device.push_token,''),
+		       device.user_id,COALESCE(device.push_token,''),device.platform,
 		       delivery.title,delivery.body,delivery.kind,delivery.conversation_id,
 		       delivery.entity_id,delivery.notification_id,delivery.status,
 		       delivery.attempts,delivery.next_attempt_at,delivery.lease_token,
@@ -3415,7 +3429,7 @@ func (s *Store) WithPushDeliveryLease(
 		WHERE delivery.id=$1 AND delivery.status='pending' AND delivery.lease_token=$2
 		FOR SHARE OF delivery,device`, id, leaseToken).Scan(
 		&delivery.ID, &delivery.OutboxEventID, &delivery.DeviceID,
-		&delivery.UserID, &delivery.PushToken, &delivery.Title, &delivery.Body,
+		&delivery.UserID, &delivery.PushToken, &delivery.Platform, &delivery.Title, &delivery.Body,
 		&delivery.Kind, &delivery.ConversationID, &delivery.EntityID,
 		&delivery.NotificationID, &delivery.Status, &delivery.Attempts,
 		&delivery.NextAttemptAt, &delivery.LeaseToken, &delivery.LockedUntil,

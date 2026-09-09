@@ -314,21 +314,40 @@ func (r *Relay) enqueuePush(ctx context.Context, item domain.OutboxEvent, recipi
 		return nil
 	}
 	pushRecipients := make([]uuid.UUID, 0, len(recipients))
+	allowed := map[uuid.UUID]struct{}{}
+	restrict := len(notification.onlyRecipients) > 0
+	for _, userID := range notification.onlyRecipients {
+		allowed[userID] = struct{}{}
+	}
 	for _, userID := range recipients {
 		if userID == notification.actorID {
 			continue
 		}
+		if restrict {
+			if _, ok := allowed[userID]; !ok {
+				continue
+			}
+		}
 		pushRecipients = append(pushRecipients, userID)
+	}
+	kind := strings.TrimSpace(notification.kind)
+	if kind == "" {
+		kind = genericPushKind
+	}
+	notificationID := notification.entityID.String()
+	if item.Topic == "conversation.member_added" || item.Topic == "conversation.member_removed" {
+		// Repeated joins/leaves must not collapse into the group's original push.
+		notificationID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("clixor-push:%d", item.ID))).String()
 	}
 	inserted, err := r.store.EnqueuePushDeliveries(ctx, domain.PushDelivery{
 		OutboxEventID: item.ID,
-		// Durable push rows are intentionally account-agnostic. The richer
-		// notification is used only to decide eligibility/identity; APNs receives
-		// the same generic values below, so persisted retry state contains no
-		// display name, group title, expense description, or message metadata.
-		Title: genericPushTitle, Body: genericPushBody, Kind: genericPushKind,
+		// Providers can deliver after logout/account erasure. Persist and send
+		// generic copy only; routing identifiers are validated by the client.
+		Title:          genericPushTitle,
+		Body:           genericPushBody,
+		Kind:           kind,
 		ConversationID: notification.conversationID, EntityID: notification.entityID,
-		NotificationID: notification.entityID.String(),
+		NotificationID: notificationID,
 	}, pushRecipients)
 	if err != nil {
 		return err
@@ -350,7 +369,7 @@ func (r *Relay) flushPush(ctx context.Context) {
 	if limit < 1 {
 		limit = 1
 	}
-	batch, err := r.store.LockPushDeliveryBatch(ctx, limit)
+	batch, err := r.store.LockPushDeliveryBatch(ctx, limit, push.EnabledPlatforms(r.push)...)
 	if err != nil {
 		observability.PushDeliveries.WithLabelValues("lock_failed").Inc()
 		r.logger.Error("push_delivery_lock_failed", "error", err)
@@ -379,9 +398,13 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 			}
 			sendContext, cancelSend := context.WithTimeout(deliveryContext, r.pushTimeout)
 			defer cancelSend()
-			sendErr = r.push.Send(
+			provider := push.ForPlatform(r.push, delivery.Platform)
+			if push.IsDisabled(provider) {
+				return domain.ErrConflict
+			}
+			sendErr = provider.Send(
 				sendContext, delivery.PushToken, genericPushTitle, genericPushBody,
-				map[string]string{"type": genericPushKind},
+				pushClientData(delivery),
 				delivery.NotificationID,
 			)
 			return nil
@@ -476,7 +499,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 		observability.PushDeliveries.WithLabelValues("dead_letter").Inc()
 		return
 	}
-	nextAttempt := r.now().UTC().Add(r.retryDelay(delivery))
+	nextAttempt := r.now().UTC().Add(max(r.retryDelay(delivery), push.MinimumRetryDelay(sendErr)))
 	if finishErr := r.store.FinishPushDelivery(
 		ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryPending,
 		nextAttempt, errorClass,
@@ -602,6 +625,7 @@ type activityNotification struct {
 	kind           string
 	title          string
 	body           string
+	onlyRecipients []uuid.UUID
 }
 
 func (r *Relay) notificationFor(
@@ -635,7 +659,7 @@ func (r *Relay) notificationFor(
 		if json.Unmarshal(item.Payload, &entity) != nil || entity.Version != 1 {
 			return activityNotification{}, false, nil
 		}
-		if entity.Kind != "expense" && entity.Kind != "task" {
+		if entity.Kind != "expense" && entity.Kind != "task" && entity.Kind != "settlement" {
 			return activityNotification{}, false, nil
 		}
 		conversation, err := r.conversationFor(ctx, entity.ConversationID, entity.CreatedBy, recipients)
@@ -667,6 +691,12 @@ func (r *Relay) notificationFor(
 			if amount != "" {
 				body += " (" + amount + ")"
 			}
+		} else if entity.Kind == "settlement" {
+			amount := formattedAmount(payload["amount"])
+			body = actor + " recorded a settlement"
+			if amount != "" {
+				body += " (" + amount + ")"
+			}
 		} else {
 			title := firstString(payload, "title", "name")
 			if title == "" {
@@ -682,8 +712,14 @@ func (r *Relay) notificationFor(
 
 	case "conversation.created":
 		var conversation domain.Conversation
-		if json.Unmarshal(item.Payload, &conversation) != nil || !isSubscription(conversation) {
+		if json.Unmarshal(item.Payload, &conversation) != nil || conversation.Kind != "group" {
 			return activityNotification{}, false, nil
+		}
+		if !isSubscription(conversation) {
+			return activityNotification{
+				actorID: conversation.CreatedBy, conversationID: conversation.ID,
+				entityID: conversation.ID, kind: "membership",
+			}, true, nil
 		}
 		return subscriptionNotification(
 			conversation, conversation.CreatedBy, conversation.ID,
@@ -702,13 +738,43 @@ func (r *Relay) notificationFor(
 			}
 			return activityNotification{}, false, err
 		}
-		if !isSubscription(conversation) {
+		if isSubscription(conversation) {
+			return subscriptionNotification(
+				conversation, added.ActorID, conversation.ID,
+				displayName(r, ctx, added.ActorID),
+			), true, nil
+		}
+		groupName := conversationTitle(conversation)
+		return activityNotification{
+			actorID: added.ActorID, conversationID: conversation.ID,
+			entityID: conversation.ID, kind: "membership", title: groupName,
+			body:           clip(displayName(r, ctx, added.ActorID)+" added you to "+groupName, 180),
+			onlyRecipients: []uuid.UUID{added.UserID},
+		}, true, nil
+
+	case "conversation.member_removed":
+		var removed domain.ConversationMemberRemoved
+		if json.Unmarshal(item.Payload, &removed) != nil {
 			return activityNotification{}, false, nil
 		}
-		return subscriptionNotification(
-			conversation, added.ActorID, conversation.ID,
-			displayName(r, ctx, added.ActorID),
-		), true, nil
+		conversation, err := r.conversationFor(ctx, removed.ConversationID, removed.ActorID, recipients)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrForbidden) {
+				return activityNotification{}, false, nil
+			}
+			return activityNotification{}, false, err
+		}
+		groupName := conversationTitle(conversation)
+		leaver := displayName(r, ctx, removed.UserID)
+		body := leaver + " left " + groupName
+		if removed.ActorID != removed.UserID {
+			body = displayName(r, ctx, removed.ActorID) + " removed " + leaver + " from " + groupName
+		}
+		return activityNotification{
+			actorID: removed.ActorID, conversationID: conversation.ID,
+			entityID: conversation.ID, kind: "member_left", title: groupName,
+			body: clip(body, 180),
+		}, true, nil
 	default:
 		return activityNotification{}, false, nil
 	}
@@ -832,6 +898,26 @@ func clip(value string, limit int) string {
 	return string(runes[:limit-1]) + "…"
 }
 
+func pushClientData(delivery domain.PushDelivery) map[string]string {
+	// Android has no routing client yet. Keep its existing minimal wake-up
+	// contract until a matching authenticated navigation handler exists.
+	if delivery.Platform != "ios" || delivery.UserID == uuid.Nil {
+		return map[string]string{"type": genericPushKind}
+	}
+	kind := strings.TrimSpace(delivery.Kind)
+	if kind == "" {
+		kind = genericPushKind
+	}
+	data := map[string]string{"type": kind, "accountId": delivery.UserID.String()}
+	if delivery.ConversationID != uuid.Nil {
+		data["groupId"] = delivery.ConversationID.String()
+	}
+	if delivery.EntityID != uuid.Nil {
+		data["entityId"] = delivery.EntityID.String()
+	}
+	return data
+}
+
 func (r *Relay) translate(ctx context.Context, item domain.OutboxEvent) (domain.RealtimeEvent, []uuid.UUID, bool) {
 	var event domain.RealtimeEvent
 	switch item.Topic {
@@ -890,8 +976,19 @@ func (r *Relay) translate(ctx context.Context, item domain.OutboxEvent) (domain.
 			return domain.RealtimeEvent{}, nil, false
 		}
 		event = domain.RealtimeEvent{
-			ID:   fmt.Sprintf("member-added:%s:%s", added.ConversationID, added.UserID),
+			ID:   fmt.Sprintf("member-added:%s:%s:%d", added.ConversationID, added.UserID, item.ID),
 			Type: item.Topic, ConversationID: &added.ConversationID,
+			Payload: item.Payload, OccurredAt: item.CreatedAt,
+		}
+	case "conversation.member_removed":
+		var removed domain.ConversationMemberRemoved
+		if err := json.Unmarshal(item.Payload, &removed); err != nil {
+			r.logger.Error("outbox_payload_invalid", "error", err, "outbox_id", item.ID)
+			return domain.RealtimeEvent{}, nil, false
+		}
+		event = domain.RealtimeEvent{
+			ID:   fmt.Sprintf("member-removed:%s:%s:%d", removed.ConversationID, removed.UserID, item.ID),
+			Type: item.Topic, ConversationID: &removed.ConversationID,
 			Payload: item.Payload, OccurredAt: item.CreatedAt,
 		}
 	default:

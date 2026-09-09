@@ -525,7 +525,8 @@ func sanitizeAccountOutbox(
 		return nil
 	}
 	topics := []string{
-		"conversation.created", "conversation.updated", "conversation.member_added", "receipt.updated",
+		"conversation.created", "conversation.updated", "conversation.member_added",
+		"conversation.member_removed", "receipt.updated",
 		"entity.updated", "entity.deleted",
 	}
 	rows, err := tx.Query(ctx, `
@@ -576,14 +577,16 @@ func sanitizeAccountOutbox(
 			}
 			continue
 		}
-		if (event.topic == "receipt.updated" || event.topic == "conversation.member_added") &&
+		if (event.topic == "receipt.updated" || event.topic == "conversation.member_added" ||
+			event.topic == "conversation.member_removed") &&
 			(typed.UserID == identity.UserID || typed.ActorID == identity.UserID) {
 			if _, err := tx.Exec(ctx, `DELETE FROM outbox_events WHERE id=$1`, event.id); err != nil {
 				return err
 			}
 			continue
 		}
-		if event.topic == "receipt.updated" || event.topic == "conversation.member_added" {
+		if event.topic == "receipt.updated" || event.topic == "conversation.member_added" ||
+			event.topic == "conversation.member_removed" {
 			continue
 		}
 		authorized, err := store.AccountJSONReferencesIdentity(event.payload, identity)

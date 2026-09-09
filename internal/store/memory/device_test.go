@@ -12,6 +12,46 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestAndroidTokenCaseAndPlatformOwnership(t *testing.T) {
+	ctx := context.Background()
+	s := New()
+	u, err := s.CreateUser(ctx, store.CreateUserParams{Email: "android-owner@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "android", PushToken: "AbCd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "android", PushToken: "abcd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ios, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "ios", PushToken: "ABCD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, device := range []domain.Device{a, b, ios} {
+		got, e := s.Device(ctx, u.ID, device.ID)
+		if e != nil || got.PushToken != device.PushToken {
+			t.Fatal("case or provider namespace was lost")
+		}
+	}
+	moved := a
+	moved.ID = uuid.New()
+	if _, err = s.UpsertDevice(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := s.Device(ctx, u.ID, a.ID)
+	if old.PushToken != "" {
+		t.Fatal("duplicate Android token retained")
+	}
+	b.Platform = "ios"
+	if _, err = s.UpsertDevice(ctx, b); !errors.Is(err, domain.ErrConflict) {
+		t.Fatal("platform identity changed")
+	}
+}
+
 func TestPreKeyClaimSkipsIncompleteDeviceIdentity(t *testing.T) {
 	ctx := context.Background()
 	persistence := New()

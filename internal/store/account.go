@@ -38,7 +38,8 @@ func AccountSanitizableOutboxTopic(topic string) bool {
 // typed user_id is the deleted account; the remaining topics may be sanitized.
 func AccountErasureOutboxTopic(topic string) bool {
 	return AccountSanitizableOutboxTopic(topic) ||
-		topic == "receipt.updated" || topic == "conversation.member_added"
+		topic == "receipt.updated" || topic == "conversation.member_added" ||
+		topic == "conversation.member_removed"
 }
 
 // AccountOutboxPayload contains only the typed routing/identity fields needed
@@ -93,6 +94,14 @@ func DecodeAccountOutboxPayload(
 		}
 		result.UserID = added.UserID
 		result.ActorID = added.ActorID
+	case "conversation.member_removed":
+		var removed domain.ConversationMemberRemoved
+		if decodeAccountOutboxStrict(raw, &removed) != nil || removed.ConversationID != aggregateID ||
+			removed.ActorID == uuid.Nil || removed.UserID == uuid.Nil {
+			return AccountOutboxPayload{}, domain.ErrInvalid
+		}
+		result.UserID = removed.UserID
+		result.ActorID = removed.ActorID
 	default:
 		return AccountOutboxPayload{}, domain.ErrInvalid
 	}

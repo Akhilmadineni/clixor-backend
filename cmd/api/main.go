@@ -250,6 +250,15 @@ func main() {
 		logger.Error("unsupported CLUSTER_STORE", "store", cfg.Store)
 		os.Exit(1)
 	}
+	var androidPush push.Service = push.Disabled{}
+	if cfg.FCM.ProjectID != "" {
+		androidPush, err = push.NewFCM(ctx, cfg.FCM.ProjectID, cfg.FCM.CredentialsFile, cfg.Android.PackageName)
+		if err != nil {
+			logger.Error("configure FCM", "error", err)
+			os.Exit(1)
+		}
+	}
+	pushService = &push.Platforms{IOS: pushService, Android: androidPush}
 	defer persistence.Close()
 	defer bus.Close()
 	defer limiter.Close()
@@ -292,6 +301,10 @@ func main() {
 			},
 		}, cfg.TrustedProxyCIDRs, cfg.MetricsToken, logger,
 	)
+	if err := api.ConfigureAndroidLinks(cfg.Android.PackageName, cfg.Android.SigningFingerprints); err != nil {
+		logger.Error("configure Android App Links", "error", err)
+		os.Exit(1)
+	}
 	if err := api.ConfigureLegalRelease(os.Getenv("CLUSTER_LEGAL_RELEASE_FILE")); err != nil {
 		logger.Error("configure legal release", "error", err)
 		os.Exit(1)

@@ -45,6 +45,8 @@ type Config struct {
 	Mail              MailConfig
 	APNS              APNSConfig
 	APNSSandbox       APNSConfig
+	FCM               FCMConfig
+	Android           AndroidConfig
 	PushDelivery      PushDeliveryConfig
 	ChoreRotation     ChoreRotationConfig
 }
@@ -113,6 +115,12 @@ type APNSConfig struct {
 	BundleID       string
 	PrivateKeyFile string
 	Environment    string
+}
+
+type FCMConfig struct{ ProjectID, CredentialsFile string }
+type AndroidConfig struct {
+	PackageName         string
+	SigningFingerprints []string
 }
 
 type PushDeliveryConfig struct {
@@ -474,6 +482,8 @@ func Load() (Config, error) {
 			PasswordResetLength:      passwordResetLength,
 			PasswordResetMaxAttempts: passwordResetMaxAttempts,
 		},
+		FCM:     FCMConfig{ProjectID: os.Getenv("CLUSTER_FCM_PROJECT_ID"), CredentialsFile: os.Getenv("CLUSTER_FCM_CREDENTIALS_FILE")},
+		Android: AndroidConfig{PackageName: os.Getenv("CLUSTER_ANDROID_PACKAGE_NAME"), SigningFingerprints: strings.FieldsFunc(os.Getenv("CLUSTER_ANDROID_SIGNING_SHA256"), func(c rune) bool { return c == ',' })},
 		APNS: APNSConfig{
 			TeamID:         os.Getenv("CLUSTER_APNS_TEAM_ID"),
 			KeyID:          os.Getenv("CLUSTER_APNS_KEY_ID"),
@@ -506,6 +516,14 @@ func Load() (Config, error) {
 }
 
 func (cfg Config) Validate() error {
+	if cfg.FCM.ProjectID != "" || cfg.FCM.CredentialsFile != "" {
+		if cfg.FCM.ProjectID == "" || cfg.FCM.CredentialsFile == "" || cfg.Android.PackageName == "" {
+			return errors.New("FCM requires project ID, credentials file, and Android package name together")
+		}
+	}
+	if len(cfg.Android.SigningFingerprints) > 0 && cfg.Android.PackageName == "" {
+		return errors.New("Android signing fingerprints require a package name")
+	}
 	switch cfg.Environment {
 	case "development", "staging", "production":
 	default:

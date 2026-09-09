@@ -2,8 +2,8 @@
 
 Go backend for Clustr messaging and shared-group data. The OCI production topology
 uses PostgreSQL, Redis, NATS, native private OCI Object Storage, a Redis-backed OTP
-service with Telnyx SMS transport, authenticated SMTP email delivery, and APNs
-support. Provider code being present does not mean its production credentials or
+service with Telnyx SMS transport, authenticated SMTP email delivery, APNs for iOS,
+and optional FCM HTTP v1 for Android. Provider code being present does not mean its production credentials or
 end-to-end delivery have been enabled or verified.
 
 This is the sole source repository for the backend. The
@@ -11,6 +11,10 @@ This is the sole source repository for the backend. The
 runtime names and `CLUSTER_*` environment keys are compatibility identifiers for
 the retired NAS deployment package. OCI is the active production target; see
 `deploy/oci/README.md`.
+
+Android uses the same REST, WebSocket, account, group, and media APIs as iOS.
+See [docs/ANDROID_INTEGRATION.md](docs/ANDROID_INTEGRATION.md) for the client
+contract, notification setup, signing prerequisites, and rollout checklist.
 
 The next-environment proposal, migration gates, cost approval, and rollback plan
 are in [PRODUCTION_MIGRATION_PLAN.md](PRODUCTION_MIGRATION_PLAN.md). It is a plan,
