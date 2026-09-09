@@ -867,12 +867,12 @@ func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.De
 	if !live || string(user.Profile) == `{"deleted":true}` {
 		return domain.Device{}, domain.ErrNotFound
 	}
-	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
+	device.PushToken = domain.NormalizePushToken(device.Platform, device.PushToken)
 	if device.ID == uuid.Nil {
 		device.ID = uuid.New()
 	}
 	if existing, ok := s.devices[device.ID]; ok {
-		if existing.UserID != device.UserID {
+		if existing.UserID != device.UserID || existing.Platform != device.Platform {
 			return domain.Device{}, domain.ErrConflict
 		}
 		if device.PushToken == "" {
@@ -893,7 +893,7 @@ func (s *Store) UpsertDevice(_ context.Context, device domain.Device) (domain.De
 		// A nonempty APNs token identifies one installation. Moving it to this
 		// authenticated device atomically removes it from every previous row.
 		for existingID, existing := range s.devices {
-			if existingID == device.ID || existing.PushToken != device.PushToken {
+			if existingID == device.ID || existing.Platform != device.Platform || existing.PushToken != device.PushToken {
 				continue
 			}
 			existing.PushToken = ""
@@ -1044,8 +1044,8 @@ func (s *Store) IssueSession(
 		return domain.User{}, domain.Device{}, domain.ErrUnauthenticated
 	}
 	device := p.Device
-	device.PushToken = strings.ToLower(strings.TrimSpace(device.PushToken))
-	if existing, exists := s.devices[device.ID]; exists && existing.UserID != device.UserID {
+	device.PushToken = domain.NormalizePushToken(device.Platform, device.PushToken)
+	if existing, exists := s.devices[device.ID]; exists && (existing.UserID != device.UserID || existing.Platform != device.Platform) {
 		return domain.User{}, domain.Device{}, domain.ErrConflict
 	} else if exists {
 		if device.PushToken == "" {
@@ -1065,7 +1065,7 @@ func (s *Store) IssueSession(
 	device.LastSeenAt = time.Now().UTC()
 	if device.PushToken != "" {
 		for id, existing := range s.devices {
-			if id != device.ID && strings.EqualFold(existing.PushToken, device.PushToken) {
+			if id != device.ID && existing.Platform == device.Platform && existing.PushToken == device.PushToken {
 				existing.PushToken = ""
 				s.devices[id] = existing
 			}
@@ -2915,7 +2915,7 @@ func (s *Store) EnqueuePushDeliveries(
 	now := time.Now().UTC()
 	for deviceID, device := range s.devices {
 		if _, eligible := recipients[device.UserID]; !eligible ||
-			device.Platform != "ios" || device.PushToken == "" {
+			!domain.MobilePlatform(device.Platform) || device.PushToken == "" {
 			continue
 		}
 		key := pushDeliveryKey(delivery.OutboxEventID, deviceID)
@@ -2939,7 +2939,7 @@ func (s *Store) EnqueuePushDeliveries(
 	return inserted, nil
 }
 
-func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.PushDelivery, error) {
+func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int, platforms ...string) ([]domain.PushDelivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if limit < 1 {
@@ -2948,6 +2948,17 @@ func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.Pu
 	now := time.Now().UTC()
 	ids := make([]int64, 0, len(s.pushDeliveries))
 	for id, delivery := range s.pushDeliveries {
+		if len(platforms) > 0 {
+			matched := false
+			for _, platform := range platforms {
+				if s.devices[delivery.DeviceID].Platform == platform {
+					matched = true
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
 		if delivery.Status == domain.PushDeliveryPending &&
 			!delivery.NextAttemptAt.After(now) &&
 			(delivery.LockedUntil.IsZero() || !delivery.LockedUntil.After(now)) {
@@ -2976,6 +2987,7 @@ func (s *Store) LockPushDeliveryBatch(_ context.Context, limit int) ([]domain.Pu
 		if device, ok := s.devices[delivery.DeviceID]; ok {
 			delivery.UserID = device.UserID
 			delivery.PushToken = device.PushToken
+			delivery.Platform = device.Platform
 		}
 		s.pushDeliveries[id] = delivery
 		claimed = append(claimed, delivery)
@@ -3015,6 +3027,7 @@ func (s *Store) WithPushDeliveryLease(
 		} else {
 			leased.UserID = device.UserID
 			leased.PushToken = device.PushToken
+			leased.Platform = device.Platform
 			s.activePushDeliveries[id] = leaseToken
 		}
 	}

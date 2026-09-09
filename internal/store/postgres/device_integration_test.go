@@ -14,6 +14,102 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestAndroidPostgresTokenOwnershipAndQueuePlatform(t *testing.T) {
+	db := os.Getenv("TEST_DATABASE_URL")
+	if db == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx := context.Background()
+	s, err := Open(ctx, db, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	u, err := s.CreateUser(ctx, store.CreateUserParams{Email: "android-" + uuid.NewString() + "@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := uuid.NewString()
+	a, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "android", PushToken: "AbCd" + suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "android", PushToken: "abcd" + suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ios, err := s.UpsertDevice(ctx, domain.Device{ID: uuid.New(), UserID: u.ID, Platform: "ios", PushToken: "ABCD" + suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, device := range []domain.Device{a, b, ios} {
+		got, e := s.Device(ctx, u.ID, device.ID)
+		if e != nil || got.PushToken != device.PushToken {
+			t.Fatal("token case/provider isolation lost")
+		}
+	}
+	b.Platform = "ios"
+	if _, err = s.UpsertDevice(ctx, b); !errors.Is(err, domain.ErrConflict) {
+		t.Fatal("device platform mutation allowed")
+	}
+	moved := a
+	moved.ID = uuid.New()
+	if _, err = s.UpsertDevice(ctx, moved); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := s.Device(ctx, u.ID, a.ID)
+	if old.PushToken != "" {
+		t.Fatal("stale token owner retained")
+	}
+	conversation, err := s.CreateConversation(ctx, store.CreateConversationParams{Kind: "group", CreatedBy: u.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := s.CreateMessage(ctx, store.CreateMessageParams{ID: uuid.New(), ClientMessageID: uuid.NewString(), ConversationID: conversation.ID, SenderID: u.ID, SenderDeviceID: moved.ID, ContentType: "text", Ciphertext: "opaque"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventID int64
+	if err = s.pool.QueryRow(ctx, `SELECT id FROM outbox_events WHERE aggregate_id=$1 AND topic='message.created' ORDER BY id DESC LIMIT 1`, conversation.ID).Scan(&eventID); err != nil {
+		t.Fatal(err)
+	}
+	count, err := s.EnqueuePushDeliveries(ctx, domain.PushDelivery{OutboxEventID: eventID, ConversationID: conversation.ID, EntityID: message.ID, NotificationID: message.ID.String()}, []uuid.UUID{u.ID})
+	if err != nil || count != 3 {
+		t.Fatalf("enqueue=%d err=%v", count, err)
+	}
+	// Claims must not spend attempts on disabled providers. Other integration
+	// fixtures may remain in this shared database, so check our exact devices.
+	batch, err := s.LockPushDeliveryBatch(ctx, 1000, "android")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, delivery := range batch {
+		if delivery.Platform != "android" {
+			t.Fatal("iOS work claimed for Android worker")
+		}
+		if delivery.OutboxEventID != eventID {
+			continue
+		}
+		seen++
+		if err = s.WithPushDeliveryLease(ctx, delivery.ID, delivery.LeaseToken, func(_ context.Context, leased domain.PushDelivery) error {
+			if leased.Platform != "android" || leased.PushToken == "" {
+				t.Fatal("lease lost Android provider identity")
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("Android claims=%d", seen)
+	}
+	var iosAttempts int
+	if err = s.pool.QueryRow(ctx, `SELECT attempts FROM push_deliveries WHERE outbox_event_id=$1 AND device_id=$2`, eventID, ios.ID).Scan(&iosAttempts); err != nil || iosAttempts != 0 {
+		t.Fatal("disabled iOS platform spent attempts")
+	}
+}
+
 func TestPushTokenUniquenessMigrationNormalizesAndKeepsNewestOwner(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

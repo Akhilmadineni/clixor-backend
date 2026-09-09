@@ -31,6 +31,7 @@ import (
 )
 
 type Server struct {
+	androidLinks           []byte
 	legalRelease           compliance.Release
 	store                  store.Store
 	tokens                 *auth.TokenManager
@@ -125,6 +126,7 @@ func (s *Server) Router() http.Handler {
 	router.Get("/support", s.supportPage)
 	router.Get("/support.js", s.supportScript)
 	router.Get("/.well-known/apple-app-site-association", s.appleAppSiteAssociation)
+	router.Get("/.well-known/assetlinks.json", s.androidAssetLinks)
 	router.Get("/apple-app-site-association", s.appleAppSiteAssociation)
 	router.Get("/join", s.joinLanding)
 	router.Handle("/metrics", s.protectMetrics(promhttp.Handler()))

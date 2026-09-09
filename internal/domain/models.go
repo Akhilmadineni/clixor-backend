@@ -280,6 +280,7 @@ type PushDelivery struct {
 	DeviceID       uuid.UUID
 	UserID         uuid.UUID
 	PushToken      string
+	Platform       string
 	Title          string
 	Body           string
 	Kind           string

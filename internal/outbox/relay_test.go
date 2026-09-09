@@ -25,6 +25,39 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestAndroidPushUsesOnlyFCMAndDisabledPlatformDoesNotConsumeAttempts(t *testing.T) {
+	f := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
+	android, err := f.store.UpsertDevice(f.ctx, domain.Device{ID: uuid.New(), UserID: f.recipient.ID, Name: "Pixel", Platform: "android", PushToken: "CaseSensitive:FCM_Token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivery := domain.PushDelivery{OutboxEventID: 999, ConversationID: f.conversation.ID, EntityID: uuid.New(), NotificationID: uuid.NewString()}
+	if _, err = f.store.EnqueuePushDeliveries(f.ctx, delivery, []uuid.UUID{f.recipient.ID}); err != nil {
+		t.Fatal(err)
+	}
+	f.relay.push = &push.Platforms{IOS: f.push, Android: push.Disabled{}}
+	f.relay.flushPush(f.ctx)
+	if len(f.push.calls) != len(f.recipientDevices) {
+		t.Fatal("Android was sent to APNs")
+	}
+	pending, err := f.store.LockPushDeliveryBatch(f.ctx, 100, "android")
+	if err != nil || len(pending) != 1 || pending[0].Attempts != 1 || pending[0].PushToken != android.PushToken {
+		t.Fatalf("disabled platform lost work/attempts: %+v %v", pending, err)
+	}
+	if err = f.store.FinishPushDelivery(f.ctx, pending[0].ID, pending[0].LeaseToken, domain.PushDeliveryPending, time.Time{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	fcm := &recordingPush{}
+	f.relay.push = &push.Platforms{IOS: f.push, Android: fcm}
+	f.relay.flushPush(f.ctx)
+	if len(fcm.calls) != 1 || fcm.calls[0].token != android.PushToken || len(f.push.calls) != len(f.recipientDevices) {
+		t.Fatal("provider routing failed")
+	}
+	if len(fcm.calls[0].data) != 1 || fcm.calls[0].data["type"] != genericPushKind {
+		t.Fatal("private content leaked to FCM")
+	}
+}
+
 func TestMessagePushFansOutToEveryRecipientDeviceAndExcludesActor(t *testing.T) {
 	fixture := newRelayFixture(t, json.RawMessage(`{"type":"Roommates"}`))
 	message := domain.Message{

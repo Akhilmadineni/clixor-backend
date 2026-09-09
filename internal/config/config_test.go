@@ -139,6 +139,31 @@ func TestValidProductionConfiguration(t *testing.T) {
 	}
 }
 
+func TestAndroidPushConfigurationRequiresCompleteIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fcm       FCMConfig
+		android   AndroidConfig
+		wantError bool
+	}{
+		{"disabled", FCMConfig{}, AndroidConfig{}, false},
+		{"package_only", FCMConfig{}, AndroidConfig{PackageName: "com.example.clixor"}, false},
+		{"project_only", FCMConfig{ProjectID: "test-project"}, AndroidConfig{}, true},
+		{"file_only", FCMConfig{CredentialsFile: "/run/secrets/fcm.json"}, AndroidConfig{}, true},
+		{"missing_package", FCMConfig{ProjectID: "test-project", CredentialsFile: "/run/secrets/fcm.json"}, AndroidConfig{}, true},
+		{"missing_package_for_links", FCMConfig{}, AndroidConfig{SigningFingerprints: []string{"AB"}}, true},
+		{"complete_push", FCMConfig{ProjectID: "test-project", CredentialsFile: "/run/secrets/fcm.json"}, AndroidConfig{PackageName: "com.example.clixor"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validProductionConfig()
+			cfg.FCM, cfg.Android = tc.fcm, tc.android
+			if err := cfg.Validate(); (err != nil) != tc.wantError {
+				t.Fatalf("Validate() = %v, want error %v", err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestSandboxAPNSCredentialsMustBeConfiguredTogether(t *testing.T) {
 	cfg := validProductionConfig()
 	cfg.APNSSandbox.TeamID = "sandbox-team"

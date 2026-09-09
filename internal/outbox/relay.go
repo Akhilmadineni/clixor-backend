@@ -350,7 +350,7 @@ func (r *Relay) flushPush(ctx context.Context) {
 	if limit < 1 {
 		limit = 1
 	}
-	batch, err := r.store.LockPushDeliveryBatch(ctx, limit)
+	batch, err := r.store.LockPushDeliveryBatch(ctx, limit, push.EnabledPlatforms(r.push)...)
 	if err != nil {
 		observability.PushDeliveries.WithLabelValues("lock_failed").Inc()
 		r.logger.Error("push_delivery_lock_failed", "error", err)
@@ -379,7 +379,11 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 			}
 			sendContext, cancelSend := context.WithTimeout(deliveryContext, r.pushTimeout)
 			defer cancelSend()
-			sendErr = r.push.Send(
+			provider := push.ForPlatform(r.push, delivery.Platform)
+			if push.IsDisabled(provider) {
+				return domain.ErrConflict
+			}
+			sendErr = provider.Send(
 				sendContext, delivery.PushToken, genericPushTitle, genericPushBody,
 				map[string]string{"type": genericPushKind},
 				delivery.NotificationID,
@@ -476,7 +480,7 @@ func (r *Relay) deliverPush(ctx context.Context, delivery domain.PushDelivery) {
 		observability.PushDeliveries.WithLabelValues("dead_letter").Inc()
 		return
 	}
-	nextAttempt := r.now().UTC().Add(r.retryDelay(delivery))
+	nextAttempt := r.now().UTC().Add(max(r.retryDelay(delivery), push.MinimumRetryDelay(sendErr)))
 	if finishErr := r.store.FinishPushDelivery(
 		ctx, delivery.ID, delivery.LeaseToken, domain.PushDeliveryPending,
 		nextAttempt, errorClass,

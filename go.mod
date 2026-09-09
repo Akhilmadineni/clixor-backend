@@ -15,9 +15,11 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/redis/go-redis/v9 v9.22.0
 	golang.org/x/crypto v0.56.0
+	golang.org/x/oauth2 v0.37.0
 )
 
 require (
+	cloud.google.com/go/compute/metadata v0.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
